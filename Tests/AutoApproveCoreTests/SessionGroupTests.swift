@@ -967,6 +967,32 @@ extension ApprovalTests {
         try expectEqual(try box.message(peerID)?.acknowledgedAt, originalACK)
         try expectEqual(try box.message(peerID)?.lastResult, "direct_submitted")
         try expectEqual(try box.pendingCount, 0)
+
+        terminal.setStatus(records[1].pid, "shell")
+        _ = try await engine.sessionGroupSessions()
+        let queuedAt = Date()
+        let blocked = try box.enqueue(groupID: group.id, senderID: members[0].id, recipientID: members[1].id,
+                                      kind: .question, text: "blocked fixture question", at: queuedAt)
+        try box.noteAttempt(blocked.id, result: "not_started", error: "fixture shell state", retryAt: .distantFuture)
+        let following = try box.enqueue(groupID: group.id, senderID: members[2].id, recipientID: members[1].id,
+                                        kind: .message, text: "queued behind question")
+        let beforeInspection = count()
+        let operation = try unwrapGroup(engine.sessionGroupOperations(group)[members[1].id])
+        try expectNotNil(operation.phase, "The conversation is confirmed even though input is blocked")
+        try expectEqual(operation.input, .deferred("Claude Code에서 셸 명령 실행 중"))
+        try expectEqual(operation.unacknowledgedCount, 2)
+        try expect(operation.isDeliveryBlocked)
+        try expectEqual(operation.lastDeliveryFailure, "fixture shell state")
+        try expectNotNil(operation.lastAcknowledgedAt)
+        try expectEqual(operation.firstPendingAt, blocked.createdAt)
+        var changedConversation = group
+        changedConversation.members[1].conversationID = UUID().uuidString
+        try expectNil(try engine.sessionGroupOperations(changedConversation)[members[1].id]?.phase)
+        try expectEqual(count(), beforeInspection, "Reading graph status must not send terminal input")
+        try box.acknowledge([blocked.id, following.id], groupID: group.id, recipientID: members[1].id)
+        try expectEqual(try engine.sessionGroupOperations(group)[members[1].id]?.isDeliveryBlocked, false)
+        terminal.setStatus(records[1].pid, "busy")
+
         // General messages use the same durable cross-agent route, even with a leader.
         for (sender, recipient) in [(0, 1), (1, 0), (2, 1), (1, 2)] {
             let receipt = try await call("send_group_message", "cross-agent general \(sender)-\(recipient)", caller: sender, target: recipient)

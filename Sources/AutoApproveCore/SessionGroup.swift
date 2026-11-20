@@ -286,6 +286,7 @@ public struct SessionGroupLiveSession: Identifiable, Equatable {
     public var messagingName: String?
     var tabShell: SessionGroupTabShell?
     var codexIdentityFromMCP = false
+    var claudeRegisteredStatus: String?
     public var id: String { session.id }
     public init(session: AgentSession, conversationID: String?, providerHome: String?, messagingName: String? = nil) {
         self.session = session; self.conversationID = conversationID; self.providerHome = providerHome; self.messagingName = messagingName
@@ -299,6 +300,22 @@ public struct SessionGroupLiveSession: Identifiable, Equatable {
         value.runtimeID = session.id
         return value
     }
+}
+
+public struct SessionGroupMemberOperation: Equatable {
+    public enum Input: Equatable {
+        case unverified
+        case idle
+        case deferred(String)
+    }
+
+    public let phase: SessionPhase?
+    public let input: Input
+    public let unacknowledgedCount: Int
+    public let lastAcknowledgedAt: Date?
+    public let firstPendingAt: Date?
+    public let lastDeliveryFailure: String?
+    public let isDeliveryBlocked: Bool
 }
 
 public enum SessionGroupMatching {

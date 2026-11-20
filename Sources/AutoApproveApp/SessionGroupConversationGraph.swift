@@ -7,6 +7,7 @@ import AutoApproveCore
     let engine: ApprovalEngine
     @State private var group: SessionGroup?
     @State private var page: SessionGroupConversationPage?
+    @State private var operations: [UUID: SessionGroupMemberOperation] = [:]
     @State private var error: String?
     @State private var selected: UUID?
     @State private var onlyPending = false
@@ -61,6 +62,8 @@ import AutoApproveCore
                 if group.members.isEmpty {
                     ContentUnavailableView("구성원이 없습니다", systemImage: "person.2")
                 } else {
+                    operationSummary(group)
+                    Divider()
                     HStack(spacing: 0) {
                         VStack(alignment: .leading, spacing: 0) {
                             VStack(alignment: .leading, spacing: 8) {
@@ -89,6 +92,7 @@ import AutoApproveCore
                             .font(.caption).foregroundStyle(.secondary).padding(12)
                             Divider()
                             GroupConversationNodes(group: group, page: page, onlyPending: onlyPending,
+                                                   blocked: Set(operations.filter { $0.value.isDeliveryBlocked }.keys),
                                                    selection: $selected, movedNodes: $movedNodes, isDragging: $isDraggingNode)
                         }
                         .frame(minWidth: 390, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -149,6 +153,40 @@ import AutoApproveCore
         Label { Text(title) } icon: { Image(systemName: "circle.fill").foregroundStyle(color) }
     }
 
+    private func operationSummary(_ group: SessionGroup) -> some View {
+        let working = operations.values.filter { $0.phase == .working }.count
+        let waiting = operations.values.reduce(0) { $0 + $1.unacknowledgedCount }
+        let blocked = group.treeOrder.map(\.member).filter { operations[$0.id]?.isDeliveryBlocked == true }
+        return HStack(spacing: 16) {
+            Label("작업 중 \(working)명", systemImage: "bolt")
+                .help("확인된 세션 중 마지막 상태가 작업 중인 구성원 수입니다.")
+            Label("수신 미확인 \(waiting)건", systemImage: "tray")
+                .help("현재 구성원에게 저장됐지만 수신 확인이 남아 있는 그룹 메시지 수입니다. 터미널에 이미 제출된 메시지도 포함됩니다.")
+            if blocked.isEmpty {
+                Label("전달 막힘 0명", systemImage: "exclamationmark.triangle")
+                    .help("전달할 메시지가 있고 현재 입력할 수 없거나, 첫 전달 시도가 보류된 구성원을 셉니다.")
+            } else {
+                Menu {
+                    ForEach(blocked) { member in
+                        Button(member.title) { selected = member.id }
+                            .help("이 구성원의 입력 상태와 마지막 전달 보류 사유를 봅니다.")
+                    }
+                } label: {
+                    Label("전달 막힘 \(blocked.count)명", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("전달이 막힌 구성원을 선택해 대기 건수와 보류 사유를 봅니다.")
+            }
+            Spacer()
+        }
+        .font(.caption.monospacedDigit())
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+
     private func deliver(_ item: SessionGroupConversation) {
         guard deliveringQuestion == nil else { return }
         let name = group.map { title(item.question.recipientID, in: $0) } ?? "대상"
@@ -168,13 +206,16 @@ import AutoApproveCore
             guard let currentGroup = try SessionGroupStore(directory: engine.paths.directory).load().first(where: { $0.id == groupID }) else {
                 group = nil
                 page = nil
+                operations = [:]
                 selected = nil
                 error = "저장된 그룹을 찾을 수 없습니다."
                 return
             }
             let next = try engine.sessionGroupConversations(groupID)
+            let nextOperations = try engine.sessionGroupOperations(currentGroup)
             if group != currentGroup { group = currentGroup }
             if page != next { page = next }
+            if operations != nextOperations { operations = nextOperations }
             if let selected, !currentGroup.members.contains(where: { $0.id == selected }) { self.selected = nil }
             error = nil
         } catch { self.error = error.localizedDescription }
@@ -189,86 +230,89 @@ import AutoApproveCore
             VStack(alignment: .leading, spacing: 0) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(member.title).font(.headline).lineLimit(2).help(member.title)
-                    Text(member.agent.title + " · " + String(conversations.count + messages.count) + "건")
+                    let role = group.isLeader(member.id) ? "그룹장" : "구성원"
+                    Text("\(member.agent.title) · \(role)")
                         .font(.caption).foregroundStyle(.secondary)
                 }.padding(14)
                 Divider()
-                if conversations.isEmpty && messages.isEmpty {
-                    ContentUnavailableView("저장된 대화가 없습니다",
-                                           systemImage: "bubble.left.and.bubble.right")
-                } else {
-                    List {
-                        if !conversations.isEmpty {
-                            Section("질문과 답변") {
-                                ForEach(conversations) { item in
-                                    let outbound = item.question.senderID == selected
-                                    let peer = outbound ? item.question.recipientID : item.question.senderID
-                                    VStack(alignment: .leading, spacing: 6) {
-                                        DisclosureGroup {
-                                            message("질문", item.question)
-                                            if let answer = item.answer { message("답변", answer) }
-                                        } label: {
-                                            VStack(alignment: .leading, spacing: 4) {
-                                                Text((outbound ? "보낸 질문 · " : "받은 질문 · ") + title(peer, in: group))
-                                                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                                Text(item.question.text).lineLimit(2)
-                                            }
-                                        }
-                                        .disclosureGroupStyle(ConversationDisclosureStyle(summary: "질문과 답변 원문"))
-                                        HStack {
-                                            Label(status(item), systemImage: item.answer == nil ? "clock" : "checkmark.circle")
-                                                .font(.caption)
-                                                .foregroundStyle(item.waitExpired ? Color.orange : Color.secondary)
-                                        }
-                                        if item.answer == nil, group.members.contains(where: { $0.id == peer }) {
-                                            HStack {
-                                                if deliveringQuestion == item.id {
-                                                    ProgressView().controlSize(.small).accessibilityLabel("질문 전달 중")
-                                                }
-                                                Spacer(minLength: 4)
-                                                Button("노드에 전달…") { deliveryTarget = item }
-                                                    .disabled(deliveringQuestion != nil)
-                                                    .help(deliveringQuestion == nil
-                                                          ? "\(title(item.question.recipientID, in: group))의 터미널에 원래 질문을 보냅니다. 제출하기 전에 확인 창이 열립니다."
-                                                          : "진행 중인 질문 전달이 끝나면 다시 사용할 수 있습니다.")
-                                                Button("답변…") { replyTarget = item }
-                                                    .help("질문을 받은 구성원 대신 답변을 작성해 원래 질문자에게 보냅니다.")
-                                            }
-                                            .buttonStyle(.bordered)
-                                            .controlSize(.small)
-                                        }
-                                    }
-                                    .padding(.vertical, 4)
-                                    .accessibilityElement(children: .contain)
-                                }
-                            }
-                        }
-                        if !messages.isEmpty {
-                            Section("메시지와 보고") {
-                                ForEach(messages, id: \.id) { item in
-                                    let outgoing = item.senderID == selected
-                                    let peer = outgoing ? item.recipientID : item.senderID
-                                    let kind = item.kind == .report ? "보고" : item.kind == .reply ? "답변" : item.kind == .choiceQuestion ? "선택 질문" : "메시지"
+                List {
+                    if let operation = operations[member.id] {
+                        Section("세션 상태") { memberOperation(operation) }
+                    }
+                    if conversations.isEmpty && messages.isEmpty {
+                        Label("저장된 대화가 없습니다", systemImage: "bubble.left.and.bubble.right")
+                            .foregroundStyle(.secondary)
+                    }
+                    if !conversations.isEmpty {
+                        Section("질문과 답변") {
+                            ForEach(conversations) { item in
+                                let outbound = item.question.senderID == selected
+                                let peer = outbound ? item.question.recipientID : item.question.senderID
+                                VStack(alignment: .leading, spacing: 6) {
                                     DisclosureGroup {
-                                        message(kind, item)
+                                        message("질문", item.question)
+                                        if let answer = item.answer { message("답변", answer) }
                                     } label: {
                                         VStack(alignment: .leading, spacing: 4) {
-                                            Text((outgoing ? "보냄 · " : "받음 · ") + title(peer, in: group))
+                                            Text((outbound ? "보낸 질문 · " : "받은 질문 · ") + title(peer, in: group))
                                                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                            Text(item.text).lineLimit(2)
-                                            Text(kind + " · " + delivery(item))
-                                                .font(.caption).foregroundStyle(.secondary)
+                                            Text(item.question.text).lineLimit(2)
                                         }
                                     }
-                                    .disclosureGroupStyle(ConversationDisclosureStyle(summary: "메시지 원문"))
-                                    .padding(.vertical, 4)
+                                    .disclosureGroupStyle(ConversationDisclosureStyle(summary: "질문과 답변 원문"))
+                                    HStack {
+                                        Label(status(item), systemImage: item.answer == nil ? "clock" : "checkmark.circle")
+                                            .font(.caption)
+                                            .foregroundStyle(item.waitExpired ? Color.orange : Color.secondary)
+                                    }
+                                    if item.answer == nil, group.members.contains(where: { $0.id == peer }) {
+                                        HStack {
+                                            if deliveringQuestion == item.id {
+                                                ProgressView().controlSize(.small).accessibilityLabel("질문 전달 중")
+                                            }
+                                            Spacer(minLength: 4)
+                                            Button("노드에 전달…") { deliveryTarget = item }
+                                                .disabled(deliveringQuestion != nil)
+                                                .help(deliveringQuestion == nil
+                                                      ? "\(title(item.question.recipientID, in: group))의 터미널에 원래 질문을 보냅니다. 제출하기 전에 확인 창이 열립니다."
+                                                      : "진행 중인 질문 전달이 끝나면 다시 사용할 수 있습니다.")
+                                            Button("답변…") { replyTarget = item }
+                                                .help("질문을 받은 구성원 대신 답변을 작성해 원래 질문자에게 보냅니다.")
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                    }
                                 }
+                                .padding(.vertical, 4)
+                                .accessibilityElement(children: .contain)
                             }
                         }
                     }
-                    .listStyle(.inset)
-                    .id(selected)
+                    if !messages.isEmpty {
+                        Section("메시지와 보고") {
+                            ForEach(messages, id: \.id) { item in
+                                let outgoing = item.senderID == selected
+                                let peer = outgoing ? item.recipientID : item.senderID
+                                let kind = item.kind == .report ? "보고" : item.kind == .reply ? "답변" : item.kind == .choiceQuestion ? "선택 질문" : "메시지"
+                                DisclosureGroup {
+                                    message(kind, item)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text((outgoing ? "보냄 · " : "받음 · ") + title(peer, in: group))
+                                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                        Text(item.text).lineLimit(2)
+                                        Text(kind + " · " + delivery(item))
+                                            .font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                                .disclosureGroupStyle(ConversationDisclosureStyle(summary: "메시지 원문"))
+                                .padding(.vertical, 4)
+                            }
+                        }
+                    }
                 }
+                .listStyle(.inset)
+                .id(selected)
             }
         } else {
             ContentUnavailableView("구성원을 선택하세요", systemImage: "cursorarrow",
@@ -276,6 +320,46 @@ import AutoApproveCore
         }
     }
 
+    private func memberOperation(_ operation: SessionGroupMemberOperation) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            let phase = operation.phase
+            statusRow("세션 연결", phase.map { "대화 확인 · " + $0.title } ?? "대화 미확인")
+            switch operation.input {
+            case .unverified: statusRow("터미널 입력", "입력 상태 미확인")
+            case .idle:
+                statusRow("터미널 입력", "대기 중 · 제출 직전 확인")
+                    .help("AutoApprove는 실제로 제출하기 전에 현재 터미널의 빈 입력창을 확인합니다.")
+            case let .deferred(reason): statusRow("터미널 입력", reason, attention: true)
+            }
+            statusRow("수신 미확인", "\(operation.unacknowledgedCount)건")
+            statusRow("마지막 수신 확인", formatOperationDate(operation.lastAcknowledgedAt))
+            if let first = operation.firstPendingAt {
+                statusRow("가장 오래된 미확인", formatOperationDate(first))
+            }
+            if let reason = operation.lastDeliveryFailure, !reason.isEmpty {
+                Label(reason, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help("이 구성원에게 먼저 전달할 메시지의 마지막 보류 사유입니다.")
+            }
+        }
+        .font(.caption)
+        .padding(.vertical, 5)
+    }
+
+    private func statusRow(_ name: String, _ value: String, attention: Bool = false) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(name).foregroundStyle(.secondary)
+            Spacer(minLength: 6)
+            Text(value).foregroundStyle(attention ? Color.orange : Color.primary)
+                .multilineTextAlignment(.trailing)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func formatOperationDate(_ date: Date?) -> String {
+        date?.formatted(date: .abbreviated, time: .shortened) ?? "기록 없음"
+    }
     private func title(_ id: UUID, in group: SessionGroup) -> String { group.members.first { $0.id == id }?.title ?? "이전 구성원" }
 
     private func status(_ item: SessionGroupConversation) -> String {
@@ -402,6 +486,7 @@ private extension AgentKind {
     let group: SessionGroup
     let page: SessionGroupConversationPage
     let onlyPending: Bool
+    let blocked: Set<UUID>
     @Binding var selection: UUID?
     @Binding var movedNodes: [UUID: CGPoint]
     @Binding var isDragging: Bool
@@ -480,6 +565,7 @@ private extension AgentKind {
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel(member.title + ", " + member.agent.title)
+                            .accessibilityValue(blocked.contains(member.id) ? "전달 막힘" : "")
                             .accessibilityAddTraits(selection == member.id ? [.isSelected] : [])
                             .onMoveCommand { direction in
                                 let offset: CGSize
@@ -516,7 +602,7 @@ private extension AgentKind {
                                     movedNodes[member.id] = normalized(shift(dragOrigin ?? point, by: value.translation, in: size), in: size)
                                     finishDrag()
                                 })
-                            .help("\(member.title) · \(member.agent.title)\n클릭하면 대화를 엽니다. 끌거나 방향키를 누르면 노드를 이동합니다.")
+                            .help("\(member.title) · \(member.agent.title)\(blocked.contains(member.id) ? " · 전달 막힘" : "")\n클릭하면 세션 상태와 대화를 엽니다. 끌거나 방향키를 누르면 노드를 이동합니다.")
                             .position(x: point.x, y: point.y + 11)
                         }
                     }
@@ -572,6 +658,16 @@ private extension AgentKind {
             .frame(width: 32, height: 32)
             .padding(3)
             .overlay { Circle().strokeBorder(highlighted ? Color.primary : .clear, lineWidth: 2) }
+            .overlay(alignment: .topTrailing) {
+                if blocked.contains(member.id) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.orange)
+                        .padding(2)
+                        .background(Color(nsColor: .windowBackgroundColor), in: Circle())
+                        .offset(x: 3, y: -2)
+                }
+            }
             Text(member.title)
                 .font(.caption.weight(highlighted ? .semibold : .regular))
                 .lineLimit(1)

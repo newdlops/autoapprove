@@ -259,6 +259,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var groupBadgeRefreshPending = false
     private var groupBadgeSessionIDs: Set<String> = []
     private var groupBadgeRefreshedAt = Date.distantPast
+    private var groupConnectionObservation: (at: Date, sessions: [SessionGroupLiveSession])?
     /// Sessions whose next choice input is a parent's delegated permission answer.
     private var delegatedPermissionInputs: Set<String> = []
     private var groupQuestionSeen: [UUID: (id: String, since: Date)] = [:]
@@ -899,6 +900,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func stop() {
         groupClearTask?.cancel(); groupClearTask = nil
         groupIdentityObservationTask?.cancel()
+        groupConnectionObservation = nil
         groupMCPIdentities.removeAll()
         cohortExecutionTasks.values.forEach{$0.cancel()};cohortExecutionTasks.removeAll()
         goalRecoveryTask?.cancel();goalRecoveryTask=nil
@@ -2808,7 +2810,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let pending = Task { try await readSessionGroupSessions() }
         groupIdentityObservationTask = pending
         defer { groupIdentityObservationTask = nil }
-        return try await pending.value
+        let observed = try await pending.value
+        if !Task.isCancelled, !pending.isCancelled { groupConnectionObservation = (.now, observed) }
+        return observed
     }
 
     private func readSessionGroupSessions(runtimeID: String? = nil, reconcile: Bool = true, useStatusCache: Bool = true) async throws -> [SessionGroupLiveSession] {
@@ -2827,7 +2831,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let environment = await Task.detached(priority: .utility) {
                 original.agent == .codex ? codexEnvironment(record) : ProcessEnvironment.read(record)
             }.value
-            var home: String?, conversation: String?, messagingName: String?
+            var home: String?, conversation: String?, messagingName: String?, claudeStatus: String?
             if original.agent == .codex {
                 home = CodexGroupIdentity.home(environment: environment)
                 let location = try? await Task.detached(priority: .utility) {
@@ -2846,21 +2850,29 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let ids = Set(rows.filter { $0.processID == original.id }.compactMap(\.conversationID))
                     if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
                     let matching = rows.filter { $0.processID == original.id && $0.conversationID == conversation }
-                    if conversation != nil, matching.count == 1 { messagingName = matching[0].peerName }
+                    if conversation != nil, matching.count == 1 {
+                        messagingName = matching[0].peerName
+                        claudeStatus = matching[0].status
+                    }
                 } else {
                     // Injected registry readers are also useful for isolated tests; do not infer a home.
                     let rows = await Task.detached(priority: .utility) { registry([record]) }.value
                     let ids = Set(rows.filter { $0.processID == original.id }.compactMap(\.conversationID))
                     if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
                     let matching = rows.filter { $0.processID == original.id && $0.conversationID == conversation }
-                    if conversation != nil, matching.count == 1 { messagingName = matching[0].peerName }
+                    if conversation != nil, matching.count == 1 {
+                        messagingName = matching[0].peerName
+                        claudeStatus = matching[0].status
+                    }
                 }
             }
             guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
                   current.tty == original.tty, current.agent == original.agent, current.cwd == original.cwd,
                   current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
                   current.phase != .ended else { continue }
-            result.append(SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName))
+            var observation = SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName)
+            observation.claudeRegisteredStatus = claudeStatus
+            result.append(observation)
         }
         // Discovery can lag while a process exits or a PID is reused. Re-read
         // the process list after the async work, and never publish a stale match.
@@ -3411,6 +3423,52 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     public func sessionGroupConversations(_ id: UUID) throws -> SessionGroupConversationPage {
         try groupMailbox().conversations(groupID: id)
+    }
+
+    /// Present existing evidence on the graph without running a terminal probe.
+    public func sessionGroupOperations(_ group: SessionGroup) throws -> [UUID: SessionGroupMemberOperation] {
+        let inboxes = try groupMailbox().inboxOperations(groupID: group.id)
+        let stopped = snapshot.paused || remoteInputStopped
+        let clearing = groupClearActive(group.id)
+        let evidence = groupConnectionObservation.map { Date().timeIntervalSince($0.at) < 120 ? $0.sessions : [] } ?? []
+        let current = evidence.compactMap { observed -> SessionGroupLiveSession? in
+            guard let live = sessions[observed.id], live.phase != .ended, live.tty == observed.session.tty,
+                  live.cwd == observed.session.cwd, live.codexApprovalBinding?.threadID == observed.session.codexApprovalBinding?.threadID,
+                  !observed.codexIdentityFromMCP || groupMCPIdentity(for: live, home: observed.providerHome)?.conversationID ==
+                    observed.conversationID.flatMap(UUID.init(uuidString:)) else { return nil }
+            var value = observed
+            value.session = live
+            return value
+        }
+        return Dictionary(uniqueKeysWithValues: group.members.map { member in
+            let live = UUID(uuidString: member.conversationID) == nil ? nil : SessionGroupMatching.match(member, in: current)
+            let inbox = inboxes[member.id]
+            let input = groupOperationInput(live, stopped: stopped, clearing: clearing)
+            let count = inbox?.unacknowledgedCount ?? 0
+            let blocked: Bool
+            if case .deferred = input { blocked = true } else { blocked = false }
+            return (member.id, SessionGroupMemberOperation(
+                phase: live?.session.phase, input: input, unacknowledgedCount: count,
+                lastAcknowledgedAt: inbox?.lastAcknowledgedAt, firstPendingAt: inbox?.firstPendingAt,
+                lastDeliveryFailure: inbox?.lastDeliveryFailure,
+                isDeliveryBlocked: count > 0 && inbox?.hasNotificationHead == true && (blocked || inbox?.headDidNotStart == true)))
+        })
+    }
+
+    private func groupOperationInput(_ live: SessionGroupLiveSession?, stopped: Bool, clearing: Bool) -> SessionGroupMemberOperation.Input {
+        if stopped { return .deferred("AutoApprove 일시 정지") }
+        if clearing { return .deferred("그룹 세션 초기화 중") }
+        guard let live else { return .unverified }
+        let session = live.session
+        if live.claudeRegisteredStatus == "shell" { return .deferred("Claude Code에서 셸 명령 실행 중") }
+        if [.approval, .input].contains(session.phase) || session.pendingInTerminal || session.osPermissionWaiting == true {
+            return .deferred("터미널에서 승인 또는 입력 대기")
+        }
+        if automaticInputBusy(session.id) || sendingMessages.contains(session.id) || userInputHasPriority(session.id) {
+            return .deferred("다른 터미널 입력 진행 중")
+        }
+        if session.phase == .working { return .deferred("세션 작업 중") }
+        return session.phase == .idle ? .idle : .unverified
     }
 
     private func saveGroupOrchestration(_ state: SessionGroupOrchestration) throws {

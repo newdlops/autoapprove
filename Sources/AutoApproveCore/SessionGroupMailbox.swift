@@ -293,12 +293,61 @@ public final class SessionGroupMailbox {
         )
         """
 
+    private static let notificationOrder = "CASE WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 0 ELSE 1 END,m.sequence"
+
+    struct InboxOperation {
+        let unacknowledgedCount: Int
+        let lastAcknowledgedAt: Date?
+        let firstPendingAt: Date?
+        let hasNotificationHead: Bool
+        let headDidNotStart: Bool
+        let lastDeliveryFailure: String?
+    }
+
+    /// Measure the whole inbox without materializing conversation bodies. The
+    /// head uses the same eligibility and priority as the delivery worker.
+    func inboxOperations(groupID: UUID) throws -> [UUID: InboxOperation] {
+        let query = try statement("""
+            WITH inbox AS (
+                SELECT recipient_id, sum(acknowledged IS NULL) AS pending, max(acknowledged) AS last_ack,
+                       min(CASE WHEN acknowledged IS NULL THEN created END) AS first_pending
+                FROM messages
+                WHERE group_id=? AND kind<>'waitNotice' AND last_result IS NOT 'superseded'
+                GROUP BY recipient_id
+            ), heads AS (
+                SELECT m.recipient_id, m.last_result, m.last_error,
+                       row_number() OVER (PARTITION BY m.recipient_id ORDER BY \(Self.notificationOrder)) AS position
+                FROM messages m WHERE m.group_id=? AND \(Self.notificationFilter)
+            )
+            SELECT inbox.recipient_id, pending, last_ack, first_pending, heads.position, heads.last_result, heads.last_error
+            FROM inbox LEFT JOIN heads ON heads.recipient_id=inbox.recipient_id AND heads.position=1
+            """, [groupID.uuidString, groupID.uuidString])
+        defer { sqlite3_finalize(query) }
+        func date(_ column: Int32) -> Date? {
+            sqlite3_column_type(query, column) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(query, column))
+        }
+        func string(_ column: Int32) -> String? { sqlite3_column_text(query, column).map { String(cString: $0) } }
+        var values: [UUID: InboxOperation] = [:]
+        while true {
+            let status = sqlite3_step(query)
+            if status == SQLITE_DONE { return values }
+            guard status == SQLITE_ROW, let id = string(0).flatMap(UUID.init(uuidString:)) else {
+                throw AppError.message("그룹 수신함의 상태를 읽지 못했습니다.")
+            }
+            let blocked = string(5) == "not_started"
+            values[id] = InboxOperation(unacknowledgedCount: Int(sqlite3_column_int64(query, 1)),
+                                        lastAcknowledgedAt: date(2), firstPendingAt: date(3),
+                                        hasNotificationHead: sqlite3_column_int(query, 4) == 1,
+                                        headDidNotStart: blocked, lastDeliveryFailure: blocked ? string(6) : nil)
+        }
+    }
+
     public func heads() throws -> [SessionGroupMessage] {
         try rows("""
             WHERE sequence IN (
                 SELECT sequence FROM (
                     SELECT m.sequence, row_number() OVER (PARTITION BY m.group_id,m.recipient_id
-                        ORDER BY CASE WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 0 ELSE 1 END,m.sequence) AS position
+                        ORDER BY \(Self.notificationOrder)) AS position
                     FROM messages m WHERE \(Self.notificationFilter)
                 ) WHERE position=1
             ) ORDER BY sequence
