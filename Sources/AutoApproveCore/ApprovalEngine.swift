@@ -3352,6 +3352,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func deliverGroupMailboxNotifications() async throws {
         guard !snapshot.paused, !remoteInputStopped else { return }
+        parkMessagesForRemovedMembers()
         notifyStalledSenders()
         let overdue = try groupMailbox().overdueReceipts()
         var heads = try groupMailbox().heads()
@@ -3408,6 +3409,43 @@ private struct ScreenAnalysisStorageKey: Hashable {
               !stalled.isEmpty else { return }
         let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
         for message in stalled { noticeStalledSender(message, groups: groups) }
+    }
+
+    /// A recipient that left its group can never be matched to a terminal, so its messages used to be
+    /// retried forever. They are parked instead: kept in the mailbox, out of the delivery queue, and the
+    /// result is reported once to the sender, or to a leader when the sender left too.
+    private func parkMessagesForRemovedMembers() {
+        // An empty store is not taken as proof that every group was deleted.
+        guard let box = try? groupMailbox(), let groups = try? SessionGroupStore(directory: paths.directory).load(),
+              !groups.isEmpty else { return }
+        let members = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, Set($0.members.map(\.id))) })
+        guard let orphaned = try? box.queuedForMissingRecipients(members: members), !orphaned.isEmpty else { return }
+        for message in orphaned {
+            let group = groups.first { $0.id == message.groupID }
+            let reason = group == nil ? "그룹이 삭제되어 전달하지 않고 수신함에 보관했습니다."
+                                      : "받을 구성원이 그룹에서 빠져 전달하지 않고 수신함에 보관했습니다."
+            guard (try? box.park(message.id, reason: reason)) != nil else { continue }
+            let notified = group.flatMap { noticeRemovedRecipient(message, group: $0, box: box) }
+            log(AuditEvent(sessionID: "", summary: "세션 그룹 메시지 \(message.id.uuidString.prefix(8))",
+                           outcome: "그룹 메시지 전달 중단", source: "세션 그룹", tool: "group_mailbox",
+                           request: reason + (notified.map { " \($0)에게 알렸습니다." } ?? " 알릴 구성원이 없습니다.")))
+        }
+    }
+
+    /// Returns who was told: the sender, or a leader when the sender left the group too.
+    private func noticeRemovedRecipient(_ message: SessionGroupMessage, group: SessionGroup, box: SessionGroupMailbox) -> String? {
+        guard ![.notice, .waitNotice].contains(message.kind) else { return nil }
+        let senderStays = group.members.contains { $0.id == message.senderID }
+        guard let target = senderStays ? message.senderID
+                : group.leaderMemberIDs.first(where: { id in group.members.contains { $0.id == id } }) else { return nil }
+        let key = "removed:" + message.id.uuidString
+        guard (try? box.message(sourceKey: key)) == nil else { return senderStays ? "보낸 구성원" : "그룹장" }
+        let whose = senderStays ? "보낸 메시지" : "그룹에서 빠진 구성원 \(message.senderID.uuidString.prefix(8))이 보낸 메시지"
+        let text = "[AutoApprove 전달 중단] \(whose)(messageID \(message.id.uuidString), \(message.kind.rawValue))를 받을 구성원 "
+            + "\(message.recipientID.uuidString.prefix(8))이 그룹에서 빠져 전달하지 않았습니다. 메시지는 수신함에 보관했고 get_group_messages로 읽을 수 있습니다. "
+            + "내용이 아직 필요하면 지금 그룹 구성원 가운데 맡을 구성원에게 다시 보내세요."
+        guard (try? box.enqueue(groupID: group.id, senderID: target, recipientID: target, kind: .notice, text: text, sourceKey: key)) != nil else { return nil }
+        return senderStays ? "보낸 구성원" : "그룹장"
     }
 
     private func noticeStalledSender(_ message: SessionGroupMessage, groups: [SessionGroup]) {

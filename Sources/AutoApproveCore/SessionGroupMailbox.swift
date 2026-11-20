@@ -242,6 +242,22 @@ public final class SessionGroupMailbox {
             """, [String(date.timeIntervalSince1970)])
     }
 
+    /// Messages still queued or awaiting a receipt whose recipient is not a member of the group any more
+    /// (or whose group is gone). `members` maps each existing group to its current member IDs.
+    func queuedForMissingRecipients(members: [UUID: Set<UUID>]) throws -> [SessionGroupMessage] {
+        try rows("""
+            WHERE acknowledged IS NULL
+              AND (last_result IS NULL OR last_result NOT IN ('superseded','batched','undelivered'))
+            ORDER BY sequence
+            """).filter { members[$0.groupID]?.contains($0.recipientID) != true }
+    }
+
+    /// Takes a message out of the delivery queue and keeps it in the mailbox, readable as before.
+    func park(_ id: UUID, reason: String) throws {
+        try update("UPDATE messages SET last_result='undelivered',last_error=? WHERE id=? AND acknowledged IS NULL",
+                   [String(reason.prefix(500)), id.uuidString])
+    }
+
     func submittedAt(_ id: UUID) throws -> Date? {
         let query = try statement("SELECT submitted FROM group_submissions WHERE message_id=?", [id.uuidString])
         defer { sqlite3_finalize(query) }

@@ -548,6 +548,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: graph matrix counts sent and received records",tests.testGraphMatrixCountsSentAndReceivedRecords),
             ("Session groups: graph matrix keyboard moves between cells and headers",tests.testGraphMatrixKeyboardMovesBetweenCellsAndHeaders),
             ("Session groups: a stalled message notifies its sender once",tests.testStalledGroupMessageNotifiesItsSenderOnce),
+            ("Session groups: messages for a removed member are kept and reported",tests.testMessagesForRemovedMemberAreKeptAndReported),
             ("Session groups: Claude original reply without MCP",tests.testGroupClaudeReplyWithoutMCP),
             ("Session groups: completion reports require recipient ACK",tests.testGroupReportRequiresRecipientAcknowledgement),
             ("Session groups: corrupt mailbox never accepts or deletes messages",tests.testGroupMailboxRefusesCorruptStorage),
