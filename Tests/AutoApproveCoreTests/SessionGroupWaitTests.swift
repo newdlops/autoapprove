@@ -2,6 +2,64 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
+    /// A result that arrives after its wait expired must still reach the waiting member once.
+    @MainActor func testGroupLateResultAfterExpiredWaitIsDelivered() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/aa-late-wait-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let paths = AppPaths(directory: directory)
+        try paths.prepare()
+        let records = ProcessDiscovery.parse("""
+        109201 1 fixture911 109201 109201 Wed Oct 28 12:00:00 2026 /fixture/codex
+        109202 1 fixture912 109202 109202 Wed Oct 28 12:00:00 2026 /fixture/codex
+        """).sorted { $0.pid < $1.pid }
+        let sessions = records.map { AgentSession(id: $0.key, agent: $0.agent!, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/project", terminal: .iterm) }
+        let identities = Dictionary(uniqueKeysWithValues: records.map { ($0.pid, UUID().uuidString.lowercased()) })
+        let members = sessions.map { session -> SessionGroupMember in
+            var member = SessionGroupMember(agent: session.agent, title: "fixture", cwd: "/project", conversationID: identities[session.pid]!, providerHome: "/fixture/home")
+            member.runtimeID = session.id
+            return member
+        }
+        let group = SessionGroup(name: "late result", members: members, leaderMemberID: members[0].id)
+        try SessionGroupStore(directory: directory).save([group])
+        let task = SessionGroupAssignment(groupID: group.id, workerMemberID: members[1].id, parentMemberID: members[0].id,
+                                          workerSessionID: sessions[1].id, parentSessionID: sessions[0].id, task: "work")
+        var seeded = SessionGroupOrchestration(assignments: [task]); seeded.markDelivered(task.id)
+        try AuditStore(path: paths.database).set(SessionGroupOrchestration.storeKey, String(decoding: JSONEncoder().encode(seeded), as: UTF8.self))
+        let engine = try ApprovalEngine(paths: paths, claudeRegistryReader: { _ in [] }, processReader: { records },
+            codexGroupReader: { r in identities[r.pid].map { .init(threadID: $0, database: "/fixture/home/thread_history_1.sqlite") } }, isolateByDefault: true)
+        engine.updateDiscovery(sessions, records: records)
+        defer { engine.stop() }
+        func call(_ name: String, _ member: Int, _ args: JSONObject) async throws -> JSONObject {
+            var input: JSONObject = ["tool": name, "owner": UUID().uuidString, "groupID": group.id.uuidString, "sessionID": sessions[member].id]
+            input.merge(args) { _, new in new }
+            return try await engine.mcpAction(input)
+        }
+        let box = try SessionGroupMailbox(directory: directory)
+        let waitID = UUID().uuidString, taskID = task.id.uuidString
+        let wait: JSONObject = ["waitID": waitID, "taskIDs": [taskID], "timeoutSeconds": 1]
+        try expectEqual(try await call("wait_group_dependencies", 0, wait)["state"] as? String, "waiting")
+        try await Task.sleep(for: .milliseconds(1200))
+        try expectEqual(try await call("wait_group_dependencies", 0, wait)["state"] as? String, "expired")
+        // The worker finishes after the deadline; its report reaches the leader's inbox.
+        _ = try await call("complete_group_task", 1, ["taskID": taskID, "summary": "late result"])
+        let report = try box.enqueue(groupID: group.id, senderID: members[1].id, recipientID: members[0].id,
+                                     kind: .report, text: "late result", sourceKey: "report:" + taskID)
+        try expectEqual(try await call("wait_group_dependencies", 0, wait)["state"] as? String, "ready")
+        let ready = try box.message(sourceKey: "wait:\(waitID):ready:\(members[0].id.uuidString)")
+        try expect(ready?.text.contains("late result") == true, "The late report is summarised in one ready notice")
+        try expect(ready?.text.contains("기한이 지난 뒤") == true, "The notice says the result arrived after the deadline")
+        // The expired notice never reached the terminal (no fixture terminal), so the ready notice replaces it.
+        try expectEqual(try box.message(sourceKey: "wait:\(waitID):expired:\(members[0].id.uuidString)")?.lastResult, "superseded")
+        // The engine's delivery loop may be typing it right now; either state means it is on its way.
+        let latest = try box.message(ready!.id)
+        try expect(try box.heads().contains { $0.id == ready?.id } || ["direct_attempting", "not_started"].contains(latest?.lastResult ?? ""),
+                   "The ready notice is queued for the terminal: \(latest?.lastResult ?? "nil")")
+        try expect(!(try box.heads()).contains { $0.id == report.id }, "The report itself is not delivered a second time")
+        // Re-reading the wait never creates another notice.
+        _ = try await call("wait_group_dependencies", 0, wait)
+        try expectEqual(try box.list(groupID: group.id, memberID: members[0].id).filter { $0.kind == .waitNotice && $0.text.contains(" · ready · ") }.count, 1)
+    }
+
     @MainActor func testGroupDependencyWaits() async throws {
         let directory = URL(fileURLWithPath: "/private/tmp/aa-waits-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

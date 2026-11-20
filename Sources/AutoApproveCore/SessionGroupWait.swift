@@ -315,8 +315,11 @@ extension SessionGroupMailbox {
             if r.external { results.append(row.externalReady); possible.append(true) }
             if r.matches(results) {
                 let singleQuestion = r.questions.count == 1 && r.tasks.isEmpty && !r.external
-                let body = row.state == "waiting" && !singleQuestion ? try readyBody(r, assignments: assignments) : ""
-                try transition(row, to: "ready", detail: "필요한 응답이 도착했습니다.", payload: body)
+                // An expired wait still owns its results: the filter withholds them from
+                // individual notices, so a late arrival must be summarised in one ready notice.
+                let body = !singleQuestion && (row.state == "waiting" || !r.tasks.isEmpty || !r.questions.isEmpty)
+                    ? try readyBody(r, assignments: assignments) : ""
+                try transition(row, to: "ready", detail: row.state == "expired" ? "기한이 지난 뒤 필요한 응답이 도착했습니다." : "필요한 응답이 도착했습니다.", payload: body)
             }
             else if !r.matches(possible) { try transition(row, to: "cancelled", detail: "필요한 작업이 결과 없이 교체되었습니다.") }
             else if row.state == "waiting", now >= row.deadline { try transition(row, to: "expired", detail: "정한 기한까지 결과가 도착하지 않았습니다.") }
@@ -349,7 +352,8 @@ extension SessionGroupMailbox {
 
     private func transition(_ row: GroupWaitRecord, to state: String, detail: String, payload: String = "") throws {
         try update("UPDATE group_waits SET state=?,detail=? WHERE id=?", [state, detail, row.request.id.uuidString])
-        if row.state == "expired", state == "ready" { return }
+        // A late external signal comes from the waiting member itself; only late results are news to it.
+        if row.state == "expired", state == "ready", payload.isEmpty { return }
         // The answer's own body is also the wake-up for a single blocking question.
         if state != "ready" || row.request.questions.count != 1 || !row.request.tasks.isEmpty || row.request.external {
             try notify(row, recipient: row.request.member, state: state, detail: detail, payload: payload)
@@ -360,8 +364,9 @@ extension SessionGroupMailbox {
         let key = "wait:\(id):\(state):\(recipient.uuidString)"
         let body = "대기 \(id) · \(state) · " + String(detail.prefix(3000)) + (payload.isEmpty ? "" : "\n" + payload)
         if row.state == "expired", let stale = try message(sourceKey: "wait:\(id):expired:\(recipient.uuidString)"),
-           stale.attempts == 0, stale.acknowledgedAt == nil {
-            // Retire only the unsubmitted hint. A reader may already know its immutable message ID.
+           stale.attempts == 0 || stale.lastResult == "not_started", stale.acknowledgedAt == nil {
+            // Retire only the unsubmitted hint: never tried, or every try stopped before typing.
+            // A reader may already know its immutable message ID.
             try update("UPDATE messages SET last_result='superseded' WHERE id=?", [stale.id.uuidString])
         }
         _ = try insertMessage(groupID: row.request.group, senderID: recipient, recipientID: recipient, kind: .waitNotice,
