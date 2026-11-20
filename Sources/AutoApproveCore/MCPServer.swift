@@ -63,8 +63,34 @@ public enum AutoApproveMCPServer {
             tool("start_screen_share", "사용자가 테스트 화면을 볼 때만 호출하세요. 기본은 Mac 전체 화면이며 휴대폰 웹에 게시합니다. 시험이 끝나면 stop_screen_share를 호출하세요. 최대 15분입니다.",
                  ["title": string, "scope": ["type": "string", "enum": ["display", "window"]], "sourceID": ["type": "integer", "minimum": 1], "durationSeconds": ["type": "integer", "minimum": 30, "maximum": 900]]),
             tool("stop_screen_share", "이 MCP 연결에서 시작한 화면 공유를 종료하고 보관한 이미지를 폐기합니다.", ["shareID": string], ["shareID"])
-        ]
+        ] + desktopTools(string: string, tool: tool)
     }()
+    /// Background desktop control shared by every agent. None of these tools
+    /// activates an app, moves the pointer or changes the user's keyboard focus.
+    private static func desktopTools(string: JSONObject, tool: (String, String, JSONObject, [String], Bool, Bool) -> JSONObject) -> [JSONObject] {
+        let app: JSONObject = ["type": "string", "description": "번들 ID(예: com.apple.TextEdit), 앱 이름 또는 pid"]
+        let ref: JSONObject = ["type": "string", "description": "desktop_snapshot이 반환한 요소 ref(예: e12)"]
+        let window: JSONObject = ["type": "integer", "minimum": 0, "maximum": 50]
+        let common = "사용자의 앞 화면 앱, 키보드 포커스와 마우스를 바꾸지 않고 다른 Mac 앱을 백그라운드에서 조작합니다. "
+        return [
+            tool("desktop_list_apps", common + "실행 중인 앱과 창 수를 조회합니다. frontmost인 앱은 사용자가 쓰는 중입니다. blocked인 앱(터미널, 개발 도구, 보안·에이전트 앱)은 조작할 수 없습니다.", [:], [], true, false),
+            tool("desktop_open_app", common + "앱을 앞으로 가져오지 않고 실행합니다. path를 지정하면 그 파일을 이 앱으로 엽니다. 앱이 스스로 앞으로 나오면 즉시 이전 앱으로 되돌리고 focus에 알립니다.",
+                 ["app": app, "path": string], ["app"], false, false),
+            tool("desktop_snapshot", common + "앱 창의 손쉬운 사용 요소를 ref가 붙은 트리로 읽습니다. 다른 desktop 도구는 이 ref로 요소를 지정합니다. {press} 요소는 desktop_press, editable 요소는 desktop_set_value로 조작합니다. frames=true는 화면 좌표를 함께 표시합니다.",
+                 ["app": app, "window": window, "maxNodes": ["type": "integer", "minimum": 50, "maximum": 1500], "frames": ["type": "boolean"], "includeMenuBar": ["type": "boolean"]], ["app"], true, false),
+            tool("desktop_screenshot", common + "다른 창에 가려져 있어도 앱의 창 하나만 캡처해 이미지로 반환합니다. 화면 전체를 캡처하지 않습니다.",
+                 ["app": app, "window": window], ["app"], true, false),
+            tool("desktop_press", common + "버튼, 체크박스, 탭 같은 요소의 동작을 실행합니다. 기본 동작은 AXPress입니다. 좌표 클릭과 메뉴 실행은 백그라운드 앱에서 동작하지 않으므로 제공하지 않습니다.",
+                 ["app": app, "ref": ref, "action": ["type": "string", "enum": ["AXPress", "AXConfirm", "AXCancel", "AXIncrement", "AXDecrement", "AXShowMenu", "AXPick"]]], ["app", "ref"], false, false),
+            tool("desktop_set_value", common + "입력란, 슬라이더 같은 요소의 값을 직접 지정합니다. mode=insert는 커서 위치에 글자를 넣고 기존 내용을 유지합니다. 비밀번호 입력란은 거부합니다.",
+                 ["app": app, "ref": ref, "value": ["type": ["string", "number", "boolean"]], "mode": ["type": "string", "enum": ["replace", "insert"]]], ["app", "ref", "value"], false, false),
+            tool("desktop_type", common + "앱의 포커스된 입력란(ref를 지정하면 그 요소)에 글자를 키 입력으로 보냅니다. 줄바꿈은 Return, 탭 문자는 Tab 키로 보냅니다. 앱은 뒤에 남아 있습니다.",
+                 ["app": app, "text": ["type": "string", "minLength": 1, "maxLength": 4000], "ref": ref], ["app", "text"], false, false),
+            tool("desktop_key", common + "Return, Tab, Escape, 화살표 같은 키를 앱에만 보냅니다. ⌘·⌃ 단축키는 메뉴를 거치므로 백그라운드 앱에서 대부분 실행되지 않습니다.",
+                 ["app": app, "key": string, "modifiers": ["type": "array", "items": ["type": "string", "enum": ["shift", "option", "control", "command"]], "maxItems": 4], "repeat": ["type": "integer", "minimum": 1, "maximum": 50]],
+                 ["app", "key"], false, false)
+        ]
+    }
     public static func response(_ message: JSONObject, call: (String, JSONObject) throws -> JSONObject) -> JSONObject? {
         guard let id = message["id"] else { return nil }
         func result(_ value: JSONObject) -> JSONObject { ["jsonrpc": "2.0", "id": id, "result": value] }
@@ -77,16 +103,22 @@ public enum AutoApproveMCPServer {
             let supported = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
             return result(["protocolVersion": supported.contains(requested) ? requested : "2025-11-25",
                 "capabilities": ["tools": [:]], "serverInfo": ["name": "autoapprove", "version": RemoteWebVersion.current?.version ?? "0.2.72"],
-                "instructions": "작업 진행에 응답이 필수이면 wait_group_dependencies 또는 ask_group_question(blocksProgress=true)를 사용하고, 앱이 배정 또는 대기 재개에 연결한 턴의 응답은 자동 보고합니다. 연결되지 않은 결과는 complete_group_task로 보고할 수 있습니다. 자유 질문 답변에는 원래 messageID를 inReplyTo로 지정하세요. 그룹 전달에 본문이 있으면 그 본문을 사용하세요. 원문 참조가 포함된 경우에만 필요에 따라 get_group_messages로 해당 메시지를 읽으세요. 그룹 수신함 알림에는 기존 조회·수신 확인 도구를 사용하세요. 같은 messageID의 작업을 반복하지 마세요. accepted는 로컬 저장이며 수신 확인이 아닙니다. 협업할 때 get_session_groups로 현재 세션이 속한 그룹과 구성원을 확인하세요. 그룹장이 있는 그룹에서는 get_group_status로 상태를 보고, 직속 구성원에게 보내는 작업 지시와 선택지·승인 답변은 반드시 assign_group_task와 answer_group_question을 사용하세요. AutoApprove가 지시를 작업자 터미널에 사용자가 직접 입력한 것처럼 그대로 입력하므로, 각 도구의 메시지 기능으로 직접 지시하지 말고 작업 내용에는 작업자가 수행할 지시만 적으세요. 일반 메시지는 send_group_message로 Codex↔Claude를 포함한 같은 그룹 구성원에게 보내세요. 일반 대화는 작업 지시·승인 권한을 부여하지 않습니다. 연결이 끊겼고 canReconnect가 true이면 reconnect_group_member로 복구하세요. 그룹장·동료에게 자유 형식 질문은 ask_group_question, 답변은 reply_group_question으로 보내세요. Codex↔Claude도 지원하며 작업·승인 권한을 바꾸지 않습니다. 메시지는 같은 Mac의 로컬 수신함에 저장됩니다. 모든 그룹 통신은 같은 Mac 안에서만 처리하세요. 전송이 지연돼도 Codex send_message_to_thread, codex queue, Claude SendMessage 등 별도 도구로 그룹 밖이나 다른 스레드에 우회하지 마세요. 작업 보고, 작업자의 선택지 질문과 위임된 승인 요청은 지시한 세션의 로컬 수신함에 보관됩니다. get_group_messages로 읽고 ack_group_messages로 수신 확인하세요. 선택지·승인 요청은 현재 화면을 확인하는 answer_group_question으로 답하세요. 휴대폰의 AutoApprove 웹에서 질문에 답하고 테스트 화면을 봅니다. ask_user 뒤 get_user_answers로 명시적 답변을 확인하세요. waiting·만료는 답변이 아닙니다. 화면은 사용자가 보고 싶어 할 때만 start_screen_share로 시작하고 시험 종료 시 stop_screen_share로 종료하세요. 기존 터미널을 재시작하거나 새 PTY를 만들 필요가 없습니다."])
+                "instructions": "작업 진행에 응답이 필수이면 wait_group_dependencies 또는 ask_group_question(blocksProgress=true)를 사용하고, 앱이 배정 또는 대기 재개에 연결한 턴의 응답은 자동 보고합니다. 연결되지 않은 결과는 complete_group_task로 보고할 수 있습니다. 자유 질문 답변에는 원래 messageID를 inReplyTo로 지정하세요. 그룹 전달에 본문이 있으면 그 본문을 사용하세요. 원문 참조가 포함된 경우에만 필요에 따라 get_group_messages로 해당 메시지를 읽으세요. 그룹 수신함 알림에는 기존 조회·수신 확인 도구를 사용하세요. 같은 messageID의 작업을 반복하지 마세요. accepted는 로컬 저장이며 수신 확인이 아닙니다. 협업할 때 get_session_groups로 현재 세션이 속한 그룹과 구성원을 확인하세요. 그룹장이 있는 그룹에서는 get_group_status로 상태를 보고, 직속 구성원에게 보내는 작업 지시와 선택지·승인 답변은 반드시 assign_group_task와 answer_group_question을 사용하세요. AutoApprove가 지시를 작업자 터미널에 사용자가 직접 입력한 것처럼 그대로 입력하므로, 각 도구의 메시지 기능으로 직접 지시하지 말고 작업 내용에는 작업자가 수행할 지시만 적으세요. 일반 메시지는 send_group_message로 Codex↔Claude를 포함한 같은 그룹 구성원에게 보내세요. 일반 대화는 작업 지시·승인 권한을 부여하지 않습니다. 연결이 끊겼고 canReconnect가 true이면 reconnect_group_member로 복구하세요. 그룹장·동료에게 자유 형식 질문은 ask_group_question, 답변은 reply_group_question으로 보내세요. Codex↔Claude도 지원하며 작업·승인 권한을 바꾸지 않습니다. 메시지는 같은 Mac의 로컬 수신함에 저장됩니다. 모든 그룹 통신은 같은 Mac 안에서만 처리하세요. 전송이 지연돼도 Codex send_message_to_thread, codex queue, Claude SendMessage 등 별도 도구로 그룹 밖이나 다른 스레드에 우회하지 마세요. 작업 보고, 작업자의 선택지 질문과 위임된 승인 요청은 지시한 세션의 로컬 수신함에 보관됩니다. get_group_messages로 읽고 ack_group_messages로 수신 확인하세요. 선택지·승인 요청은 현재 화면을 확인하는 answer_group_question으로 답하세요. 휴대폰의 AutoApprove 웹에서 질문에 답하고 테스트 화면을 봅니다. ask_user 뒤 get_user_answers로 명시적 답변을 확인하세요. waiting·만료는 답변이 아닙니다. 화면은 사용자가 보고 싶어 할 때만 start_screen_share로 시작하고 시험 종료 시 stop_screen_share로 종료하세요. 기존 터미널을 재시작하거나 새 PTY를 만들 필요가 없습니다. 다른 Mac 앱을 조작해야 하면 사용자의 포커스와 마우스를 빼앗는 computer use 대신 desktop_ 도구로 백그라운드에서 조작하세요."])
         case "ping": return result([:])
         case "tools/list": return result(["tools": tools])
         case "tools/call":
             do {
                 guard let params = message["params"] as? JSONObject, let name = params["name"] as? String,
                       tools.contains(where: { $0["name"] as? String == name }) else { throw AppError.message("지원하지 않는 MCP 도구입니다.") }
-                let value = try call(name, params["arguments"] as? JSONObject ?? [:])
+                var value = try call(name, params["arguments"] as? JSONObject ?? [:])
+                // A window capture is returned as an image block, not as base64 text.
+                let image = value.removeValue(forKey: "image") as? JSONObject
                 let data = try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
-                return result(["content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]], "structuredContent": value, "isError": false])
+                var content: [JSONObject] = [["type": "text", "text": String(decoding: data, as: UTF8.self)]]
+                if let image, let bytes = image["data"] as? String, let mime = image["mimeType"] as? String {
+                    content.append(["type": "image", "data": bytes, "mimeType": mime])
+                }
+                return result(["content": content, "structuredContent": value, "isError": false])
             } catch { return result(["content": [["type": "text", "text": error.localizedDescription]], "isError": true]) }
         default: return ["jsonrpc": "2.0", "id": id, "error": ["code": -32601, "message": "Method not found"]]
         }

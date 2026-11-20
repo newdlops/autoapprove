@@ -106,6 +106,13 @@ import AutoApproveCore
                     params["enabled"] = arguments[1] == "on"
                 }
                 try printJSON(SocketClient.request(path: paths.socket, message: ["method": "isolation", "params": params]))
+            case "desktop-guard":
+                var params: JSONObject = [:]
+                if arguments.count > 1 {
+                    guard ["on", "off"].contains(arguments[1]) else { throw AppError.message("autoapprove desktop-guard on 또는 off를 사용해주세요.") }
+                    params["enabled"] = arguments[1] == "on"
+                }
+                try printJSON(SocketClient.request(path: paths.socket, message: ["method": "desktopGuard", "params": params]))
             case "hook":
                 do {
                     let input = FileHandle.standardInput.readDataToEndOfFile()
@@ -141,6 +148,8 @@ import AutoApproveCore
                   autoapprove serve --web   저장된 OFF 설정에도 웹 관리 켜기 (기본 포트 8765)
                   autoapprove serve --loopback  이 Mac의 127.0.0.1에서만 웹 열기·Mac 검색 안 함
                   autoapprove web [on|off]   웹 접속 상태·주소 확인 또는 켜기/끄기
+                  autoapprove desktop-guard [on|off]
+                                            Claude computer use 조작을 막고 백그라운드 desktop_ 도구로 안내 (기본 켬)
                   autoapprove enable ID     연결된 세션 자동 승인 켜기
                   autoapprove disable ID    자동 승인 끄기
                   autoapprove restart ID [--no-resume]

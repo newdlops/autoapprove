@@ -31,6 +31,26 @@ private func bridgeAnswer(_ value: JSONObject) -> JSONObject? { (value["autoappr
 private func fixturePaths() -> AppPaths { AppPaths(directory: FileManager.default.temporaryDirectory.appendingPathComponent("aa-hook-" + UUID().uuidString)) }
 
 extension ApprovalTests {
+    func testClaudeComputerUseIsRedirectedToBackgroundTools() throws {
+        let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let engine = try hookEngine(paths), now = Date()
+        defer { engine.stop() }
+        func call(_ tool: String, _ input: JSONObject = [:]) throws -> JSONObject? {
+            var payload = hookPayload(now); payload["tool_name"] = tool; payload["tool_input"] = input
+            let output = bridgeAnswer(try engine.handleClaudeHook(payload, at: now))?["hookSpecificOutput"] as? JSONObject
+            try engine.acknowledgeClaudeHook(payload, at: now)
+            return output
+        }
+        try expect(engine.backgroundComputerUseGuard, "The guard is on by default")
+        let denied = try call("mcp__computer-use__left_click", ["coordinate": [10, 10]])
+        try expectEqual(denied?["permissionDecision"] as? String, "deny")
+        try expect((denied?["permissionDecisionReason"] as? String ?? "").contains("desktop_snapshot"), "The denial directs Claude to the background tools")
+        try expect(engine.snapshot.events.contains { $0.outcome == "포커스 보호 · 백그라운드 조작 안내" }, "The redirection is recorded in history")
+        try expect(try call("mcp__computer-use__screenshot")?["permissionDecision"] as? String != "deny", "Observation keeps working")
+        try engine.setBackgroundComputerUseGuard(false)
+        try expect(try call("mcp__computer-use__left_click")?["permissionDecision"] as? String != "deny", "Turning the guard off restores Claude's computer use")
+    }
+
     func testClaudeTaskChoicesStayManualWhileConfirmationsContinue() throws {
         let paths = fixturePaths(); defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try hookEngine(paths), now = Date()

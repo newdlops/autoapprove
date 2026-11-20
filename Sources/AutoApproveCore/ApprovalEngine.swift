@@ -68,6 +68,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
     let accountPINReader=RemoteAccountPINReader()
     public let webQuestions = WebQuestionInbox()
     public let testScreens: TestScreenSharing
+    public let backgroundDesktop = BackgroundDesktopController()
+    /// On by default: Claude's focus-taking computer-use calls are redirected to the background desktop tools.
+    public var backgroundComputerUseGuard: Bool { store.value("backgroundComputerUseGuard") != "false" }
+    public func setBackgroundComputerUseGuard(_ enabled: Bool) throws { try store.set("backgroundComputerUseGuard", enabled ? "true" : "false") }
     private let tmuxRelay = TmuxRelay()
     private var ptyAutomatic: [String: Bool] = [:]
     private var ptyLifecycleObservers: [String: (terminal: ManagedPTY, token: UUID)] = [:]
@@ -4635,8 +4639,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         case "stop_screen_share":
             guard let id = object["shareID"] as? String else { throw RemoteHTTPError(400, "공유 ID를 지정해주세요.") }
             try testScreens.stop(id, owner: owner); return ["stopped": true]
+        case let name where name.hasPrefix("desktop_"):
+            return try await backgroundDesktop.handle(tool: name, object, owner: owner)
         case "disconnect":
-            groupMCPIdentities.removeValue(forKey: owner)
+            groupMCPIdentities.removeValue(forKey: owner); backgroundDesktop.release(owner: owner)
             testScreens.stopAll(owner: owner); webQuestions.cancel(owner: owner); return ["ok": true]
         default: throw RemoteHTTPError(400, "지원하지 않는 MCP 도구입니다.")
         }
@@ -7284,6 +7290,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return bridgeResponse([:])
             }
         }
+        // Claude's computer use moves the real pointer and activates apps. While the guard is on, those calls
+        // are denied with directions to the background desktop tools, so the user's focus is never taken.
+        if envelope.event == "PreToolUse",
+           let message = ClaudeComputerUseRedirect.denial(tool: request.tool, input: payload["tool_input"] as? JSONObject ?? [:]),
+           backgroundComputerUseGuard {
+            let response = SystemCommandRisk.denial(event: envelope.event, message: message)
+            receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
+            try saveClaudeReceipt(receipt)
+            log(AuditEvent(sessionID: request.sessionID, summary: request.summary, outcome: "포커스 보호 · 백그라운드 조작 안내",
+                           source: "Claude 훅", tool: request.tool))
+            publish()
+            return bridgeResponse(response)
+        }
         // A worker on a group task never waits for a person. A question AutoApprove cannot answer at once
         // is returned, so the worker ends its turn and the question reaches the assigning member as a report.
         if request.isQuestion, ["PreToolUse", "PermissionRequest"].contains(envelope.event),
@@ -7618,6 +7637,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             case "isolation":
                 if let enabled = params["enabled"] as? Bool { try setNetworkIsolation(enabled) }
                 result = ["enabled": networkIsolated]
+            case "desktopGuard":
+                if let enabled = params["enabled"] as? Bool { try setBackgroundComputerUseGuard(enabled) }
+                result = ["enabled": backgroundComputerUseGuard]
             case "hook": result = params["autoapproveProtocol"] as? Int == 1 ? try handleClaudeHook(params) : handleHook(params)
             case "hookAck": try acknowledgeClaudeHook(params)
             case "claudeApprove":
