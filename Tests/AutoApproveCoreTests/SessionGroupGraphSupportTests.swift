@@ -84,4 +84,173 @@ extension ApprovalTests {
         _ = try writer.enqueue(groupID: UUID(), senderID: UUID(), recipientID: UUID(), kind: .message, text: "fixture")
         try expect(try reader.dataVersion != initial, "A commit on another connection changes the version")
     }
+
+    // MARK: Conversation graph presentation
+
+    func testGraphNodeStatusUsesShapeForEveryAgent() throws {
+        typealias G = SessionGroupGraph
+        try expectEqual(G.status(phase: .working, blocked: false).shape, .working)
+        try expectEqual(G.status(phase: .idle, blocked: false).shape, .idle)
+        try expectEqual(G.status(phase: .approval, blocked: false).shape, .attention)
+        try expectEqual(G.status(phase: .input, blocked: false).shape, .attention)
+        for phase in [SessionPhase?.none, .unknown, .ended] {
+            try expectEqual(G.status(phase: phase, blocked: false).shape, .unknown)
+            try expect(!G.status(phase: phase, blocked: false).filled, "An unknown state has no fill")
+        }
+        let blocked = G.status(phase: .idle, blocked: true)
+        try expectEqual(blocked.title, "전달 막힘")
+        try expectEqual(blocked.phaseTitle, "대기 중", "The fill of a blocked node still follows its phase")
+        try expectEqual(G.status(phase: nil, blocked: false).title, "상태 미확인")
+        let approval = G.status(phase: .approval, blocked: false), input = G.status(phase: .input, blocked: false)
+        try expectEqual([approval.title, input.title], ["응답 필요", "응답 필요"], "Legend, list and panel heading use one name")
+        try expectEqual([approval.detailTitle, input.detailTitle], ["승인 대기", "입력 대기"], "Only the panel details tell them apart")
+        try expect(approval.needsResponse && input.needsResponse && !G.status(phase: .working, blocked: false).needsResponse)
+        try expectEqual(G.detailTitle(.working), "작업 중")
+    }
+
+    func testGraphNamesPreferNicknamesAndKeepProvisionalNamesDistinct() throws {
+        func member(_ title: String, _ cwd: String) -> SessionGroupMember {
+            SessionGroupMember(agent: .codex, title: title, cwd: cwd, conversationID: UUID().uuidString.lowercased())
+        }
+        let members = [member("터미널 제목 미확인", "/fixture/shop"), member("결제 정리", "/fixture/shop"),
+                       member("터미널 제목 미확인", "/fixture/shop"), member("로그 정리", "/fixture/logs"),
+                       member("중복 이름", "/fixture/a"), member("중복 이름", "/fixture/b"), member("", "")]
+        let group = SessionGroup(name: "fixture", members: members)
+        let names = SessionGroupGraph.names(group: group, liveNicknames: [members[0].id: "주문 검토", members[1].id: ""])
+        try expectEqual(names[members[0].id], .init(text: "주문 검토", provisional: false), "A connected nickname wins")
+        try expectEqual(names[members[1].id], .init(text: "shop · 2", provisional: true), "A connected member without a nickname is provisional")
+        try expectEqual(names[members[2].id], .init(text: "shop · 3", provisional: true), "An unconfirmed terminal title is not a name")
+        try expectEqual(names[members[3].id], .init(text: "로그 정리", provisional: false), "A unique stored title names an unconnected member")
+        try expectEqual(names[members[4].id]?.provisional, true, "A stored title used twice does not tell members apart")
+        try expectEqual(names[members[5].id]?.text, "b · 6")
+        try expectEqual(names[members[6].id]?.text, "Codex · 7", "A member without a folder uses its agent")
+    }
+
+    func testGraphEdgesSplitRecentPendingAndOlderRecords() throws {
+        let a = UUID(), b = UUID(), c = UUID(), outsider = UUID()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func at(_ minutes: Double) -> Date { now.addingTimeInterval(-minutes * 60) }
+        var records = [SessionGroupGraph.Record]()
+        for minute in [1.0, 5, 29.9] { records.append(.init(from: a, to: b, createdAt: at(minute), kind: .record)) }
+        records.append(.init(from: a, to: b, createdAt: at(30.5), kind: .record))
+        records.append(.init(from: b, to: a, createdAt: at(240), kind: .pendingQuestion))
+        records.append(.init(from: b, to: a, createdAt: at(10), kind: .record))
+        records.append(.init(from: c, to: a, createdAt: at(120), kind: .expiredQuestion))
+        records.append(.init(from: c, to: b, createdAt: at(120), kind: .record))
+        records.append(.init(from: a, to: outsider, createdAt: at(1), kind: .record))
+        records.append(.init(from: a, to: a, createdAt: at(1), kind: .record))
+        let members: Set = [a, b, c]
+        let recent = SessionGroupGraph.edges(records, members: members, scope: .recent, now: now)
+        try expectEqual(recent.count, 2, "Older records, expired questions, outsiders and self messages stay off the recent view")
+        let ab = recent.first { $0.from == a && $0.to == b }, ba = recent.first { $0.from == b && $0.to == a }
+        try expectEqual(ab?.kind, .recent); try expectEqual(ab?.count, 3); try expectEqual(ab?.width, 3)
+        try expectEqual(ba?.kind, .pendingQuestion, "A waiting question shows regardless of age")
+        try expectEqual(ba?.pendingQuestions, 1); try expectEqual(ba?.count, 2)
+        let all = SessionGroupGraph.edges(records, members: members, scope: .all, now: now)
+        try expectEqual(all.first { $0.from == a && $0.to == b }?.count, 4)
+        try expectEqual(all.first { $0.from == c && $0.to == a }?.dashed, true, "An expired question is a faded dashed line")
+        try expectEqual(all.first { $0.from == c && $0.to == b }?.faded, true)
+        try expectEqual(all.last?.kind, .pendingQuestion, "Waiting questions are drawn last, over other lines")
+        try expectEqual([1, 2, 4, 5, 9, 10, 40].map(SessionGroupGraph.width(forCount:)), [1.5, 3, 3, 4.5, 4.5, 6, 6])
+        let fresh = SessionGroupGraph.freshKeys(previous: Array(recent.prefix(1)), current: all)
+        try expect(fresh.allSatisfy { $0.kind == .recent || $0.kind == .pendingQuestion }, "Lines that only aged are not new")
+        try expectEqual(fresh.count, 1)
+    }
+
+    func testGraphRecordsReadTheMailboxPageWithoutNotices() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-graph-records-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let box = try SessionGroupMailbox(directory: directory)
+        let group = UUID(), a = UUID(), b = UUID()
+        let question = try box.enqueue(groupID: group, senderID: a, recipientID: b, kind: .question, text: "fixture question")
+        _ = try box.enqueue(groupID: group, senderID: b, recipientID: a, kind: .reply, text: "fixture answer", sourceKey: "answer:" + question.id.uuidString)
+        _ = try box.enqueue(groupID: group, senderID: a, recipientID: b, kind: .question, text: "fixture open question")
+        _ = try box.enqueue(groupID: group, senderID: b, recipientID: a, kind: .report, text: "fixture report")
+        _ = try box.enqueue(groupID: group, senderID: a, recipientID: a, kind: .notice, text: "fixture naming notice")
+        let records = SessionGroupGraph.records(try box.conversations(groupID: group))
+        try expectEqual(records.count, 4, "Question, answer, open question and report; the notice is not a record")
+        try expectEqual(records.filter { $0.kind == .pendingQuestion }.count, 1)
+    }
+
+    func testGraphTreeAndCircleLayoutsFollowTreeOrder() throws {
+        func member(_ title: String) -> SessionGroupMember {
+            SessionGroupMember(agent: .claude, title: title, cwd: "/fixture", conversationID: UUID().uuidString.lowercased())
+        }
+        var members = ["lead", "a", "a1", "a2", "b", "b1"].map(member)
+        members[2].parentMemberID = members[1].id; members[3].parentMemberID = members[1].id; members[5].parentMemberID = members[4].id
+        let group = SessionGroup(name: "fixture", members: members, leaderMemberID: members[0].id)
+        let tree = SessionGroupGraph.positions(group.treeOrder, hasLeader: true, layout: .tree)
+        func at(_ index: Int) -> CGPoint { tree[members[index].id] ?? CGPoint(x: -1, y: -1) }
+        try expectEqual([at(2).x, at(3).x, at(5).x], [0, 144, 288], "Leaves are 144pt apart from the left")
+        try expectEqual(at(1).x, 72, "A parent sits over the middle of its children")
+        try expectEqual(at(4).x, 288)
+        try expectEqual(at(0).x, 180, "The leader centres over its children")
+        try expectEqual([at(0).y, at(1).y, at(2).y], [0, 104, 208], "Layers are 104pt apart")
+        let flat = SessionGroupGraph.positions(SessionGroup(name: "peers", members: members).treeOrder, hasLeader: false, layout: .tree)
+        try expect(Set(flat.values.map(\.y)) == [0], "A group without a leader is one row")
+        let circle = SessionGroupGraph.positions(group.treeOrder, hasLeader: true, layout: .circle)
+        try expectEqual(circle[members[0].id], .zero, "The leader is in the middle")
+        let first = group.treeOrder[1].member.id, second = group.treeOrder[2].member.id
+        try expectEqual(circle[first], CGPoint(x: 0, y: -160), "The ring starts at 12 o'clock with the minimum radius")
+        try expect((circle[second]?.x ?? 0) > 0, "The ring goes clockwise")
+        let large = SessionGroup(name: "large", members: (0..<15).map { member("m\($0)") })
+        let ring = SessionGroupGraph.positions(large.treeOrder, hasLeader: false, layout: .circle)
+        let radius = hypot(ring[large.members[0].id]!.x, ring[large.members[0].id]!.y)
+        try expectEqual(radius, (15 * 144 / (2 * Double.pi)).rounded(), "A large ring keeps 144pt between neighbours")
+        let frame = SessionGroupGraph.frame(tree)
+        try expectEqual(frame.points[members[2].id].map { Double($0.x) }, SessionGroupGraph.horizontalMargin)
+        try expectEqual(frame.size.width, 288 + 2 * SessionGroupGraph.horizontalMargin, "No compression: the frame grows with the graph")
+    }
+
+    func testGraphLineGeometryAvoidsFalseConnections() throws {
+        let a = UUID(), b = UUID(), c = UUID()
+        let points = [a: CGPoint(x: 0, y: 0), b: CGPoint(x: 200, y: 0), c: CGPoint(x: 400, y: 4)]
+        func edge(_ from: UUID, _ to: UUID) -> SessionGroupGraph.Edge { .init(from: from, to: to, kind: .recent, count: 1, pendingQuestions: 0) }
+        let through = SessionGroupGraph.bends([edge(a, b), edge(b, c)], points: points)
+        try expect(through[edge(a, b).key]! * through[edge(b, c).key]! < 0, "Two lines continuing straight through a node bend to opposite sides")
+        let opposite = SessionGroupGraph.bends([edge(a, b), edge(c, b)], points: points)
+        try expect(opposite[edge(a, b).key]! * opposite[edge(c, b).key]! > 0, "Lines already on opposite sides stay as they are")
+        let bent = SessionGroupGraph.bends([edge(a, b), edge(b, c)], points: [a: .zero, b: CGPoint(x: 200, y: 0), c: CGPoint(x: 200, y: 200)])
+        try expect(bent.values.allSatisfy { $0 == 1 }, "A corner is not a straight continuation")
+        guard let forward = SessionGroupGraph.geometry(from: points[a]!, to: points[b]!, width: 3, bend: 1),
+              let backward = SessionGroupGraph.geometry(from: points[b]!, to: points[a]!, width: 3, bend: 1) else { throw AppError.message("geometry missing") }
+        try expect(forward.control.y * backward.control.y < 0, "The two directions between one pair never overlap")
+        try expectEqual(hypot(forward.tip.x - 200, forward.tip.y - 0).rounded(), 22, "The arrow stops outside the node ring")
+        let head = hypot(forward.tip.x - (forward.headLeft.x + forward.headRight.x) / 2, forward.tip.y - (forward.headLeft.y + forward.headRight.y) / 2)
+        try expect(abs(head - 12.5) < 0.001, "Arrowhead length is width × 2.5 + 5")
+        try expect(SessionGroupGraph.geometry(from: .zero, to: CGPoint(x: 30, y: 0), width: 1.5, bend: 1) == nil, "Overlapping nodes draw no line")
+        guard let marked = SessionGroupGraph.geometry(from: points[a]!, to: points[b]!, width: 3, bend: 1, endClearance: SessionGroupGraph.markClearance)
+        else { throw AppError.message("marked geometry missing") }
+        try expectEqual(hypot(marked.tip.x - 200, marked.tip.y).rounded(), 30, "The arrow stops clear of a warning or bubble mark")
+    }
+
+    /// The leader's line to a grandchild must not run under the parent's circle or name band.
+    func testGraphLinesBendAroundUnrelatedNodes() throws {
+        let lead = UUID(), middle = UUID(), child = UUID(), straight = UUID(), through = UUID(), below = UUID()
+        let points = [lead: CGPoint(x: 216, y: 0), middle: CGPoint(x: 360, y: 104), child: CGPoint(x: 432, y: 208),
+                      straight: CGPoint(x: 600, y: 0), through: CGPoint(x: 600, y: 104), below: CGPoint(x: 600, y: 208)]
+        func edge(_ from: UUID, _ to: UUID) -> SessionGroupGraph.Edge { .init(from: from, to: to, kind: .older, count: 1, pendingQuestions: 0) }
+        try expect(SessionGroupGraph.crossings(from: points[lead]!, to: points[child]!, width: 1.5, bend: 1, nodes: [points[middle]!]) > 0,
+                   "The fixture line starts out under the middle node")
+        for line in [edge(lead, child), edge(straight, below)] {
+            let bends = SessionGroupGraph.bends([line], points: points)
+            let others = points.filter { $0.key != line.from && $0.key != line.to }.map(\.value)
+            try expectEqual(SessionGroupGraph.crossings(from: points[line.from]!, to: points[line.to]!, width: line.width,
+                                                        bend: bends[line.key]!, nodes: others), 0, "The line passes clear of other nodes")
+        }
+        // With a reverse line the pair keeps opposite sides, so the bend only grows on its own side.
+        let pair = SessionGroupGraph.bends([edge(lead, child), edge(child, lead)], points: points)
+        try expect(pair[edge(lead, child).key]! > 0 && pair[edge(child, lead).key]! > 0, "Both directions keep their own side")
+        let clear = SessionGroupGraph.bends([edge(lead, middle)], points: points)
+        try expectEqual(clear[edge(lead, middle).key], 1, "A line already clear keeps the normal bend")
+    }
+
+    func testGraphAccessibilityValueDescribesRelations() throws {
+        let a = UUID(), b = UUID(), c = UUID()
+        let edges: [SessionGroupGraph.Edge] = [.init(from: a, to: b, kind: .recent, count: 3, pendingQuestions: 0),
+                                               .init(from: c, to: a, kind: .pendingQuestion, count: 2, pendingQuestions: 2)]
+        let value = SessionGroupGraph.accessibilityValue(member: a, status: SessionGroupGraph.status(phase: .working, blocked: true),
+                                                         edges: edges, names: [b: "api 정리", c: "테스트 보강"])
+        try expectEqual(value, "작업 중. 보냄 api 정리 3건. 받음 테스트 보강 2건. 답을 기다리는 질문 2건. 전달 막힘")
+    }
 }

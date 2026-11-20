@@ -1,5 +1,8 @@
 import SwiftUI
 import AppKit
+import Combine
+import QuartzCore
+import CSQLite
 import AutoApproveCore
 
 private final class GroupRefreshReads: @unchecked Sendable {
@@ -15,10 +18,460 @@ private final class GroupRefreshReads: @unchecked Sendable {
     static func observe(_ groups: [SessionGroup]) { bodies += 1; names = groups.map(\.name) }
 }
 
+/// The render script inserts calls to this probe into the graph sources for
+/// `--verify-drag` and `--verify-graph-refresh`. Nothing else calls it.
+@MainActor enum GraphProbe {
+    static var roots = 0
+    static var canvases = 0
+    static var frames = 0
+    static var firstFrame: CFTimeInterval?
+    static var messageCount = -1
+    static func root() { roots += 1 }
+    static func root(_ messages: Int?) { roots += 1; messageCount = messages ?? -1 }
+    static func canvas() { canvases += 1 }
+    static var places: [String: CGPoint] = [:]
+    static func place(_ name: String, _ point: CGPoint) { places[name] = point }
+    /// SwiftUI global coordinates start at the top left of the hosting view.
+    static func center(_ name: String, in host: NSView) -> CGPoint? {
+        places[name].map { CGPoint(x: $0.x, y: host.bounds.height - $0.y) }
+    }
+    static func frame() { frames += 1; if firstFrame == nil { firstFrame = CACurrentMediaTime() } }
+    static var beganAt: CFTimeInterval?
+    static func began() { if beganAt == nil { beganAt = CACurrentMediaTime() } }
+}
+
+/// Counts storage checks and records whether any ran on the main thread.
+final class GraphReadProbe: @unchecked Sendable {
+    static let shared = GraphReadProbe()
+    private let lock = NSLock()
+    private var checks = 0, onMain = 0
+    func check() {
+        lock.lock(); defer { lock.unlock() }
+        checks += 1
+        if pthread_main_np() != 0 { onMain += 1 }
+    }
+    var value: (checks: Int, onMain: Int) { lock.lock(); defer { lock.unlock() }; return (checks, onMain) }
+}
+
+/// Invented members, folders and messages only. The repository is public.
+@MainActor struct GraphFixture {
+    let engine: ApprovalEngine
+    let group: SessionGroup
+    let directory: URL
+    let now: Date
+    let id: [String: UUID]
+
+    nonisolated static let fixedNow = Date(timeIntervalSince1970: 1_795_149_725) // 2026-11-20 13:42:05 +0900
+
+    static func make(root: URL, name: String, now: Date = fixedNow, heavy: Bool = false, empty: Bool = false) throws -> GraphFixture {
+        let directory = root.appendingPathComponent(name)
+        try? FileManager.default.removeItem(at: directory)
+        // key, agent, connected nickname (nil: no nickname), stored title, folder, parent key
+        let plan: [(String, AgentKind, String?, String, String, String?)] = [
+            ("lead", .claude, "결제 총괄", "결제 총괄", "/fixture/payments", nil),
+            ("api", .codex, "api 정리", "api 정리", "/fixture/payments/api", "lead"),
+            ("test", .codex, "테스트 보강", "테스트 보강", "/fixture/payments/tests", "api"),
+            ("fix", .claude, nil, "터미널 제목 미확인", "/fixture/payments/fixture", "api"),
+            ("doc", .claude, "문서 검토", "문서 검토", "/fixture/payments/docs", "lead"),
+            ("mig", .codex, "마이그레이션", "마이그레이션", "/fixture/payments/migrate", "doc"),
+            ("log", .codex, nil, "로그 정리", "/fixture/payments/logs", "mig"),
+            ("ui", .claude, "화면 점검", "화면 점검", "/fixture/payments/screens", "doc")
+        ]
+        let connected = plan.filter { $0.2 != nil }
+        let lines = connected.enumerated().map { index, entry in
+            "\(100_600 + index) 1 graph\(index) \(100_600 + index) \(100_600 + index) Fri Nov 20 09:00:00 2026 /fixture/\(entry.1 == .codex ? "codex" : "claude")"
+        }
+        let records = ProcessDiscovery.parse(lines.joined(separator: "\n"))
+        var sessions: [String: AgentSession] = [:]
+        for (index, entry) in connected.enumerated() {
+            guard let record = records.first(where: { $0.pid == 100_600 + index }) else { throw AppError.message("fixture record missing") }
+            sessions[entry.0] = AgentSession(id: record.key, agent: entry.1, pid: record.pid, started: record.started,
+                                             tty: "/dev/" + record.tty, cwd: entry.4, terminal: .terminal)
+        }
+        let transport = CodexReplyTransport(prepare: { _, _ in throw AppError.message("unused") },
+            send: { _, _ in throw AppError.message("never send") },
+            queueHome: { _ in .init(executable: "", home: "/tmp/graph-fixture-home", threadID: "") })
+        let queue = CodexQueueTransport(list: { _ in [] }, delete: { _, _ in .init(removed: []) }, validate: { _, _ in })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport,
+            claudeRegistryReader: { _ in [] }, processReader: { records }, codexQueue: queue)
+        engine.updateDiscovery(Array(sessions.values), records: records)
+        for entry in connected {
+            if let session = sessions[entry.0], let nickname = entry.2 {
+                try engine.setCustomization(session.id, value: SessionCustomization(title: nickname))
+            }
+        }
+        var ids: [String: UUID] = [:]
+        var members: [SessionGroupMember] = []
+        for entry in plan {
+            var member = SessionGroupMember(agent: entry.1, title: entry.3, cwd: entry.4,
+                                            conversationID: UUID().uuidString.lowercased(), providerHome: "/tmp/graph-fixture-home")
+            member.runtimeID = sessions[entry.0]?.id
+            ids[entry.0] = member.id
+            members.append(member)
+        }
+        for (index, entry) in plan.enumerated() {
+            if let parent = entry.5, parent != "lead" { members[index].parentMemberID = ids[parent] }
+        }
+        let group = empty ? SessionGroup(name: "디자인 회의", members: [])
+            : SessionGroup(name: "결제 리뷰", members: members, leaderMemberID: ids["lead"])
+        try SessionGroupStore(directory: directory).save([group])
+        if !empty { try seedMessages(directory: directory, group: group, id: ids, now: now, heavy: heavy) }
+        return GraphFixture(engine: engine, group: group, directory: directory, now: now, id: ids)
+    }
+
+    private static func seedMessages(directory: URL, group: SessionGroup, id: [String: UUID], now: Date, heavy: Bool) throws {
+        let box = try SessionGroupMailbox(directory: directory)
+        var acknowledged: [(UUID, UUID)] = []
+        func send(_ from: String, _ to: String, _ kind: SessionGroupMessage.Kind, _ text: String,
+                  minutes: Double, keep: Bool = false) throws -> SessionGroupMessage {
+            guard let sender = id[from], let recipient = id[to] else { throw AppError.message("fixture member missing") }
+            let message = try box.enqueue(groupID: group.id, senderID: sender, recipientID: recipient, kind: kind, text: text,
+                                          at: now.addingTimeInterval(-minutes * 60))
+            if !keep { acknowledged.append((message.id, recipient)) }
+            return message
+        }
+        // Recent 30 minutes
+        for i in 0..<3 { _ = try send("lead", "api", .message, "api 응답 형식을 정리해 주세요 \(i + 1)", minutes: Double(4 + i * 6)) }
+        _ = try send("api", "lead", .report, "응답 형식 초안을 올렸습니다", minutes: 2)
+        _ = try send("lead", "doc", .message, "결제 실패 안내 문구를 검토해 주세요", minutes: 12)
+        _ = try send("api", "fix", .message, "샘플 데이터 3건을 추가해 주세요", minutes: 29)
+        _ = try send("api", "fix", .message, "환불 케이스도 넣어 주세요", minutes: 9)
+        for i in 0..<10 { _ = try send("doc", "mig", .message, "마이그레이션 문서 항목 \(i + 1)을 확인해 주세요", minutes: Double(1 + i * 2)) }
+        for i in 0..<6 { _ = try send("mig", "doc", .report, "항목 \(i + 1) 반영했습니다", minutes: Double(2 + i * 3)) }
+        _ = try send("ui", "doc", .message, "결제 화면 문구가 바뀌었습니다", minutes: 1)
+        _ = try send("doc", "mig", .message, "다음 단계 확인 부탁드립니다", minutes: 3, keep: true)
+        // Questions that still wait for an answer, regardless of age
+        _ = try send("test", "api", .question, "새 스키마에 맞춰 fixture 를 다시 만들까요?", minutes: 4)
+        _ = try send("test", "api", .question, "결제 실패 응답도 테스트에 넣을까요?", minutes: 120)
+        // Older than 30 minutes
+        _ = try send("log", "mig", .message, "로그 형식을 바꿨습니다", minutes: 31)
+        _ = try send("lead", "fix", .message, "fixture 폴더를 정리해 주세요", minutes: 120)
+        for i in 0..<3 { _ = try send("ui", "mig", .message, "화면 점검 결과 \(i + 1)", minutes: Double(118 + i)) }
+        _ = try send("lead", "ui", .message, "결제 화면을 점검해 주세요", minutes: 125)
+        _ = try send("mig", "log", .message, "로그 보관 기간을 알려 주세요", minutes: 122)
+        let answered = try send("api", "lead", .question, "응답 코드를 문자열로 바꿔도 될까요?", minutes: 64)
+        _ = try box.enqueue(groupID: group.id, senderID: id["lead"]!, recipientID: id["api"]!, kind: .reply,
+                            text: "네, 문자열로 바꿔 주세요", sourceKey: "answer:" + answered.id.uuidString,
+                            at: now.addingTimeInterval(-60 * 60))
+        let expired = try send("test", "lead", .question, "테스트 계정을 새로 만들어도 될까요?", minutes: 118)
+        if heavy {
+            let keys = ["lead", "api", "test", "doc", "mig", "ui"]
+            for i in 0..<300 {
+                let from = keys[i % keys.count], to = keys[(i * 7 + 1) % keys.count]
+                guard from != to else { continue }
+                _ = try send(from, to, .message, "지난 작업 기록 \(i + 1)", minutes: Double(40 + i))
+            }
+        }
+        for (message, recipient) in acknowledged {
+            try box.acknowledge([message], groupID: group.id, recipientID: recipient, at: now)
+        }
+        try insertExpiredWait(directory: directory, group: group.id, member: id["test"]!, question: expired.id, now: now)
+    }
+
+    /// The mailbox has no public writer for waits, so the fixture stores an expired wait row directly.
+    private static func insertExpiredWait(directory: URL, group: UUID, member: UUID, question: UUID, now: Date) throws {
+        guard let parent = realpath(directory.path, nil) else { throw AppError.message("fixture directory missing") }
+        let path = String(cString: parent) + "/group-messages.sqlite"; free(parent)
+        var db: OpaquePointer?
+        guard sqlite3_open(path, &db) == SQLITE_OK else { throw AppError.message("fixture database") }
+        defer { sqlite3_close(db) }
+        let wait = UUID()
+        let request = #"{"id":"\#(wait.uuidString)","group":"\#(group.uuidString)","member":"\#(member.uuidString)","tasks":[],"questions":["\#(question.uuidString)"],"external":false,"mode":"all","seconds":600}"#
+        let sql = "INSERT INTO group_waits(id,group_id,owner_task,request,state,deadline) VALUES('\(wait.uuidString)','\(group.uuidString)','fixture','\(request)','expired',\(now.addingTimeInterval(-100 * 60).timeIntervalSince1970))"
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw AppError.message("fixture wait: " + String(cString: sqlite3_errmsg(db))) }
+    }
+}
+
+/// A transparent window that never takes mouse events or focus. The harness
+/// sends events to its hosting view directly, so the user's front app keeps focus.
+@MainActor func hiddenHarnessWindow<Content: View>(_ view: Content, size: CGSize) -> (NSWindow, NSHostingView<Content>) {
+    // A prohibited app can never become active, so nothing here can take focus from the user's front app.
+    NSApp.setActivationPolicy(.prohibited)
+    let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    let window = NSWindow(contentRect: NSRect(origin: screen.origin, size: size), styleMask: [.borderless],
+                          backing: .buffered, defer: false)
+    window.isReleasedWhenClosed = false
+    // 1% opacity: invisible to the user, but the window server still composites it, so display links fire.
+    window.alphaValue = 0.01
+    window.isOpaque = false
+    window.backgroundColor = .clear
+    window.ignoresMouseEvents = true
+    window.hasShadow = false
+    window.level = .floating
+    window.collectionBehavior = [.transient, .ignoresCycle, .canJoinAllSpaces]
+    let host = NSHostingView(rootView: view)
+    host.frame = NSRect(origin: .zero, size: size)
+    window.contentView = host
+    window.orderFrontRegardless()
+    return (window, host)
+}
+
+@MainActor func mouse(_ type: NSEvent.EventType, _ point: CGPoint, _ window: NSWindow, delta: CGVector = .zero) -> NSEvent {
+    let base = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                  windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+                                  pressure: type == .leftMouseUp ? 0 : 1)!
+    // Drag events also carry the movement deltas a real mouse reports.
+    guard type == .leftMouseDragged, let copy = base.cgEvent?.copy() else { return base }
+    copy.setIntegerValueField(.mouseEventDeltaX, value: Int64(delta.dx))
+    copy.setIntegerValueField(.mouseEventDeltaY, value: Int64(delta.dy))
+    if let value = NSEvent(cgEvent: copy), value.window === window { return value }
+    return base
+}
+
+/// Measures main-thread time from the moment the app dequeues a drag event until the
+/// main run loop is about to sleep again, which includes SwiftUI updates and the Core Animation commit.
+@MainActor final class MainBusyMeter {
+    var durations: [Double] = []
+    var origin: CGPoint = .zero
+    var dragStart: CFTimeInterval?
+    private var started: CFTimeInterval?
+    private var monitor: Any?
+    private var observer: CFRunLoopObserver?
+    func start() {
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let now = CACurrentMediaTime()
+                self.started = now
+                // The first pointer movement, whatever distance each version waits for before lifting the node.
+                if self.dragStart == nil { self.dragStart = now }
+            }
+            return event
+        }
+        observer = CFRunLoopObserverCreateWithHandler(nil, CFRunLoopActivity.beforeWaiting.rawValue, true, Int.max) { [weak self] _, _ in
+            MainActor.assumeIsolated {
+                guard let self, let started = self.started else { return }
+                self.durations.append((CACurrentMediaTime() - started) * 1000)
+                self.started = nil
+            }
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+    }
+    func stop() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        if let observer { CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes) }
+    }
+}
+
+/// Same procedure before and after the rewrite: a transparent window that cannot take focus,
+/// the same fixture, a press on one node, 60 drag events 2pt apart at about 120 events per
+/// second through the app's event queue, and a release. Three trials.
+@MainActor func verifyDrag(root: URL) async throws {
+    let fixture = try GraphFixture.make(root: root, name: "drag-state", heavy: true)
+    let frontApp = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    let size = CGSize(width: 1040, height: 680)
+    let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine)
+        .frame(width: size.width, height: size.height), size: size)
+    defer { window.close(); fixture.engine.stop() }
+    try await Task.sleep(for: .seconds(2.5))
+    host.layoutSubtreeIfNeeded()
+    guard let start = GraphProbe.center("문서 검토", in: host) else { throw AppError.message("drag node not found") }
+    var trials: [[String: Any]] = []
+    var allDurations: [Double] = []
+    var allRoots = 0, allCanvases = 0
+    for trial in 0..<3 {
+        GraphProbe.firstFrame = nil; GraphProbe.frames = 0; GraphProbe.beganAt = nil
+        let origin = trial == 0 ? start : (GraphProbe.center("문서 검토", in: host) ?? start)
+        let meter = MainBusyMeter(); meter.origin = origin; meter.start()
+        NSApp.postEvent(mouse(.leftMouseDown, origin, window), atStart: false)
+        try await Task.sleep(for: .milliseconds(40))
+        let rootsBefore = GraphProbe.roots, canvasesBefore = GraphProbe.canvases
+        let direction: CGFloat = trial % 2 == 0 ? -1 : 1
+        for step in 1...60 {
+            let point = CGPoint(x: origin.x + CGFloat(step) * 2 * direction, y: origin.y - CGFloat(step))
+            NSApp.postEvent(mouse(.leftMouseDragged, point, window, delta: CGVector(dx: 2 * direction, dy: 1)), atStart: false)
+            try await Task.sleep(for: .milliseconds(8))
+        }
+        try await Task.sleep(for: .milliseconds(40))
+        let rootsDuring = GraphProbe.roots - rootsBefore, canvasesDuring = GraphProbe.canvases - canvasesBefore
+        meter.stop()
+        let end = CGPoint(x: origin.x + 120 * direction, y: origin.y - 60)
+        NSApp.postEvent(mouse(.leftMouseUp, end, window), atStart: false)
+        try await Task.sleep(for: .milliseconds(500))
+        var firstFrame: Double?
+        if let frame = GraphProbe.firstFrame, let dragStart = meter.dragStart { firstFrame = (frame - dragStart) * 1000 }
+        var liftedNode: Double?
+        if let began = GraphProbe.beganAt, let dragStart = meter.dragStart { liftedNode = (began - dragStart) * 1000 }
+        let durations = meter.durations
+        trials.append(["rootBodiesDuringDrag": rootsDuring, "canvasBodiesDuringDrag": canvasesDuring,
+                       "rootBodiesIncludingRelease": GraphProbe.roots - rootsBefore, "measuredEvents": durations.count,
+                       "medianMs": percentile(durations, 0.5), "p95Ms": percentile(durations, 0.95), "maxMs": durations.max() ?? 0,
+                       "firstDisplayFrameMs": firstFrame as Any, "previewBeginMs": liftedNode as Any, "displayFrames": GraphProbe.frames])
+        allDurations += durations; allRoots += rootsDuring; allCanvases += canvasesDuring
+    }
+    let result: [String: Any] = [
+        "events": allDurations.count, "rootBodiesDuringDrag": allRoots, "canvasBodiesDuringDrag": allCanvases,
+        "medianMs": percentile(allDurations, 0.5), "p95Ms": percentile(allDurations, 0.95),
+        "windowVisible": window.occlusionState.contains(.visible), "trials": trials,
+        "harnessBecameActive": NSApp.isActive,
+        "frontAppUnchanged": NSWorkspace.shared.frontmostApplication?.processIdentifier == frontApp,
+        "eventDeltaCarried": mouse(.leftMouseDragged, start, window, delta: CGVector(dx: 1, dy: 0)).deltaX == 1
+    ]
+    let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
+    try data.write(to: root.appendingPathComponent("drag-measure.json"))
+    print(String(decoding: data, as: UTF8.self))
+}
+
+/// Fixed states for the five node shapes: working, idle, waiting for input, delivery blocked, unknown.
+@MainActor func fixedSources(_ fixture: GraphFixture) -> ConversationGraphModel.Sources {
+    let id = fixture.id
+    let phases: [UUID: SessionPhase] = [id["lead"]!: .working, id["api"]!: .idle, id["test"]!: .approval,
+                                        id["doc"]!: .working, id["mig"]!: .idle, id["ui"]!: .idle]
+    let blocked = id["mig"]!
+    let live = ConversationGraphModel.Sources.live(fixture.engine)
+    return ConversationGraphModel.Sources(
+        now: { GraphFixture.fixedNow },
+        operations: { group, inboxes in
+            Dictionary(uniqueKeysWithValues: group.members.map { member in
+                let inbox = inboxes[member.id], phase = phases[member.id]
+                let reason = "터미널에서 승인 또는 입력 대기"
+                return (member.id, GraphMemberOperation(
+                    phase: phase, input: member.id == blocked ? .deferred(reason) : phase == nil ? .unverified : .idle,
+                    unacknowledgedCount: inbox?.unacknowledgedCount ?? 0, lastAcknowledgedAt: inbox?.lastAcknowledgedAt,
+                    firstPendingAt: inbox?.firstPendingAt, lastDeliveryFailure: member.id == blocked ? reason : inbox?.lastDeliveryFailure,
+                    isDeliveryBlocked: member.id == blocked))
+            })
+        },
+        liveNicknames: live.liveNicknames,
+        sessions: Empty<[ConversationGraphModel.SessionKey], Never>().eraseToAnyPublisher())
+}
+
+/// Seven scenes, two window sizes, light and dark: 28 PNG files.
+@MainActor func renderGraphScenes(root: URL) async throws {
+    let fixture = try GraphFixture.make(root: root, name: "graph-state")
+    let empty = try GraphFixture.make(root: root, name: "graph-empty", empty: true)
+    let groupFile = fixture.directory.appendingPathComponent("session-groups.json")
+    let original = try Data(contentsOf: groupFile)
+    let scenes: [(String, GraphFixture, UUID?, SessionGroupGraph.Scope, SessionGroupGraph.Layout, Bool)] = [
+        ("1-none", fixture, nil, .recent, .tree, false),
+        ("2-leader-selected", fixture, fixture.id["lead"], .recent, .tree, false),
+        ("3-blocked-selected", fixture, fixture.id["mig"], .recent, .tree, false),
+        ("4-circle", fixture, nil, .recent, .circle, false),
+        ("5-all", fixture, nil, .all, .tree, false),
+        ("6-empty-group", empty, nil, .recent, .tree, false),
+        ("7-read-failure", fixture, nil, .recent, .tree, true)
+    ]
+    var written: [String] = []
+    for (name, scene, selection, scope, layout, failing) in scenes {
+        for (label, width, height) in [("720x460", 720.0, 460.0), ("1040x680", 1040.0, 680.0)] {
+            for (theme, scheme) in [("light", ColorScheme.light), ("dark", ColorScheme.dark)] {
+                let view = SessionGroupConversationGraph(groupID: scene.group.id, engine: scene.engine, sources: fixedSources(scene),
+                                                         initialSelection: selection, initialScope: scope, layout: layout)
+                    .frame(width: width, height: height)
+                    .background(Color(nsColor: .windowBackgroundColor))
+                    .environment(\.colorScheme, scheme)
+                let (window, host) = hiddenHarnessWindow(view, size: CGSize(width: width, height: height))
+                host.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
+                try await Task.sleep(for: .milliseconds(1300))
+                if failing {
+                    try Data("{".utf8).write(to: groupFile)
+                    try await Task.sleep(for: .milliseconds(1600))
+                }
+                host.layoutSubtreeIfNeeded(); host.displayIfNeeded()
+                guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { throw AppError.message("렌더 결과 없음") }
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                guard let png = bitmap.representation(using: .png, properties: [:]) else { throw AppError.message("PNG 결과 없음") }
+                let file = root.appendingPathComponent("graph-\(name)-\(label)-\(theme).png")
+                try png.write(to: file)
+                written.append(file.lastPathComponent)
+                window.close()
+                if failing { try original.write(to: groupFile) }
+            }
+        }
+    }
+    fixture.engine.stop(); empty.engine.stop()
+    print("PASS graph scenes: \(written.count) PNG\n" + written.joined(separator: "\n"))
+}
+
+/// Another connection writes, and the window must follow within two seconds without
+/// recomputing when nothing changed, reading off the main thread and stopping while hidden.
+@MainActor func verifyGraphRefresh(root: URL) async throws {
+    let fixture = try GraphFixture.make(root: root, name: "refresh-state")
+    defer { fixture.engine.stop() }
+    let size = CGSize(width: 1040, height: 680)
+    let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine)
+        .frame(width: size.width, height: size.height), size: size)
+    defer { window.close() }
+    func require(_ ok: Bool, _ message: String) throws { if !ok { throw AppError.message(message) } }
+    func waitForMessages(_ count: Int, within seconds: Double) async throws -> Double? {
+        let start = CACurrentMediaTime()
+        while CACurrentMediaTime() - start < seconds {
+            if GraphProbe.messageCount == count { return CACurrentMediaTime() - start }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        return nil
+    }
+    try await Task.sleep(for: .seconds(2))
+    host.layoutSubtreeIfNeeded()
+    let initial = GraphProbe.messageCount
+    try require(initial > 0, "Initial graph load missing")
+    let probe = GraphReadProbe.shared
+    let rootsBefore = GraphProbe.roots, checksBefore = probe.value.checks
+    try await Task.sleep(for: .seconds(3))
+    let unchangedRoots = GraphProbe.roots - rootsBefore, unchangedChecks = probe.value.checks - checksBefore
+    try require(unchangedChecks >= 2, "Visible window stopped checking storage")
+    try require(unchangedRoots == 0, "Unchanged checks recomputed the window \(unchangedRoots) times")
+    let placesBefore = GraphProbe.places
+    let writer = try SessionGroupMailbox(directory: fixture.directory)
+    _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["ui"]!, recipientID: fixture.id["lead"]!,
+                           kind: .message, text: "결제 화면 캡처를 새로 올렸습니다")
+    guard let latency = try await waitForMessages(initial + 1, within: 3) else { throw AppError.message("New message did not appear within 3 s") }
+    try require(latency < 2, "New message took \(latency) s")
+    try await Task.sleep(for: .milliseconds(400))
+    host.layoutSubtreeIfNeeded()
+    let moved = placesBefore.filter { name, point in
+        guard let after = GraphProbe.places[name] else { return true }
+        return hypot(after.x - point.x, after.y - point.y) > 0.5
+    }
+    try require(!placesBefore.isEmpty && moved.isEmpty, "Nodes moved after a new message: " + moved.keys.sorted().map { "\($0) \(placesBefore[$0]!) -> \(String(describing: GraphProbe.places[$0]))" }.joined(separator: "; "))
+    try require(probe.value.onMain == 0, "Storage was read on the main thread \(probe.value.onMain) times")
+    window.orderOut(nil)
+    try await Task.sleep(for: .milliseconds(600))
+    let hiddenChecks = probe.value.checks
+    try await Task.sleep(for: .milliseconds(2500))
+    let checksWhileHidden = probe.value.checks - hiddenChecks
+    try require(checksWhileHidden == 0, "Hidden window kept checking storage")
+    _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["api"]!, recipientID: fixture.id["test"]!,
+                           kind: .message, text: "숨긴 동안 보낸 메시지입니다")
+    window.orderFrontRegardless()
+    guard let reopen = try await waitForMessages(initial + 2, within: 3) else { throw AppError.message("Shown window did not read again") }
+    let result: [String: Any] = ["newMessageLatencyMs": latency * 1000, "rootBodiesWhileUnchanged3s": unchangedRoots,
+                                 "storageChecksWhileUnchanged3s": unchangedChecks, "mainThreadReads": probe.value.onMain,
+                                 "totalReads": probe.value.checks, "nodesMovedAfterMessage": moved.count,
+                                 "checksWhileHidden2_5s": checksWhileHidden, "reopenReadMs": reopen * 1000,
+                                 "nodeCount": placesBefore.count]
+    let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
+    try data.write(to: root.appendingPathComponent("refresh-verify.json"))
+    print("PASS graph refresh: new message in \(Int(latency * 1000)) ms, 0 root bodies while unchanged, reads off the main thread, no checks while hidden, nodes kept their positions\n" + String(decoding: data, as: UTF8.self))
+}
+
+func percentile(_ values: [Double], _ p: Double) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    return sorted[min(sorted.count - 1, Int((Double(sorted.count - 1) * p).rounded()))]
+}
+
 @main struct SessionGroupsRender {
     @MainActor static func main() async throws {
         _ = NSApplication.shared
         let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+        if CommandLine.arguments.contains("--graph") || CommandLine.arguments.contains("--verify-graph-refresh") {
+            let refresh = CommandLine.arguments.contains("--verify-graph-refresh")
+            Task { @MainActor in
+                do {
+                    if refresh { try await verifyGraphRefresh(root: root) } else { try await renderGraphScenes(root: root) }
+                    NSApp.terminate(nil)
+                } catch { fputs("Graph \(refresh ? "refresh" : "render") QA: \(error)\n", stderr); exit(1) }
+            }
+            NSApp.run(); return
+        }
+        if CommandLine.arguments.contains("--verify-drag") {
+            Task { @MainActor in
+                do { try await verifyDrag(root: root); NSApp.terminate(nil) }
+                catch { fputs("Graph drag QA: \(error)\n", stderr); exit(1) }
+            }
+            NSApp.run(); return
+        }
         let directory = root.appendingPathComponent("fixture-state")
         let records = ProcessDiscovery.parse("""
         100541 1 group1 100541 100541 Wed Oct 28 12:00:00 2026 /fixture/codex
