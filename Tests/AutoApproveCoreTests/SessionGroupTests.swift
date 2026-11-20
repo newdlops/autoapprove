@@ -135,6 +135,56 @@ extension ApprovalTests {
         try expect(engine.networkIsolated); try expectEqual(try box.pendingCount, 0)
     }
 
+    /// A message held for a busy recipient waits for the recipient to turn idle instead of a short
+    /// timer, and the idle state seen on the screen or in Claude's registry, not only a Claude hook,
+    /// types it right away.
+    @MainActor func testGroupMailboxWaitsForRecipientIdleWithoutHook() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/aa-idle-wake-" + UUID().uuidString.prefix(8))
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("""
+        104501 1 fixture501 104501 104501 Wed Oct 28 12:00:00 2026 /fixture/claude
+        104502 1 fixture502 104502 104502 Wed Oct 28 12:00:00 2026 /fixture/claude
+        """)
+        let sessions = records.map { AgentSession(id: $0.key, agent: .claude, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/fixture", terminal: .iterm) }
+        let ids = Dictionary(uniqueKeysWithValues: records.map { ($0.pid, UUID().uuidString) })
+        let writer = GroupTerminalWriter(), terminal = GroupLineTerminal()
+        terminal.needsEnter = false
+        let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
+            rows.map { .init(processID: $0.key, kind: "interactive", sessionID: ids[$0.pid], status: terminal.status($0.pid)) }
+        }
+        let rule = String(repeating: "─", count: 30)
+        let custom = "answer\n\(rule)\n❯ \n\(rule)\nuser@host project (main) | fixture status line"
+        for session in sessions { writer.show(custom, on: session.tty) }
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: writer.screen($0.tty)) }) },
+            approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { _,_,_,_ in .missingTarget })
+        adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.iterm: adapter], isolateByDefault: true)
+        defer { engine.stop() }
+        engine.groupMailboxPollInterval = 0.05; engine.groupMailboxHeldFallback = 300
+        engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
+        let live = try await engine.sessionGroupSessions()
+        let members = try sessions.map { session in try unwrapGroup(live.first { $0.id == session.id }).member }
+        let group = SessionGroup(name: "fixture idle wake", members: members, leaderMemberID: members[0].id)
+        try SessionGroupStore(directory: directory).save([group])
+        let box = try SessionGroupMailbox(directory: directory)
+        terminal.setStatus(records[1].pid, "busy")
+        engine.updateDiscovery(sessions, records: records); await engine.refreshScreens()
+        let receipt = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "send_group_message", "sessionID": sessions[0].id,
+            "groupID": group.id.uuidString, "memberID": members[1].id.uuidString, "text": "fixture held for busy"])
+        let id = try unwrapGroup((receipt["messageID"] as? String).flatMap(UUID.init(uuidString:)))
+        try expect(try await waitForGroup(5) { (try? box.message(id)?.lastResult) == "not_started" })
+        let retryIn = try unwrapGroup(try box.message(id)?.nextAttemptAt).timeIntervalSinceNow
+        try expect(retryIn > 200, "A busy recipient is not retried on the short timer (next try in \(Int(retryIn))s)")
+        try expect(terminal.typed.isEmpty)
+        // No hook: Claude's registry turns idle and the next discovery and screen pass notice it.
+        terminal.setStatus(records[1].pid, "idle")
+        engine.updateDiscovery(sessions, records: records); await engine.refreshScreens()
+        try expect(try await waitForGroup(5) { (try? box.message(id)?.lastResult) == "direct_submitted" },
+                   "Turning idle types the held message without waiting for the timer")
+        try expectEqual(terminal.typed.count, 1)
+        try expect(terminal.typed[0].contains("fixture held for busy"))
+    }
+
     func testSessionGroupTerminalStatusRequiresFreshCard() throws {
         let old = UUID().uuidString.lowercased(), next = UUID().uuidString.lowercased()
         func card(_ id: String) -> String {

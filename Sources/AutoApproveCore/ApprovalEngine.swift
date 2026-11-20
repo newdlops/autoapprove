@@ -239,13 +239,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var groupMailboxStore: SessionGroupMailbox?
     private var groupWaitTimer: Task<Void, Never>?
     private let groupMailboxSignal = RemoteTerminalChangeSignal()
-    private var groupMailboxIdleClaude: Set<String> = []
+    private var groupMailboxIdleSessions: Set<String> = []
     private var groupMailboxTask: Task<Void, Never>?
     private var activeGroupMailboxMessages: Set<UUID> = []
     private var claudeGroupPrompts: [String: (prompt: String, turn: String)] = [:]
     private var groupMailboxDelegations: [String: (id: UUID, at: Date, group: String)] = [:]
     public var groupMailboxPollInterval: TimeInterval = 5
     public var groupMailboxReminderInterval: TimeInterval = 120
+    /// Retry timer for a message held because its recipient is busy; the idle signal normally comes first.
+    public var groupMailboxHeldFallback: TimeInterval = 300
+    /// How often the loop parks messages for removed members and tells senders about stalled messages.
+    public var groupMailboxHousekeepingInterval: TimeInterval = 60
+    private var groupHousekeepingAt = Date.distantPast
     /// How long a typed group message may go unobserved before the engine looks for proof of loss.
     public var groupMailboxReceiptGrace: TimeInterval = 60
     /// Typings without an observed receipt before a message is parked as undelivered.
@@ -919,7 +924,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         appUpdates.stop(); updateReceiver.stop()
         groupDeliveryTask?.cancel(); groupDeliveryTask = nil
         groupMailboxTask?.cancel(); groupMailboxTask = nil
-        groupMailboxIdleClaude.removeAll()
+        groupMailboxIdleSessions.removeAll()
         groupWaitTimer?.cancel(); groupWaitTimer = nil
         groupBadgeTask?.cancel(); groupBadgeTask = nil
         sessionRestartTasks.values.forEach { $0.cancel() }; sessionRestartTasks.removeAll()
@@ -3352,12 +3357,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func deliverGroupMailboxNotifications() async throws {
         guard !snapshot.paused, !remoteInputStopped else { return }
-        parkMessagesForRemovedMembers()
-        notifyStalledSenders()
+        // Both checks read the group store and scan held messages; their thresholds are minutes long,
+        // so running them on every pass of the loop only repeats the same answer.
+        if Date().timeIntervalSince(groupHousekeepingAt) >= groupMailboxHousekeepingInterval {
+            groupHousekeepingAt = Date()
+            parkMessagesForRemovedMembers()
+            notifyStalledSenders()
+        }
         let overdue = try groupMailbox().overdueReceipts()
         var heads = try groupMailbox().heads()
-        let idle = groupMailboxIdleClaude
-        groupMailboxIdleClaude.removeAll()
+        let idle = groupMailboxIdleSessions
+        groupMailboxIdleSessions.removeAll()
         let now = Date()
         guard !overdue.isEmpty || heads.contains(where: { $0.nextAttemptAt <= now || (!idle.isEmpty && $0.lastResult == "not_started") }) else { return }
         let observed = try await sessionGroupSessions()
@@ -3369,7 +3379,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if !idle.isEmpty {
             for group in try SessionGroupStore(directory: paths.directory).load() {
                 eligible[group.id] = Set(group.members.filter { member in
-                    member.agent == .claude && SessionGroupMatching.match(member, in: observed).map { idle.contains($0.id) } == true
+                    SessionGroupMatching.match(member, in: observed).map { idle.contains($0.id) } == true
                 }.map(\.id))
             }
         }
@@ -3391,8 +3401,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             } catch {
                 let result = (error as? RemoteHTTPError)?.diagnostics?["delivery"] ?? "unknown"
                 if result == "not_started" {
-                    // Nothing was typed, so this try does not count toward the parking limit.
-                    let backoff = min(groupMailboxReminderInterval, max(groupMailboxPollInterval, Double(message.attempts + 1) * 5))
+                    // Nothing was typed, so this try does not count toward the parking limit. A recipient
+                    // that is working or waiting for an answer wakes the loop itself when it turns idle,
+                    // so the timer is only a fallback for a missed event. Other holds (a draft in the
+                    // composer, an unreadable screen) have no event and keep the short backoff.
+                    let backoff = recipientWakesLoop(message, observed: observed) ? groupMailboxHeldFallback
+                        : min(groupMailboxReminderInterval, max(groupMailboxPollInterval, Double(message.attempts + 1) * 5))
                     try groupMailbox().noteAttempt(message.id, result: result, error: error.localizedDescription, retryAt: Date().addingTimeInterval(backoff), increment: -1)
                 } else {
                     try groupMailbox().noteAttempt(message.id, result: "direct_unknown", error: error.localizedDescription, retryAt: receiptDue)
@@ -3409,6 +3423,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
               !stalled.isEmpty else { return }
         let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
         for message in stalled { noticeStalledSender(message, groups: groups) }
+    }
+
+    /// Whether the recipient is in a state that ends with an idle signal (`presentPhase` or a Claude hook).
+    private func recipientWakesLoop(_ message: SessionGroupMessage, observed: [SessionGroupLiveSession]) -> Bool {
+        guard let groups = try? SessionGroupStore(directory: paths.directory).load(),
+              let recipient = groups.first(where: { $0.id == message.groupID })?.members.first(where: { $0.id == message.recipientID }),
+              let live = SessionGroupMatching.match(recipient, in: observed), let session = sessions[live.id] else { return false }
+        if let status = live.claudeRegisteredStatus, ["busy", "waiting"].contains(status) { return true }
+        return [.working, .approval, .input].contains(session.phase) || session.pendingInTerminal
     }
 
     /// A recipient that left its group can never be matched to a terminal, so its messages used to be
@@ -4263,9 +4286,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func claudeStatuses(_ targets: [AgentSession]) async -> [String: String] {
         let claude = targets.filter { $0.agent == .claude && $0.phase != .ended }
         guard !claude.isEmpty else { return [:] }
-        let reader = processReader, registry = claudeRegistryReader
+        // Delivery checks one or two recipients, several times a second while it confirms a submission;
+        // reading those processes alone avoids a system-wide process snapshot on every check.
+        let reader = processReader, single = singleProcessReader, registry = claudeRegistryReader
         return await Task.detached(priority: .utility) {
-            guard let records = try? reader() else { return [:] }
+            let records: [ProcessRecord]?
+            if claude.count <= 4 {
+                records = try? claude.flatMap { try single($0.pid) }
+            } else {
+                records = try? reader()
+            }
+            guard let records else { return [:] }
             var result: [String: String] = [:]
             for session in claude {
                 guard let record = records.first(where: { $0.key == session.id && $0.agent == .claude }) else { continue }
@@ -4286,8 +4317,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard ClaudeSessionRegistration.acceptsPrompt(before) else {
                 throw RemoteHTTPError(409, "대상 Claude가 대기 상태가 아니어서 입력하지 않았습니다. (상태: \(before))", diagnostics: ["delivery": "not_started"])
             }
-            let reader = processReader
-            guard let records = try? await Task.detached(operation: { try reader() }).value,
+            let reader = singleProcessReader, pid = session.pid
+            guard let records = try? await Task.detached(operation: { try reader(pid) }).value,
                   let process = records.first(where: { $0.key == session.id && $0.agent == .claude && "/dev/" + $0.tty == session.tty && $0.isForeground }),
                   sendingMessages.insert(session.id).inserted else {
                 throw RemoteHTTPError(409, "대상 CLI를 확인하지 못해 입력하지 않았습니다.", diagnostics: ["delivery": "not_started"])
@@ -7353,7 +7384,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions[key] = session
         if groupMailboxTask != nil, session.phase == .idle,
            event == "Stop" || (event == "Notification" && payload["notification_type"] as? String == "idle_prompt") {
-            groupMailboxIdleClaude.insert(key)
+            groupMailboxIdleSessions.insert(key)
             groupMailboxSignal.notify()
         }
         if session.interruption != nil { persistInterruption(key) }
@@ -8650,6 +8681,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     /// One phase per frame: a stopped turn shows as such, and asks for attention only once automation gave up.
     private func presentPhase(_ id: String, _ observed: ActivityObservation, at now: Date) {
+        // Turning idle is the moment a held group message can be typed, for every agent and screen
+        // source; waking the delivery loop here replaces retrying held messages on a timer.
+        let before = sessions[id]?.phase
+        defer {
+            if groupMailboxTask != nil, before != .idle, sessions[id]?.phase == .idle {
+                groupMailboxIdleSessions.insert(id); groupMailboxSignal.notify()
+            }
+        }
         var activity = observed
         // A custom Claude status line hides the idle composer from the screen reader. Claude still
         // records idle/busy for its own process, so an unreadable screen falls back to that record.
