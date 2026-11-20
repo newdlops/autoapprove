@@ -139,9 +139,11 @@ import AutoApproveCore
                 }
                 Menu {
                     Button("대화 그래프…", systemImage: "point.3.connected.trianglepath.dotted") { openWindow(id: "session-group-graph", value: group.id) }
+                        .help("이 그룹의 연결선과 저장된 메시지를 독립 창에서 엽니다.")
                     Button("그룹 삭제", role: .destructive) { deleteConfirm = true }
                 } label: { Image(systemName: "ellipsis.circle") }
                     .menuStyle(.borderlessButton).fixedSize().accessibilityLabel("그룹 관리")
+                    .help("그룹 관리 메뉴를 엽니다. 대화 그래프를 열거나 그룹을 삭제할 수 있습니다.")
             }
             Text(group.leaderMemberID == nil
                  ? "구성원의 역할 메뉴에서 그룹장을 한 명 이상 지정할 수 있습니다."

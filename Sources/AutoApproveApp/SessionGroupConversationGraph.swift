@@ -37,7 +37,7 @@ import AutoApproveCore
                 .help("미응답은 답변을 기다리는 질문의 연결만 표시합니다. 전체는 저장된 대화의 연결을 모두 표시합니다.")
                 Button("새로고침", systemImage: "arrow.clockwise", action: refresh)
                     .labelStyle(.iconOnly)
-                    .help("질문과 답변 상태 새로고침")
+                    .help("로컬에 저장된 그룹 메시지와 질문·답변의 전달 상태를 다시 읽습니다.")
             }
             .padding(16)
             Divider()
@@ -52,6 +52,7 @@ import AutoApproveCore
                     Spacer()
                     Button("닫기", systemImage: "xmark") { self.deliveryFeedback = nil }
                         .labelStyle(.iconOnly)
+                        .help("질문 전달 결과 표시를 닫습니다.")
                 }
                 .font(.caption).foregroundStyle(.secondary).padding(12)
                 Divider()
@@ -65,14 +66,14 @@ import AutoApproveCore
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack {
                                     Label("발신 → 수신", systemImage: "arrow.right")
-                                        .help("화살표는 질문이나 메시지를 보낸 구성원에서 받은 구성원을 가리킵니다. 두꺼운 선은 기록이 더 많다는 뜻입니다.")
+                                        .help("화살표는 수신 구성원을 가리킵니다. 양끝의 화살표는 두 구성원이 서로 메시지를 주고받았다는 뜻입니다.")
                                     Text("노드를 드래그해 이동")
                                         .help("노드를 누른 채 끌면 연결선이 따라옵니다. 클릭하면 해당 구성원의 대화를 봅니다.")
                                     Spacer()
                                     Button("배치 초기화", systemImage: "arrow.counterclockwise") { movedNodes.removeAll() }
                                         .labelStyle(.iconOnly)
-                                        .help("노드 자동 배치로 돌아가기")
                                         .disabled(movedNodes.isEmpty)
+                                        .help(movedNodes.isEmpty ? "현재 노드가 자동으로 배치되어 있습니다." : "직접 이동한 노드를 자동 배치 위치로 되돌립니다.")
                                 }
                                 HStack(spacing: 12) {
                                     legend(AgentKind.codex.title, color: AgentKind.codex.graphColor)
@@ -82,7 +83,7 @@ import AutoApproveCore
                                     }
                                     Spacer(minLength: 0)
                                     legend("미응답 연결", color: .orange)
-                                        .help("주황색 연결선에는 아직 답변되지 않은 질문이 있습니다. 다른 연결선은 발신 노드의 색을 사용합니다.")
+                                        .help("주황색 연결선에는 아직 답변되지 않은 질문이 있습니다. 나머지 양방향 연결은 회색으로 표시합니다.")
                                 }
                             }
                             .font(.caption).foregroundStyle(.secondary).padding(12)
@@ -123,7 +124,9 @@ import AutoApproveCore
             get: { deliveryTarget != nil }, set: { if !$0 { deliveryTarget = nil } }
         ), titleVisibility: .visible, presenting: deliveryTarget) { item in
             Button("터미널에 전달") { deliver(item) }
+                .help("원래 질문을 수신 구성원의 터미널에 제출합니다.")
             Button("취소", role: .cancel) {}
+                .help("질문을 전달하지 않고 돌아갑니다.")
         } message: { item in
             let name = group.map { title(item.question.recipientID, in: $0) } ?? ""
             Text("\(name)의 터미널에 원래 질문을 보냅니다. 이미 본 질문이면 새 응답이 시작될 수 있습니다.")
@@ -132,6 +135,7 @@ import AutoApproveCore
             get: { deliveryError != nil }, set: { if !$0 { deliveryError = nil } }
         ), presenting: deliveryError) { _ in
             Button("확인", role: .cancel) {}
+                .help("전달 결과 안내를 닫습니다.")
         } message: { Text($0) }
         .task {
             while !Task.isCancelled {
@@ -210,7 +214,7 @@ import AutoApproveCore
                                                 Text(item.question.text).lineLimit(2)
                                             }
                                         }
-                                        .disclosureGroupStyle(QuestionDisclosureStyle())
+                                        .disclosureGroupStyle(ConversationDisclosureStyle(summary: "질문과 답변 원문"))
                                         HStack {
                                             Label(status(item), systemImage: item.answer == nil ? "clock" : "checkmark.circle")
                                                 .font(.caption)
@@ -224,7 +228,9 @@ import AutoApproveCore
                                                 Spacer(minLength: 4)
                                                 Button("노드에 전달…") { deliveryTarget = item }
                                                     .disabled(deliveringQuestion != nil)
-                                                    .help("원래 질문을 지정 수신자의 터미널에 제출합니다. 대상의 빈 입력창을 확인한 뒤 전달합니다.")
+                                                    .help(deliveringQuestion == nil
+                                                          ? "\(title(item.question.recipientID, in: group))의 터미널에 원래 질문을 보냅니다. 제출하기 전에 확인 창이 열립니다."
+                                                          : "진행 중인 질문 전달이 끝나면 다시 사용할 수 있습니다.")
                                                 Button("답변…") { replyTarget = item }
                                                     .help("질문을 받은 구성원 대신 답변을 작성해 원래 질문자에게 보냅니다.")
                                             }
@@ -253,7 +259,9 @@ import AutoApproveCore
                                             Text(kind + " · " + delivery(item))
                                                 .font(.caption).foregroundStyle(.secondary)
                                         }
-                                    }.padding(.vertical, 4)
+                                    }
+                                    .disclosureGroupStyle(ConversationDisclosureStyle(summary: "메시지 원문"))
+                                    .padding(.vertical, 4)
                                 }
                             }
                         }
@@ -295,7 +303,9 @@ import AutoApproveCore
     }
 }
 
-private struct QuestionDisclosureStyle: DisclosureGroupStyle {
+private struct ConversationDisclosureStyle: DisclosureGroupStyle {
+    let summary: String
+
     func makeBody(configuration: Configuration) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Button {
@@ -314,6 +324,7 @@ private struct QuestionDisclosureStyle: DisclosureGroupStyle {
             }
             .buttonStyle(.plain)
             .accessibilityValue(configuration.isExpanded ? "펼침" : "접힘")
+            .help(summary + (configuration.isExpanded ? " 접기" : " 펼치기"))
             if configuration.isExpanded {
                 configuration.content.padding(.leading, 15)
             }
@@ -357,13 +368,18 @@ private struct GroupConversationReplyEditor: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(body.count > limit ? Color.red : Color.secondary)
                 Spacer()
-                Button("취소") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("취소") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .help("작성 중인 답변을 보관하지 않고 닫습니다.")
                 Button("답변 보내기") {
                     do { try send(body); dismiss() }
                     catch { self.error = error.localizedDescription }
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(body.isEmpty || body.count > limit || body.contains("\0"))
+                .help(body.isEmpty ? "답변 내용을 입력하면 보낼 수 있습니다."
+                      : body.count > limit ? "답변을 \(limit)자 이하로 줄여주세요."
+                      : "답변을 원래 질문에 연결하고 \(recipient)의 로컬 그룹 수신함에 저장합니다.")
             }
         }
         .padding(20)
@@ -403,6 +419,7 @@ private extension AgentKind {
     }
     private struct Edge {
         let link: ConversationGraphLayout.Link
+        let twoWay: Bool
         let color: Color
         let active: Bool
         let count: Int
@@ -417,11 +434,20 @@ private extension AgentKind {
         let flows = flows(for: Set(ids))
         let topology = ConversationGraphLayout(members: ids, links: Set(flows.keys.map(\.undirected)))
         let colors = Dictionary(uniqueKeysWithValues: members.map { ($0.id, $0.agent.graphColor) })
-        let edges = flows.keys.sorted().compactMap { link -> Edge? in
-            guard let flow = flows[link], !onlyPending || flow.pending > 0 else { return nil }
-            let color = flow.pending > 0 ? Color.orange : colors[link.from, default: .secondary]
-            return Edge(link: link, color: color, active: selection == nil || link.from == selection || link.to == selection,
-                        count: onlyPending ? flow.pending : flow.count)
+        let edges = topology.links.sorted().compactMap { link -> Edge? in
+            let reverse = ConversationGraphLayout.Link(from: link.to, to: link.from)
+            let forward = flows[link, default: Flow()]
+            let backward = flows[reverse, default: Flow()]
+            let outgoing = onlyPending ? forward.pending : forward.count
+            let incoming = onlyPending ? backward.pending : backward.count
+            guard outgoing + incoming > 0 else { return nil }
+            let direction = outgoing > 0 ? link : reverse
+            let twoWay = outgoing > 0 && incoming > 0
+            let color: Color = forward.pending + backward.pending > 0 ? .orange
+                : twoWay ? .secondary : colors[direction.from, default: .secondary]
+            return Edge(link: direction, twoWay: twoWay, color: color,
+                        active: selection == nil || link.from == selection || link.to == selection,
+                        count: outgoing + incoming)
         }
         GeometryReader { proxy in
             let minimum = max(350, ceil(sqrt(CGFloat(members.count))) * 90)
@@ -438,8 +464,8 @@ private extension AgentKind {
                     Canvas { context, _ in
                         for edge in edges where !edge.touches(movingNode) {
                             guard let from = points[edge.link.from], let to = points[edge.link.to],
-                                  let path = Self.edgePath(from, to) else { continue }
-                            context.stroke(path, with: .color(edge.color.opacity(edge.active ? 0.78 : 0.12)),
+                                  let path = Self.edgePath(from, to, twoWay: edge.twoWay) else { continue }
+                            context.stroke(path, with: .color(edge.color.opacity(edge.active ? 0.78 : 0.24)),
                                            style: StrokeStyle(lineWidth: edge.width, lineCap: .round))
                         }
                     }
@@ -476,7 +502,8 @@ private extension AgentKind {
                                             guard edge.touches(member.id) else { return nil }
                                             let outgoing = edge.link.from == member.id
                                             guard let anchor = points[outgoing ? edge.link.to : edge.link.from] else { return nil }
-                                            return .init(anchor: anchor, outgoing: outgoing, color: NSColor(edge.color.opacity(0.88)), width: edge.width)
+                                            return .init(anchor: anchor, outgoing: outgoing, twoWay: edge.twoWay,
+                                                         color: NSColor(edge.color.opacity(0.88)), width: edge.width)
                                         }
                                         let visible = preview.begin(nodeLabel(member, highlighted: true)
                                             .environment(\.colorScheme, colorScheme), edges: incident,
@@ -571,11 +598,11 @@ private extension AgentKind {
         return totals
     }
 
-    static func edgePath(_ from: CGPoint, _ to: CGPoint) -> Path? {
+    static func edgePath(_ from: CGPoint, _ to: CGPoint, twoWay: Bool) -> Path? {
         let distance = hypot(to.x - from.x, to.y - from.y)
         guard distance > 40 else { return nil }
         let dx = (to.x - from.x) / distance, dy = (to.y - from.y) / distance
-        let bend = min(47, max(15, distance * 0.22))
+        let bend = min(23, distance * 0.10)
         let control = CGPoint(x: (from.x + to.x) / 2 - dy * bend,
                               y: (from.y + to.y) / 2 + dx * bend)
         let startAngle = atan2(control.y - from.y, control.x - from.x)
@@ -585,10 +612,14 @@ private extension AgentKind {
         var path = Path()
         path.move(to: start)
         path.addQuadCurve(to: end, control: control)
-        for offset in [-0.48, 0.48] {
-            path.move(to: end)
-            path.addLine(to: CGPoint(x: end.x - 7 * cos(endAngle + offset), y: end.y - 7 * sin(endAngle + offset)))
+        func arrow(at tip: CGPoint, angle: CGFloat) {
+            for offset in [-0.48, 0.48] {
+                path.move(to: tip)
+                path.addLine(to: CGPoint(x: tip.x - 7 * cos(angle + offset), y: tip.y - 7 * sin(angle + offset)))
+            }
         }
+        arrow(at: end, angle: endAngle)
+        if twoWay { arrow(at: start, angle: startAngle + .pi) }
         return path
     }
 }
@@ -612,6 +643,7 @@ private extension AgentKind {
     struct Edge {
         let anchor: CGPoint
         let outgoing: Bool
+        let twoWay: Bool
         let color: NSColor
         let width: CGFloat
     }
@@ -690,7 +722,7 @@ private extension AgentKind {
         for (edge, layer) in edges {
             let from = edge.outgoing ? point : edge.anchor
             let to = edge.outgoing ? edge.anchor : point
-            layer.path = GroupConversationNodes.edgePath(from, to)?.cgPath.copy(using: &flip)
+            layer.path = GroupConversationNodes.edgePath(from, to, twoWay: edge.twoWay)?.cgPath.copy(using: &flip)
         }
     }
 
