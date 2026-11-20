@@ -32,7 +32,10 @@ extension ApprovalTests {
         try expectEqual(observe("idle", "g1"), .idle)
         try expectEqual(observe("busy", "g2"), .working)
         try expectEqual(observe("waiting", "g3"), .unknown, "A waiting request is never inferred from the registry")
-        try expectEqual(observe("shell", "g4"), .unknown)
+        try expectEqual(observe("shell", "g4"), .idle, "Background shell tasks leave the composer free for the next prompt")
+        try expectEqual(observe("compacting", "g5"), .unknown)
+        try expect(ClaudeSessionRegistration.acceptsPrompt("idle") && ClaudeSessionRegistration.acceptsPrompt("shell"))
+        try expect(!ClaudeSessionRegistration.acceptsPrompt("busy") && !ClaudeSessionRegistration.acceptsPrompt("waiting"))
     }
 
     /// Naming is asked once: the leader names everyone, or each member names itself without a leader.

@@ -4110,7 +4110,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard !remoteInputStopped, !Task.isCancelled,
                   let member = groups.first(where: { $0.id == item.groupID })?.members.first(where: { $0.id == item.workerMemberID }),
                   let live = SessionGroupMatching.match(member, in: observed), live.id == item.workerSessionID,
-                  statuses[live.id] == "idle", let current = sessions[live.id], !current.pendingInTerminal, current.backgroundMonitoring != true,
+                  statuses[live.id].map(ClaudeSessionRegistration.acceptsPrompt) == true, let current = sessions[live.id],
+                  !current.pendingInTerminal, current.backgroundMonitoring != true,
                   current.interruption?.needsAttention != true,
                   ![.approval, .input, .ended].contains(current.phase),
                   let completion = await Task.detached(priority: .utility, operation: { reader(live, item.sentAt, item.task) }).value,
@@ -4244,7 +4245,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func sendGroupLine(_ session: AgentSession, text: String, preflight: (() async throws -> Void)? = nil) async throws {
         if session.agent == .claude, let host = ScreenHost(kind: session.terminal), screenConnections[host]?.enabled == true,
            let type = screenAdapters[host]?.typeLine, let before = await claudeStatuses([session])[session.id] {
-            guard before == "idle" else {
+            guard ClaudeSessionRegistration.acceptsPrompt(before) else {
                 throw RemoteHTTPError(409, "대상 Claude가 대기 상태가 아니어서 입력하지 않았습니다. (상태: \(before))", diagnostics: ["delivery": "not_started"])
             }
             let reader = processReader
@@ -4263,7 +4264,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let until = Date().addingTimeInterval(seconds)
                 while Date() < until {
                     try? await Task.sleep(for: .milliseconds(300))
-                    if let status = await claudeStatuses([session])[session.id], status != "idle" { return true }
+                    if let status = await claudeStatuses([session])[session.id], !ClaudeSessionRegistration.acceptsPrompt(status) { return true }
                 }
                 return false
             }
@@ -4695,7 +4696,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             defer { groupWorkerActions.remove(worker.id) }
             // Claude registers its own status; the screen reading reports "unknown" when Claude shows a status line.
             if let status = await claudeStatuses([current])[worker.id] {
-                guard status == "idle" else {
+                guard ClaudeSessionRegistration.acceptsPrompt(status) else {
                     throw RemoteHTTPError(409, "작업자가 대기 상태가 아닙니다. (Claude 상태: \(status)) 완료 보고를 받은 뒤 다시 지시하세요.")
                 }
             } else {
@@ -8618,6 +8619,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if activity.phase == .unknown, sessions[id]?.agent == .claude, let status = claudeRegistryStatus[id] {
             switch status {
             case "idle": activity = ActivityObservation(phase: .idle, detail: "Claude가 다음 지시를 기다리고 있습니다. (Claude 세션 기록 기준)")
+            case "shell": activity = ActivityObservation(phase: .idle, detail: "Claude가 다음 지시를 기다리고 있습니다. 백그라운드 셸 작업은 계속 실행 중입니다. (Claude 세션 기록 기준)")
             case "busy": activity = ActivityObservation(phase: .working, detail: "Claude가 작업 중입니다. (Claude 세션 기록 기준)")
             default: break
             }

@@ -18,6 +18,11 @@ public struct ClaudeSessionRegistration: Equatable {
     /// The conversation to use for identity: the registered one, or the one reported with a known activity.
     public var conversationID: String? { sessionID ?? activity?.providerID }
 
+    /// Whether a registered status means Claude has no turn running and takes the next prompt.
+    /// "shell" is idle with background shell tasks still running (a dev server, a polling loop);
+    /// those tasks can run for days, so treating it as busy holds every message for that long.
+    public static func acceptsPrompt(_ status: String) -> Bool { status == "idle" || status == "shell" }
+
     public init(processID: String, kind: String, jobID: String? = nil, parkedJobID: String? = nil, activity: ClaudeSessionActivity? = nil,
                 peerName: String? = nil, sessionID: String? = nil, status: String? = nil) {
         self.processID = processID; self.kind = kind
