@@ -18,9 +18,20 @@ public enum ClaudeComposerReadiness {
         func rule(_ row: String) -> Bool {
             row.count >= 3 && row.allSatisfy { "─━╌".contains($0) }
         }
+        // A renamed Claude session draws its name inside the composer border, e.g. "──────── name ─".
+        // One short, space-padded label between rule runs is still a border; a draft never appears there.
+        func border(_ row: String) -> Bool {
+            if rule(row) { return true }
+            let line = "─━╌"
+            guard row.prefix(3).allSatisfy({ line.contains($0) }), let last = row.last, line.contains(last) else { return false }
+            let labels = row.split(whereSeparator: { line.contains($0) })
+            guard labels.count == 1, let label = labels.first, label.hasPrefix(" "), label.hasSuffix(" ") else { return false }
+            let name = label.trimmingCharacters(in: .whitespaces)
+            return !name.isEmpty && name.count <= 40
+        }
         // Both borders must be visible. Text on a following line before the
         // closing border is a multiline draft, never a status-line continuation.
-        guard rule(rows[prompt - 1]), rule(rows[prompt + 1]) else { return false }
+        guard border(rows[prompt - 1]), border(rows[prompt + 1]) else { return false }
         let footer = rows.dropFirst(prompt + 2)
         // Outside the closed composer, model/usage/reset text is supplemental.
         // Do not widen ActivityDetector or infer completion from these rows.

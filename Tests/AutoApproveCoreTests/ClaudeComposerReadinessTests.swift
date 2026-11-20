@@ -31,5 +31,24 @@ extension ApprovalTests {
                        "```\n" + custom + "\n```"] {
             try expect(!ClaudeComposerReadiness.isEmpty(screen), "Drafts, menus and ambiguous/clipped composers must stay blocked")
         }
+        // A renamed session shows its name inside the top border. That composer is still empty and ready,
+        // while a draft under the same labelled border, or a label that is really wrapped text, stays blocked.
+        let labelled = String(repeating: "─", count: 40) + " 4번 ─"
+        func named(_ body: String, top: String = labelled) -> String { "answer\n\(top)\n❯ \(body)\n\(rule)\n\(status)\n⏵⏵ auto mode on (shift+tab to cycle)" }
+        for screen in [named(""), named("", top: "─── fixture 리뷰 ───"), named("Try \"fix lint errors\"")] {
+            try expect(ClaudeComposerReadiness.isEmpty(screen), "A name inside the composer border must not block delivery")
+        }
+        for screen in [named("draft text"), named("", top: "─── two labels ─── here ─"), named("", top: "─── " + String(repeating: "x", count: 41) + " ─"),
+                       named("", top: "──name──"), named("", top: "text ─────")] {
+            try expect(!ClaudeComposerReadiness.isEmpty(screen), "Drafts and text that is not a border label stay blocked")
+        }
+        // A held group message names the actual reason, so the sender can tell a busy or drafting
+        // recipient apart from a composer the screen reader could not recognise.
+        func reason(_ screen: String, input: String? = nil) -> String { ApprovalEngine.composerHoldReason(screen, agent: .claude, inputReason: input) }
+        try expectEqual(reason(framed("user draft", footer: status)), "입력창에 작성 중인 글이 있음")
+        try expectEqual(reason(framed("", footer: "Which environment?\n❯ 1. Development\n  2. Production\nEnter to select")), "선택지나 확인 화면이 열려 있음")
+        try expectEqual(reason("✻ Thinking… (12s · esc to interrupt)\n\(rule)\n❯ \n\(rule)"), "세션이 작업 중임")
+        try expectEqual(reason("answer\n❯ \n" + status + "\n? for shortcuts"), "입력창 모양을 판독하지 못함")
+        try expectEqual(reason(custom, input: "Claude Code에서 셸 명령 실행 중"), "터미널이 입력을 받을 수 없음(Claude Code에서 셸 명령 실행 중)")
     }
 }

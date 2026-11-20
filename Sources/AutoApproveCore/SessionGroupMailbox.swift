@@ -231,6 +231,17 @@ public final class SessionGroupMailbox {
         return !parked
     }
 
+    /// Agent-sent messages that have not started typing since `date` and whose sender was not told yet.
+    /// Reports and choice questions are sent on a worker's behalf after its turn, so they are left out.
+    func stalledForSenders(createdBefore date: Date) throws -> [SessionGroupMessage] {
+        try rows("""
+            WHERE acknowledged IS NULL AND kind IN ('question','reply','message') AND sender_id<>recipient_id AND created<=?
+              AND (last_result IS NULL OR last_result IN ('not_started','undelivered'))
+              AND NOT EXISTS(SELECT 1 FROM messages n WHERE n.source_key='stalled:' || messages.id)
+            ORDER BY sequence LIMIT 50
+            """, [String(date.timeIntervalSince1970)])
+    }
+
     func submittedAt(_ id: UUID) throws -> Date? {
         let query = try statement("SELECT submitted FROM group_submissions WHERE message_id=?", [id.uuidString])
         defer { sqlite3_finalize(query) }

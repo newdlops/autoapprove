@@ -250,6 +250,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public var groupMailboxReceiptGrace: TimeInterval = 60
     /// Typings without an observed receipt before a message is parked as undelivered.
     public var groupMailboxDirectAttemptLimit = 3
+    /// How long an agent's message may wait without being typed before its sender is told once.
+    public var groupStallNoticeAfter: TimeInterval = 600
     private var sessionRestartTasks: [String: Task<Void, Never>] = [:]
     /// Conversation IDs read the way session groups read them, once per restart request.
     private var restartIdentityTask: Task<[String: String], Never>?
@@ -2972,7 +2974,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         if let direct = (object["sessionID"] as? String).flatMap({ id in observed.first { $0.id == id } }) {
             if let claimed, !(recovery && direct.conversationID == nil), UUID(uuidString: claimed) != direct.conversationID.flatMap(UUID.init(uuidString:)) {
-                throw RemoteHTTPError(409, "지정한 대화 ID가 현재 세션과 다릅니다.")
+                throw RemoteHTTPError(409, "지정한 대화 ID가 현재 세션과 다릅니다. conversationID에는 이 도구를 호출하는 세션 자신의 대화 ID만 넣을 수 있습니다. 다른 구성원의 대화 ID와 memberID는 get_session_groups 결과의 members에서 확인하세요.")
             }
             return (direct, "process")
         }
@@ -3350,6 +3352,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func deliverGroupMailboxNotifications() async throws {
         guard !snapshot.paused, !remoteInputStopped else { return }
+        notifyStalledSenders()
         let overdue = try groupMailbox().overdueReceipts()
         var heads = try groupMailbox().heads()
         let idle = groupMailboxIdleClaude
@@ -3397,6 +3400,46 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
+    /// Tells the sender once when its message has waited too long without being typed. The notice is
+    /// itself a `.notice`, which is never checked here, so senders that are also blocked cannot loop.
+    private func notifyStalledSenders() {
+        guard let box = try? groupMailbox(),
+              let stalled = try? box.stalledForSenders(createdBefore: Date().addingTimeInterval(-groupStallNoticeAfter)),
+              !stalled.isEmpty else { return }
+        let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
+        for message in stalled { noticeStalledSender(message, groups: groups) }
+    }
+
+    private func noticeStalledSender(_ message: SessionGroupMessage, groups: [SessionGroup]) {
+        guard [.question, .reply, .message].contains(message.kind), message.senderID != message.recipientID,
+              let group = groups.first(where: { $0.id == message.groupID }),
+              group.members.contains(where: { $0.id == message.senderID }),
+              let box = try? groupMailbox(), (try? box.message(sourceKey: "stalled:" + message.id.uuidString)) == nil else { return }
+        let recipient = group.members.first { $0.id == message.recipientID }?.title ?? "받는 구성원"
+        let minutes = max(1, Int(Date().timeIntervalSince(message.createdAt) / 60))
+        let reason = message.lastResult == "undelivered"
+            ? "입력한 메시지가 여러 번 대화에 들어가지 않아 자동 입력을 멈췄습니다"
+            : (message.lastError.flatMap { $0.isEmpty ? nil : $0 } ?? "받는 구성원의 앞선 메시지가 아직 전달되지 않아 순서를 기다리고 있습니다")
+        let text = "[AutoApprove 전달 지연] 보낸 메시지(messageID \(message.id.uuidString), \(message.kind.rawValue))가 '\(recipient)'에게 \(minutes)분째 입력되지 않았습니다. 사유: \(reason) "
+            + "메시지는 수신함에 보관되어 있고, 받는 쪽 입력창이 비면 자동으로 전달됩니다. 같은 내용을 다시 보내지 마세요. 진행에 꼭 필요하면 사용자에게 알리세요."
+        _ = try? box.enqueue(groupID: group.id, senderID: message.senderID, recipientID: message.senderID, kind: .notice, text: text,
+                             sourceKey: "stalled:" + message.id.uuidString)
+    }
+
+    /// Why a group message is held instead of typed, so the sender and the graph can tell a busy
+    /// recipient or a draft apart from a composer the screen reader could not recognise.
+    public nonisolated static func composerHoldReason(_ screen: String, agent: AgentKind, inputReason: String?) -> String {
+        if let inputReason, !inputReason.isEmpty { return "터미널이 입력을 받을 수 없음(\(inputReason))" }
+        if RemoteMessageReadiness.hasMenu(screen, agent: agent) { return "선택지나 확인 화면이 열려 있음" }
+        if ActivityDetector.detect(screen, agent: agent).phase == .working { return "세션이 작업 중임" }
+        let marker: Character = agent == .codex ? "›" : "❯"
+        if let line = ActivityDetector.nonemptyTail(screen).last(where: { $0.first == marker }),
+           !String(line.dropFirst()).trimmingCharacters(in: .whitespaces).isEmpty {
+            return "입력창에 작성 중인 글이 있음"
+        }
+        return "입력창 모양을 판독하지 못함"
+    }
+
     private enum GroupReceiptEvidence { case received, lost, unknown }
 
     /// Commit or redeliver typed messages whose receipt is overdue. Only proof of loss
@@ -3422,6 +3465,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     log(AuditEvent(sessionID: session.id, summary: "세션 그룹 메시지 \(message.id.uuidString.prefix(8))",
                                    outcome: "그룹 메시지 자동 전달 중단", source: "세션 그룹", tool: "group_mailbox",
                                    request: parked.lastError))
+                    noticeStalledSender(parked, groups: groups)
                 }
             }
         }
@@ -3500,7 +3544,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let busyCodex = message.deliversBody && current.agent == .codex &&
                 ActivityDetector.detect(frame.screen, agent: .codex).phase != .idle
             guard empty, !busyCodex, frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: current.agent) else {
-                throw RemoteHTTPError(409, "대상의 빈 입력창을 확인하지 못해 메시지를 보관하고 있습니다.", diagnostics: ["delivery": "not_started"])
+                let reason = Self.composerHoldReason(frame.screen, agent: current.agent, inputReason: frame.inputReason)
+                throw RemoteHTTPError(409, "대상의 빈 입력창을 확인하지 못해 메시지를 보관하고 있습니다. 사유: \(reason).", diagnostics: ["delivery": "not_started"])
             }
             try ready()
             let box = try self.groupMailbox()
@@ -10263,7 +10308,37 @@ private struct ScreenAnalysisStorageKey: Hashable {
             ["id":"accessibility","label":"손쉬운 사용","state":keyboard ? "ok":"attention","detail":keyboard ? "이 앱의 권한이 허용되어 있습니다.":"원래 창을 검증하는 키보드 입력에는 이 Mac의 승인이 필요합니다."],
             ["id":"event_posting","label":"키 입력 권한","state":posting ? "ok":"attention","detail":posting ? "키 이벤트 게시가 허용되어 있습니다.":"이 앱의 키 이벤트 게시 허용을 확인해주세요."],
             ["id":"direct_input","label":"Terminal 직접 입력","state":direct ? "ok":"unavailable","detail":direct ? "손쉬운 사용 권한으로 원본 터미널에 입력합니다.":"Mac의 손쉬운 사용에서 AutoApprove를 허용해주세요. 별도 입력 서비스를 설치하지 않습니다."]]
-        return RemoteDiagnostics.report(nodeID:nodeID ?? store.value("webNodeID") ?? "local",name:name ?? Host.current().localizedName ?? "Mac",sessions:sessionCopy,records:rows,targets:targets,servers:statuses,attachments:journal,transitions:transitions,events:eventCopy,permissions:permissions,errors:failures)
+        var report = RemoteDiagnostics.report(nodeID:nodeID ?? store.value("webNodeID") ?? "local",name:name ?? Host.current().localizedName ?? "Mac",sessions:sessionCopy,records:rows,targets:targets,servers:statuses,attachments:journal,transitions:transitions,events:eventCopy,permissions:permissions,errors:failures)
+        if let delivery = groupDeliveryCheck() {
+            report["checks"] = ((report["checks"] as? [JSONObject]) ?? []) + [delivery]
+            if delivery["state"] as? String == "attention", var summary = report["summary"] as? JSONObject, summary["level"] as? String == "ok" {
+                summary["level"] = "attention"; report["summary"] = summary
+            }
+        }
+        return report
+    }
+
+    /// Session-group delivery for every agent, Claude included: a member whose first queued message
+    /// could not be typed, or that holds a parked message, is reported with the last hold reason.
+    private func groupDeliveryCheck() -> JSONObject? {
+        guard let groups = try? SessionGroupStore(directory: paths.directory).load(), !groups.isEmpty,
+              let box = try? groupMailbox() else { return nil }
+        var held: [String] = [], pending = 0
+        for group in groups {
+            guard let inboxes = try? box.inboxOperations(groupID: group.id) else { continue }
+            for member in group.members {
+                guard let inbox = inboxes[member.id] else { continue }
+                pending += inbox.unacknowledgedCount
+                guard inbox.unacknowledgedCount > 0, inbox.headDidNotStart || inbox.hasParkedMessage else { continue }
+                let since = inbox.firstPendingAt.map { " · 가장 오래된 메시지 " + $0.formatted(date: .omitted, time: .shortened) } ?? ""
+                // Names are left out: a diagnostic snapshot may be handed to an analysis model.
+                let role = group.isLeader(member.id) ? "그룹장" : "구성원"
+                held.append("\(role) \(member.id.uuidString.prefix(8)): 미전달 \(inbox.unacknowledgedCount)건\(since) · \(inbox.lastDeliveryFailure ?? "사유 미기록")")
+            }
+        }
+        let detail = held.isEmpty ? "그룹 \(groups.count)개 · 수신 미확인 \(pending)건 · 전달이 막힌 구성원 없음"
+            : "전달이 막힌 구성원 \(held.count)명 · " + held.prefix(6).joined(separator: " / ") + (held.count > 6 ? " 외 \(held.count - 6)명" : "")
+        return ["id": "group_delivery", "label": "세션 그룹 메시지 전달", "state": held.isEmpty ? "ok" : "attention", "detail": detail]
     }
     public func diagnosticCodexAction(_ object:JSONObject,nodeID:String,name:String) async throws -> JSONObject {
         guard let action=object["action"] as? String,let request=object["requestID"] as? String,UUID(uuidString:request) != nil else{throw RemoteHTTPError(400,"진단 요청 ID를 확인해주세요.")}
