@@ -21,6 +21,7 @@ import AutoApproveCore
     @State private var nicknameNote: String?
     private let initialScope: SessionGroupGraph.Scope
     private let forcedLayout: SessionGroupGraph.Layout?
+    private let initialZoom: Double?
 
     private struct GraphAlert: Identifiable {
         let id = UUID()
@@ -28,13 +29,14 @@ import AutoApproveCore
         let message: String
     }
 
-    /// `sources`, `initialScope` and `layout` exist for the render harness; the app uses the defaults.
+    /// `sources`, `initialScope`, `layout` and `zoom` exist for the render harness; the app uses the defaults.
     init(groupID: UUID, engine: ApprovalEngine, sources: ConversationGraphModel.Sources? = nil, initialSelection: UUID? = nil,
-         initialScope: SessionGroupGraph.Scope = .recent, layout: SessionGroupGraph.Layout? = nil) {
+         initialScope: SessionGroupGraph.Scope = .recent, layout: SessionGroupGraph.Layout? = nil, zoom: Double? = nil) {
         self.groupID = groupID
         self.engine = engine
         self.initialScope = initialScope
         forcedLayout = layout
+        initialZoom = zoom
         _selected = State(initialValue: initialSelection)
         _model = StateObject(wrappedValue: ConversationGraphModel(groupID: groupID, directory: engine.paths.directory,
                                                                  sources: sources ?? .live(engine)))
@@ -67,7 +69,8 @@ import AutoApproveCore
                     HStack(spacing: 0) {
                         ConversationGraphCanvas(nodes: content.nodes, recent: content.recentEdges, all: content.allEdges,
                                                 fresh: model.freshEdges, hasLeader: !content.group.leaderMemberIDs.isEmpty,
-                                                selection: $selected, initialScope: initialScope, forcedLayout: forcedLayout)
+                                                selection: $selected, initialScope: initialScope, forcedLayout: forcedLayout,
+                                                initialZoom: initialZoom)
                             .frame(minWidth: 390, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         Divider()
                         inspector(content)
@@ -614,8 +617,8 @@ private extension AgentKind {
 
 // MARK: - Graph area
 
-/// Controls, legend and the graph. Drag state, moved positions, focus and the view choice
-/// live here only, so moving a node never recomputes the window around it.
+/// Controls, legend and the graph. Drag state, moved positions, zoom, pan, focus and the view
+/// choice live here only, so moving, zooming or panning never recomputes the window around it.
 @MainActor private struct ConversationGraphCanvas: View {
     let nodes: [GraphNode]
     let recent: [SessionGroupGraph.Edge]
@@ -633,31 +636,52 @@ private extension AgentKind {
     @GestureState private var dragging = false
     @FocusState private var focused: UUID?
     @Environment(\.colorScheme) private var colorScheme
+    /// Fitted until the user zooms, pans or moves a node; after that data updates keep the view.
+    @State private var mode: ViewMode
+    /// The view when an empty-space drag passed 4pt or a pinch began.
+    @State private var panStart: SessionGroupGraph.Viewport?
+    @State private var pinchStart: SessionGroupGraph.Viewport?
+    /// The graph area size, for the zoom buttons above it.
+    @State private var areaSize: CGSize = .zero
 
-    private static let space = "conversationCanvas"
+    /// The graph area, before zoom and pan: gestures in it report pointer positions in this space.
+    private static let space = "conversationViewport"
+
+    private enum ViewMode: Equatable {
+        /// Recomputed from the nodes and the area size; 60% to 100% on open and after a layout change,
+        /// 25% to 100% after "맞춤", one fixed scale for the render harness.
+        case fitted(minimum: Double, maximum: Double)
+        case manual(SessionGroupGraph.Viewport)
+
+        static let automatic = ViewMode.fitted(minimum: SessionGroupGraph.automaticFitMinimum, maximum: 1)
+    }
 
     init(nodes: [GraphNode], recent: [SessionGroupGraph.Edge], all: [SessionGroupGraph.Edge], fresh: Set<SessionGroupGraph.EdgeKey>,
-         hasLeader: Bool, selection: Binding<UUID?>, initialScope: SessionGroupGraph.Scope, forcedLayout: SessionGroupGraph.Layout?) {
+         hasLeader: Bool, selection: Binding<UUID?>, initialScope: SessionGroupGraph.Scope, forcedLayout: SessionGroupGraph.Layout?,
+         initialZoom: Double? = nil) {
         self.nodes = nodes; self.recent = recent; self.all = all; self.fresh = fresh; self.hasLeader = hasLeader
         _selection = selection
         self.forcedLayout = forcedLayout
         _scope = State(initialValue: initialScope)
+        _mode = State(initialValue: initialZoom.map { .fitted(minimum: $0, maximum: $0) } ?? .automatic)
     }
 
+    /// Node centres in graph coordinates: the automatic layout and, on top of it, moved positions.
     private struct Placement {
         let base: [UUID: CGPoint]
         let points: [UUID: CGPoint]
-        let size: CGSize
+        /// Every node with its ring and name band, for fitting and for the pan limit.
+        let content: CGRect
+        let leader: CGPoint?
     }
 
     var body: some View {
         let layout = forcedLayout ?? storedLayout
         let edges = scope == .recent ? recent : all
         let moved = offsets[layout] ?? [:]
-        let frame = SessionGroupGraph.frame(SessionGroupGraph.positions(nodes.map { (id: $0.id, depth: $0.depth) },
-                                                                        hasLeader: hasLeader, layout: layout))
+        let placement = place(layout: layout, moved: moved)
         VStack(alignment: .leading, spacing: 0) {
-            controls(layout: layout, moved: !moved.isEmpty)
+            controls(layout: layout, moved: !moved.isEmpty, view: viewport(placement, size: areaSize), placement: placement)
             // The hidden full legend reserves the height, so a state or line kind appearing
             // never pushes the graph down and the nodes keep their places.
             ZStack(alignment: .topLeading) {
@@ -666,53 +690,117 @@ private extension AgentKind {
             }
             Divider()
             GeometryReader { proxy in
-                let placement = place(frame, moved: moved, viewport: proxy.size)
+                let size = proxy.size
+                let view = viewport(placement, size: size)
+                /* graph-probe: viewport */
                 let bends = SessionGroupGraph.bends(edges, points: placement.points)
                 let related = selection.map { chosen in Set(edges.filter { $0.touches(chosen) }.flatMap { [$0.from, $0.to] }).union([chosen]) }
-                let leader = nodes.first.flatMap { placement.points[$0.id] } ?? .zero
-                ScrollView([.horizontal, .vertical]) {
-                    ZStack(alignment: .topLeading) {
-                        Color.clear
-                            .contentShape(Rectangle())
-                            .onTapGesture { selection = nil; focused = nil }
-                            .accessibilityHidden(true)
-                        Canvas { context, _ in
-                            draw(edges, points: placement.points, bends: bends, in: &context)
-                        }
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                        ForEach(nodes) { node in
-                            if let point = placement.points[node.id] {
-                                nodeView(node, at: point, layout: layout, placement: placement, edges: edges, bends: bends,
-                                         dimmed: related.map { !$0.contains(node.id) } ?? false)
+                // A scroll view that never scrolls: zoom and pan move the graph instead. Its container
+                // takes the first click in an inactive window, as the graph did when it scrolled, so
+                // pressing a node there starts the drag or selection at once.
+                ScrollView([]) {
+                ZStack(alignment: .topLeading) {
+                    // A click on empty space clears the selection; a drag of 4pt or more pans.
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.space))
+                            .onChanged { value in
+                                if panStart == nil {
+                                    guard hypot(value.translation.width, value.translation.height) >= 4 else { return }
+                                    panStart = view
+                                }
+                                guard let start = panStart else { return }
+                                adjust(start.panned(by: CGVector(dx: value.translation.width, dy: value.translation.height)), placement, size)
                             }
+                            .onEnded { _ in
+                                if panStart == nil { selection = nil; focused = nil }
+                                panStart = nil
+                            })
+                        .accessibilityHidden(true)
+                    Canvas { context, _ in
+                        context.translateBy(x: view.offset.x, y: view.offset.y)
+                        context.scaleBy(x: view.scale, y: view.scale)
+                        draw(edges, points: placement.points, bends: bends, in: &context)
+                    }
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                    ForEach(nodes) { node in
+                        if let point = placement.points[node.id] {
+                            nodeView(node, at: point, layout: layout, placement: placement, view: view, size: size, edges: edges, bends: bends,
+                                     dimmed: related.map { !$0.contains(node.id) } ?? false)
                         }
                     }
-                    .frame(width: placement.size.width, height: placement.size.height)
-                    .overlay { ConversationDragSurface(preview: preview).allowsHitTesting(false).accessibilityHidden(true) }
-                    .coordinateSpace(name: Self.space)
                 }
-                // The leader's share of the content width and height lines up with the same share of
-                // the viewport, so a graph larger than the window first opens with the leader in view.
-                .defaultScrollAnchor(UnitPoint(x: leader.x / max(1, placement.size.width), y: leader.y / max(1, placement.size.height)))
-                .overlay(alignment: .topLeading) {
-                    if scope == .recent && edges.isEmpty {
-                        Text("최근 30분 동안 오간 메시지가 없습니다")
-                            .font(.caption).foregroundStyle(.secondary)
-                            .padding(.horizontal, 16).padding(.top, 8)
+                .frame(width: size.width, height: size.height, alignment: .topLeading)
+                .clipped()
+                .contentShape(Rectangle())
+                .simultaneousGesture(MagnifyGesture()
+                    .onChanged { value in
+                        let start = pinchStart ?? view
+                        if pinchStart == nil { pinchStart = view }
+                        adjust(start.zoomed(to: start.scale * value.magnification, around: value.startLocation), placement, size)
                     }
+                    .onEnded { _ in pinchStart = nil })
+                .overlay { ConversationDragSurface(preview: preview).allowsHitTesting(false).accessibilityHidden(true) }
+                .background {
+                    ConversationScrollEvents { delta, pointer, zooming in
+                        if zooming {
+                            adjust(view.zoomed(to: view.scale * exp(delta.dy / 100), around: pointer), placement, size)
+                        } else {
+                            adjust(view.panned(by: delta), placement, size)
+                        }
+                    }
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                }
+                .coordinateSpace(name: Self.space)
+                }
+                .scrollDisabled(true)
+                .onAppear { areaSize = size }
+                .onChange(of: size) { _, value in areaSize = value }
+            }
+            .overlay(alignment: .topLeading) {
+                if scope == .recent && edges.isEmpty {
+                    Text("최근 30분 동안 오간 메시지가 없습니다")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .padding(.horizontal, 16).padding(.top, 8)
+                        .allowsHitTesting(false)
                 }
             }
         }
         .onChange(of: dragging) { _, active in
             if !active, preview.isActive { finishDrag() }
         }
+        .onChange(of: storedLayout) { _, _ in
+            if forcedLayout == nil { mode = .automatic }
+        }
         .onDisappear { if preview.isActive { finishDrag() } }
+    }
+
+    // MARK: Zoom and pan
+
+    private func viewport(_ placement: Placement, size: CGSize) -> SessionGroupGraph.Viewport {
+        switch mode {
+        case let .fitted(minimum, maximum):
+            SessionGroupGraph.fit(placement.content, in: size, minimum: minimum, maximum: maximum, focus: placement.leader)
+        case let .manual(view): view
+        }
+    }
+
+    /// A zoom or pan by the user: the view stays as set until the user fits it again.
+    private func adjust(_ view: SessionGroupGraph.Viewport, _ placement: Placement, _ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        mode = .manual(SessionGroupGraph.constrained(view, content: placement.content, size: size))
+    }
+
+    /// Buttons and shortcuts zoom around the middle of the graph area.
+    private func zoom(to scale: Double, from view: SessionGroupGraph.Viewport, placement: Placement) {
+        adjust(view.zoomed(to: scale, around: CGPoint(x: areaSize.width / 2, y: areaSize.height / 2)), placement, areaSize)
     }
 
     // MARK: Controls and legend
 
-    private func controls(layout: SessionGroupGraph.Layout, moved: Bool) -> some View {
+    private func controls(layout: SessionGroupGraph.Layout, moved: Bool, view: SessionGroupGraph.Viewport, placement: Placement) -> some View {
         let pickers = HStack(spacing: 12) {
             Picker("보기", selection: $scope) {
                 Text("최근").tag(SessionGroupGraph.Scope.recent)
@@ -727,7 +815,7 @@ private extension AgentKind {
             }
             .pickerStyle(.segmented)
             .fixedSize()
-            .help("트리는 그룹장을 맨 위에, 구성원을 상위 구성원 아래 층에 놓습니다. 원형은 그룹장을 가운데에, 나머지를 트리 순서대로 둘레에 놓습니다. 고른 배치는 다음에 열 때도 유지합니다.")
+            .help("트리는 그룹장을 맨 위에, 구성원을 상위 구성원 아래 층에 놓습니다. 원형은 그룹장을 가운데에, 나머지를 트리 순서대로 둘레에 놓습니다. 고른 배치는 다음에 열 때도 유지하고, 배치를 바꾸면 전체가 보이게 맞춥니다.")
             // Shown only while a node is moved, so a link never sits there unclickable. It keeps
             // its width while hidden, so the row does not shift when it appears.
             Button("자동 배치로") { offsets[layout] = nil }
@@ -738,18 +826,77 @@ private extension AgentKind {
                 .help("직접 옮긴 노드를 자동 배치 위치로 되돌립니다.")
         }
         .controlSize(.small)
+        let zoom = zoomControls(view, placement: placement)
         let hints = HStack(spacing: 12) {
             Text("노드를 드래그해 이동")
-                .help("노드를 누른 채 끌면 연결선이 따라옵니다. 클릭하면 해당 구성원의 대화를 봅니다. 옮긴 위치는 창을 닫으면 자동 배치로 돌아갑니다.")
+                .help("노드를 누른 채 끌면 연결선이 따라옵니다. 클릭하면 해당 구성원의 대화를 봅니다. 옮긴 위치는 창을 닫으면 자동 배치로 돌아갑니다. 빈 곳을 끌거나 두 손가락으로 스크롤하면 그래프를 옮기고, 핀치나 ⌘ 키를 누른 채 스크롤하면 포인터 위치를 기준으로 확대하거나 축소합니다.")
             Label("발신 → 수신", systemImage: "arrow.right")
                 .help("화살표는 수신 구성원을 가리킵니다. 두 구성원이 서로 주고받으면 방향마다 선을 하나씩 그립니다.")
         }
         .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-        return ViewThatFits(in: .horizontal) {
-            HStack(spacing: 12) { pickers; Spacer(minLength: 12); hints }
-            HStack(spacing: 12) { pickers; Spacer(minLength: 0) }
+        // The hints show only when they fit between the pickers and the zoom buttons.
+        return ControlRowLayout(spacing: 12, lineSpacing: 6) {
+            pickers
+            ViewThatFits(in: .horizontal) { hints; Color.clear.frame(width: 0, height: 0) }
+            zoom
         }
         .padding(.horizontal, 16).padding(.top, 10).padding(.bottom, 8)
+    }
+
+    /// − NN% + 맞춤. ⌘− ⌘+ ⌘0 work while this window is the key window, since a button's
+    /// shortcut belongs to its window. The percentage returns to 100%.
+    private func zoomControls(_ view: SessionGroupGraph.Viewport, placement: Placement) -> some View {
+        let percent = Int((view.scale * 100).rounded())
+        let smallest = view.scale <= SessionGroupGraph.minimumZoom + 0.001
+        let largest = view.scale >= SessionGroupGraph.maximumZoom - 0.001
+        let value = "\(percent)%"
+        let larger = { zoom(to: SessionGroupGraph.steppedZoom(from: view.scale, larger: true), from: view, placement: placement) }
+        return HStack(spacing: 2) {
+            Button { zoom(to: SessionGroupGraph.steppedZoom(from: view.scale, larger: false), from: view, placement: placement) } label: {
+                Image(systemName: "minus").frame(width: 12)
+            }
+            .keyboardShortcut("-", modifiers: .command)
+            .disabled(smallest)
+            .help(smallest ? "가장 작은 배율(25%)입니다." : "그래프를 축소합니다(⌘−).")
+            .accessibilityLabel("축소")
+            .accessibilityValue(value)
+            Button { zoom(to: 1, from: view, placement: placement) } label: {
+                Text(value).monospacedDigit().frame(minWidth: 34)
+            }
+            .help("지금 배율은 \(value)입니다. 누르면 100%로 되돌립니다.")
+            .accessibilityLabel("배율")
+            .accessibilityValue(value)
+            .accessibilityHint("누르면 100%로 되돌립니다.")
+            Button(action: larger) {
+                Image(systemName: "plus").frame(width: 12)
+            }
+            .keyboardShortcut("=", modifiers: .command)
+            .disabled(largest)
+            .help(largest ? "가장 큰 배율(300%)입니다." : "그래프를 확대합니다(⌘+).")
+            .accessibilityLabel("확대")
+            .accessibilityValue(value)
+            Button("맞춤") { mode = .fitted(minimum: SessionGroupGraph.minimumZoom, maximum: 1) }
+                .keyboardShortcut("0", modifiers: .command)
+                .help("구성원 전체가 보이도록 배율과 위치를 맞춥니다(⌘0).")
+                .accessibilityHint("구성원 전체가 보이도록 배율과 위치를 맞춥니다.")
+        }
+        .buttonStyle(GraphZoomButtonStyle())
+        .focusEffectDisabled()
+        .padding(1)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .background {
+            // ⌘+ typed with Shift, or on the numeric keypad. Invisible and outside the Tab order.
+            Button("확대", action: larger)
+                .keyboardShortcut("+", modifiers: .command)
+                .disabled(largest)
+                .opacity(0)
+                .frame(width: 0, height: 0)
+                .focusable(false)
+                .accessibilityHidden(true)
+        }
+        .fixedSize()
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("확대와 축소")
     }
 
     /// Only the agents, states and line kinds on screen, then the width steps.
@@ -831,18 +978,14 @@ private extension AgentKind {
 
     // MARK: Graph
 
-    /// Centred when smaller than the viewport; never compressed. A moved node can widen the canvas.
-    private func place(_ frame: SessionGroupGraph.Frame, moved: [UUID: CGSize], viewport: CGSize) -> Placement {
-        let inset = CGSize(width: max(0, (viewport.width - frame.size.width) / 2), height: max(0, (viewport.height - frame.size.height) / 2))
-        let base = frame.points.mapValues { CGPoint(x: $0.x + inset.width, y: $0.y + inset.height) }
+    /// Never compressed: zoom and pan decide what part of it the area shows.
+    private func place(layout: SessionGroupGraph.Layout, moved: [UUID: CGSize]) -> Placement {
+        let base = SessionGroupGraph.frame(SessionGroupGraph.positions(nodes.map { (id: $0.id, depth: $0.depth) },
+                                                                       hasLeader: hasLeader, layout: layout)).points
         var points = base
         for (id, offset) in moved { if let point = base[id] { points[id] = CGPoint(x: point.x + offset.width, y: point.y + offset.height) } }
-        var size = CGSize(width: max(frame.size.width, viewport.width), height: max(frame.size.height, viewport.height))
-        for point in points.values {
-            size.width = max(size.width, point.x + SessionGroupGraph.horizontalMargin)
-            size.height = max(size.height, point.y + SessionGroupGraph.bottomMargin)
-        }
-        return Placement(base: base, points: points, size: size)
+        return Placement(base: base, points: points, content: SessionGroupGraph.contentBounds(points),
+                         leader: nodes.first.flatMap { points[$0.id] })
     }
 
     /// Room a line end keeps from a node whose warning or speech bubble mark sticks out.
@@ -887,10 +1030,17 @@ private extension AgentKind {
         }
     }
 
+    /// `point` is in graph coordinates. Pointer movement is divided by the scale, so the node
+    /// stays under the pointer at every zoom; the node is drawn at `view.screen(point)`.
     private func nodeView(_ node: GraphNode, at point: CGPoint, layout: SessionGroupGraph.Layout, placement: Placement,
+                          view: SessionGroupGraph.Viewport, size: CGSize,
                           edges: [SessionGroupGraph.Edge], bends: [SessionGroupGraph.EdgeKey: Double], dimmed: Bool) -> some View {
         let selected = selection == node.id
-        return GraphNodeView(node: node, selected: selected, dimmed: dimmed, lifted: movingNode == node.id, focused: focused == node.id)
+        let scale = view.scale
+        let shown = view.screen(point)
+        let visible = view.visible(size)
+        return GraphNodeView(node: node, selected: selected, dimmed: dimmed, lifted: movingNode == node.id, focused: focused == node.id,
+                             scale: CGFloat(scale))
             .equatable()
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("\(node.name), \(node.agent.title), \(node.isLeader ? "그룹장" : "구성원")")
@@ -902,20 +1052,23 @@ private extension AgentKind {
             .focusEffectDisabled()
             .onKeyPress(keys: [.space, .return]) { _ in selection = node.id; return .handled }
             .onMoveCommand { direction in
+                // 16pt on screen at every zoom.
+                let unit = 16 / scale
                 let step: CGSize
                 switch direction {
-                case .left: step = CGSize(width: -16, height: 0)
-                case .right: step = CGSize(width: 16, height: 0)
-                case .up: step = CGSize(width: 0, height: -16)
-                case .down: step = CGSize(width: 0, height: 16)
+                case .left: step = CGSize(width: -unit, height: 0)
+                case .right: step = CGSize(width: unit, height: 0)
+                case .up: step = CGSize(width: 0, height: -unit)
+                case .down: step = CGSize(width: 0, height: unit)
                 @unknown default: return
                 }
-                move(node.id, to: clamp(CGPoint(x: point.x + step.width, y: point.y + step.height), in: placement.size), layout: layout, placement: placement)
+                move(node.id, to: clamp(CGPoint(x: point.x + step.width, y: point.y + step.height), in: visible),
+                     layout: layout, placement: placement, view: view)
             }
             .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.space))
                 .updating($dragging) { _, state, _ in state = true }
                 .onChanged { value in
-                    let target = clamp(CGPoint(x: point.x + value.translation.width, y: point.y + value.translation.height), in: placement.size)
+                    let target = clamp(CGPoint(x: point.x + value.translation.width / scale, y: point.y + value.translation.height / scale), in: visible)
                     if preview.isActive { preview.move(to: target); return }
                     guard !preview.attempted, hypot(value.translation.width, value.translation.height) >= 4 else { return }
                     let incident = edges.filter { $0.touches(node.id) }.compactMap { edge -> ConversationDragPreview.Edge? in
@@ -926,10 +1079,11 @@ private extension AgentKind {
                                      width: edge.width, bend: bends[edge.key] ?? 1, dashed: edge.dashed,
                                      startClearance: clearance(edge.from), endClearance: clearance(edge.to))
                     }
-                    let lifted = GraphNodeView(node: node, selected: selected, dimmed: false, lifted: false, focused: false)
-                        .padding(GraphNodeView.previewPadding)
+                    let lifted = GraphNodeView(node: node, selected: selected, dimmed: false, lifted: false, focused: false,
+                                               scale: CGFloat(scale))
+                        .padding(GraphNodeView.previewPadding * CGFloat(scale))
                         .environment(\.colorScheme, colorScheme)
-                    if preview.begin(lifted, edges: incident, origin: point, at: target) { movingNode = node.id }
+                    if preview.begin(lifted, edges: incident, origin: point, at: target, view: view) { movingNode = node.id }
                 }
                 .onEnded { value in
                     let distance = hypot(value.translation.width, value.translation.height)
@@ -937,29 +1091,72 @@ private extension AgentKind {
                         selection = node.id
                     } else {
                         let start = preview.origin ?? point
-                        move(node.id, to: clamp(CGPoint(x: start.x + value.translation.width, y: start.y + value.translation.height), in: placement.size),
-                             layout: layout, placement: placement)
+                        move(node.id, to: clamp(CGPoint(x: start.x + value.translation.width / scale, y: start.y + value.translation.height / scale),
+                                                in: visible),
+                             layout: layout, placement: placement, view: view)
                     }
                     finishDrag()
                 })
             .help("\(node.name) · \(node.agent.title) · \(node.status.title)"
                   + (node.provisional ? "\n임시 이름입니다. 닉네임이 정해지면 바뀝니다." : "")
                   + "\n클릭하면 세션 상태와 대화를 엽니다. 끌거나 방향키를 누르면 노드를 옮깁니다.")
-            .position(x: point.x, y: point.y + GraphNodeView.centerOffset)
+            .position(x: shown.x, y: shown.y + GraphNodeView.centerOffset * scale)
     }
 
-    private func clamp(_ point: CGPoint, in size: CGSize) -> CGPoint {
-        CGPoint(x: min(size.width - 64, max(64, point.x)), y: min(size.height - 48, max(28, point.y)))
+    /// Keeps a moved node's circle and name band inside the visible part of the graph.
+    private func clamp(_ point: CGPoint, in visible: CGRect) -> CGPoint {
+        func limit(_ value: CGFloat, _ low: CGFloat, _ high: CGFloat) -> CGFloat { low > high ? (low + high) / 2 : min(high, max(low, value)) }
+        return CGPoint(x: limit(point.x, visible.minX + 64, visible.maxX - 64), y: limit(point.y, visible.minY + 28, visible.maxY - 48))
     }
 
-    private func move(_ id: UUID, to point: CGPoint, layout: SessionGroupGraph.Layout, placement: Placement) {
+    /// Moving a node while the view is fitted keeps the current zoom and position, so the
+    /// graph does not jump to fit the new bounds when the node is dropped.
+    private func move(_ id: UUID, to point: CGPoint, layout: SessionGroupGraph.Layout, placement: Placement, view: SessionGroupGraph.Viewport) {
         guard let base = placement.base[id] else { return }
+        if case .fitted = mode { mode = .manual(view) }
         offsets[layout, default: [:]][id] = CGSize(width: point.x - base.x, height: point.y - base.y)
     }
 
     private func finishDrag() {
         preview.end()
         if movingNode != nil { movingNode = nil }
+    }
+}
+
+/// Pickers on the left and zoom buttons on the right of one line, with the hints between them
+/// when there is room. A graph too narrow for both puts the zoom buttons on a second line.
+private struct ControlRowLayout: Layout {
+    let spacing: CGFloat
+    let lineSpacing: CGFloat
+
+    private func arrange(width: CGFloat?, subviews: Subviews) -> (oneLine: Bool, size: CGSize) {
+        let pickers = subviews[0].sizeThatFits(.unspecified), zoom = subviews[2].sizeThatFits(.unspecified)
+        let width = width ?? pickers.width + spacing + zoom.width
+        if pickers.width + spacing + zoom.width <= width {
+            let hints = subviews[1].sizeThatFits(.unspecified)
+            return (true, CGSize(width: width, height: max(pickers.height, zoom.height, hints.height)))
+        }
+        return (false, CGSize(width: width, height: pickers.height + lineSpacing + zoom.height))
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        arrange(width: proposal.width, subviews: subviews).size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let pickers = subviews[0].sizeThatFits(.unspecified), zoom = subviews[2].sizeThatFits(.unspecified)
+        let line = arrange(width: bounds.width, subviews: subviews)
+        if line.oneLine {
+            subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(pickers))
+            subviews[2].place(at: CGPoint(x: bounds.maxX, y: bounds.midY), anchor: .trailing, proposal: ProposedViewSize(zoom))
+            let room = max(0, bounds.width - pickers.width - zoom.width - 2 * spacing)
+            subviews[1].place(at: CGPoint(x: bounds.maxX - zoom.width - spacing, y: bounds.midY), anchor: .trailing,
+                              proposal: ProposedViewSize(width: room, height: nil))
+        } else {
+            subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.minY), proposal: ProposedViewSize(pickers))
+            subviews[2].place(at: CGPoint(x: bounds.minX, y: bounds.minY + pickers.height + lineSpacing), proposal: ProposedViewSize(zoom))
+            subviews[1].place(at: CGPoint(x: bounds.maxX, y: bounds.minY), anchor: .topTrailing, proposal: ProposedViewSize(width: 0, height: 0))
+        }
     }
 }
 
@@ -1082,51 +1279,144 @@ private struct GraphNodeSymbol: View {
 }
 
 /// A node with its name band. Equatable, so a change elsewhere in the graph does not redraw it.
+/// Sizes in the comments are at 100%; `scale` draws the circle, text and spacing at the zoom
+/// itself, so names stay sharp instead of being a stretched bitmap.
 private struct GraphNodeView: View, Equatable {
     static let width: CGFloat = 128
     static let height: CGFloat = 58
     /// The circle centre is 16pt below the top; the view centre is 29pt below it.
     static let centerOffset: CGFloat = 13
     static let previewPadding: CGFloat = 8
+    /// The caption text style's size, so the name at 100% is the same as before zooming existed.
+    private static let nameSize = NSFont.preferredFont(forTextStyle: .caption1).pointSize
     let node: GraphNode
     let selected: Bool
     let dimmed: Bool
     let lifted: Bool
     let focused: Bool
+    var scale: CGFloat = 1
     @State private var hovering = false
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.node == rhs.node && lhs.selected == rhs.selected && lhs.dimmed == rhs.dimmed && lhs.lifted == rhs.lifted && lhs.focused == rhs.focused
+            && lhs.scale == rhs.scale
     }
 
     var body: some View {
-        VStack(spacing: 6) {
-            GraphNodeSymbol(agent: node.agent, status: node.status, role: node.isLeader ? .leader : .member)
+        VStack(spacing: 6 * scale) {
+            GraphNodeSymbol(agent: node.agent, status: node.status, role: node.isLeader ? .leader : .member, diameter: 32 * scale)
                 .overlay {
-                    if hovering && !selected { Circle().stroke(node.agent.graphColor, lineWidth: 1).padding(-8) }
+                    if hovering && !selected { Circle().stroke(node.agent.graphColor, lineWidth: 1).padding(-8 * scale) }
                 }
                 .overlay {
-                    if selected { Circle().stroke(Color.accentColor, lineWidth: 3).padding(-9) }
+                    if selected { Circle().stroke(Color.accentColor, lineWidth: 3).padding(-9 * scale) }
                 }
                 .overlay {
-                    if focused { Circle().stroke(Color(nsColor: .keyboardFocusIndicatorColor), lineWidth: 3).padding(selected ? -13 : -9) }
+                    if focused { Circle().stroke(Color(nsColor: .keyboardFocusIndicatorColor), lineWidth: 3).padding((selected ? -13 : -9) * scale) }
                 }
                 .contentShape(Circle())
             Text(node.name)
-                .font(.caption.weight(selected ? .semibold : .regular))
+                .font(.system(size: Self.nameSize * scale, weight: selected ? .semibold : .regular))
                 .foregroundStyle(node.provisional ? .secondary : .primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .padding(.horizontal, 6).padding(.vertical, 2)
+                .padding(.horizontal, 6 * scale).padding(.vertical, 2 * scale)
                 .background(Color(nsColor: .windowBackgroundColor), in: Capsule())
                 .overlay(Capsule().strokeBorder(hovering ? node.agent.graphColor : Color(nsColor: .separatorColor), lineWidth: hovering ? 1 : 0.5))
-                .frame(maxWidth: Self.width)
+                .frame(maxWidth: Self.width * scale)
                 .contentShape(Capsule())
         }
-        .frame(width: Self.width, height: Self.height, alignment: .top)
+        .frame(width: Self.width * scale, height: Self.height * scale, alignment: .top)
         .opacity(lifted ? 0.15 : dimmed ? 0.24 : 1)
         .onHover { hovering = $0 }
         /* graph-probe: node */
+    }
+}
+
+/// Two-finger scrolls and mouse wheels over the graph area pan it; with ⌘ held they zoom around
+/// the pointer. A local event monitor reads them, so clicks and drags still reach the nodes.
+@MainActor private struct ConversationScrollEvents: NSViewRepresentable {
+    /// Scroll distance in points, the pointer in the graph area, and whether ⌘ is held.
+    let action: (CGVector, CGPoint, Bool) -> Void
+
+    init(_ action: @escaping (CGVector, CGPoint, Bool) -> Void) { self.action = action }
+
+    func makeNSView(context: Context) -> EventView {
+        let view = EventView()
+        view.action = action
+        return view
+    }
+
+    func updateNSView(_ view: EventView, context: Context) { view.action = action }
+
+    static func dismantleNSView(_ view: EventView, coordinator: ()) { view.stopMonitoring() }
+
+    final class EventView: NSView {
+        var action: ((CGVector, CGPoint, Bool) -> Void)?
+        private var monitor: Any?
+
+        override var isFlipped: Bool { true }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            stopMonitoring()
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                // Local monitors run on the main thread while the app dispatches the event.
+                nonisolated(unsafe) let scroll = event
+                let handled = MainActor.assumeIsolated { self?.handle(scroll) == true }
+                return handled ? nil : event
+            }
+        }
+
+        func stopMonitoring() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+
+        private func handle(_ event: NSEvent) -> Bool {
+            guard let window, event.window === window, !isHiddenOrHasHiddenAncestor, let action else { return false }
+            let pointer = convert(event.locationInWindow, from: nil)
+            guard bounds.contains(pointer) else { return false }
+            // A mouse wheel reports lines; about 10pt each.
+            let factor: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 10
+            let delta = CGVector(dx: event.scrollingDeltaX * factor, dy: event.scrollingDeltaY * factor)
+            if event.modifierFlags.contains(.command) {
+                // Wheel away from the user zooms in, whatever the natural scrolling setting.
+                let away = event.isDirectionInvertedFromDevice ? -delta.dy : delta.dy
+                action(CGVector(dx: 0, dy: away), pointer, true)
+            } else {
+                action(delta, pointer, false)
+            }
+            return true
+        }
+    }
+}
+
+/// The zoom buttons: no bezel at rest, a light fill on hover, a darker one while pressed, the
+/// keyboard focus ring colour when focused, and faded text when disabled.
+private struct GraphZoomButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View { ZoomButton(configuration: configuration) }
+
+    private struct ZoomButton: View {
+        let configuration: Configuration
+        @Environment(\.isEnabled) private var enabled
+        @Environment(\.isFocused) private var focused
+        @State private var hovering = false
+
+        var body: some View {
+            let shape = RoundedRectangle(cornerRadius: 5, style: .continuous)
+            configuration.label
+                .font(.caption.weight(.medium).monospacedDigit())
+                .foregroundStyle(enabled ? Color.primary : Color.secondary.opacity(0.5))
+                .padding(.horizontal, 5)
+                .frame(minWidth: 22, minHeight: 20)
+                .background(shape.fill(Color.primary.opacity(!enabled ? 0 : configuration.isPressed ? 0.16 : hovering ? 0.08 : 0)))
+                .overlay { if focused { shape.stroke(Color(nsColor: .keyboardFocusIndicatorColor), lineWidth: 3).padding(-1) } }
+                .contentShape(shape)
+                .onHover { hovering = $0 }
+        }
     }
 }
 
@@ -1145,6 +1435,8 @@ private struct GraphNodeView: View, Equatable {
 
 /// The canvas and SwiftUI controls keep their layout while the pointer is held.
 /// Core Animation presents the lifted node and its incident lines at display cadence.
+/// Points are in graph coordinates; the zoom and pan at the start of the drag place them
+/// in the graph area, and the surface layer covers that area.
 @MainActor private final class ConversationDragPreview: NSObject {
     struct Edge {
         let anchor: CGPoint
@@ -1167,13 +1459,18 @@ private struct GraphNodeView: View, Equatable {
     private var edges: [(edge: Edge, line: CAShapeLayer, head: CAShapeLayer)] = []
     private var displayLink: CADisplayLink?
     private var pending: CGPoint?
+    private var transform = SessionGroupGraph.Viewport.identity
 
-    func begin(_ label: some View, edges incident: [Edge], origin: CGPoint, at point: CGPoint) -> Bool {
+    func begin(_ label: some View, edges incident: [Edge], origin: CGPoint, at point: CGPoint, view: SessionGroupGraph.Viewport) -> Bool {
         end()
         attempted = true
         guard let surface, let root = surface.layer else { return false }
+        transform = view
+        let scale = CGFloat(view.scale)
+        let backing = surface.window?.backingScaleFactor ?? 1
+        // The label is already drawn at the zoom, so the lifted node matches the nodes around it.
         let renderer = ImageRenderer(content: label)
-        renderer.scale = surface.window?.backingScaleFactor ?? 1
+        renderer.scale = backing
         guard let image = renderer.cgImage else { return false }
         withoutAnimations {
             for edge in incident {
@@ -1181,22 +1478,23 @@ private struct GraphNodeView: View, Equatable {
                 for layer in [line, head] { layer.frame = root.bounds; root.addSublayer(layer) }
                 line.fillColor = nil
                 line.strokeColor = edge.color.cgColor
-                line.lineWidth = edge.width
+                line.lineWidth = edge.width * scale
                 line.lineCap = edge.dashed ? .butt : .round
-                line.lineDashPattern = edge.dashed ? [6, 4] : nil
+                line.lineDashPattern = edge.dashed ? [NSNumber(value: 6 * scale), NSNumber(value: 4 * scale)] : nil
                 head.fillColor = edge.color.cgColor
                 head.strokeColor = nil
                 edges.append((edge, line, head))
             }
             node.contents = image
-            node.contentsScale = renderer.scale
-            node.bounds.size = CGSize(width: CGFloat(image.width) / renderer.scale, height: CGFloat(image.height) / renderer.scale)
+            node.contentsScale = backing
+            node.bounds.size = CGSize(width: CGFloat(image.width) / backing, height: CGFloat(image.height) / backing)
             node.shadowColor = NSColor.black.cgColor
             node.shadowOpacity = 0.24
             node.shadowRadius = 4
             node.shadowOffset = CGSize(width: 0, height: -2)
-            let circleCenter = node.bounds.height - GraphNodeView.previewPadding - 16
-            node.shadowPath = CGPath(ellipseIn: CGRect(x: node.bounds.midX - 18, y: circleCenter - 18, width: 36, height: 36), transform: nil)
+            let circleCenter = node.bounds.height - (GraphNodeView.previewPadding + 16) * scale
+            node.shadowPath = CGPath(ellipseIn: CGRect(x: node.bounds.midX - 18 * scale, y: circleCenter - 18 * scale,
+                                                       width: 36 * scale, height: 36 * scale), transform: nil)
             root.addSublayer(node)
             present(point, height: surface.bounds.height)
         }
@@ -1235,11 +1533,16 @@ private struct GraphNodeView: View, Equatable {
         guard let point = pending, let surface else { return }
         pending = nil
         withoutAnimations { present(point, height: surface.bounds.height) }
+        /* graph-probe: preview */
     }
 
+    /// The surface layer's origin is at the bottom left of the graph area, so graph y grows downward
+    /// after the zoom and pan are applied.
     private func present(_ point: CGPoint, height: CGFloat) {
-        node.position = CGPoint(x: point.x, y: height - point.y - GraphNodeView.centerOffset)
-        var flip = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: height)
+        let scale = CGFloat(transform.scale)
+        let shown = transform.screen(point)
+        node.position = CGPoint(x: shown.x, y: height - shown.y - GraphNodeView.centerOffset * scale)
+        var flip = CGAffineTransform(a: scale, b: 0, c: 0, d: -scale, tx: transform.offset.x, ty: height - transform.offset.y)
         for (edge, line, head) in edges {
             let from = edge.outgoing ? point : edge.anchor
             let to = edge.outgoing ? edge.anchor : point

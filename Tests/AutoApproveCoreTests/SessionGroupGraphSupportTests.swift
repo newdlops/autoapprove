@@ -245,6 +245,86 @@ extension ApprovalTests {
         try expectEqual(clear[edge(lead, middle).key], 1, "A line already clear keeps the normal bend")
     }
 
+    func testGraphScreenAndGraphCoordinatesConvertBothWays() throws {
+        let view = SessionGroupGraph.Viewport(scale: 2, offset: CGPoint(x: -30, y: 12))
+        try expectEqual(view.screen(CGPoint(x: 100, y: 50)), CGPoint(x: 170, y: 112), "Screen = graph × scale + offset")
+        try expectEqual(view.graph(CGPoint(x: 170, y: 112)), CGPoint(x: 100, y: 50), "Graph = (screen − offset) ÷ scale")
+        try expectEqual(view.visible(CGSize(width: 400, height: 200)), CGRect(x: 15, y: -6, width: 200, height: 100),
+                        "The visible graph part is the area divided by the scale")
+        let half = SessionGroupGraph.Viewport(scale: 0.5, offset: CGPoint(x: 40, y: 0))
+        let point = CGPoint(x: 333, y: -21)
+        let back = half.graph(half.screen(point))
+        try expect(abs(back.x - point.x) < 1e-9 && abs(back.y - point.y) < 1e-9, "A round trip returns the same point")
+        // A drag of t screen points moves a node t ÷ scale graph points, so it stays under the pointer.
+        let node = CGPoint(x: 120, y: 80), translation = CGVector(dx: 50, dy: -30)
+        let pressed = view.screen(node)
+        let moved = view.screen(CGPoint(x: node.x + translation.dx / view.scale, y: node.y + translation.dy / view.scale))
+        try expectEqual(moved, CGPoint(x: pressed.x + translation.dx, y: pressed.y + translation.dy), "The dragged node follows the pointer")
+    }
+
+    func testGraphZoomKeepsThePointUnderThePointer() throws {
+        let view = SessionGroupGraph.Viewport(scale: 1, offset: CGPoint(x: 20, y: 10))
+        let pointer = CGPoint(x: 300, y: 200)
+        let under = view.graph(pointer)
+        for target in [0.5, 2, 3] {
+            let zoomed = view.zoomed(to: target, around: pointer)
+            try expectEqual(zoomed.scale, target)
+            let after = zoomed.screen(under)
+            try expect(abs(after.x - pointer.x) < 1e-9 && abs(after.y - pointer.y) < 1e-9, "The graph point under the pointer stays there at \(target)")
+        }
+        try expectEqual(view.zoomed(to: 9, around: pointer).scale, 3, "Zoom stops at 300%")
+        try expectEqual(view.zoomed(to: 0.1, around: pointer).scale, 0.25, "Zoom stops at 25%")
+        try expectEqual(SessionGroupGraph.steppedZoom(from: 1, larger: true), 1.25)
+        try expectEqual(SessionGroupGraph.steppedZoom(from: 1, larger: false), 0.8)
+        try expectEqual(SessionGroupGraph.steppedZoom(from: 0.9, larger: true), 1, "A scale between steps goes to the nearest step")
+        try expectEqual(SessionGroupGraph.steppedZoom(from: 0.9, larger: false), 0.8)
+        try expectEqual(SessionGroupGraph.steppedZoom(from: 3, larger: true), 3, "+ stays at 300%")
+        try expectEqual(SessionGroupGraph.steppedZoom(from: 0.25, larger: false), 0.25, "− stays at 25%")
+    }
+
+    func testGraphFitKeepsTheWholeGraphOrTheLeaderInView() throws {
+        let area = CGSize(width: 400, height: 300)
+        let small = CGRect(x: 0, y: 0, width: 200, height: 100)
+        let centred = SessionGroupGraph.fit(small, in: area, minimum: SessionGroupGraph.automaticFitMinimum, focus: nil)
+        try expectEqual(centred.scale, 1, "A small graph is not enlarged")
+        try expectEqual(centred.offset, CGPoint(x: 100, y: 100), "A small graph is centred")
+        let medium = CGRect(x: -100, y: 0, width: 600, height: 300)
+        let shrunk = SessionGroupGraph.fit(medium, in: area, minimum: SessionGroupGraph.automaticFitMinimum, focus: nil)
+        try expect(abs(shrunk.scale - 2.0 / 3) < 1e-9, "A larger graph shrinks until it fits")
+        try expect(abs(shrunk.screen(CGPoint(x: -100, y: 0)).x) < 1e-9 && abs(shrunk.screen(CGPoint(x: 500, y: 0)).x - 400) < 1e-9,
+                   "The fitted graph fills the width exactly")
+        let huge = CGRect(x: 0, y: 0, width: 2000, height: 300)
+        let leader = CGPoint(x: 1500, y: 36)
+        let floored = SessionGroupGraph.fit(huge, in: area, minimum: SessionGroupGraph.automaticFitMinimum, focus: leader)
+        try expectEqual(floored.scale, 0.6, "Fitting on open never goes below 60%")
+        let shown = floored.screen(leader)
+        try expect(shown.x >= 0 && shown.x <= area.width, "A graph still too large keeps the leader in view")
+        try expect(floored.screen(CGPoint(x: 0, y: 0)).x <= 0 && floored.screen(CGPoint(x: 2000, y: 0)).x >= area.width,
+                   "No empty space shows beside a graph larger than the area")
+        let everything = SessionGroupGraph.fit(huge, in: area, minimum: SessionGroupGraph.minimumZoom, focus: leader)
+        try expectEqual(everything.scale, 0.25, "The fit button may go down to 25%")
+        let fixed = SessionGroupGraph.fit(small, in: area, minimum: 2, maximum: 2, focus: CGPoint(x: 100, y: 36))
+        try expectEqual(fixed.scale, 2, "A fixed scale keeps that scale")
+        let bounds = SessionGroupGraph.contentBounds([UUID(): CGPoint(x: 10, y: 20), UUID(): CGPoint(x: 210, y: 124)])
+        try expectEqual(bounds, CGRect(x: 10 - SessionGroupGraph.horizontalMargin, y: 20 - SessionGroupGraph.topMargin,
+                                       width: 200 + 2 * SessionGroupGraph.horizontalMargin,
+                                       height: 104 + SessionGroupGraph.topMargin + SessionGroupGraph.bottomMargin),
+                        "Content bounds keep the frame margins around node centres")
+    }
+
+    func testGraphPanKeepsPartOfTheGraphInView() throws {
+        let area = CGSize(width: 400, height: 300)
+        let content = CGRect(x: 0, y: 0, width: 600, height: 200)
+        let lost = SessionGroupGraph.Viewport(scale: 1, offset: CGPoint(x: -2000, y: 900))
+        let kept = SessionGroupGraph.constrained(lost, content: content, size: area)
+        try expectEqual(kept.offset, CGPoint(x: -600 + 80, y: 300 - 80), "80pt of the graph stays inside the area")
+        let inside = SessionGroupGraph.Viewport(scale: 1, offset: CGPoint(x: -50, y: 20))
+        try expectEqual(SessionGroupGraph.constrained(inside, content: content, size: area), inside, "A view inside the limits is unchanged")
+        let tiny = CGRect(x: 0, y: 0, width: 40, height: 40)
+        let gone = SessionGroupGraph.Viewport(scale: 1, offset: CGPoint(x: 1000, y: 0))
+        try expectEqual(SessionGroupGraph.constrained(gone, content: tiny, size: area).offset.x, 360, "A graph smaller than 80pt stays whole")
+    }
+
     func testGraphAccessibilityValueDescribesRelations() throws {
         let a = UUID(), b = UUID(), c = UUID()
         let edges: [SessionGroupGraph.Edge] = [.init(from: a, to: b, kind: .recent, count: 3, pendingQuestions: 0),

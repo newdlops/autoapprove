@@ -301,6 +301,107 @@ public enum SessionGroupGraph {
         return Frame(points: points, size: CGSize(width: maxX - minX + 2 * horizontalMargin, height: maxY - minY + topMargin + bottomMargin))
     }
 
+    // MARK: Zoom and pan
+
+    public static let minimumZoom = 0.25
+    public static let maximumZoom = 3.0
+    /// Fitting on open and after a layout change never goes below this, so names stay readable.
+    public static let automaticFitMinimum = 0.6
+    /// The − and + buttons and ⌘− ⌘+ move between these steps.
+    public static let zoomSteps: [Double] = [0.25, 0.33, 0.5, 0.67, 0.8, 1, 1.25, 1.5, 2, 2.5, 3]
+
+    /// A graph point `g` appears at `g × scale + offset` in the graph area, whose top left is (0, 0).
+    public struct Viewport: Equatable, Sendable {
+        public var scale: Double
+        public var offset: CGPoint
+
+        public init(scale: Double, offset: CGPoint) { self.scale = scale; self.offset = offset }
+
+        public static let identity = Viewport(scale: 1, offset: .zero)
+
+        /// Where a graph point appears in the graph area.
+        public func screen(_ point: CGPoint) -> CGPoint {
+            CGPoint(x: point.x * scale + offset.x, y: point.y * scale + offset.y)
+        }
+
+        /// The graph point under a point of the graph area.
+        public func graph(_ point: CGPoint) -> CGPoint {
+            CGPoint(x: (point.x - offset.x) / scale, y: (point.y - offset.y) / scale)
+        }
+
+        /// The part of the graph that an area of `size` shows.
+        public func visible(_ size: CGSize) -> CGRect {
+            let origin = graph(.zero)
+            return CGRect(x: origin.x, y: origin.y, width: size.width / scale, height: size.height / scale)
+        }
+
+        /// The graph point under `anchor` stays under it, so zooming follows the pointer.
+        public func zoomed(to newScale: Double, around anchor: CGPoint) -> Viewport {
+            let target = SessionGroupGraph.clampZoom(newScale)
+            let fixed = graph(anchor)
+            return Viewport(scale: target, offset: CGPoint(x: anchor.x - fixed.x * target, y: anchor.y - fixed.y * target))
+        }
+
+        public func panned(by delta: CGVector) -> Viewport {
+            Viewport(scale: scale, offset: CGPoint(x: offset.x + delta.dx, y: offset.y + delta.dy))
+        }
+    }
+
+    public static func clampZoom(_ scale: Double) -> Double {
+        guard scale.isFinite else { return 1 }
+        return min(maximumZoom, max(minimumZoom, scale))
+    }
+
+    /// The next step above or below `scale`; a scale between steps goes to the nearest step in that direction.
+    public static func steppedZoom(from scale: Double, larger: Bool) -> Double {
+        let next = larger ? zoomSteps.first { $0 > scale + 0.001 } : zoomSteps.last { $0 < scale - 0.001 }
+        return next ?? (larger ? maximumZoom : minimumZoom)
+    }
+
+    /// Node circle centres widened by the frame margins, so circles, rings and name bands are inside.
+    public static func contentBounds(_ points: [UUID: CGPoint]) -> CGRect {
+        guard let first = points.values.first else {
+            return CGRect(x: 0, y: 0, width: 2 * horizontalMargin, height: topMargin + bottomMargin)
+        }
+        var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
+        for point in points.values {
+            minX = min(minX, point.x); maxX = max(maxX, point.x); minY = min(minY, point.y); maxY = max(maxY, point.y)
+        }
+        return CGRect(x: minX - horizontalMargin, y: minY - topMargin,
+                      width: maxX - minX + 2 * horizontalMargin, height: maxY - minY + topMargin + bottomMargin)
+    }
+
+    /// The largest scale between `minimum` and `maximum` that shows all of `content`. An axis that
+    /// fits is centred. An axis that still does not fit puts `focus` (the leader) at the same share
+    /// of the area as its share of the content, so the focus is in view and no empty space shows.
+    public static func fit(_ content: CGRect, in size: CGSize, minimum: Double, maximum: Double = 1, focus: CGPoint?) -> Viewport {
+        guard size.width > 0, size.height > 0, content.width > 0, content.height > 0 else { return .identity }
+        let scale = clampZoom(min(maximum, max(minimum, min(size.width / content.width, size.height / content.height))))
+        func axis(_ low: Double, _ length: Double, _ area: Double, _ focus: Double?) -> Double {
+            let scaled = length * scale
+            if scaled <= area + 0.001 { return (area - scaled) / 2 - low * scale }
+            let share = focus.map { min(1, max(0, ($0 - low) / length)) } ?? 0.5
+            return share * area - (low + share * length) * scale
+        }
+        return Viewport(scale: scale, offset: CGPoint(x: axis(content.minX, content.width, size.width, focus.map { Double($0.x) }),
+                                                      y: axis(content.minY, content.height, size.height, focus.map { Double($0.y) })))
+    }
+
+    /// Moves the view back just enough that at least `keep` points of the content (or all of it,
+    /// when smaller) stay inside the area, so panning never loses the whole graph.
+    public static func constrained(_ viewport: Viewport, content: CGRect, size: CGSize, keep: Double = 80) -> Viewport {
+        func axis(_ offset: Double, _ low: Double, _ high: Double, _ area: Double) -> Double {
+            let start = low * viewport.scale + offset, end = high * viewport.scale + offset
+            let margin = min(keep, end - start, area)
+            if end < margin { return offset + margin - end }
+            if start > area - margin { return offset - (start - (area - margin)) }
+            return offset
+        }
+        return Viewport(scale: viewport.scale,
+                        offset: CGPoint(x: axis(viewport.offset.x, content.minX, content.maxX, size.width),
+                                        y: axis(viewport.offset.y, content.minY, content.maxY, size.height)))
+    }
+
     // MARK: Line geometry
 
     public struct EdgeGeometry: Equatable, Sendable {

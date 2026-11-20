@@ -47,9 +47,14 @@ if(verifyDrag||verifyGraphRefresh) {
   // Node centers in window coordinates, so the harness can press a node without accessibility.
   const oldNode='        .frame(width: 128, height: 61, alignment: .top)\n    }\n';
   const place='.background(GeometryReader { g in let _ = GraphProbe.place(PROBE_NAME, CGPoint(x: g.frame(in: .global).midX, y: g.frame(in: .global).minY + PROBE_TOP)); Color.clear })';
-  if(text.includes('/* graph-probe: node */'))text=text.replace('/* graph-probe: node */',place.replace('PROBE_NAME','node.name').replace('PROBE_TOP','16'));
+  // The circle centre is 16pt below the top of the 58pt node at 100%; the global frame includes the zoom.
+  const scaledPlace='.background(GeometryReader { g in let f = g.frame(in: .global); let _ = GraphProbe.place(node.name, CGPoint(x: f.midX, y: f.minY + 16 * f.height / GraphNodeView.height)); Color.clear })';
+  if(text.includes('/* graph-probe: node */'))text=text.replace('/* graph-probe: node */',scaledPlace);
   else if(text.includes(oldNode))text=text.replace(oldNode,'        .frame(width: 128, height: 61, alignment: .top)\n        '+place.replace('PROBE_NAME','member.title').replace('PROBE_TOP','19')+'\n    }\n');
   else throw Error('Missing node instrumentation point');
+  // The zoom and pan of the graph area, and the lifted node's circle centre in window coordinates.
+  text=text.replace('/* graph-probe: viewport */','let _ = GraphProbe.viewport(view)');
+  text=text.replace('/* graph-probe: preview */','GraphProbe.preview(surface.convert(CGPoint(x: node.position.x, y: node.position.y + GraphNodeView.centerOffset * CGFloat(transform.scale)), to: nil))');
   const begin=text.match(/\n    func begin\([^\n]*\{\n/);
   if(!begin)throw Error('Missing drag preview begin');
   text=text.replace(begin[0],begin[0]+'        GraphProbe.began()\n');

@@ -38,6 +38,12 @@ private final class GroupRefreshReads: @unchecked Sendable {
     static func frame() { frames += 1; if firstFrame == nil { firstFrame = CACurrentMediaTime() } }
     static var beganAt: CFTimeInterval?
     static func began() { if beganAt == nil { beganAt = CACurrentMediaTime() } }
+    /// The zoom and pan of the graph area at its last body evaluation.
+    static var view: SessionGroupGraph.Viewport?
+    static func viewport(_ value: SessionGroupGraph.Viewport) { view = value }
+    /// The lifted node's circle centre in window coordinates at the last display frame.
+    static var previewCenter: CGPoint?
+    static func preview(_ point: CGPoint) { previewCenter = point }
 }
 
 /// Counts storage checks and records whether any ran on the main thread.
@@ -63,7 +69,8 @@ final class GraphReadProbe: @unchecked Sendable {
 
     nonisolated static let fixedNow = Date(timeIntervalSince1970: 1_795_149_725) // 2026-11-20 13:42:05 +0900
 
-    static func make(root: URL, name: String, now: Date = fixedNow, heavy: Bool = false, empty: Bool = false) throws -> GraphFixture {
+    /// `extra` adds that many unconnected members under the four deepest members, for a graph wider than the window.
+    static func make(root: URL, name: String, now: Date = fixedNow, heavy: Bool = false, empty: Bool = false, extra: Int = 0) throws -> GraphFixture {
         let directory = root.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: directory)
         // key, agent, connected nickname (nil: no nickname), stored title, folder, parent key
@@ -76,7 +83,10 @@ final class GraphReadProbe: @unchecked Sendable {
             ("mig", .codex, "마이그레이션", "마이그레이션", "/fixture/payments/migrate", "doc"),
             ("log", .codex, nil, "로그 정리", "/fixture/payments/logs", "mig"),
             ("ui", .claude, "화면 점검", "화면 점검", "/fixture/payments/screens", "doc")
-        ]
+        ] + (0..<extra).map { index -> (String, AgentKind, String?, String, String, String?) in
+            ("extra\(index)", index % 2 == 0 ? AgentKind.codex : .claude, nil, "보조 작업 \(index + 1)",
+             "/fixture/payments/extra\(index + 1)", ["test", "fix", "log", "ui"][index % 4])
+        }
         let connected = plan.filter { $0.2 != nil }
         let lines = connected.enumerated().map { index, entry in
             "\(100_600 + index) 1 graph\(index) \(100_600 + index) \(100_600 + index) Fri Nov 20 09:00:00 2026 /fixture/\(entry.1 == .codex ? "codex" : "claude")"
@@ -255,61 +265,110 @@ final class GraphReadProbe: @unchecked Sendable {
 
 /// Same procedure before and after the rewrite: a transparent window that cannot take focus,
 /// the same fixture, a press on one node, 60 drag events 2pt apart at about 120 events per
-/// second through the app's event queue, and a release. Three trials.
+/// second through the app's event queue, and a release. Three trials at each of 100%, 60% and
+/// 200%. At each zoom the lifted node's circle centre is compared with the pointer before the
+/// release, and the dropped node's centre with the release point.
 @MainActor func verifyDrag(root: URL) async throws {
-    let fixture = try GraphFixture.make(root: root, name: "drag-state", heavy: true)
     let frontApp = NSWorkspace.shared.frontmostApplication?.processIdentifier
     let size = CGSize(width: 1040, height: 680)
-    let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine)
-        .frame(width: size.width, height: size.height), size: size)
-    defer { window.close(); fixture.engine.stop() }
-    try await Task.sleep(for: .seconds(2.5))
-    host.layoutSubtreeIfNeeded()
-    guard let start = GraphProbe.center("문서 검토", in: host) else { throw AppError.message("drag node not found") }
-    var trials: [[String: Any]] = []
+    var zooms: [[String: Any]] = []
     var allDurations: [Double] = []
     var allRoots = 0, allCanvases = 0
-    for trial in 0..<3 {
-        GraphProbe.firstFrame = nil; GraphProbe.frames = 0; GraphProbe.beganAt = nil
-        let origin = trial == 0 ? start : (GraphProbe.center("문서 검토", in: host) ?? start)
-        let meter = MainBusyMeter(); meter.origin = origin; meter.start()
-        NSApp.postEvent(mouse(.leftMouseDown, origin, window), atStart: false)
-        try await Task.sleep(for: .milliseconds(40))
-        let rootsBefore = GraphProbe.roots, canvasesBefore = GraphProbe.canvases
-        let direction: CGFloat = trial % 2 == 0 ? -1 : 1
-        for step in 1...60 {
-            let point = CGPoint(x: origin.x + CGFloat(step) * 2 * direction, y: origin.y - CGFloat(step))
-            NSApp.postEvent(mouse(.leftMouseDragged, point, window, delta: CGVector(dx: 2 * direction, dy: 1)), atStart: false)
-            try await Task.sleep(for: .milliseconds(8))
+    var worstPreview = 0.0, worstDrop = 0.0
+    var eventDeltaCarried = false
+    for zoom in [1.0, 0.6, 2.0] {
+        let fixture = try GraphFixture.make(root: root, name: "drag-state-\(Int(zoom * 100))", heavy: true)
+        GraphProbe.places = [:]; GraphProbe.view = nil
+        let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine, zoom: zoom)
+            .frame(width: size.width, height: size.height), size: size)
+        try await Task.sleep(for: .seconds(2.5))
+        host.layoutSubtreeIfNeeded()
+        // The node nearest the middle of the graph area (left of the 320pt panel, below the controls),
+        // so a 120pt by 60pt drag stays inside the visible part at every zoom.
+        let middle = CGPoint(x: (size.width - 320) / 2, y: 245)
+        guard let name = GraphProbe.places.keys.compactMap({ key in GraphProbe.center(key, in: host).map { (key, $0) } })
+                .min(by: { hypot($0.1.x - middle.x, $0.1.y - middle.y) < hypot($1.1.x - middle.x, $1.1.y - middle.y) })?.0,
+              let start = GraphProbe.center(name, in: host) else { throw AppError.message("drag node not found") }
+        eventDeltaCarried = mouse(.leftMouseDragged, start, window, delta: CGVector(dx: 1, dy: 0)).deltaX == 1
+        var trials: [[String: Any]] = []
+        for trial in 0..<3 {
+            GraphProbe.firstFrame = nil; GraphProbe.frames = 0; GraphProbe.beganAt = nil; GraphProbe.previewCenter = nil
+            host.layoutSubtreeIfNeeded()
+            let origin = trial == 0 ? start : (GraphProbe.center(name, in: host) ?? start)
+            let meter = MainBusyMeter(); meter.origin = origin; meter.start()
+            NSApp.postEvent(mouse(.leftMouseDown, origin, window), atStart: false)
+            try await Task.sleep(for: .milliseconds(40))
+            let rootsBefore = GraphProbe.roots, canvasesBefore = GraphProbe.canvases
+            let direction: CGFloat = trial % 2 == 0 ? -1 : 1
+            // Window y grows upward: a node below the middle moves up, so the edge limit never holds it.
+            let rise: CGFloat = origin.y < middle.y ? 1 : -1
+            for step in 1...60 {
+                let point = CGPoint(x: origin.x + CGFloat(step) * 2 * direction, y: origin.y + CGFloat(step) * rise)
+                NSApp.postEvent(mouse(.leftMouseDragged, point, window, delta: CGVector(dx: 2 * direction, dy: -rise)), atStart: false)
+                try await Task.sleep(for: .milliseconds(8))
+            }
+            try await Task.sleep(for: .milliseconds(40))
+            let rootsDuring = GraphProbe.roots - rootsBefore, canvasesDuring = GraphProbe.canvases - canvasesBefore
+            meter.stop()
+            let end = CGPoint(x: origin.x + 120 * direction, y: origin.y + 60 * rise)
+            let previewError = GraphProbe.previewCenter.map { hypot($0.x - end.x, $0.y - end.y) }
+            NSApp.postEvent(mouse(.leftMouseUp, end, window), atStart: false)
+            try await Task.sleep(for: .milliseconds(500))
+            host.layoutSubtreeIfNeeded()
+            let dropped = GraphProbe.center(name, in: host)
+            let dropError = dropped.map { hypot($0.x - end.x, $0.y - end.y) }
+            var firstFrame: Double?
+            if let frame = GraphProbe.firstFrame, let dragStart = meter.dragStart { firstFrame = (frame - dragStart) * 1000 }
+            var liftedNode: Double?
+            if let began = GraphProbe.beganAt, let dragStart = meter.dragStart { liftedNode = (began - dragStart) * 1000 }
+            let durations = meter.durations
+            trials.append(["rootBodiesDuringDrag": rootsDuring, "canvasBodiesDuringDrag": canvasesDuring,
+                           "rootBodiesIncludingRelease": GraphProbe.roots - rootsBefore, "measuredEvents": durations.count,
+                           "medianMs": percentile(durations, 0.5), "p95Ms": percentile(durations, 0.95), "maxMs": durations.max() ?? 0,
+                           "firstDisplayFrameMs": firstFrame as Any, "previewBeginMs": liftedNode as Any, "displayFrames": GraphProbe.frames,
+                           "previewPointerErrorPt": previewError as Any, "dropPointerErrorPt": dropError as Any])
+            guard let previewError, let dropError else {
+                throw AppError.message("Preview or dropped node missing at \(Int(zoom * 100))% trial \(trial + 1): node \(name) at \(origin), "
+                    + "drag events seen \(meter.durations.count), began \(GraphProbe.beganAt != nil), frames \(GraphProbe.frames), preview \(String(describing: GraphProbe.previewCenter)), "
+                    + "dropped \(String(describing: dropped)), view \(String(describing: GraphProbe.view)), places \(GraphProbe.places)")
+            }
+            worstPreview = max(worstPreview, previewError); worstDrop = max(worstDrop, dropError)
+            allDurations += durations; allRoots += rootsDuring; allCanvases += canvasesDuring
         }
-        try await Task.sleep(for: .milliseconds(40))
-        let rootsDuring = GraphProbe.roots - rootsBefore, canvasesDuring = GraphProbe.canvases - canvasesBefore
-        meter.stop()
-        let end = CGPoint(x: origin.x + 120 * direction, y: origin.y - 60)
-        NSApp.postEvent(mouse(.leftMouseUp, end, window), atStart: false)
-        try await Task.sleep(for: .milliseconds(500))
-        var firstFrame: Double?
-        if let frame = GraphProbe.firstFrame, let dragStart = meter.dragStart { firstFrame = (frame - dragStart) * 1000 }
-        var liftedNode: Double?
-        if let began = GraphProbe.beganAt, let dragStart = meter.dragStart { liftedNode = (began - dragStart) * 1000 }
-        let durations = meter.durations
-        trials.append(["rootBodiesDuringDrag": rootsDuring, "canvasBodiesDuringDrag": canvasesDuring,
-                       "rootBodiesIncludingRelease": GraphProbe.roots - rootsBefore, "measuredEvents": durations.count,
-                       "medianMs": percentile(durations, 0.5), "p95Ms": percentile(durations, 0.95), "maxMs": durations.max() ?? 0,
-                       "firstDisplayFrameMs": firstFrame as Any, "previewBeginMs": liftedNode as Any, "displayFrames": GraphProbe.frames])
-        allDurations += durations; allRoots += rootsDuring; allCanvases += canvasesDuring
+        zooms.append(["zoomPercent": Int(zoom * 100), "node": name, "scale": GraphProbe.view?.scale as Any,
+                      "windowVisible": window.occlusionState.contains(.visible), "trials": trials])
+        window.close(); fixture.engine.stop()
     }
     let result: [String: Any] = [
         "events": allDurations.count, "rootBodiesDuringDrag": allRoots, "canvasBodiesDuringDrag": allCanvases,
         "medianMs": percentile(allDurations, 0.5), "p95Ms": percentile(allDurations, 0.95),
-        "windowVisible": window.occlusionState.contains(.visible), "trials": trials,
+        "worstPreviewPointerErrorPt": worstPreview, "worstDropPointerErrorPt": worstDrop, "zooms": zooms,
         "harnessBecameActive": NSApp.isActive,
         "frontAppUnchanged": NSWorkspace.shared.frontmostApplication?.processIdentifier == frontApp,
-        "eventDeltaCarried": mouse(.leftMouseDragged, start, window, delta: CGVector(dx: 1, dy: 0)).deltaX == 1
+        "eventDeltaCarried": eventDeltaCarried
     ]
     let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
     try data.write(to: root.appendingPathComponent("drag-measure.json"))
     print(String(decoding: data, as: UTF8.self))
+}
+
+/// A two-finger scroll of `dy` pixels at a window point, with ⌘ held when `command` is set,
+/// addressed to the harness window like the mouse events above.
+@MainActor func scroll(_ point: CGPoint, _ window: NSWindow, dy: Int32, command: Bool) throws -> NSEvent {
+    // A mouse event made for the window keeps the window when its CGEvent copy becomes a scroll.
+    guard let base = NSEvent.mouseEvent(with: .mouseMoved, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                        windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 0, pressure: 0),
+          let event = base.cgEvent?.copy() else { throw AppError.message("scroll event") }
+    event.type = .scrollWheel
+    event.flags = command ? .maskCommand : []
+    event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+    event.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(dy))
+    event.setIntegerValueField(.scrollWheelEventDeltaAxis1, value: Int64(dy > 0 ? 1 : -1))
+    guard let value = NSEvent(cgEvent: event) else { throw AppError.message("scroll event conversion") }
+    guard value.window === window, value.type == .scrollWheel else {
+        throw AppError.message("scroll event is not addressed to the harness window (window \(String(describing: value.window)), type \(value.type.rawValue))")
+    }
+    return value
 }
 
 /// Fixed states for the five node shapes: working, idle, waiting for input, delivery blocked, unknown.
@@ -336,27 +395,32 @@ final class GraphReadProbe: @unchecked Sendable {
         sessions: Empty<[ConversationGraphModel.SessionKey], Never>().eraseToAnyPublisher())
 }
 
-/// Seven scenes, two window sizes, light and dark: 28 PNG files.
+/// Ten scenes, two window sizes, light and dark: 40 PNG files. Scenes 1 to 8 open fitted as the
+/// app does; 8 is a group wider than the window, 9 and 10 fix the zoom at 50% and 200%.
 @MainActor func renderGraphScenes(root: URL) async throws {
     let fixture = try GraphFixture.make(root: root, name: "graph-state")
     let empty = try GraphFixture.make(root: root, name: "graph-empty", empty: true)
+    let wide = try GraphFixture.make(root: root, name: "graph-wide", extra: 12)
     let groupFile = fixture.directory.appendingPathComponent("session-groups.json")
     let original = try Data(contentsOf: groupFile)
-    let scenes: [(String, GraphFixture, UUID?, SessionGroupGraph.Scope, SessionGroupGraph.Layout, Bool)] = [
-        ("1-none", fixture, nil, .recent, .tree, false),
-        ("2-leader-selected", fixture, fixture.id["lead"], .recent, .tree, false),
-        ("3-blocked-selected", fixture, fixture.id["mig"], .recent, .tree, false),
-        ("4-circle", fixture, nil, .recent, .circle, false),
-        ("5-all", fixture, nil, .all, .tree, false),
-        ("6-empty-group", empty, nil, .recent, .tree, false),
-        ("7-read-failure", fixture, nil, .recent, .tree, true)
+    let scenes: [(String, GraphFixture, UUID?, SessionGroupGraph.Scope, SessionGroupGraph.Layout, Bool, Double?)] = [
+        ("1-none", fixture, nil, .recent, .tree, false, nil),
+        ("2-leader-selected", fixture, fixture.id["lead"], .recent, .tree, false, nil),
+        ("3-blocked-selected", fixture, fixture.id["mig"], .recent, .tree, false, nil),
+        ("4-circle", fixture, nil, .recent, .circle, false, nil),
+        ("5-all", fixture, nil, .all, .tree, false, nil),
+        ("6-empty-group", empty, nil, .recent, .tree, false, nil),
+        ("7-read-failure", fixture, nil, .recent, .tree, true, nil),
+        ("8-fit-wide-group", wide, nil, .recent, .tree, false, nil),
+        ("9-zoom-50", fixture, nil, .recent, .tree, false, 0.5),
+        ("10-zoom-200", fixture, nil, .recent, .tree, false, 2)
     ]
     var written: [String] = []
-    for (name, scene, selection, scope, layout, failing) in scenes {
+    for (name, scene, selection, scope, layout, failing, zoom) in scenes {
         for (label, width, height) in [("720x460", 720.0, 460.0), ("1040x680", 1040.0, 680.0)] {
             for (theme, scheme) in [("light", ColorScheme.light), ("dark", ColorScheme.dark)] {
                 let view = SessionGroupConversationGraph(groupID: scene.group.id, engine: scene.engine, sources: fixedSources(scene),
-                                                         initialSelection: selection, initialScope: scope, layout: layout)
+                                                         initialSelection: selection, initialScope: scope, layout: layout, zoom: zoom)
                     .frame(width: width, height: height)
                     .background(Color(nsColor: .windowBackgroundColor))
                     .environment(\.colorScheme, scheme)
@@ -379,7 +443,7 @@ final class GraphReadProbe: @unchecked Sendable {
             }
         }
     }
-    fixture.engine.stop(); empty.engine.stop()
+    fixture.engine.stop(); empty.engine.stop(); wide.engine.stop()
     print("PASS graph scenes: \(written.count) PNG\n" + written.joined(separator: "\n"))
 }
 
@@ -424,6 +488,51 @@ final class GraphReadProbe: @unchecked Sendable {
         return hypot(after.x - point.x, after.y - point.y) > 0.5
     }
     try require(!placesBefore.isEmpty && moved.isEmpty, "Nodes moved after a new message: " + moved.keys.sorted().map { "\($0) \(placesBefore[$0]!) -> \(String(describing: GraphProbe.places[$0]))" }.joined(separator: "; "))
+    // The user zooms with ⌘ and a scroll over the leader. Later updates, a new message and a new
+    // member, must keep that zoom and pan; the new member changes the layout, so only the view is compared.
+    func same(_ a: SessionGroupGraph.Viewport?, _ b: SessionGroupGraph.Viewport?) -> Bool {
+        guard let a, let b else { return false }
+        return abs(a.scale - b.scale) < 1e-6 && hypot(a.offset.x - b.offset.x, a.offset.y - b.offset.y) < 0.01
+    }
+    let fitted = GraphProbe.view
+    guard let leaderBefore = GraphProbe.center("결제 총괄", in: host), let fittedScale = fitted?.scale else { throw AppError.message("Leader or view probe missing") }
+    NSApp.postEvent(try scroll(leaderBefore, window, dy: 200, command: true), atStart: false)
+    try await Task.sleep(for: .milliseconds(400))
+    host.layoutSubtreeIfNeeded()
+    let zoomed = GraphProbe.view
+    try require((zoomed?.scale ?? 0) > fittedScale + 0.05, "⌘ scroll did not zoom: \(fittedScale) -> \(String(describing: zoomed?.scale))")
+    guard let leaderZoomed = GraphProbe.center("결제 총괄", in: host) else { throw AppError.message("Leader missing after zoom") }
+    let anchorError = hypot(leaderZoomed.x - leaderBefore.x, leaderZoomed.y - leaderBefore.y)
+    try require(anchorError < 1, "The point under the pointer moved \(anchorError) pt while zooming")
+    let placesZoomed = GraphProbe.places
+    _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["doc"]!, recipientID: fixture.id["lead"]!,
+                           kind: .message, text: "확대한 뒤 보낸 메시지입니다")
+    guard try await waitForMessages(initial + 2, within: 3) != nil else { throw AppError.message("Message after zoom did not appear within 3 s") }
+    try await Task.sleep(for: .milliseconds(400))
+    host.layoutSubtreeIfNeeded()
+    let viewAfterMessage = GraphProbe.view
+    try require(same(zoomed, viewAfterMessage), "A new message changed the zoom or pan: \(String(describing: zoomed)) -> \(String(describing: viewAfterMessage))")
+    let movedWhileZoomed = placesZoomed.filter { name, point in
+        guard let after = GraphProbe.places[name] else { return true }
+        return hypot(after.x - point.x, after.y - point.y) > 0.5
+    }
+    try require(movedWhileZoomed.isEmpty, "Nodes moved after a message while zoomed: " + movedWhileZoomed.keys.sorted().joined(separator: ", "))
+    var grown = fixture.group
+    var added = SessionGroupMember(agent: .codex, title: "검증 추가", cwd: "/fixture/payments/extra",
+                                   conversationID: UUID().uuidString.lowercased(), providerHome: "/tmp/graph-fixture-home")
+    added.parentMemberID = fixture.id["ui"]
+    grown.members.append(added)
+    try SessionGroupStore(directory: fixture.directory).save([grown])
+    let memberStart = CACurrentMediaTime()
+    while GraphProbe.places["검증 추가"] == nil && CACurrentMediaTime() - memberStart < 3 {
+        try await Task.sleep(for: .milliseconds(50))
+        host.layoutSubtreeIfNeeded()
+    }
+    try require(GraphProbe.places["검증 추가"] != nil, "New member did not appear within 3 s")
+    try await Task.sleep(for: .milliseconds(300))
+    host.layoutSubtreeIfNeeded()
+    let viewAfterMember = GraphProbe.view
+    try require(same(zoomed, viewAfterMember), "A new member changed the zoom or pan: \(String(describing: zoomed)) -> \(String(describing: viewAfterMember))")
     try require(probe.value.onMain == 0, "Storage was read on the main thread \(probe.value.onMain) times")
     window.orderOut(nil)
     try await Task.sleep(for: .milliseconds(600))
@@ -434,15 +543,18 @@ final class GraphReadProbe: @unchecked Sendable {
     _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["api"]!, recipientID: fixture.id["test"]!,
                            kind: .message, text: "숨긴 동안 보낸 메시지입니다")
     window.orderFrontRegardless()
-    guard let reopen = try await waitForMessages(initial + 2, within: 3) else { throw AppError.message("Shown window did not read again") }
+    guard let reopen = try await waitForMessages(initial + 3, within: 3) else { throw AppError.message("Shown window did not read again") }
     let result: [String: Any] = ["newMessageLatencyMs": latency * 1000, "rootBodiesWhileUnchanged3s": unchangedRoots,
                                  "storageChecksWhileUnchanged3s": unchangedChecks, "mainThreadReads": probe.value.onMain,
                                  "totalReads": probe.value.checks, "nodesMovedAfterMessage": moved.count,
                                  "checksWhileHidden2_5s": checksWhileHidden, "reopenReadMs": reopen * 1000,
-                                 "nodeCount": placesBefore.count]
+                                 "nodeCount": placesBefore.count, "fittedScale": fittedScale, "zoomedScale": zoomed?.scale as Any,
+                                 "zoomAnchorErrorPt": anchorError, "viewKeptAfterMessage": same(zoomed, viewAfterMessage),
+                                 "nodesMovedAfterMessageWhileZoomed": movedWhileZoomed.count,
+                                 "viewKeptAfterNewMember": same(zoomed, viewAfterMember)]
     let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
     try data.write(to: root.appendingPathComponent("refresh-verify.json"))
-    print("PASS graph refresh: new message in \(Int(latency * 1000)) ms, 0 root bodies while unchanged, reads off the main thread, no checks while hidden, nodes kept their positions\n" + String(decoding: data, as: UTF8.self))
+    print("PASS graph refresh: new message in \(Int(latency * 1000)) ms, 0 root bodies while unchanged, reads off the main thread, no checks while hidden, nodes kept their positions, a user zoom survived a new message and a new member\n" + String(decoding: data, as: UTF8.self))
 }
 
 func percentile(_ values: [Double], _ p: Double) -> Double {
