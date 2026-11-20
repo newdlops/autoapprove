@@ -34,6 +34,8 @@ extension ApprovalTests {
             try expect(ClaudeComputerUseRedirect.denial(tool: tool, input: input) == nil, tool)
         }
         try expect(ClaudeComputerUseRedirect.guidance.contains("desktop_snapshot"))
+        try expect(ClaudeComputerUseRedirect.guidance.contains("ToolSearch") && ClaudeComputerUseRedirect.guidance.contains("/mcp"),
+                   "A session whose MCP server predates the desktop tools learns how to get them")
     }
 
     func testMCPReturnsDesktopCaptureAsImageContent() throws {
