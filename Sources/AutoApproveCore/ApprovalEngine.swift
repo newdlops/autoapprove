@@ -244,6 +244,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var groupMailboxDelegations: [String: (id: UUID, at: Date, group: String)] = [:]
     public var groupMailboxPollInterval: TimeInterval = 5
     public var groupMailboxReminderInterval: TimeInterval = 120
+    /// How long a typed group message may go unobserved before the engine looks for proof of loss.
+    public var groupMailboxReceiptGrace: TimeInterval = 60
+    /// Typings without an observed receipt before a message is parked as undelivered.
+    public var groupMailboxDirectAttemptLimit = 3
     private var sessionRestartTasks: [String: Task<Void, Never>] = [:]
     /// Conversation IDs read the way session groups read them, once per restart request.
     private var restartIdentityTask: Task<[String: String], Never>?
@@ -3275,7 +3279,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 do {
                     let box = try self.groupMailbox()
                     let questions = try box.recoverableClaudeQuestions()
-                    guard try box.hasNotificationWork || !questions.isEmpty else { self.groupMailboxTask = nil; return }
+                    guard try box.hasNotificationWork || box.hasPendingReceipts || !questions.isEmpty else { self.groupMailboxTask = nil; return }
                     if Date().timeIntervalSince(self.groupRecoveryAt) >= 5, !questions.isEmpty,
                        self.sessions.values.contains(where: { $0.agent == .claude && $0.phase != .ended }) {
                         self.groupRecoveryAt = Date()
@@ -3312,12 +3316,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func deliverGroupMailboxNotifications() async throws {
         guard !snapshot.paused, !remoteInputStopped else { return }
-        let heads = try groupMailbox().heads()
+        let overdue = try groupMailbox().overdueReceipts()
+        var heads = try groupMailbox().heads()
         let idle = groupMailboxIdleClaude
         groupMailboxIdleClaude.removeAll()
         let now = Date()
-        guard heads.contains(where: { $0.nextAttemptAt <= now || (!idle.isEmpty && $0.lastResult == "not_started") }) else { return }
+        guard !overdue.isEmpty || heads.contains(where: { $0.nextAttemptAt <= now || (!idle.isEmpty && $0.lastResult == "not_started") }) else { return }
         let observed = try await sessionGroupSessions()
+        if !overdue.isEmpty {
+            await verifyGroupReceipts(overdue, observed: observed)
+            heads = try groupMailbox().heads()
+        }
         var eligible: [UUID: Set<UUID>] = [:]
         if !idle.isEmpty {
             for group in try SessionGroupStore(directory: paths.directory).load() {
@@ -3326,27 +3335,105 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }.map(\.id))
             }
         }
-        for message in heads where message.nextAttemptAt <= now ||
+        let dueAt = Date()
+        for message in heads where message.nextAttemptAt <= dueAt ||
             (message.lastResult == "not_started" && eligible[message.groupID]?.contains(message.recipientID) == true) {
             guard !Task.isCancelled, !remoteInputStopped else { return }
             guard let current = try groupMailbox().message(message.id), current.acknowledgedAt == nil,
                   current.attempts == message.attempts, current.lastResult == message.lastResult,
                   activeGroupMailboxMessages.insert(message.id).inserted else { continue }
             defer { activeGroupMailboxMessages.remove(message.id) }
-            // A direct submission with an uncertain outcome stays in the inbox.
-            // Repeating it could start a second model turn.
-            let retry = Date().addingTimeInterval(groupMailboxReminderInterval)
-            try groupMailbox().noteAttempt(message.id, result: message.deliversBody ? "direct_attempting" : "attempting", retryAt: retry, increment: true)
+            // A typed message is never repeated on a timer. After the grace period the
+            // receipt check either finds it in the conversation or proves it was lost.
+            let receiptDue = Date().addingTimeInterval(groupMailboxReceiptGrace)
+            try groupMailbox().noteAttempt(message.id, result: "direct_attempting", retryAt: receiptDue, increment: true)
             do {
                 try await sendGroupMailboxNotice(message, observed: observed)
-                try groupMailbox().noteAttempt(message.id, result: message.deliversBody ? "direct_submitted" : "submitted", retryAt: retry)
+                try groupMailbox().noteAttempt(message.id, result: "direct_submitted", retryAt: receiptDue)
             } catch {
                 let result = (error as? RemoteHTTPError)?.diagnostics?["delivery"] ?? "unknown"
-                let backoff = result == "not_started" ? min(groupMailboxReminderInterval, max(groupMailboxPollInterval, Double(message.attempts + 1) * 5)) : groupMailboxReminderInterval
-                let storedResult = message.deliversBody && result != "not_started" ? "direct_unknown" : result
-                try groupMailbox().noteAttempt(message.id, result: storedResult, error: error.localizedDescription, retryAt: Date().addingTimeInterval(backoff))
+                if result == "not_started" {
+                    // Nothing was typed, so this try does not count toward the parking limit.
+                    let backoff = min(groupMailboxReminderInterval, max(groupMailboxPollInterval, Double(message.attempts + 1) * 5))
+                    try groupMailbox().noteAttempt(message.id, result: result, error: error.localizedDescription, retryAt: Date().addingTimeInterval(backoff), increment: -1)
+                } else {
+                    try groupMailbox().noteAttempt(message.id, result: "direct_unknown", error: error.localizedDescription, retryAt: receiptDue)
+                }
             }
         }
+    }
+
+    private enum GroupReceiptEvidence { case received, lost, unknown }
+
+    /// Commit or redeliver typed messages whose receipt is overdue. Only proof of loss
+    /// (an idle recipient, an empty composer and no trace of the prompt) types a message
+    /// again, so a message that reached the model never costs a second turn.
+    private func verifyGroupReceipts(_ messages: [SessionGroupMessage], observed: [SessionGroupLiveSession]) async {
+        guard let box = try? groupMailbox() else { return }
+        let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
+        for message in messages {
+            guard !Task.isCancelled, !remoteInputStopped else { return }
+            let later = Date().addingTimeInterval(groupMailboxReceiptGrace)
+            guard let recipient = groups.first(where: { $0.id == message.groupID })?.members.first(where: { $0.id == message.recipientID }),
+                  let live = SessionGroupMatching.match(recipient, in: observed), let session = sessions[live.id] else {
+                // An offline recipient proves nothing; keep the message and look again later.
+                try? box.deferReceipt(message.id, until: later); continue
+            }
+            switch await groupReceiptEvidence(message, live: live, session: session) {
+            case .received: break
+            case .unknown: try? box.deferReceipt(message.id, until: later)
+            case .lost:
+                if (try? box.requeueLostSubmission(message.id, attemptLimit: groupMailboxDirectAttemptLimit)) == false,
+                   let parked = try? box.message(message.id), parked.lastResult == "undelivered" {
+                    log(AuditEvent(sessionID: session.id, summary: "세션 그룹 메시지 \(message.id.uuidString.prefix(8))",
+                                   outcome: "그룹 메시지 자동 전달 중단", source: "세션 그룹", tool: "group_mailbox",
+                                   request: parked.lastError))
+                }
+            }
+        }
+    }
+
+    private func groupReceiptEvidence(_ message: SessionGroupMessage, live: SessionGroupLiveSession, session: AgentSession) async -> GroupReceiptEvidence {
+        // A busy, asking or occupied recipient may still be holding the typed prompt.
+        guard ![.working, .approval, .input, .ended].contains(session.phase), !session.pendingInTerminal,
+              !automaticInputBusy(session.id), !userInputHasPriority(session.id),
+              let frame = try? await remoteTerminal(sessionID: session.id, realtime: true, textOnly: true),
+              frame.inputReason == nil,
+              session.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen) : ClaudeComposerReadiness.isEmpty(frame.screen) else { return .unknown }
+        guard let box = try? groupMailbox(), let current = try? box.message(message.id) else { return .unknown }
+        if current.acknowledgedAt != nil { return .received }
+        switch session.agent {
+        case .claude:
+            // The transcript is the durable record. A prompt carrying this ID means it arrived,
+            // even when the hook missed it or the terminal reflowed its text.
+            let reader = groupTranscriptReader
+            if let turn = await Task.detached(priority: .utility, operation: { reader.recoverableGroupTurn(live) }).value,
+               SessionGroupMessage.terminalMessageID(turn.prompt) == message.id {
+                if let conversation = live.conversationID,
+                   let id = try? box.recoveryTurn(message.id, promptAt: turn.date, fallback: turn.response.id) {
+                    receiveGroupTurn(conversation: conversation, turn: id, prompt: turn.prompt, response: turn.response.originalResponse)
+                }
+                commitGroupReceipt(message)
+                return .received
+            }
+            // With hooks, UserPromptSubmit commits every submitted prompt at once; without
+            // them, the transcript above is the only trace. Either way nothing arrived.
+            return .lost
+        case .codex:
+            // Proof needs an observation taken after the typing; an older one cannot show the prompt.
+            guard let entry = codexTurns[session.id], let submitted = try? box.submittedAt(message.id),
+                  entry.1 > submitted.addingTimeInterval(groupMailboxPollInterval) else { return .unknown }
+            // Its completion commits it through the turn observer.
+            if entry.0.userPrompt.flatMap(SessionGroupMessage.terminalMessageID) == message.id { return .unknown }
+            return .lost
+        default: return .unknown
+        }
+    }
+
+    private func commitGroupReceipt(_ message: SessionGroupMessage) {
+        guard let box = try? groupMailbox(), (try? box.message(message.id))?.acknowledgedAt == nil else { return }
+        try? box.confirmDelivery(message)
+        if [.report, .choiceQuestion].contains(message.kind) { try? applyGroupMessageAcknowledgements([message.id]) }
     }
 
     private func sendGroupMailboxNotice(_ message: SessionGroupMessage, observed: [SessionGroupLiveSession],
@@ -3370,15 +3457,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         try ready()
-        var line = "[AutoApprove 그룹 수신함] 알림 기준 ID: \(message.id.uuidString). 미확인 메시지가 있습니다. get_group_messages(groupID: \(group.id.uuidString))로 순서대로 읽고, 받은 messageID를 ack_group_messages로 수신 확인하세요. 같은 ID를 이미 처리했다면 작업을 반복하지 말고 수신 확인만 하세요. 이 알림은 반복될 수 있습니다. 다른 스레드나 그룹 밖으로 전달하지 마세요."
-        if message.sourceKey?.hasPrefix("decision:") == true || message.kind == .waitNotice {
-            line = "[AutoApprove 그룹 수신함] 작업 대기 관련 알림입니다. get_group_messages(groupID: \(group.id.uuidString), messageID: \(message.id.uuidString))로 이 항목을 먼저 확인하고 처리 후 수신 확인하세요. 질문에 답할 때는 inReplyTo에 원래 질문 ID를 지정하세요."
-        }
-        if message.deliversBody {
-            let senderTitle = group.members.first { $0.id == message.senderID }?.title ?? ""
-            line = message.terminalPrompt(senderTitle: senderTitle)
-        }
-        let prompt = line
+        // Every kind is typed with its body; the observed prompt is the delivery receipt.
+        let prompt = message.terminalPrompt(senderTitle: group.members.first { $0.id == message.senderID }?.title ?? "")
         try await sendGroupLine(current, text: prompt, preflight: {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
             let empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
@@ -3455,7 +3535,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 phase: live?.session.phase, input: input, unacknowledgedCount: count,
                 lastAcknowledgedAt: inbox?.lastAcknowledgedAt, firstPendingAt: inbox?.firstPendingAt,
                 lastDeliveryFailure: inbox?.lastDeliveryFailure,
-                isDeliveryBlocked: count > 0 && inbox?.hasNotificationHead == true && (blocked || inbox?.headDidNotStart == true)))
+                isDeliveryBlocked: count > 0 && (inbox?.hasParkedMessage == true ||
+                    inbox?.hasNotificationHead == true && (blocked || inbox?.headDidNotStart == true))))
         })
     }
 
@@ -3818,12 +3899,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try box.transaction {
                 guard try box.claimTurn(id, turn: turn) else { return }
                 try box.confirmDelivery(request)
-                if request.containsOriginalReport { receipts.append(id) }
+                // An observed report or choice question counts as received, exactly like an ACK.
+                if [.report, .choiceQuestion].contains(request.kind) { receipts.append(id) }
                 let isReference = request.isReferencePrompt(prompt)
                 let batch = isReference ? [] : try box.batchSources(request)
                 for item in batch {
                     try box.confirmDelivery(item)
-                    if item.kind == .report { receipts.append(item.id) }
+                    if [.report, .choiceQuestion].contains(item.kind) { receipts.append(item.id) }
                 }
                 if response == nil { try box.notePromptReceipt(id) }
                 guard !isReference, let response, !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,

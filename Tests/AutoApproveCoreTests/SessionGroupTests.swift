@@ -1021,7 +1021,9 @@ extension ApprovalTests {
         let disconnectedID = try unwrapGroup((disconnectedMessage["messageID"] as? String).flatMap(UUID.init(uuidString:)))
         try await Task.sleep(for: .milliseconds(350)); try expectNil(try box.message(disconnectedID)?.acknowledgedAt)
         try store.save([group]); try await acknowledge([disconnectedID], caller: 0)
-        // Submission uncertainty survives app restart without another terminal input.
+        // Submission uncertainty survives app restart. The terminal ignored the first typing, so after
+        // restart the recipient is idle with an empty composer and no trace of the prompt: that is proof
+        // of loss, and the same message (same ID) is typed exactly once more, then waits for its receipt.
         showReady(1); terminal.ignoresInput = true; engine.groupMailboxReminderInterval = 30
         let uncertain = try await call("reply_group_question", "retained after restart", caller: 2, target: 1)
         let uncertainID = try unwrapGroup((uncertain["messageID"] as? String).flatMap(UUID.init(uuidString:)))
@@ -1032,12 +1034,58 @@ extension ApprovalTests {
         engine = try makeEngine(); engine.groupMailboxReminderInterval = 30
         engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
         try engine.start(poll: false)
+        try expect(try await waitForGroup(8) { (try? box.message(uncertainID)?.lastResult) == "direct_submitted" }, "The lost message is typed again")
+        let redelivered = Array(terminal.typed.suffix(2))
+        try expect(redelivered.first?.contains("[AutoApprove 그룹 전달 \(uncertainID.uuidString)]") == true, "Redelivery keeps the message ID")
+        try expectEqual(count(), submittedBeforeRestart + 2, "One paste and one Enter")
         try await Task.sleep(for: .milliseconds(450))
-        try expectEqual(count(), submittedBeforeRestart)
+        try expectEqual(count(), submittedBeforeRestart + 2, "Waiting for the receipt types nothing more")
         try expectEqual(try box.message(uncertainID)?.text, "retained after restart")
         try expectEqual(try box.pendingCount, 1)
         try await acknowledge([uncertainID], caller: 1)
         try expectEqual(try box.pendingCount, 0)
+        // A recipient that never takes the typed prompt is not typed at forever: after the
+        // attempt limit the message is parked, kept in the inbox and shown as blocked.
+        // Each ignored typing waits ~10 s for Claude to accept it, so the fixture uses a limit of two.
+        engine.groupMailboxReceiptGrace = 0.3; engine.groupMailboxPollInterval = 0.2; engine.groupMailboxDirectAttemptLimit = 2
+        showReady(1); terminal.ignoresInput = true
+        let beforeParking = count()
+        let parkedReceipt = try await call("reply_group_question", "never reaches the model", caller: 2, target: 1)
+        let parkedID = try unwrapGroup((parkedReceipt["messageID"] as? String).flatMap(UUID.init(uuidString:)))
+        let parkedInTime = try await waitForGroup(40) { (try? box.message(parkedID)?.lastResult) == "undelivered" }
+        let parkedState = try box.message(parkedID)
+        try expect(parkedInTime, "The message is parked after the attempt limit: \(parkedState?.lastResult ?? "nil") attempts=\(parkedState?.attempts ?? -1) error=\(parkedState?.lastError ?? "") typed=\(terminal.typed.filter { $0.contains(parkedID.uuidString) }.count)")
+        let typings = terminal.typed.filter { $0.contains("[AutoApprove 그룹 전달 \(parkedID.uuidString)]") }.count
+        try expectEqual(typings, engine.groupMailboxDirectAttemptLimit, "Each typing was proven lost before the next one")
+        try await Task.sleep(for: .milliseconds(800))
+        try expectEqual(terminal.typed.filter { $0.contains(parkedID.uuidString) }.count, typings, "A parked message is never typed again")
+        try expect(count() > beforeParking)
+        try expectNil(try box.message(parkedID)?.acknowledgedAt)
+        let parkedOperation = try unwrapGroup(engine.sessionGroupOperations(group)[members[1].id])
+        try expect(parkedOperation.isDeliveryBlocked, "The graph shows the parked message as blocked")
+        try expect(parkedOperation.lastDeliveryFailure?.contains("자동 입력을 멈췄습니다") == true)
+        try expect(engine.snapshot.events.contains { $0.outcome == "그룹 메시지 자동 전달 중단" }, "Parking is recorded in history")
+        terminal.ignoresInput = false
+        // The recipient can still pull and ACK it; that clears the blocked state.
+        try await acknowledge([parkedID], caller: 1)
+        try expectEqual(try engine.sessionGroupOperations(group)[members[1].id]?.isDeliveryBlocked, false)
+        // A summary report is typed with its body and IDs, and the observed prompt commits it:
+        // no pointer line, no lookup or ACK call, and no reminder afterwards.
+        engine.groupMailboxReceiptGrace = 30; engine.groupMailboxDirectAttemptLimit = 3; showReady(1)
+        let report = try box.enqueue(groupID: group.id, senderID: members[0].id, recipientID: members[1].id,
+                                     kind: .report, text: "요약 보고 본문", sourceKey: "report:" + UUID().uuidString)
+        try expect(try await waitForGroup(8) { (try? box.message(report.id)?.lastResult) == "direct_submitted" }, "The report is typed directly")
+        guard let typedReport = terminal.typed.last(where: { $0.contains(report.id.uuidString) }) else { throw AppError.message("No typed report") }
+        try expect(typedReport.contains("요약 보고 본문") && typedReport.contains("groupID " + group.id.uuidString) &&
+                   typedReport.contains("senderMemberID " + members[0].id.uuidString), "Body and reply IDs are in the prompt: \(typedReport)")
+        try expect(!typedReport.contains("미확인 메시지가 있습니다"), "No pointer line")
+        _ = engine.handleHook(["hook_event_name": "UserPromptSubmit", "session_id": ids[records[1].pid]!, "requestID": UUID().uuidString,
+                               "agentPID": records[1].pid, "agentStarted": records[1].started, "prompt": typedReport])
+        try expectEqual(try box.message(report.id)?.lastResult, "observed", "The observed prompt is the receipt")
+        try expectNotNil(try box.message(report.id)?.acknowledgedAt)
+        let afterReceipt = count()
+        try await Task.sleep(for: .milliseconds(450))
+        try expectEqual(count(), afterReceipt, "A committed message is never typed again")
         for tool in ["assign_group_task", "answer_group_question"] {
             try await rejects { try await call(tool, caller: 1, target: 0, extra: ["task": "invalid", "choice": 1]) }
         }

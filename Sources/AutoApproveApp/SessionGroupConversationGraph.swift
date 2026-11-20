@@ -372,6 +372,8 @@ import AutoApproveCore
         switch message.lastResult {
         case "direct_attempting", "direct_unknown", "unknown": return "전달 여부 미확인"
         case "direct_submitted", "submitted": return "터미널 제출"
+        case "redeliver": return "다시 전달 대기"
+        case "undelivered": return "자동 전달 중단"
         case "late": return "기한 후 수신함 보관"
         case "batched": return "묶음 전달 대기"
         default: return "전달 대기"

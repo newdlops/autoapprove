@@ -23,12 +23,16 @@ public struct SessionGroupMessage: Equatable {
     static let promptPrefix = "[AutoApprove 그룹 전달 "
     private static let directInputBytes = 4096
 
-    var deliversBody: Bool { [.question, .reply, .message, .waitNotice].contains(kind) || containsOriginalReport }
+    /// Every kind is typed with its body, so one turn delivers it and the observed
+    /// prompt commits it. No kind relies on an agent ACK followed by reminders.
+    var deliversBody: Bool { true }
 
     func terminalPrompt(senderTitle: String) -> String {
         let heading = Self.promptPrefix + id.uuidString + "] "
         let sender = String(SessionGroupOrchestration.oneLine(senderTitle).prefix(100))
-        let context = heading + sender + " · " + kind.rawValue + " · 그룹 메시지 본문 · "
+        // The IDs let the recipient answer (answer_group_question, reply_group_question) without a lookup call.
+        let context = heading + sender + " · " + kind.rawValue + " · groupID " + groupID.uuidString +
+            " · senderMemberID " + senderID.uuidString + " · 그룹 메시지 본문 · "
         // Some native terminals can only submit one line. JSON escaping
         // preserves every line boundary without creating another keystroke.
         let body: String
@@ -197,6 +201,44 @@ public final class SessionGroupMailbox {
     public func message(sourceKey: String) throws -> SessionGroupMessage? { try rows("WHERE source_key=?", [sourceKey]).first }
     public var pendingCount: Int { get throws { try scalar("SELECT count(*) FROM messages WHERE acknowledged IS NULL AND last_result IS NOT 'superseded'") } }
 
+    // MARK: Delivery receipts
+    // The mailbox is a per-recipient log. A typed message is committed when its prompt is
+    // observed in the recipient's conversation (or the recipient ACKs it). Until then it
+    // stays "submitted"; it is typed again only after the engine finds proof that the
+    // earlier typing never reached the model. Repeated loss moves it to "undelivered".
+
+    private static let awaitingReceipt = "acknowledged IS NULL AND last_result IN ('direct_submitted','direct_unknown')"
+
+    var hasPendingReceipts: Bool { get throws { try scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE " + Self.awaitingReceipt + ")") != 0 } }
+
+    func overdueReceipts(at date: Date = Date()) throws -> [SessionGroupMessage] {
+        try rows("WHERE " + Self.awaitingReceipt + " AND next_attempt<=? ORDER BY sequence", [String(date.timeIntervalSince1970)])
+    }
+
+    /// Proof of loss: queue the same message (same ID) for one more typing, or park it.
+    func requeueLostSubmission(_ id: UUID, attemptLimit: Int, at date: Date = Date()) throws -> Bool {
+        guard let message = try message(id), message.acknowledgedAt == nil,
+              ["direct_submitted", "direct_unknown"].contains(message.lastResult ?? "") else { return false }
+        let parked = message.attempts >= attemptLimit
+        try update("UPDATE messages SET last_result=?,next_attempt=?,last_error=? WHERE id=? AND acknowledged IS NULL",
+                   [parked ? "undelivered" : "redeliver", String(date.timeIntervalSince1970),
+                    parked ? "입력한 메시지가 \(message.attempts)번 모두 대화에 들어가지 않아 자동 입력을 멈췄습니다." : "이전 입력이 대화에 들어가지 않아 다시 입력합니다.",
+                    id.uuidString])
+        return !parked
+    }
+
+    func submittedAt(_ id: UUID) throws -> Date? {
+        let query = try statement("SELECT submitted FROM group_submissions WHERE message_id=?", [id.uuidString])
+        defer { sqlite3_finalize(query) }
+        guard sqlite3_step(query) == SQLITE_ROW, sqlite3_column_type(query, 0) != SQLITE_NULL else { return nil }
+        return Date(timeIntervalSince1970: sqlite3_column_double(query, 0))
+    }
+
+    /// No proof either way yet (the recipient is busy or its composer has text): look again later.
+    func deferReceipt(_ id: UUID, until date: Date) throws {
+        try update("UPDATE messages SET next_attempt=? WHERE id=? AND " + Self.awaitingReceipt, [String(date.timeIntervalSince1970), id.uuidString])
+    }
+
     public func enqueue(id: UUID? = nil, groupID: UUID, senderID: UUID, recipientID: UUID, kind: SessionGroupMessage.Kind,
                         text: String, sourceKey: String? = nil, at date: Date = Date(), originalReport: Bool = false) throws -> SessionGroupMessage {
         try transaction {
@@ -281,7 +323,7 @@ public final class SessionGroupMailbox {
     private static let notificationFilter = """
         m.acknowledged IS NULL
         AND (m.last_result IS NULL OR m.last_result NOT IN
-            ('superseded','direct_attempting','direct_submitted','direct_unknown','late','batched'))
+            ('superseded','direct_attempting','direct_submitted','direct_unknown','late','batched','undelivered'))
         AND NOT EXISTS (
             SELECT 1 FROM group_waits w
             WHERE w.group_id=m.group_id AND w.state IN ('waiting','ready','expired')
@@ -302,6 +344,8 @@ public final class SessionGroupMailbox {
         let hasNotificationHead: Bool
         let headDidNotStart: Bool
         let lastDeliveryFailure: String?
+        /// A message parked after repeated lost typings; it has left the delivery queue.
+        var hasParkedMessage = false
     }
 
     /// Measure the whole inbox without materializing conversation bodies. The
@@ -310,7 +354,8 @@ public final class SessionGroupMailbox {
         let query = try statement("""
             WITH inbox AS (
                 SELECT recipient_id, sum(acknowledged IS NULL) AS pending, max(acknowledged) AS last_ack,
-                       min(CASE WHEN acknowledged IS NULL THEN created END) AS first_pending
+                       min(CASE WHEN acknowledged IS NULL THEN created END) AS first_pending,
+                       max(CASE WHEN acknowledged IS NULL AND last_result='undelivered' THEN last_error END) AS parked
                 FROM messages
                 WHERE group_id=? AND kind<>'waitNotice' AND last_result IS NOT 'superseded'
                 GROUP BY recipient_id
@@ -319,7 +364,7 @@ public final class SessionGroupMailbox {
                        row_number() OVER (PARTITION BY m.recipient_id ORDER BY \(Self.notificationOrder)) AS position
                 FROM messages m WHERE m.group_id=? AND \(Self.notificationFilter)
             )
-            SELECT inbox.recipient_id, pending, last_ack, first_pending, heads.position, heads.last_result, heads.last_error
+            SELECT inbox.recipient_id, pending, last_ack, first_pending, heads.position, heads.last_result, heads.last_error, inbox.parked
             FROM inbox LEFT JOIN heads ON heads.recipient_id=inbox.recipient_id AND heads.position=1
             """, [groupID.uuidString, groupID.uuidString])
         defer { sqlite3_finalize(query) }
@@ -334,11 +379,14 @@ public final class SessionGroupMailbox {
             guard status == SQLITE_ROW, let id = string(0).flatMap(UUID.init(uuidString:)) else {
                 throw AppError.message("그룹 수신함의 상태를 읽지 못했습니다.")
             }
-            let blocked = string(5) == "not_started"
+            // A parked message (typed repeatedly, never observed) blocks delivery just like one that cannot start.
+            let parked = string(7)
+            let blocked = string(5) == "not_started" || parked != nil
             values[id] = InboxOperation(unacknowledgedCount: Int(sqlite3_column_int64(query, 1)),
                                         lastAcknowledgedAt: date(2), firstPendingAt: date(3),
                                         hasNotificationHead: sqlite3_column_int(query, 4) == 1,
-                                        headDidNotStart: blocked, lastDeliveryFailure: blocked ? string(6) : nil)
+                                        headDidNotStart: blocked, lastDeliveryFailure: blocked ? (string(5) == "not_started" ? string(6) : parked) : nil,
+                                        hasParkedMessage: parked != nil)
         }
     }
 
@@ -435,8 +483,13 @@ public final class SessionGroupMailbox {
     }
 
     public func noteAttempt(_ id: UUID, result: String, error: String? = nil, retryAt: Date, increment: Bool = false) throws {
-        try update("UPDATE messages SET attempts=attempts+?,next_attempt=?,last_result=?,last_error=? WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'batched'",
-                   [increment ? "1" : "0", String(retryAt.timeIntervalSince1970), result, String((error ?? "").prefix(500)), id.uuidString])
+        try noteAttempt(id, result: result, error: error, retryAt: retryAt, increment: increment ? 1 : 0)
+    }
+
+    /// `attempts` counts typings. A try that stopped before typing passes -1 to undo its count.
+    public func noteAttempt(_ id: UUID, result: String, error: String? = nil, retryAt: Date, increment: Int) throws {
+        try update("UPDATE messages SET attempts=max(0,attempts+?),next_attempt=?,last_result=?,last_error=? WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'batched'",
+                   [String(increment), String(retryAt.timeIntervalSince1970), result, String((error ?? "").prefix(500)), id.uuidString])
     }
 
     func unansweredQuestion(_ id: UUID, in groupID: UUID) throws -> SessionGroupMessage? {
