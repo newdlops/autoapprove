@@ -33,6 +33,12 @@ struct GraphNode: Equatable, Identifiable {
     let unacknowledged: Int
     let accessibilityRecent: String
     let accessibilityAll: String
+    /// Records on this member's lines in the "최근" and "전체" views; they set the node size.
+    let recentMessages: Int
+    let allMessages: Int
+
+    func messages(_ scope: SessionGroupGraph.Scope) -> Int { scope == .recent ? recentMessages : allMessages }
+    func size(_ scope: SessionGroupGraph.Scope) -> SessionGroupGraph.NodeSize { SessionGroupGraph.nodeSize(forMessages: messages(scope)) }
 }
 
 /// Reads the group file and the mailbox on its own connection, never on the main thread.
@@ -247,7 +253,9 @@ actor ConversationGraphReader {
                              agent: member.agent, isLeader: group.isLeader(member.id), depth: entry.depth, status: status,
                              unacknowledged: operation?.unacknowledgedCount ?? 0,
                              accessibilityRecent: SessionGroupGraph.accessibilityValue(member: member.id, status: status, edges: recent, names: plainNames),
-                             accessibilityAll: SessionGroupGraph.accessibilityValue(member: member.id, status: status, edges: all, names: plainNames))
+                             accessibilityAll: SessionGroupGraph.accessibilityValue(member: member.id, status: status, edges: all, names: plainNames),
+                             recentMessages: SessionGroupGraph.messageCount(member: member.id, edges: recent),
+                             allMessages: SessionGroupGraph.messageCount(member: member.id, edges: all))
         }
         let next = Content(group: group, page: page, operations: operations, names: names, nodes: nodes, recentEdges: recent, allEdges: all)
         guard next != content else { return }

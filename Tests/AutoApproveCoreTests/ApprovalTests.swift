@@ -542,6 +542,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: graph zoom keeps the point under the pointer",tests.testGraphZoomKeepsThePointUnderThePointer),
             ("Session groups: graph fit keeps the whole graph or the leader in view",tests.testGraphFitKeepsTheWholeGraphOrTheLeaderInView),
             ("Session groups: graph pan keeps part of the graph in view",tests.testGraphPanKeepsPartOfTheGraphInView),
+            ("Session groups: graph node size follows message steps",tests.testGraphNodeSizeFollowsMessageSteps),
+            ("Session groups: graph layout makes room for large nodes",tests.testGraphLayoutMakesRoomForLargeNodes),
             ("Session groups: a stalled message notifies its sender once",tests.testStalledGroupMessageNotifiesItsSenderOnce),
             ("Session groups: Claude original reply without MCP",tests.testGroupClaudeReplyWithoutMCP),
             ("Session groups: completion reports require recipient ACK",tests.testGroupReportRequiresRecipientAcknowledgement),

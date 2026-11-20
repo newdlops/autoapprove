@@ -30,7 +30,20 @@ private final class GroupRefreshReads: @unchecked Sendable {
     static func root(_ messages: Int?) { roots += 1; messageCount = messages ?? -1 }
     static func canvas() { canvases += 1 }
     static var places: [String: CGPoint] = [:]
+    /// Each node's circle and name band in SwiftUI global coordinates.
+    static var rects: [String: CGRect] = [:]
     static func place(_ name: String, _ point: CGPoint) { places[name] = point }
+    static func place(_ name: String, _ point: CGPoint, frame: CGRect) { places[name] = point; rects[name] = frame }
+    /// Pairs of nodes whose circle and name band overlap, ignoring a sliver of half a point.
+    static func overlaps() -> [String] {
+        let names = rects.keys.sorted()
+        var found: [String] = []
+        for (i, a) in names.enumerated() { for b in names[(i + 1)...] {
+            let shared = rects[a]!.intersection(rects[b]!)
+            if !shared.isNull, shared.width > 0.5, shared.height > 0.5 { found.append(a + " / " + b) }
+        } }
+        return found
+    }
     /// SwiftUI global coordinates start at the top left of the hosting view.
     static func center(_ name: String, in host: NSView) -> CGPoint? {
         places[name].map { CGPoint(x: $0.x, y: host.bounds.height - $0.y) }
@@ -70,7 +83,9 @@ final class GraphReadProbe: @unchecked Sendable {
     nonisolated static let fixedNow = Date(timeIntervalSince1970: 1_795_149_725) // 2026-11-20 13:42:05 +0900
 
     /// `extra` adds that many unconnected members under the four deepest members, for a graph wider than the window.
-    static func make(root: URL, name: String, now: Date = fixedNow, heavy: Bool = false, empty: Bool = false, extra: Int = 0) throws -> GraphFixture {
+    /// `burst` adds that many recent messages from the leader to "api 정리", so message amounts differ widely.
+    static func make(root: URL, name: String, now: Date = fixedNow, heavy: Bool = false, empty: Bool = false, extra: Int = 0,
+                     burst: Int = 0) throws -> GraphFixture {
         let directory = root.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: directory)
         // key, agent, connected nickname (nil: no nickname), stored title, folder, parent key
@@ -125,11 +140,11 @@ final class GraphReadProbe: @unchecked Sendable {
         let group = empty ? SessionGroup(name: "디자인 회의", members: [])
             : SessionGroup(name: "결제 리뷰", members: members, leaderMemberID: ids["lead"])
         try SessionGroupStore(directory: directory).save([group])
-        if !empty { try seedMessages(directory: directory, group: group, id: ids, now: now, heavy: heavy) }
+        if !empty { try seedMessages(directory: directory, group: group, id: ids, now: now, heavy: heavy, burst: burst) }
         return GraphFixture(engine: engine, group: group, directory: directory, now: now, id: ids)
     }
 
-    private static func seedMessages(directory: URL, group: SessionGroup, id: [String: UUID], now: Date, heavy: Bool) throws {
+    private static func seedMessages(directory: URL, group: SessionGroup, id: [String: UUID], now: Date, heavy: Bool, burst: Int = 0) throws {
         let box = try SessionGroupMailbox(directory: directory)
         var acknowledged: [(UUID, UUID)] = []
         func send(_ from: String, _ to: String, _ kind: SessionGroupMessage.Kind, _ text: String,
@@ -164,6 +179,7 @@ final class GraphReadProbe: @unchecked Sendable {
                             text: "네, 문자열로 바꿔 주세요", sourceKey: "answer:" + answered.id.uuidString,
                             at: now.addingTimeInterval(-60 * 60))
         let expired = try send("test", "lead", .question, "테스트 계정을 새로 만들어도 될까요?", minutes: 118)
+        for i in 0..<burst { _ = try send("lead", "api", .message, "응답 필드 \(i + 1)을 확인해 주세요", minutes: 1 + Double(i % 25)) }
         if heavy {
             let keys = ["lead", "api", "test", "doc", "mig", "ui"]
             for i in 0..<300 {
@@ -277,7 +293,8 @@ final class GraphReadProbe: @unchecked Sendable {
     var worstPreview = 0.0, worstDrop = 0.0
     var eventDeltaCarried = false
     for zoom in [1.0, 0.6, 2.0] {
-        let fixture = try GraphFixture.make(root: root, name: "drag-state-\(Int(zoom * 100))", heavy: true)
+        // Relative to the real clock, so the recent view draws its lines and nodes have different sizes.
+        let fixture = try GraphFixture.make(root: root, name: "drag-state-\(Int(zoom * 100))", now: Date(), heavy: true)
         GraphProbe.places = [:]; GraphProbe.view = nil
         let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine, zoom: zoom)
             .frame(width: size.width, height: size.height), size: size)
@@ -395,12 +412,14 @@ final class GraphReadProbe: @unchecked Sendable {
         sessions: Empty<[ConversationGraphModel.SessionKey], Never>().eraseToAnyPublisher())
 }
 
-/// Ten scenes, two window sizes, light and dark: 40 PNG files. Scenes 1 to 8 open fitted as the
-/// app does; 8 is a group wider than the window, 9 and 10 fix the zoom at 50% and 200%.
+/// Twelve scenes, two window sizes, light and dark: 48 PNG files. Scenes 1 to 8 and 11 to 12 open
+/// fitted as the app does; 8 is a group wider than the window, 9 and 10 fix the zoom at 50% and 200%,
+/// 11 and 12 mix members with very different message amounts in the tree and circle layouts.
 @MainActor func renderGraphScenes(root: URL) async throws {
     let fixture = try GraphFixture.make(root: root, name: "graph-state")
     let empty = try GraphFixture.make(root: root, name: "graph-empty", empty: true)
     let wide = try GraphFixture.make(root: root, name: "graph-wide", extra: 12)
+    let uneven = try GraphFixture.make(root: root, name: "graph-uneven", burst: 24)
     let groupFile = fixture.directory.appendingPathComponent("session-groups.json")
     let original = try Data(contentsOf: groupFile)
     let scenes: [(String, GraphFixture, UUID?, SessionGroupGraph.Scope, SessionGroupGraph.Layout, Bool, Double?)] = [
@@ -413,7 +432,9 @@ final class GraphReadProbe: @unchecked Sendable {
         ("7-read-failure", fixture, nil, .recent, .tree, true, nil),
         ("8-fit-wide-group", wide, nil, .recent, .tree, false, nil),
         ("9-zoom-50", fixture, nil, .recent, .tree, false, 0.5),
-        ("10-zoom-200", fixture, nil, .recent, .tree, false, 2)
+        ("10-zoom-200", fixture, nil, .recent, .tree, false, 2),
+        ("11-size-tree", uneven, nil, .recent, .tree, false, nil),
+        ("12-size-circle", uneven, nil, .recent, .circle, false, nil)
     ]
     var written: [String] = []
     for (name, scene, selection, scope, layout, failing, zoom) in scenes {
@@ -443,14 +464,16 @@ final class GraphReadProbe: @unchecked Sendable {
             }
         }
     }
-    fixture.engine.stop(); empty.engine.stop(); wide.engine.stop()
+    fixture.engine.stop(); empty.engine.stop(); wide.engine.stop(); uneven.engine.stop()
     print("PASS graph scenes: \(written.count) PNG\n" + written.joined(separator: "\n"))
 }
 
 /// Another connection writes, and the window must follow within two seconds without
 /// recomputing when nothing changed, reading off the main thread and stopping while hidden.
 @MainActor func verifyGraphRefresh(root: URL) async throws {
-    let fixture = try GraphFixture.make(root: root, name: "refresh-state")
+    // The window reads the real clock here, so the messages are placed relative to now and the
+    // recent view shows the same counts and size steps as the rendered scenes.
+    let fixture = try GraphFixture.make(root: root, name: "refresh-state", now: Date())
     defer { fixture.engine.stop() }
     let size = CGSize(width: 1040, height: 680)
     let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine)
@@ -476,6 +499,7 @@ final class GraphReadProbe: @unchecked Sendable {
     try require(unchangedChecks >= 2, "Visible window stopped checking storage")
     try require(unchangedRoots == 0, "Unchanged checks recomputed the window \(unchangedRoots) times")
     let placesBefore = GraphProbe.places
+    let sizesBefore = GraphProbe.rects.mapValues { $0.height / $0.width }
     let writer = try SessionGroupMailbox(directory: fixture.directory)
     _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["ui"]!, recipientID: fixture.id["lead"]!,
                            kind: .message, text: "결제 화면 캡처를 새로 올렸습니다")
@@ -487,6 +511,8 @@ final class GraphReadProbe: @unchecked Sendable {
         guard let after = GraphProbe.places[name] else { return true }
         return hypot(after.x - point.x, after.y - point.y) > 0.5
     }
+    let resized = sizesBefore.filter { name, ratio in abs((GraphProbe.rects[name].map { $0.height / $0.width } ?? 0) - ratio) > 0.01 }
+    try require(resized.isEmpty, "One message changed a size step: " + resized.keys.sorted().joined(separator: ", "))
     try require(!placesBefore.isEmpty && moved.isEmpty, "Nodes moved after a new message: " + moved.keys.sorted().map { "\($0) \(placesBefore[$0]!) -> \(String(describing: GraphProbe.places[$0]))" }.joined(separator: "; "))
     // The user zooms with ⌘ and a scroll over the leader. Later updates, a new message and a new
     // member, must keep that zoom and pan; the new member changes the layout, so only the view is compared.
@@ -505,7 +531,8 @@ final class GraphReadProbe: @unchecked Sendable {
     let anchorError = hypot(leaderZoomed.x - leaderBefore.x, leaderZoomed.y - leaderBefore.y)
     try require(anchorError < 1, "The point under the pointer moved \(anchorError) pt while zooming")
     let placesZoomed = GraphProbe.places
-    _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["doc"]!, recipientID: fixture.id["lead"]!,
+    // Neither member crosses a size step with this message.
+    _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["api"]!, recipientID: fixture.id["test"]!,
                            kind: .message, text: "확대한 뒤 보낸 메시지입니다")
     guard try await waitForMessages(initial + 2, within: 3) != nil else { throw AppError.message("Message after zoom did not appear within 3 s") }
     try await Task.sleep(for: .milliseconds(400))
@@ -533,6 +560,25 @@ final class GraphReadProbe: @unchecked Sendable {
     host.layoutSubtreeIfNeeded()
     let viewAfterMember = GraphProbe.view
     try require(same(zoomed, viewAfterMember), "A new member changed the zoom or pan: \(String(describing: zoomed)) -> \(String(describing: viewAfterMember))")
+    // 20 messages from "화면 점검" to the leader move both from a smaller size step to the largest.
+    // The layout makes room for the larger circles, no two nodes overlap, and the zoom and pan stay.
+    let widthsBefore = GraphProbe.rects.mapValues { $0.height / $0.width }
+    let placesBeforeBurst = GraphProbe.places
+    for i in 0..<20 {
+        _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["ui"]!, recipientID: fixture.id["lead"]!,
+                               kind: .message, text: "화면 점검 결과 \(i + 1)을 정리했습니다")
+    }
+    guard try await waitForMessages(initial + 22, within: 3) != nil else { throw AppError.message("Message burst did not appear within 3 s") }
+    try await Task.sleep(for: .milliseconds(400))
+    host.layoutSubtreeIfNeeded()
+    let grew = ["결제 총괄", "화면 점검"].filter { name in (GraphProbe.rects[name].map { $0.height / $0.width } ?? 0) > (widthsBefore[name] ?? 0) + 0.01 }
+    try require(grew.count == 2, "The leader and 화면 점검 did not grow to a larger size step: \(grew)")
+    let relaid = placesBeforeBurst.filter { name, point in GraphProbe.places[name].map { hypot($0.x - point.x, $0.y - point.y) > 0.5 } ?? true }
+    try require(!relaid.isEmpty, "A size step change did not lay the graph out again")
+    let overlapsAfterBurst = GraphProbe.overlaps()
+    try require(overlapsAfterBurst.isEmpty, "Nodes overlap after a size step change: " + overlapsAfterBurst.joined(separator: ", "))
+    let viewAfterBurst = GraphProbe.view
+    try require(same(zoomed, viewAfterBurst), "A size step change changed the zoom or pan")
     try require(probe.value.onMain == 0, "Storage was read on the main thread \(probe.value.onMain) times")
     window.orderOut(nil)
     try await Task.sleep(for: .milliseconds(600))
@@ -543,18 +589,20 @@ final class GraphReadProbe: @unchecked Sendable {
     _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["api"]!, recipientID: fixture.id["test"]!,
                            kind: .message, text: "숨긴 동안 보낸 메시지입니다")
     window.orderFrontRegardless()
-    guard let reopen = try await waitForMessages(initial + 3, within: 3) else { throw AppError.message("Shown window did not read again") }
+    guard let reopen = try await waitForMessages(initial + 23, within: 3) else { throw AppError.message("Shown window did not read again") }
     let result: [String: Any] = ["newMessageLatencyMs": latency * 1000, "rootBodiesWhileUnchanged3s": unchangedRoots,
                                  "storageChecksWhileUnchanged3s": unchangedChecks, "mainThreadReads": probe.value.onMain,
-                                 "totalReads": probe.value.checks, "nodesMovedAfterMessage": moved.count,
+                                 "totalReads": probe.value.checks, "nodesMovedAfterMessage": moved.count, "sizeStepsChangedByOneMessage": resized.count,
                                  "checksWhileHidden2_5s": checksWhileHidden, "reopenReadMs": reopen * 1000,
                                  "nodeCount": placesBefore.count, "fittedScale": fittedScale, "zoomedScale": zoomed?.scale as Any,
                                  "zoomAnchorErrorPt": anchorError, "viewKeptAfterMessage": same(zoomed, viewAfterMessage),
                                  "nodesMovedAfterMessageWhileZoomed": movedWhileZoomed.count,
-                                 "viewKeptAfterNewMember": same(zoomed, viewAfterMember)]
+                                 "viewKeptAfterNewMember": same(zoomed, viewAfterMember), "nodesGrownByBurst": grew,
+                                 "nodesRelaidByStepChange": relaid.count, "overlapsAfterStepChange": overlapsAfterBurst.count,
+                                 "viewKeptAfterStepChange": same(zoomed, viewAfterBurst)]
     let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
     try data.write(to: root.appendingPathComponent("refresh-verify.json"))
-    print("PASS graph refresh: new message in \(Int(latency * 1000)) ms, 0 root bodies while unchanged, reads off the main thread, no checks while hidden, nodes kept their positions, a user zoom survived a new message and a new member\n" + String(decoding: data, as: UTF8.self))
+    print("PASS graph refresh: new message in \(Int(latency * 1000)) ms, 0 root bodies while unchanged, reads off the main thread, no checks while hidden, nodes kept their positions, a user zoom survived a new message, a new member and a size step change, no overlaps after the step change\n" + String(decoding: data, as: UTF8.self))
 }
 
 func percentile(_ values: [Double], _ p: Double) -> Double {

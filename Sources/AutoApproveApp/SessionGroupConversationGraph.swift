@@ -670,6 +670,9 @@ private extension AgentKind {
     private struct Placement {
         let base: [UUID: CGPoint]
         let points: [UUID: CGPoint]
+        /// Circle diameters from each member's message step in the current view.
+        let diameters: [UUID: Double]
+        var radii: [UUID: Double] { diameters.mapValues { $0 / 2 } }
         /// Every node with its ring and name band, for fitting and for the pan limit.
         let content: CGRect
         let leader: CGPoint?
@@ -693,7 +696,7 @@ private extension AgentKind {
                 let size = proxy.size
                 let view = viewport(placement, size: size)
                 /* graph-probe: viewport */
-                let bends = SessionGroupGraph.bends(edges, points: placement.points)
+                let bends = SessionGroupGraph.bends(edges, points: placement.points, radii: placement.radii)
                 let related = selection.map { chosen in Set(edges.filter { $0.touches(chosen) }.flatMap { [$0.from, $0.to] }).union([chosen]) }
                 // A scroll view that never scrolls: zoom and pan move the graph instead. Its container
                 // takes the first click in an inactive window, as the graph did when it scrolled, so
@@ -720,7 +723,7 @@ private extension AgentKind {
                     Canvas { context, _ in
                         context.translateBy(x: view.offset.x, y: view.offset.y)
                         context.scaleBy(x: view.scale, y: view.scale)
-                        draw(edges, points: placement.points, bends: bends, in: &context)
+                        draw(edges, placement: placement, bends: bends, in: &context)
                     }
                     .allowsHitTesting(false)
                     .accessibilityHidden(true)
@@ -950,6 +953,22 @@ private extension AgentKind {
                 .accessibilityLabel("선 굵기는 건수입니다. 1건, 2에서 4건, 5에서 9건, 10건 이상")
                 .layoutValue(key: LegendGroupStart.self, value: true)
             }
+            // Circles at 30% of the node diameters, so the four steps read as growing sizes.
+            HStack(spacing: 8) {
+                Text("크기")
+                ForEach(SessionGroupGraph.NodeSize.allCases, id: \.self) { size in
+                    HStack(spacing: 3) {
+                        Circle().strokeBorder(Self.gray, lineWidth: 1)
+                            .frame(width: size.diameter * 0.3, height: size.diameter * 0.3)
+                            .frame(width: 16, height: 16)
+                        Text(size.title)
+                    }
+                }
+            }
+            .help("원 크기는 지금 보기에 그려진 선에서 그 구성원이 보내고 받은 메시지 수입니다. 0건, 1~4건, 5~19건, 20건 이상의 네 단계로 나눕니다.")
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("원 크기는 주고받은 메시지 수입니다. 0건, 1에서 4건, 5에서 19건, 20건 이상")
+            .layoutValue(key: LegendGroupStart.self, value: true)
         }
         .font(.caption).foregroundStyle(.secondary)
         .padding(.horizontal, 16).padding(.bottom, 8)
@@ -978,28 +997,36 @@ private extension AgentKind {
 
     // MARK: Graph
 
-    /// Never compressed: zoom and pan decide what part of it the area shows.
+    /// Never compressed: zoom and pan decide what part of it the area shows. The automatic layout
+    /// depends only on the size steps, so a message that keeps every step never moves a node.
     private func place(layout: SessionGroupGraph.Layout, moved: [UUID: CGSize]) -> Placement {
+        let diameters = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.size(scope).diameter) })
+        let largest = diameters.values.max() ?? SessionGroupGraph.standardDiameter
         let base = SessionGroupGraph.frame(SessionGroupGraph.positions(nodes.map { (id: $0.id, depth: $0.depth) },
-                                                                       hasLeader: hasLeader, layout: layout)).points
+                                                                       hasLeader: hasLeader, layout: layout, diameters: diameters),
+                                           largestDiameter: largest).points
         var points = base
         for (id, offset) in moved { if let point = base[id] { points[id] = CGPoint(x: point.x + offset.width, y: point.y + offset.height) } }
-        return Placement(base: base, points: points, content: SessionGroupGraph.contentBounds(points),
+        return Placement(base: base, points: points, diameters: diameters,
+                         content: SessionGroupGraph.contentBounds(points, largestDiameter: largest),
                          leader: nodes.first.flatMap { points[$0.id] })
     }
 
     /// Room a line end keeps from a node whose warning or speech bubble mark sticks out.
-    private func clearance(_ id: UUID) -> Double {
+    private func clearance(_ id: UUID, _ placement: Placement) -> Double {
         guard let status = nodes.first(where: { $0.id == id })?.status, status.blocked || status.needsResponse else { return 0 }
-        return SessionGroupGraph.markClearance
+        return SessionGroupGraph.markClearance(radius: placement.radii[id] ?? SessionGroupGraph.nodeRadius)
     }
 
-    private func draw(_ edges: [SessionGroupGraph.Edge], points: [UUID: CGPoint], bends: [SessionGroupGraph.EdgeKey: Double],
+    private func draw(_ edges: [SessionGroupGraph.Edge], placement: Placement, bends: [SessionGroupGraph.EdgeKey: Double],
                       in context: inout GraphicsContext) {
+        let points = placement.points, radii = placement.radii
         for edge in edges where !edge.touches(movingNode) {
             guard let from = points[edge.from], let to = points[edge.to],
                   let shape = SessionGroupGraph.geometry(from: from, to: to, width: edge.width, bend: bends[edge.key] ?? 1,
-                                                         startClearance: clearance(edge.from), endClearance: clearance(edge.to)) else { continue }
+                                                         startClearance: clearance(edge.from, placement), endClearance: clearance(edge.to, placement),
+                                                         startRadius: radii[edge.from] ?? SessionGroupGraph.nodeRadius,
+                                                         endRadius: radii[edge.to] ?? SessionGroupGraph.nodeRadius) else { continue }
             let color = edge.kind == .pendingQuestion ? Color.orange : Self.gray
             var opacity = edge.faded ? 0.35 : 1
             if let selection, !edge.touches(selection) { opacity = min(opacity, 0.24) }
@@ -1039,8 +1066,9 @@ private extension AgentKind {
         let scale = view.scale
         let shown = view.screen(point)
         let visible = view.visible(size)
+        let diameter = CGFloat(placement.diameters[node.id] ?? SessionGroupGraph.standardDiameter)
         return GraphNodeView(node: node, selected: selected, dimmed: dimmed, lifted: movingNode == node.id, focused: focused == node.id,
-                             scale: CGFloat(scale))
+                             scale: CGFloat(scale), diameter: diameter)
             .equatable()
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("\(node.name), \(node.agent.title), \(node.isLeader ? "그룹장" : "구성원")")
@@ -1077,13 +1105,15 @@ private extension AgentKind {
                         let color = edge.kind == .pendingQuestion ? NSColor.systemOrange : NSColor.systemGray
                         return .init(anchor: anchor, outgoing: outgoing, color: color.withAlphaComponent(edge.faded ? 0.35 : 0.9),
                                      width: edge.width, bend: bends[edge.key] ?? 1, dashed: edge.dashed,
-                                     startClearance: clearance(edge.from), endClearance: clearance(edge.to))
+                                     startClearance: clearance(edge.from, placement), endClearance: clearance(edge.to, placement),
+                                     startRadius: placement.radii[edge.from] ?? SessionGroupGraph.nodeRadius,
+                                     endRadius: placement.radii[edge.to] ?? SessionGroupGraph.nodeRadius)
                     }
                     let lifted = GraphNodeView(node: node, selected: selected, dimmed: false, lifted: false, focused: false,
-                                               scale: CGFloat(scale))
+                                               scale: CGFloat(scale), diameter: diameter)
                         .padding(GraphNodeView.previewPadding * CGFloat(scale))
                         .environment(\.colorScheme, colorScheme)
-                    if preview.begin(lifted, edges: incident, origin: point, at: target, view: view) { movingNode = node.id }
+                    if preview.begin(lifted, edges: incident, origin: point, at: target, view: view, diameter: diameter) { movingNode = node.id }
                 }
                 .onEnded { value in
                     let distance = hypot(value.translation.width, value.translation.height)
@@ -1099,6 +1129,7 @@ private extension AgentKind {
                 })
             .help("\(node.name) · \(node.agent.title) · \(node.status.title)"
                   + (node.provisional ? "\n임시 이름입니다. 닉네임이 정해지면 바뀝니다." : "")
+                  + "\n주고받은 메시지 \(node.messages(scope))건(지금 보기 기준)"
                   + "\n클릭하면 세션 상태와 대화를 엽니다. 끌거나 방향키를 누르면 노드를 옮깁니다.")
             .position(x: shown.x, y: shown.y + GraphNodeView.centerOffset * scale)
     }
@@ -1280,12 +1311,15 @@ private struct GraphNodeSymbol: View {
 
 /// A node with its name band. Equatable, so a change elsewhere in the graph does not redraw it.
 /// Sizes in the comments are at 100%; `scale` draws the circle, text and spacing at the zoom
-/// itself, so names stay sharp instead of being a stretched bitmap.
+/// itself, so names stay sharp instead of being a stretched bitmap. `diameter` is the circle
+/// size from the member's message step.
 private struct GraphNodeView: View, Equatable {
     static let width: CGFloat = 128
-    static let height: CGFloat = 58
-    /// The circle centre is 16pt below the top; the view centre is 29pt below it.
-    static let centerOffset: CGFloat = 13
+    /// The circle, a 6pt gap and the 20pt name band.
+    static func height(diameter: CGFloat) -> CGFloat { diameter + CGFloat(SessionGroupGraph.nameBandDrop) }
+    /// The circle centre is half a diameter below the top and the view centre half a height, so
+    /// the view centre is always 13pt below the circle centre.
+    static let centerOffset: CGFloat = CGFloat(SessionGroupGraph.nameBandDrop) / 2
     static let previewPadding: CGFloat = 8
     /// The caption text style's size, so the name at 100% is the same as before zooming existed.
     private static let nameSize = NSFont.preferredFont(forTextStyle: .caption1).pointSize
@@ -1295,16 +1329,17 @@ private struct GraphNodeView: View, Equatable {
     let lifted: Bool
     let focused: Bool
     var scale: CGFloat = 1
+    var diameter: CGFloat = 32
     @State private var hovering = false
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.node == rhs.node && lhs.selected == rhs.selected && lhs.dimmed == rhs.dimmed && lhs.lifted == rhs.lifted && lhs.focused == rhs.focused
-            && lhs.scale == rhs.scale
+            && lhs.scale == rhs.scale && lhs.diameter == rhs.diameter
     }
 
     var body: some View {
         VStack(spacing: 6 * scale) {
-            GraphNodeSymbol(agent: node.agent, status: node.status, role: node.isLeader ? .leader : .member, diameter: 32 * scale)
+            GraphNodeSymbol(agent: node.agent, status: node.status, role: node.isLeader ? .leader : .member, diameter: diameter * scale)
                 .overlay {
                     if hovering && !selected { Circle().stroke(node.agent.graphColor, lineWidth: 1).padding(-8 * scale) }
                 }
@@ -1326,7 +1361,7 @@ private struct GraphNodeView: View, Equatable {
                 .frame(maxWidth: Self.width * scale)
                 .contentShape(Capsule())
         }
-        .frame(width: Self.width * scale, height: Self.height * scale, alignment: .top)
+        .frame(width: Self.width * scale, height: Self.height(diameter: diameter) * scale, alignment: .top)
         .opacity(lifted ? 0.15 : dimmed ? 0.24 : 1)
         .onHover { hovering = $0 }
         /* graph-probe: node */
@@ -1447,6 +1482,8 @@ private struct GraphZoomButtonStyle: ButtonStyle {
         let dashed: Bool
         let startClearance: Double
         let endClearance: Double
+        let startRadius: Double
+        let endRadius: Double
     }
 
     weak var surface: NSView?
@@ -1461,7 +1498,8 @@ private struct GraphZoomButtonStyle: ButtonStyle {
     private var pending: CGPoint?
     private var transform = SessionGroupGraph.Viewport.identity
 
-    func begin(_ label: some View, edges incident: [Edge], origin: CGPoint, at point: CGPoint, view: SessionGroupGraph.Viewport) -> Bool {
+    func begin(_ label: some View, edges incident: [Edge], origin: CGPoint, at point: CGPoint, view: SessionGroupGraph.Viewport,
+               diameter: CGFloat) -> Bool {
         end()
         attempted = true
         guard let surface, let root = surface.layer else { return false }
@@ -1492,9 +1530,10 @@ private struct GraphZoomButtonStyle: ButtonStyle {
             node.shadowOpacity = 0.24
             node.shadowRadius = 4
             node.shadowOffset = CGSize(width: 0, height: -2)
-            let circleCenter = node.bounds.height - (GraphNodeView.previewPadding + 16) * scale
-            node.shadowPath = CGPath(ellipseIn: CGRect(x: node.bounds.midX - 18 * scale, y: circleCenter - 18 * scale,
-                                                       width: 36 * scale, height: 36 * scale), transform: nil)
+            let circleCenter = node.bounds.height - (GraphNodeView.previewPadding + diameter / 2) * scale
+            let shadow = (diameter / 2 + 2) * scale
+            node.shadowPath = CGPath(ellipseIn: CGRect(x: node.bounds.midX - shadow, y: circleCenter - shadow,
+                                                       width: 2 * shadow, height: 2 * shadow), transform: nil)
             root.addSublayer(node)
             present(point, height: surface.bounds.height)
         }
@@ -1547,7 +1586,8 @@ private struct GraphZoomButtonStyle: ButtonStyle {
             let from = edge.outgoing ? point : edge.anchor
             let to = edge.outgoing ? edge.anchor : point
             guard let shape = SessionGroupGraph.geometry(from: from, to: to, width: edge.width, bend: edge.bend,
-                                                         startClearance: edge.startClearance, endClearance: edge.endClearance) else {
+                                                         startClearance: edge.startClearance, endClearance: edge.endClearance,
+                                                         startRadius: edge.startRadius, endRadius: edge.endRadius) else {
                 line.path = nil; head.path = nil; continue
             }
             let curve = CGMutablePath()

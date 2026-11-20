@@ -325,12 +325,75 @@ extension ApprovalTests {
         try expectEqual(SessionGroupGraph.constrained(gone, content: tiny, size: area).offset.x, 360, "A graph smaller than 80pt stays whole")
     }
 
+    func testGraphNodeSizeFollowsMessageSteps() throws {
+        let steps = [0, 1, 4, 5, 19, 20, 300].map { SessionGroupGraph.nodeSize(forMessages: $0) }
+        try expectEqual(steps, [.none, .few, .few, .some, .some, .many, .many], "Four steps: 0, 1-4, 5-19, 20 or more")
+        try expectEqual(SessionGroupGraph.NodeSize.allCases.map(\.diameter), [28, 34, 42, 52])
+        let a = UUID(), b = UUID(), c = UUID()
+        let edges: [SessionGroupGraph.Edge] = [.init(from: a, to: b, kind: .recent, count: 3, pendingQuestions: 0),
+                                               .init(from: b, to: a, kind: .recent, count: 2, pendingQuestions: 0),
+                                               .init(from: c, to: b, kind: .pendingQuestion, count: 1, pendingQuestions: 1)]
+        try expectEqual(SessionGroupGraph.messageCount(member: a, edges: edges), 5, "Sent and received records both count")
+        try expectEqual(SessionGroupGraph.messageCount(member: b, edges: edges), 6)
+        try expectEqual(SessionGroupGraph.messageCount(member: UUID(), edges: edges), 0)
+    }
+
+    /// Larger circles widen the layer below them and the ring, so no two nodes' circles and name
+    /// bands overlap, and the same sizes always give the same positions.
+    func testGraphLayoutMakesRoomForLargeNodes() throws {
+        func member(_ title: String) -> SessionGroupMember {
+            SessionGroupMember(agent: .claude, title: title, cwd: "/fixture", conversationID: UUID().uuidString.lowercased())
+        }
+        var members = ["lead", "a", "a1", "a2", "b", "b1", "b2"].map(member)
+        members[2].parentMemberID = members[1].id; members[3].parentMemberID = members[1].id
+        members[5].parentMemberID = members[4].id; members[6].parentMemberID = members[4].id
+        let group = SessionGroup(name: "fixture", members: members, leaderMemberID: members[0].id)
+        let order = group.treeOrder.map { (id: $0.member.id, depth: $0.depth) }
+        let big = Dictionary(uniqueKeysWithValues: members.enumerated().map { ($1.id, $0 % 2 == 0 ? 52.0 : 28.0) })
+        func overlaps(_ points: [UUID: CGPoint]) -> [String] {
+            var found: [String] = []
+            let ids = Array(points.keys)
+            for i in ids.indices { for j in ids.indices where j > i {
+                let first = SessionGroupGraph.nodeArea(points[ids[i]]!, radius: (big[ids[i]] ?? 32) / 2)
+                let second = SessionGroupGraph.nodeArea(points[ids[j]]!, radius: (big[ids[j]] ?? 32) / 2)
+                if first.intersects(second) { found.append("\(i)-\(j)") }
+            } }
+            return found
+        }
+        for layout in SessionGroupGraph.Layout.allCases {
+            let points = SessionGroupGraph.positions(order, hasLeader: true, layout: layout, diameters: big)
+            try expectEqual(overlaps(points), [], "No two nodes overlap in the \(layout) layout")
+            try expectEqual(points, SessionGroupGraph.positions(order, hasLeader: true, layout: layout, diameters: big),
+                            "The same sizes give the same positions in the \(layout) layout")
+        }
+        let standard = SessionGroupGraph.positions(order, hasLeader: true, layout: .tree)
+        let widened = SessionGroupGraph.positions(order, hasLeader: true, layout: .tree, diameters: big)
+        try expectEqual(standard[members[1].id]!.y - standard[members[0].id]!.y, 104, "32pt circles keep 104pt layers")
+        // The leader layer and the next layer both hold a 52pt circle: 26 + 26 + 46 + 26.
+        try expectEqual(widened[members[1].id]!.y - widened[members[0].id]!.y, 124, "A layer of large circles moves the next layer down")
+        let leaves = [members[2].id, members[3].id].map { widened[$0]!.x }
+        try expectEqual(leaves[1] - leaves[0], 144 + 20, "Leaves in a layer with a 52pt circle are 20pt further apart")
+        let small = Dictionary(uniqueKeysWithValues: members.map { ($0.id, 28.0) })
+        try expectEqual(SessionGroupGraph.positions(order, hasLeader: true, layout: .tree, diameters: small), standard,
+                        "Small circles never pull the layout tighter than the standard spacing")
+        let ring = SessionGroupGraph.positions(order, hasLeader: true, layout: .circle, diameters: big)
+        let first = group.treeOrder[1].member.id
+        try expectEqual(hypot(ring[first]!.x, ring[first]!.y), 180, "The ring radius grows by the largest circle's extra 20pt")
+        guard let line = SessionGroupGraph.geometry(from: .zero, to: CGPoint(x: 200, y: 0), width: 1.5, bend: 1, startRadius: 26, endRadius: 14)
+        else { throw AppError.message("geometry missing") }
+        try expectEqual(hypot(line.start.x, line.start.y).rounded(), 32, "A line starts 6pt outside a 52pt circle")
+        try expectEqual(hypot(line.tip.x - 200, line.tip.y).rounded(), 20, "A line ends 6pt outside a 28pt circle")
+        try expectEqual(SessionGroupGraph.markClearance(radius: 26), 13, "The mark room grows with the circle")
+        let frame = SessionGroupGraph.frame(widened, largestDiameter: 52)
+        try expectEqual(frame.points.values.map(\.y).min(), SessionGroupGraph.topMargin + 10, "The top margin grows with the largest circle")
+    }
+
     func testGraphAccessibilityValueDescribesRelations() throws {
         let a = UUID(), b = UUID(), c = UUID()
         let edges: [SessionGroupGraph.Edge] = [.init(from: a, to: b, kind: .recent, count: 3, pendingQuestions: 0),
                                                .init(from: c, to: a, kind: .pendingQuestion, count: 2, pendingQuestions: 2)]
         let value = SessionGroupGraph.accessibilityValue(member: a, status: SessionGroupGraph.status(phase: .working, blocked: true),
                                                          edges: edges, names: [b: "api 정리", c: "테스트 보강"])
-        try expectEqual(value, "작업 중. 보냄 api 정리 3건. 받음 테스트 보강 2건. 답을 기다리는 질문 2건. 전달 막힘")
+        try expectEqual(value, "작업 중. 주고받은 메시지 5건. 보냄 api 정리 3건. 받음 테스트 보강 2건. 답을 기다리는 질문 2건. 전달 막힘")
     }
 }
