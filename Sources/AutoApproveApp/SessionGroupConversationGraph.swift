@@ -232,8 +232,8 @@ import AutoApproveCore
         Task {
             defer { requestingNicknames = false; model.reload() }
             do {
-                let sent = try engine.requestSessionGroupNicknames(groupID: groupID, memberIDs: members)
-                nicknameNote = sent == 0 ? "이미 요청한 구성원입니다" : "닉네임 정하기를 요청했습니다"
+                let sent = try engine.requestSessionGroupNicknames(groupID: groupID, memberIDs: members, byUser: true)
+                nicknameNote = sent == 0 ? "요청할 구성원이 없습니다" : "닉네임 정하기를 요청했습니다"
             } catch { alert = GraphAlert(title: "닉네임 정하기를 요청하지 못했습니다", message: error.localizedDescription) }
         }
     }
@@ -265,7 +265,7 @@ import AutoApproveCore
                         .controlSize(.small)
                         .disabled(requestingNicknames)
                         .help(requestingNicknames ? "요청을 저장하고 있습니다."
-                              : "임시 이름(작업 폴더 · 순번)으로 보이는 구성원 \(provisional.count)명의 이름을 정해 달라고 한 번 요청합니다. 그룹장이 있으면 그룹장에게, 없으면 각 구성원에게 보냅니다.")
+                              : "임시 이름(작업 폴더 · 순번)으로 보이는 구성원 \(provisional.count)명의 이름을 정해 달라고 요청합니다. 그룹장이 있으면 그룹장에게, 없으면 각 구성원에게 보냅니다. 이름이 바뀌지 않았으면 다시 눌러 한 번 더 요청할 수 있습니다.")
                     if let nicknameNote {
                         Text(nicknameNote).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }

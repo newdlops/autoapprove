@@ -30,10 +30,18 @@ public struct SessionGroupMessage: Equatable {
 
     func terminalPrompt(senderTitle: String) -> String {
         let heading = Self.promptPrefix + id.uuidString + "] "
-        let sender = String(SessionGroupOrchestration.oneLine(senderTitle).prefix(100))
-        // The IDs let the recipient answer (answer_group_question, reply_group_question) without a lookup call.
-        let context = heading + sender + " · " + kind.rawValue + " · groupID " + groupID.uuidString +
-            " · senderMemberID " + senderID.uuidString + " · 그룹 메시지 본문 · "
+        let context: String
+        if kind == .notice {
+            // A notice comes from AutoApprove, not a member. It is stored in the recipient's own inbox, so
+            // naming the recipient as its sender made it look forged; the lookup lets the recipient verify it.
+            context = heading + "AutoApprove 알림 · notice · groupID " + groupID.uuidString +
+                " · get_group_messages(groupID, messageID: " + id.uuidString + ", includeAcknowledged: true)로 원문 확인 가능 · 본문 · "
+        } else {
+            let sender = String(SessionGroupOrchestration.oneLine(senderTitle).prefix(100))
+            // The IDs let the recipient answer (answer_group_question, reply_group_question) without a lookup call.
+            context = heading + sender + " · " + kind.rawValue + " · groupID " + groupID.uuidString +
+                " · senderMemberID " + senderID.uuidString + " · 그룹 메시지 본문 · "
+        }
         // Some native terminals can only submit one line. JSON escaping
         // preserves every line boundary without creating another keystroke.
         let body: String
@@ -52,7 +60,9 @@ public struct SessionGroupMessage: Equatable {
             groupID.uuidString + ", messageID: " + id.uuidString + ", includeAcknowledged: true)"
     }
 
-    func isReferencePrompt(_ prompt: String) -> Bool { prompt.hasSuffix(" · 그룹 메시지 본문 · " + referenceText) }
+    func isReferencePrompt(_ prompt: String) -> Bool {
+        prompt.hasSuffix(" · 그룹 메시지 본문 · " + referenceText) || prompt.hasSuffix(" · 본문 · " + referenceText)
+    }
 
     static func terminalMessageID(_ prompt: String) -> UUID? {
         guard prompt.hasPrefix(promptPrefix),

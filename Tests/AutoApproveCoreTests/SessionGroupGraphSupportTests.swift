@@ -61,6 +61,15 @@ extension ApprovalTests {
         try expect(led.allSatisfy { notices[0].text.contains($0.id.uuidString) }, "The leader's request lists every member")
         try expect(notices[0].text.contains("set_group_member_title"))
         try expectEqual(try engine.requestSessionGroupNicknames(groupID: withLeader.id, memberIDs: led.map(\.id)), 0, "Asked members are not asked again")
+        try expect(!notices[0].text.contains("\n"), "The request is one line, so it is never typed as a paste")
+        try expect(notices[0].text.contains("mcp__autoapprove__set_group_member_title") && notices[0].text.contains("ToolSearch"),
+                   "The request names the tool as Claude Code lists it and how to load it")
+        try expect(notices[0].text.contains("구성원이 추가되어"), "An automatic request says why it was sent")
+        try expectEqual(try engine.requestSessionGroupNicknames(groupID: withLeader.id, memberIDs: led.map(\.id), byUser: true), 1,
+                        "The user's button asks again even for members asked before")
+        let again = try box.list(groupID: withLeader.id, memberID: led[0].id).filter { $0.kind == .notice }
+        try expectEqual(again.count, 2)
+        try expect(again.contains { $0.text.contains("사용자가 AutoApprove 대화 그래프에서") }, "A button request says the user sent it")
         let added = member("터미널 제목 미확인")
         var grown = withLeader; grown.members.append(added)
         try SessionGroupStore(directory: directory).save([grown, peers], expected: [withLeader, peers])
