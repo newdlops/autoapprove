@@ -36,6 +36,8 @@ struct GraphNode: Equatable, Identifiable {
     /// Records on this member's lines in the "최근" and "전체" views; they set the node size.
     let recentMessages: Int
     let allMessages: Int
+    /// What the member works on, as its leader set it with the nickname.
+    var role: String? = nil
 
     func messages(_ scope: SessionGroupGraph.Scope) -> Int { scope == .recent ? recentMessages : allMessages }
     func size(_ scope: SessionGroupGraph.Scope) -> SessionGroupGraph.NodeSize { SessionGroupGraph.nodeSize(forMessages: messages(scope)) }
@@ -255,7 +257,8 @@ actor ConversationGraphReader {
                              accessibilityRecent: SessionGroupGraph.accessibilityValue(member: member.id, status: status, edges: recent, names: plainNames),
                              accessibilityAll: SessionGroupGraph.accessibilityValue(member: member.id, status: status, edges: all, names: plainNames),
                              recentMessages: SessionGroupGraph.messageCount(member: member.id, edges: recent),
-                             allMessages: SessionGroupGraph.messageCount(member: member.id, edges: all))
+                             allMessages: SessionGroupGraph.messageCount(member: member.id, edges: all),
+                             role: member.role)
         }
         let next = Content(group: group, page: page, operations: operations, names: names, nodes: nodes, recentEdges: recent, allEdges: all)
         guard next != content else { return }

@@ -144,6 +144,7 @@ final class GraphReadProbe: @unchecked Sendable {
             var member = SessionGroupMember(agent: entry.1, title: entry.3, cwd: entry.4,
                                             conversationID: UUID().uuidString.lowercased(), providerHome: "/tmp/graph-fixture-home")
             member.runtimeID = sessions[entry.0]?.id
+            if entry.0 == "doc" { member.role = "결제 API 변경에 맞춰 개발 문서와 마이그레이션 안내를 고칩니다" }
             ids[entry.0] = member.id
             members.append(member)
         }

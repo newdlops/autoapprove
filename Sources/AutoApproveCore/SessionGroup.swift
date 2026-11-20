@@ -40,6 +40,8 @@ public struct SessionGroupMember: Codable, Equatable, Identifiable, Sendable {
     public var tabShell: SessionGroupTabShell?
     /// The member that directs this one. Nil places a member directly under the leader.
     public var parentMemberID: UUID? = nil
+    /// One line on what this member works on, set with its nickname through set_group_member_title.
+    public var role: String? = nil
 
     public init(id: UUID = UUID(), agent: AgentKind, title: String, cwd: String,
                 conversationID: String, providerHome: String? = nil) {
@@ -50,7 +52,7 @@ public struct SessionGroupMember: Codable, Equatable, Identifiable, Sendable {
     /// Updating a terminal binding never changes the member's place in its group.
     public func updatingConnection(from live: SessionGroupLiveSession) -> SessionGroupMember {
         var result = live.member
-        result.id = id; result.parentMemberID = parentMemberID
+        result.id = id; result.parentMemberID = parentMemberID; result.role = role
         return result
     }
 }

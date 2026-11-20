@@ -3124,12 +3124,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return value
     }
 
-    /// Asks once for role nicknames: the leader names every listed member, or in a group without
-    /// a leader each listed member names itself. Members asked before are skipped. Returns the number
-    /// of requests queued. The request costs one short turn and only calls set_group_member_title.
+    /// Asks for nicknames and roles: the leader names every listed member, or in a group without a
+    /// leader each listed member names itself. Returns the number of requests queued; each costs one short
+    /// turn that only calls set_group_member_title. `byUser` is a press of a request button in the graph:
+    /// the user can ask again at any time, for one member or the whole group, even when names exist.
+    /// Adding members (`byUser` false) asks once per member and skips members asked before.
     @discardableResult
-    /// `byUser` is a press of the request button: it asks again even for members already asked once,
-    /// because the user can see the names did not change. Adding members asks only once (`byUser` false).
     public func requestSessionGroupNicknames(groupID: UUID, memberIDs: [UUID], byUser: Bool = false) throws -> Int {
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }) else { return 0 }
         func key(_ member: UUID) -> String { "groupNicknameRequested:\(groupID.uuidString):\(member.uuidString)" }
@@ -3137,31 +3137,48 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !targets.isEmpty else { return 0 }
         // One line per member, joined with " / " so the request stays one line and is never typed as a paste.
         func line(_ member: SessionGroupMember) -> String {
-            "memberID \(member.id.uuidString), \(member.agent.title), 작업 폴더 \(member.cwd), 지금 이름 \(member.title.isEmpty ? "(없음)" : member.title)"
+            "memberID \(member.id.uuidString), \(member.agent.title), 작업 폴더 \(member.cwd), 지금 이름 \(member.title.isEmpty ? "(없음)" : member.title), 지금 역할 \(member.role ?? "(없음)")"
         }
         // The recipient sees no tool call of its own and no user message, so the text says where the request
         // came from, which tool to use and how to load it; agents rightly refuse unexplained instructions.
-        let origin = byUser ? "사용자가 AutoApprove 대화 그래프에서 '닉네임 정하기 요청'을 눌러 보낸 요청입니다."
+        let scope = targets.count == group.members.count ? "전체 구성원" : "선택한 구성원"
+        let origin = byUser ? "사용자가 AutoApprove 대화 그래프에서 \(scope)의 이름과 역할을 다시 정해 달라고 요청했습니다."
                             : "그룹에 구성원이 추가되어 AutoApprove가 한 번 보내는 요청입니다."
-        let tool = "도구는 AutoApprove MCP 서버의 set_group_member_title(groupID, memberID, title)이고, Claude Code에서는 mcp__autoapprove__set_group_member_title입니다. 목록에 보이지 않으면 ToolSearch로 불러오세요."
-        let rule = "이름은 맡은 일을 나타내는 3~20자로 서로 겹치지 않게 짓고, 이미 맡은 일을 나타내는 이름은 그대로 둡니다. 이름을 정하는 것 말고 다른 작업은 하지 마세요."
+        let tool = "도구는 AutoApprove MCP 서버의 set_group_member_title(groupID, memberID, title, role)이고, Claude Code에서는 mcp__autoapprove__set_group_member_title입니다. 목록에 보이지 않으면 ToolSearch로 불러오세요."
+        let rule = "구성원마다 지금 하는 일을 확인해 role에 맡은 일을 한 줄(120자 이내)로 적고, title에는 그 역할을 나타내는 3~20자 이름을 서로 겹치지 않게 적습니다. 이름과 역할을 정하는 것 말고 다른 작업은 하지 마세요."
         let box = try groupMailbox()
         var requests: [(recipient: UUID, text: String)] = []
         if let leader = group.leaderMemberID, group.members.contains(where: { $0.id == leader }) {
-            requests.append((leader, "[AutoApprove 닉네임 요청] \(origin) 그룹 '\(group.name)'(groupID \(group.id.uuidString))의 아래 구성원 \(targets.count)명에게 이름을 지어 설정해 주세요. \(rule) \(tool) 대상: " + targets.map(line).joined(separator: " / ")))
+            requests.append((leader, "[AutoApprove 닉네임 요청] \(origin) 그룹 '\(group.name)'(groupID \(group.id.uuidString))의 아래 구성원 \(targets.count)명의 이름과 역할을 정해 설정해 주세요. \(rule) \(tool) 대상: " + targets.map(line).joined(separator: " / ")))
         } else {
             for member in targets {
-                requests.append((member.id, "[AutoApprove 닉네임 요청] \(origin) 그룹 '\(group.name)'(groupID \(group.id.uuidString))에서 이 세션(memberID \(member.id.uuidString))이 맡은 일을 나타내는 이름을 지어 설정해 주세요. \(rule) \(tool) 지금 정보: " + line(member)))
+                requests.append((member.id, "[AutoApprove 닉네임 요청] \(origin) 그룹 '\(group.name)'(groupID \(group.id.uuidString))에서 이 세션(memberID \(member.id.uuidString))의 이름과 역할을 정해 설정해 주세요. \(rule) \(tool) 지금 정보: " + line(member)))
             }
         }
         for request in requests {
             _ = try box.enqueue(groupID: group.id, senderID: request.recipient, recipientID: request.recipient, kind: .notice, text: request.text)
         }
         for member in targets { try store.set(key(member.id), String(Date().timeIntervalSince1970)) }
-        log(AuditEvent(sessionID: "", summary: "세션 그룹 '\(group.name)' 닉네임 요청", outcome: "구성원 \(targets.count)명의 이름 정하기 요청",
+        log(AuditEvent(sessionID: "", summary: "세션 그룹 '\(group.name)' 닉네임 요청", outcome: "구성원 \(targets.count)명의 이름과 역할 정하기 요청",
                        source: "세션 그룹", tool: "set_group_member_title"))
         scheduleGroupMailboxDelivery()
         return requests.count
+    }
+
+    /// Stores the role a leader set with a nickname. Retries on a concurrent edit of the group store.
+    private func setGroupMemberRole(groupID: UUID, memberID: UUID, role: String) throws {
+        let store = SessionGroupStore(directory: paths.directory)
+        for _ in 0..<3 {
+            let latest = try store.load()
+            guard let gi = latest.firstIndex(where: { $0.id == groupID }),
+                  let mi = latest[gi].members.firstIndex(where: { $0.id == memberID }) else {
+                throw AppError.message("역할을 저장할 구성원을 찾지 못했습니다.")
+            }
+            guard latest[gi].members[mi].role != role else { return }
+            var next = latest; next[gi].members[mi].role = role
+            do { try store.save(next, expected: latest); publish(); return } catch { continue }
+        }
+        throw AppError.message("그룹 정보가 계속 바뀌어 역할을 저장하지 못했습니다.")
     }
 
     public func queueSessionGroupMessage(groupID: UUID, senderID: UUID, recipientID: UUID,
@@ -4560,9 +4577,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let host = ScreenHost(kind: session.terminal), let write = screenAdapters[host]?.setTabLabel else { throw RemoteHTTPError(501, "탭 이름·색상 표식 변경은 Terminal과 iTerm2에서 지원합니다.") }
             var customization = session.customization ?? .init()
             let title: String
+            var role: String?
             if tool == "set_group_member_title" {
                 guard let value = object["title"] as? String else { throw RemoteHTTPError(400, "새 탭 이름 title을 지정해주세요.") }
                 title = value
+                if let value = object["role"] as? String {
+                    let line = SessionGroupOrchestration.oneLine(value).trimmingCharacters(in: .whitespaces)
+                    guard (1...120).contains(line.count) else { throw RemoteHTTPError(400, "role은 한 줄로 1~120자로 적어주세요.") }
+                    role = line
+                }
             } else {
                 guard let color = object["color"] as? String, color == "default" || SessionColor(rawValue: color) != nil else { throw RemoteHTTPError(400, "탭 색상을 지정해주세요. red·orange·yellow·green·blue·purple·gray·default를 지원합니다.") }
                 title = customization.title.isEmpty ? TerminalTabLabel.baseTitle(session.terminalTitle ?? member.title) : customization.title
@@ -4583,8 +4606,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             customization.title = label.title
             do { try setCustomization(session.id, value: customization) }
             catch { throw RemoteHTTPError(500, "원래 탭 이름은 변경했지만 표시 설정을 저장하지 못했습니다. " + error.localizedDescription, diagnostics: ["nativeApplied": "true"]) }
+            if let role {
+                do { try setGroupMemberRole(groupID: groupID, memberID: memberID, role: role) }
+                catch { throw RemoteHTTPError(500, "탭 이름은 변경했지만 역할을 저장하지 못했습니다. " + error.localizedDescription, diagnostics: ["nativeApplied": "true"]) }
+            }
             return ["groupID": groupID.uuidString, "memberID": memberID.uuidString, "conversationID": live.conversationID as Any? ?? NSNull(),
-                    "applied": true, "verified": true, "title": label.title, "tabTitle": actual,
+                    "applied": true, "verified": true, "title": label.title, "role": role as Any? ?? NSNull(), "tabTitle": actual,
                     "color": label.color as Any? ?? NSNull(), "colorMode": "title_marker", "transport": "local_terminal", "networkRequired": false]
         case "clear_session_group", "clear_group_member", "get_group_clear_status":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)) else { throw RemoteHTTPError(400, "groupID를 지정해주세요.") }
@@ -4686,7 +4713,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let members: [JSONObject] = group.members.map { member in
                     let live = SessionGroupMatching.match(member, in: observed)
                     let unresolved = live == nil ? SessionGroupMatching.connection(member, in: observed) : nil
-                    return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title,
+                    return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "role": member.role as Any? ?? NSNull(),
                             "cwd": member.cwd, "conversationID": member.conversationID,
                             "providerHome": member.providerHome as Any? ?? NSNull(), "connected": live != nil,
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
@@ -4723,7 +4750,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let members: [JSONObject] = group.treeOrder.map { entry in
                     let member = entry.member, live = SessionGroupMatching.match(member, in: observed)
                     let phase = live.flatMap { sessions[$0.id]?.phase }
-                    return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "cwd": member.cwd,
+                    return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "role": member.role as Any? ?? NSNull(), "cwd": member.cwd,
                             "claudeStatus": live.flatMap { memberStatuses[$0.id] } as Any? ?? NSNull(),
                             "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
                             "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),

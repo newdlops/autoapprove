@@ -233,8 +233,22 @@ import AutoApproveCore
             defer { requestingNicknames = false; model.reload() }
             do {
                 let sent = try engine.requestSessionGroupNicknames(groupID: groupID, memberIDs: members, byUser: true)
-                nicknameNote = sent == 0 ? "요청할 구성원이 없습니다" : "닉네임 정하기를 요청했습니다"
-            } catch { alert = GraphAlert(title: "닉네임 정하기를 요청하지 못했습니다", message: error.localizedDescription) }
+                nicknameNote = sent == 0 ? "요청할 구성원이 없습니다"
+                    : (members.count == 1 ? "이 구성원의 이름과 역할을 다시 정해 달라고 요청했습니다" : "전체 구성원의 이름과 역할을 다시 정해 달라고 요청했습니다")
+            } catch { alert = GraphAlert(title: "이름 다시 정하기를 요청하지 못했습니다", message: error.localizedDescription) }
+        }
+    }
+
+    /// Who receives a rename request, for the button help: the leader names everyone, or members name themselves.
+    private func renameRecipient(_ content: ConversationGraphModel.Content) -> String {
+        content.nodes.contains(where: \.isLeader) ? "그룹장에게" : "각 구성원에게"
+    }
+
+    private func nicknameNoteView() -> some View {
+        Group {
+            if let nicknameNote {
+                Text(nicknameNote).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
         }
     }
 
@@ -253,22 +267,19 @@ import AutoApproveCore
     }
 
     private func memberList(_ content: ConversationGraphModel.Content) -> some View {
-        let provisional = content.provisionalMembers
         return VStack(alignment: .leading, spacing: 8) {
             Text("구성원을 고르면 대화 기록을 봅니다")
                 .font(.caption).foregroundStyle(.secondary)
                 .padding(.horizontal, 16).padding(.top, 12)
-            if !provisional.isEmpty {
-                HStack(spacing: 8) {
-                    Button("닉네임 정하기 요청") { requestNicknames(provisional) }
+            if !content.nodes.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Button("전체 다시 정하기") { requestNicknames(content.nodes.map(\.id)) }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(requestingNicknames)
                         .help(requestingNicknames ? "요청을 저장하고 있습니다."
-                              : "임시 이름(작업 폴더 · 순번)으로 보이는 구성원 \(provisional.count)명의 이름을 정해 달라고 요청합니다. 그룹장이 있으면 그룹장에게, 없으면 각 구성원에게 보냅니다. 이름이 바뀌지 않았으면 다시 눌러 한 번 더 요청할 수 있습니다.")
-                    if let nicknameNote {
-                        Text(nicknameNote).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                    }
+                              : "구성원 \(content.nodes.count)명의 이름과 역할을 지금 하는 일에 맞게 다시 정해 달라고 \(renameRecipient(content)) 요청합니다. 언제든 다시 요청할 수 있습니다.")
+                    nicknameNoteView()
                 }
                 .padding(.horizontal, 16)
             }
@@ -332,6 +343,17 @@ import AutoApproveCore
                     Text(node.status.title).foregroundStyle(statusColor(node.status))
                     Text("\(node.agent.title) · \(node.isLeader ? "그룹장" : "구성원")")
                         .font(.caption).foregroundStyle(.secondary)
+                    if let role = node.role {
+                        Text("역할: " + role).font(.callout).lineLimit(3).padding(.top, 2).help(role)
+                    }
+                    Button("이 구성원 이름 다시 정하기") { requestNicknames([node.id]) }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(requestingNicknames)
+                        .padding(.top, 6)
+                        .help(requestingNicknames ? "요청을 저장하고 있습니다."
+                              : "이 구성원의 이름과 역할을 지금 하는 일에 맞게 다시 정해 달라고 \(renameRecipient(content)) 요청합니다. 언제든 다시 요청할 수 있습니다.")
+                    nicknameNoteView()
                 }
                 .padding(.leading, inset).padding(.trailing, 16).padding(.top, 8).padding(.bottom, 12)
                 Divider()

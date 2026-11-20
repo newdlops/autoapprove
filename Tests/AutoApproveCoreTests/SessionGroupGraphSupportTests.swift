@@ -70,6 +70,18 @@ extension ApprovalTests {
         let again = try box.list(groupID: withLeader.id, memberID: led[0].id).filter { $0.kind == .notice }
         try expectEqual(again.count, 2)
         try expect(again.contains { $0.text.contains("사용자가 AutoApprove 대화 그래프에서") }, "A button request says the user sent it")
+        try expect(again.allSatisfy { $0.text.contains("set_group_member_title(groupID, memberID, title, role)") && $0.text.contains("지금 역할") },
+                   "The request asks for a role with each name and shows the current one")
+        try expectEqual(try engine.requestSessionGroupNicknames(groupID: withLeader.id, memberIDs: [led[2].id], byUser: true), 1,
+                        "One member can be asked again even though it already has a real name")
+        let single = try box.list(groupID: withLeader.id, memberID: led[0].id).filter { $0.kind == .notice }
+        try expect(single.contains { $0.text.contains("선택한 구성원") && $0.text.contains(led[2].id.uuidString) && !$0.text.contains(led[1].id.uuidString) })
+        // A stored role survives the group store, and groups saved before roles existed still load.
+        var roled = withLeader; roled.members[2].role = "결제 PR 리뷰와 머지 판단"
+        let roleStore = SessionGroupStore(directory: directory.appendingPathComponent("roles"))
+        try roleStore.save([roled])
+        try expectEqual(try roleStore.load().first?.members[2].role, "결제 PR 리뷰와 머지 판단")
+        try expectNil(try roleStore.load().first?.members[0].role)
         let added = member("터미널 제목 미확인")
         var grown = withLeader; grown.members.append(added)
         try SessionGroupStore(directory: directory).save([grown, peers], expected: [withLeader, peers])
