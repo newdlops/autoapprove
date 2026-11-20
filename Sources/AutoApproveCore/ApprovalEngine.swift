@@ -3135,28 +3135,47 @@ private struct ScreenAnalysisStorageKey: Hashable {
         func key(_ member: UUID) -> String { "groupNicknameRequested:\(groupID.uuidString):\(member.uuidString)" }
         let targets = group.members.filter { member in memberIDs.contains(member.id) && (byUser || store.value(key(member.id)) == nil) }
         guard !targets.isEmpty else { return 0 }
-        // One line per member, joined with " / " so the request stays one line and is never typed as a paste.
-        func line(_ member: SessionGroupMember) -> String {
-            "memberID \(member.id.uuidString), \(member.agent.title), 작업 폴더 \(member.cwd), 지금 이름 \(member.title.isEmpty ? "(없음)" : member.title), 지금 역할 \(member.role ?? "(없음)")"
-        }
-        // The recipient sees no tool call of its own and no user message, so the text says where the request
-        // came from, which tool to use and how to load it; agents rightly refuse unexplained instructions.
-        let scope = targets.count == group.members.count ? "전체 구성원" : "선택한 구성원"
-        let origin = byUser ? "사용자가 AutoApprove 대화 그래프에서 \(scope)의 이름과 역할을 다시 정해 달라고 요청했습니다."
-                            : "그룹에 구성원이 추가되어 AutoApprove가 한 번 보내는 요청입니다."
-        let tool = "도구는 AutoApprove MCP 서버의 set_group_member_title(groupID, memberID, title, role)이고, Claude Code에서는 mcp__autoapprove__set_group_member_title입니다. 목록에 보이지 않으면 ToolSearch로 불러오세요."
-        let rule = "구성원마다 지금 하는 일을 확인해 role에 맡은 일을 한 줄(120자 이내)로 적고, title에는 그 역할을 나타내는 3~20자 이름을 서로 겹치지 않게 적습니다. 이름과 역할을 정하는 것 말고 다른 작업은 하지 마세요."
         let box = try groupMailbox()
-        var requests: [(recipient: UUID, text: String)] = []
-        if let leader = group.leaderMemberID, group.members.contains(where: { $0.id == leader }) {
-            requests.append((leader, "[AutoApprove 닉네임 요청] \(origin) 그룹 '\(group.name)'(groupID \(group.id.uuidString))의 아래 구성원 \(targets.count)명의 이름과 역할을 정해 설정해 주세요. \(rule) \(tool) 대상: " + targets.map(line).joined(separator: " / ")))
+        var requests: [(recipient: UUID, text: String, sourceKey: String?)] = []
+        let leader = group.leaderMemberID.flatMap { id in group.members.contains(where: { $0.id == id }) ? id : nil }
+        let howTo = "role에는 맡은 일을 한 줄(120자 이내)로, title에는 그 역할을 나타내는 3~20자 이름을 서로 겹치지 않게 적어. "
+            + "도구는 AutoApprove MCP의 set_group_member_title(groupID, memberID, title, role)이고 Claude Code에서는 mcp__autoapprove__set_group_member_title이야. 안 보이면 ToolSearch로 불러와. "
+            + "이름과 역할 설정 말고 다른 작업은 하지 마."
+        if byUser {
+            // The user pressed a button for this, so it is typed as the user's own short request; the text says
+            // which button sent it. Members, IDs and current names come from get_group_status, keeping it short.
+            let button = targets.count == 1 ? "'이 구성원 이름 다시 정하기'" : "'전체 다시 정하기'"
+            let scope = targets.count == 1
+                ? "구성원 '\(targets[0].title)'(memberID \(targets[0].id.uuidString)) 한 명의"
+                : "구성원 \(targets.count)명의"
+            if let leader {
+                requests.append((leader, "AutoApprove 대화 그래프에서 \(button) 버튼을 눌러 보내는 내 요청이야. 그룹 '\(group.name)'(groupID \(group.id.uuidString)) \(scope) 이름과 역할을 지금 하는 일에 맞게 다시 정해 줘. get_group_status로 구성원 memberID와 지금 이름, 역할을 확인하고 구성원마다 설정해. " + howTo,
+                                 SessionGroupMessage.userButtonSourcePrefix + "rename:" + UUID().uuidString))
+            } else {
+                for member in targets {
+                    requests.append((member.id, "AutoApprove 대화 그래프에서 \(button) 버튼을 눌러 보내는 내 요청이야. 그룹 '\(group.name)'(groupID \(group.id.uuidString))에서 이 세션(memberID \(member.id.uuidString))의 이름과 역할을 지금 하는 일에 맞게 다시 정해 줘. get_group_status로 다른 구성원의 이름을 확인해 겹치지 않게 해. " + howTo,
+                                     SessionGroupMessage.userButtonSourcePrefix + "rename:" + UUID().uuidString))
+                }
+            }
         } else {
-            for member in targets {
-                requests.append((member.id, "[AutoApprove 닉네임 요청] \(origin) 그룹 '\(group.name)'(groupID \(group.id.uuidString))에서 이 세션(memberID \(member.id.uuidString))의 이름과 역할을 정해 설정해 주세요. \(rule) \(tool) 지금 정보: " + line(member)))
+            // Sent by AutoApprove when members are added; it stays a notice, and the recipient may decline it.
+            func line(_ member: SessionGroupMember) -> String {
+                "memberID \(member.id.uuidString), \(member.agent.title), 작업 폴더 \(member.cwd), 지금 이름 \(member.title.isEmpty ? "(없음)" : member.title), 지금 역할 \(member.role ?? "(없음)")"
+            }
+            let origin = "그룹에 구성원이 추가되어 AutoApprove가 한 번 보내는 요청입니다."
+            let tool = "도구는 AutoApprove MCP 서버의 set_group_member_title(groupID, memberID, title, role)이고, Claude Code에서는 mcp__autoapprove__set_group_member_title입니다. 목록에 보이지 않으면 ToolSearch로 불러오세요."
+            let rule = "구성원마다 지금 하는 일을 확인해 role에 맡은 일을 한 줄(120자 이내)로 적고, title에는 그 역할을 나타내는 3~20자 이름을 서로 겹치지 않게 적습니다. 이름과 역할을 정하는 것 말고 다른 작업은 하지 마세요."
+            if let leader {
+                requests.append((leader, "[AutoApprove 닉네임 요청] \(origin) 그룹 '\(group.name)'(groupID \(group.id.uuidString))의 아래 구성원 \(targets.count)명의 이름과 역할을 정해 설정해 주세요. \(rule) \(tool) 대상: " + targets.map(line).joined(separator: " / "), nil))
+            } else {
+                for member in targets {
+                    requests.append((member.id, "[AutoApprove 닉네임 요청] \(origin) 그룹 '\(group.name)'(groupID \(group.id.uuidString))에서 이 세션(memberID \(member.id.uuidString))의 이름과 역할을 정해 설정해 주세요. \(rule) \(tool) 지금 정보: " + line(member), nil))
+                }
             }
         }
         for request in requests {
-            _ = try box.enqueue(groupID: group.id, senderID: request.recipient, recipientID: request.recipient, kind: .notice, text: request.text)
+            _ = try box.enqueue(groupID: group.id, senderID: request.recipient, recipientID: request.recipient, kind: .notice,
+                                text: request.text, sourceKey: request.sourceKey)
         }
         for member in targets { try store.set(key(member.id), String(Date().timeIntervalSince1970)) }
         log(AuditEvent(sessionID: "", summary: "세션 그룹 '\(group.name)' 닉네임 요청", outcome: "구성원 \(targets.count)명의 이름과 역할 정하기 요청",

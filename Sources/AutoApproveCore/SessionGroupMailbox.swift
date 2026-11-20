@@ -28,7 +28,15 @@ public struct SessionGroupMessage: Equatable {
     /// prompt commits it. No kind relies on an agent ACK followed by reminders.
     var deliversBody: Bool { true }
 
+    /// A request the user sent with a button in AutoApprove. It is the user's own input, typed for them,
+    /// so it carries no relay header; agents rightly refuse to take a relayed notice as the user's word.
+    static let userButtonSourcePrefix = "userButton:"
+    private static let userButtonMarker = " (AutoApprove 요청 ID "
+    var isUserButtonInput: Bool { kind == .notice && sourceKey?.hasPrefix(Self.userButtonSourcePrefix) == true }
+
     func terminalPrompt(senderTitle: String) -> String {
+        // The trailing ID lets the receipt check find the prompt in the conversation like a header does.
+        if isUserButtonInput { return SessionGroupOrchestration.oneLine(text) + Self.userButtonMarker + id.uuidString + ")" }
         let heading = Self.promptPrefix + id.uuidString + "] "
         let context: String
         if kind == .notice {
@@ -65,6 +73,10 @@ public struct SessionGroupMessage: Equatable {
     }
 
     static func terminalMessageID(_ prompt: String) -> UUID? {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasSuffix(")"), let marker = trimmed.range(of: userButtonMarker, options: .backwards) {
+            return UUID(uuidString: String(trimmed[marker.upperBound..<trimmed.index(before: trimmed.endIndex)]))
+        }
         guard prompt.hasPrefix(promptPrefix),
               let end = prompt.firstIndex(of: "]") else { return nil }
         return UUID(uuidString: String(prompt[prompt.index(prompt.startIndex, offsetBy: promptPrefix.count)..<end]))

@@ -69,13 +69,19 @@ extension ApprovalTests {
                         "The user's button asks again even for members asked before")
         let again = try box.list(groupID: withLeader.id, memberID: led[0].id).filter { $0.kind == .notice }
         try expectEqual(again.count, 2)
-        try expect(again.contains { $0.text.contains("사용자가 AutoApprove 대화 그래프에서") }, "A button request says the user sent it")
-        try expect(again.allSatisfy { $0.text.contains("set_group_member_title(groupID, memberID, title, role)") && $0.text.contains("지금 역할") },
-                   "The request asks for a role with each name and shows the current one")
+        guard let button = again.first(where: { $0.sourceKey?.hasPrefix("userButton:") == true }) else {
+            throw AppError.message("The button request was not queued as the user's input")
+        }
+        try expect(button.text.contains("'전체 다시 정하기' 버튼을 눌러 보내는 내 요청"), "A button request is the user's own request and says which button sent it")
+        try expect(!button.text.contains("[AutoApprove"), "A button request has no relay header: \(button.text)")
+        try expect(button.text.contains("get_group_status") && !button.text.contains(led[1].id.uuidString),
+                   "Members are looked up instead of listed, keeping the typed request short")
+        try expect(button.text.count < 700, "The typed request stays short (\(button.text.count) characters)")
+        try expect(again.allSatisfy { $0.text.contains("set_group_member_title(groupID, memberID, title, role)") }, "Every request asks for a role with the name")
         try expectEqual(try engine.requestSessionGroupNicknames(groupID: withLeader.id, memberIDs: [led[2].id], byUser: true), 1,
                         "One member can be asked again even though it already has a real name")
         let single = try box.list(groupID: withLeader.id, memberID: led[0].id).filter { $0.kind == .notice }
-        try expect(single.contains { $0.text.contains("선택한 구성원") && $0.text.contains(led[2].id.uuidString) && !$0.text.contains(led[1].id.uuidString) })
+        try expect(single.contains { $0.text.contains("'이 구성원 이름 다시 정하기'") && $0.text.contains(led[2].id.uuidString) && !$0.text.contains(led[1].id.uuidString) })
         // A stored role survives the group store, and groups saved before roles existed still load.
         var roled = withLeader; roled.members[2].role = "결제 PR 리뷰와 머지 판단"
         let roleStore = SessionGroupStore(directory: directory.appendingPathComponent("roles"))

@@ -185,6 +185,50 @@ extension ApprovalTests {
         try expect(terminal.typed[0].contains("fixture held for busy"))
     }
 
+    /// A rename request from the graph button is typed as the user's own short request, with no relay
+    /// header, and the trailing request ID still lets the observed prompt count as its receipt.
+    @MainActor func testGroupRenameButtonTypesUserRequestWithReceipt() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp/aa-rename-" + UUID().uuidString.prefix(8))
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("""
+        104601 1 fixture601 104601 104601 Wed Oct 28 12:00:00 2026 /fixture/claude
+        104602 1 fixture602 104602 104602 Wed Oct 28 12:00:00 2026 /fixture/claude
+        """)
+        let sessions = records.map { AgentSession(id: $0.key, agent: .claude, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/fixture", terminal: .iterm) }
+        let ids = Dictionary(uniqueKeysWithValues: records.map { ($0.pid, UUID().uuidString) })
+        let writer = GroupTerminalWriter(), terminal = GroupLineTerminal()
+        terminal.needsEnter = false
+        let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
+            rows.map { .init(processID: $0.key, kind: "interactive", sessionID: ids[$0.pid], status: terminal.status($0.pid)) }
+        }
+        let rule = String(repeating: "─", count: 30)
+        for session in sessions { writer.show("answer\n\(rule)\n❯ \n\(rule)\nuser@host project (main) | fixture status line", on: session.tty) }
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: writer.screen($0.tty)) }) },
+            approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { _,_,_,_ in .missingTarget })
+        adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.iterm: adapter], isolateByDefault: true)
+        defer { engine.stop() }
+        engine.groupMailboxPollInterval = 0.05
+        for record in records { terminal.setStatus(record.pid, "idle") }
+        engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
+        let live = try await engine.sessionGroupSessions()
+        let members = try sessions.map { session in try unwrapGroup(live.first { $0.id == session.id }).member }
+        let group = SessionGroup(name: "fixture rename", members: members, leaderMemberID: members[0].id)
+        try SessionGroupStore(directory: directory).save([group])
+        let box = try SessionGroupMailbox(directory: directory)
+        try expectEqual(try engine.requestSessionGroupNicknames(groupID: group.id, memberIDs: members.map(\.id), byUser: true), 1)
+        let request = try unwrapGroup(try box.list(groupID: group.id, memberID: members[0].id).first { $0.kind == .notice })
+        try expect(try await waitForGroup(5) { (try? box.message(request.id)?.lastResult) == "direct_submitted" })
+        let typed = try unwrapGroup(terminal.typed.last)
+        try expect(typed.hasPrefix("AutoApprove 대화 그래프에서 '전체 다시 정하기' 버튼을 눌러 보내는 내 요청이야."), "Typed as the user's request: \(typed)")
+        try expect(!typed.contains("[AutoApprove 그룹 전달") && !typed.contains("senderMemberID"), "No relay header")
+        try expect(typed.hasSuffix("(AutoApprove 요청 ID " + request.id.uuidString + ")"))
+        _ = engine.handleHook(["hook_event_name": "UserPromptSubmit", "session_id": ids[records[0].pid]!, "requestID": UUID().uuidString,
+                               "agentPID": records[0].pid, "agentStarted": records[0].started, "prompt": typed])
+        try expectEqual(try box.message(request.id)?.lastResult, "observed", "The observed prompt is the receipt, so it is never typed again")
+        try expectEqual(terminal.typed.count, 1)
+    }
+
     func testSessionGroupTerminalStatusRequiresFreshCard() throws {
         let old = UUID().uuidString.lowercased(), next = UUID().uuidString.lowercased()
         func card(_ id: String) -> String {

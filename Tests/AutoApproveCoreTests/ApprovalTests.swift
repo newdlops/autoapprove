@@ -555,6 +555,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: Claude composer separates custom status from drafts",tests.testClaudeMailboxComposerSeparatesCustomStatusFromDrafts),
             ("Session groups: Claude mailbox retries after busy with custom status",tests.testGroupClaudeMailboxCustomStatus),
             ("Session groups: held message waits for recipient idle without a hook",tests.testGroupMailboxWaitsForRecipientIdleWithoutHook),
+            ("Session groups: rename button types the user's request with a receipt",tests.testGroupRenameButtonTypesUserRequestWithReceipt),
             ("Session groups: exact conversation identity validation",tests.testSessionGroupIdentityValidation),
             ("Session groups: Codex MCP metadata instead of shared PID",tests.testCodexGroupMCPMetadata),
             ("MCP: process language follows UTF-8 environment or macOS preference",tests.testMCPProcessLanguageEnvironment),
