@@ -1,4 +1,5 @@
 import SwiftUI
+import QuartzCore
 import AutoApproveCore
 
 @MainActor struct SessionGroupConversationGraph: View {
@@ -15,6 +16,7 @@ import AutoApproveCore
     @State private var deliveryFeedback: String?
     @State private var deliveryError: String?
     @State private var movedNodes: [UUID: CGPoint] = [:]
+    @State private var isDraggingNode = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -32,6 +34,7 @@ import AutoApproveCore
                 .accessibilityLabel("그래프에 표시할 질문")
                 .pickerStyle(.segmented)
                 .frame(width: 160)
+                .help("미응답은 답변을 기다리는 질문의 연결만 표시합니다. 전체는 저장된 대화의 연결을 모두 표시합니다.")
                 Button("새로고침", systemImage: "arrow.clockwise", action: refresh)
                     .labelStyle(.iconOnly)
                     .help("질문과 답변 상태 새로고침")
@@ -59,21 +62,33 @@ import AutoApproveCore
                 } else {
                     HStack(spacing: 0) {
                         VStack(alignment: .leading, spacing: 0) {
-                            HStack {
-                                Label("발신 → 수신", systemImage: "arrow.right")
-                                Text("노드를 드래그해 이동")
-                                Spacer()
-                                Label { Text("미응답") } icon: { Image(systemName: "circle.fill").foregroundStyle(.orange) }
-                                if !onlyPending { Label("기타 기록", systemImage: "circle.fill") }
-                                Button("배치 초기화", systemImage: "arrow.counterclockwise") { movedNodes.removeAll() }
-                                    .labelStyle(.iconOnly)
-                                    .help("노드 자동 배치로 돌아가기")
-                                    .disabled(movedNodes.isEmpty)
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack {
+                                    Label("발신 → 수신", systemImage: "arrow.right")
+                                        .help("화살표는 질문이나 메시지를 보낸 구성원에서 받은 구성원을 가리킵니다. 두꺼운 선은 기록이 더 많다는 뜻입니다.")
+                                    Text("노드를 드래그해 이동")
+                                        .help("노드를 누른 채 끌면 연결선이 따라옵니다. 클릭하면 해당 구성원의 대화를 봅니다.")
+                                    Spacer()
+                                    Button("배치 초기화", systemImage: "arrow.counterclockwise") { movedNodes.removeAll() }
+                                        .labelStyle(.iconOnly)
+                                        .help("노드 자동 배치로 돌아가기")
+                                        .disabled(movedNodes.isEmpty)
+                                }
+                                HStack(spacing: 12) {
+                                    legend(AgentKind.codex.title, color: AgentKind.codex.graphColor)
+                                    legend(AgentKind.claude.title, color: AgentKind.claude.graphColor)
+                                    if group.members.contains(where: { $0.agent == .shell }) {
+                                        legend(AgentKind.shell.title, color: AgentKind.shell.graphColor)
+                                    }
+                                    Spacer(minLength: 0)
+                                    legend("미응답 연결", color: .orange)
+                                        .help("주황색 연결선에는 아직 답변되지 않은 질문이 있습니다. 다른 연결선은 발신 노드의 색을 사용합니다.")
+                                }
                             }
                             .font(.caption).foregroundStyle(.secondary).padding(12)
                             Divider()
                             GroupConversationNodes(group: group, page: page, onlyPending: onlyPending,
-                                                   selection: $selected, movedNodes: $movedNodes)
+                                                   selection: $selected, movedNodes: $movedNodes, isDragging: $isDraggingNode)
                         }
                         .frame(minWidth: 390, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         Divider()
@@ -120,10 +135,14 @@ import AutoApproveCore
         } message: { Text($0) }
         .task {
             while !Task.isCancelled {
-                refresh()
+                if !isDraggingNode { refresh() }
                 do { try await Task.sleep(for: .seconds(6)) } catch { return }
             }
         }
+    }
+
+    private func legend(_ title: String, color: Color) -> some View {
+        Label { Text(title) } icon: { Image(systemName: "circle.fill").foregroundStyle(color) }
     }
 
     private func deliver(_ item: SessionGroupConversation) {
@@ -205,7 +224,9 @@ import AutoApproveCore
                                                 Spacer(minLength: 4)
                                                 Button("노드에 전달…") { deliveryTarget = item }
                                                     .disabled(deliveringQuestion != nil)
+                                                    .help("원래 질문을 지정 수신자의 터미널에 제출합니다. 대상의 빈 입력창을 확인한 뒤 전달합니다.")
                                                 Button("답변…") { replyTarget = item }
+                                                    .help("질문을 받은 구성원 대신 답변을 작성해 원래 질문자에게 보냅니다.")
                                             }
                                             .buttonStyle(.bordered)
                                             .controlSize(.small)
@@ -351,24 +372,31 @@ private struct GroupConversationReplyEditor: View {
     }
 }
 
-// Only the moving node and its incident edges observe pointer updates.
-@Observable private final class ConversationNodeMotion {
-    var point: CGPoint?
+private extension AgentKind {
+    var graphColor: Color {
+        switch self {
+        case .codex: .blue
+        case .claude: .purple
+        case .shell: .gray
+        }
+    }
 }
 
-private struct GroupConversationNodes: View {
+@MainActor private struct GroupConversationNodes: View {
     let group: SessionGroup
     let page: SessionGroupConversationPage
     let onlyPending: Bool
     @Binding var selection: UUID?
     @Binding var movedNodes: [UUID: CGPoint]
+    @Binding var isDragging: Bool
+    @Environment(\.colorScheme) private var colorScheme
     @State private var layout: [UUID: CGPoint] = [:]
-    @State private var motion = ConversationNodeMotion()
+    @State private var deferredLayout: [UUID: CGPoint]?
+    @State private var preview = ConversationDragPreview()
     @State private var movingNode: UUID?
     @GestureState private var dragging = false
     @State private var dragOrigin: CGPoint?
 
-    private static let palette: [Color] = [.blue, .purple, .teal, .pink, .green, .indigo, .cyan, .mint]
     private struct Flow {
         var count = 0
         var pending = 0
@@ -376,7 +404,9 @@ private struct GroupConversationNodes: View {
     private struct Edge {
         let link: ConversationGraphLayout.Link
         let color: Color
+        let active: Bool
         let count: Int
+        var width: CGFloat { 1 + min(4, log2(CGFloat(count) + 1) * 0.65) }
 
         func touches(_ id: UUID?) -> Bool { link.from == id || link.to == id }
     }
@@ -386,11 +416,11 @@ private struct GroupConversationNodes: View {
         let ids = members.map(\.id)
         let flows = flows(for: Set(ids))
         let topology = ConversationGraphLayout(members: ids, links: Set(flows.keys.map(\.undirected)))
-        let colors = memberColors(members)
+        let colors = Dictionary(uniqueKeysWithValues: members.map { ($0.id, $0.agent.graphColor) })
         let edges = flows.keys.sorted().compactMap { link -> Edge? in
             guard let flow = flows[link], !onlyPending || flow.pending > 0 else { return nil }
             let color = flow.pending > 0 ? Color.orange : colors[link.from, default: .secondary]
-            return Edge(link: link, color: color.opacity(selection == nil || link.from == selection || link.to == selection ? 0.78 : 0.12),
+            return Edge(link: link, color: color, active: selection == nil || link.from == selection || link.to == selection,
                         count: onlyPending ? flow.pending : flow.count)
         }
         GeometryReader { proxy in
@@ -405,35 +435,22 @@ private struct GroupConversationNodes: View {
             }
             ScrollView([.horizontal, .vertical]) {
                 ZStack(alignment: .topLeading) {
-                    EdgeLayer(edges: edges.filter { !$0.touches(movingNode) }, points: points)
-                    if let movingNode {
-                        EdgeLayer(edges: edges.filter { $0.touches(movingNode) }, points: points,
-                                  movingNode: movingNode, motion: motion)
+                    Canvas { context, _ in
+                        for edge in edges where !edge.touches(movingNode) {
+                            guard let from = points[edge.link.from], let to = points[edge.link.to],
+                                  let path = Self.edgePath(from, to) else { continue }
+                            context.stroke(path, with: .color(edge.color.opacity(edge.active ? 0.78 : 0.12)),
+                                           style: StrokeStyle(lineWidth: edge.width, lineCap: .round))
+                        }
                     }
+                    .accessibilityHidden(true)
+                    .allowsHitTesting(false)
                     ForEach(members) { member in
                         if let point = points[member.id] {
+                            let label = nodeLabel(member, highlighted: selection == member.id)
                             Button { selection = member.id } label: {
-                                VStack(spacing: 3) {
-                                    let color = colors[member.id, default: .blue]
-                                    ZStack {
-                                        Circle().fill(color.opacity(0.83))
-                                        Image(systemName: group.isLeader(member.id) ? "crown.fill" : "person.fill")
-                                            .font(.system(size: 12, weight: .semibold))
-                                            .foregroundStyle(.white)
-                                    }
-                                    .frame(width: 32, height: 32)
-                                    .padding(3)
-                                    .overlay {
-                                        Circle().strokeBorder(selection == member.id ? Color.primary : .clear, lineWidth: 2)
-                                    }
-                                    Text(member.title)
-                                        .font(.caption.weight(selection == member.id ? .semibold : .regular))
-                                        .lineLimit(1)
-                                        .padding(.horizontal, 4)
-                                        .background(Color(nsColor: .windowBackgroundColor).opacity(0.92), in: Capsule())
-                                }
-                                .frame(width: 128, height: 61, alignment: .top)
-                                .contentShape(Rectangle())
+                                label.opacity(movingNode == member.id ? 0.15 : 1)
+                                    .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel(member.title + ", " + member.agent.title)
@@ -454,39 +471,58 @@ private struct GroupConversationNodes: View {
                                 .onChanged { value in
                                     if dragOrigin == nil {
                                         dragOrigin = point
-                                        movingNode = member.id
+                                        isDragging = true
+                                        let incident = edges.compactMap { edge -> ConversationDragPreview.Edge? in
+                                            guard edge.touches(member.id) else { return nil }
+                                            let outgoing = edge.link.from == member.id
+                                            guard let anchor = points[outgoing ? edge.link.to : edge.link.from] else { return nil }
+                                            return .init(anchor: anchor, outgoing: outgoing, color: NSColor(edge.color.opacity(0.88)), width: edge.width)
+                                        }
+                                        let visible = preview.begin(nodeLabel(member, highlighted: true)
+                                            .environment(\.colorScheme, colorScheme), edges: incident,
+                                            at: shift(point, by: value.translation, in: size))
+                                        if visible { movingNode = member.id }
                                     }
-                                    motion.point = shift(dragOrigin ?? point, by: value.translation, in: size)
+                                    preview.move(to: shift(dragOrigin ?? point, by: value.translation, in: size))
                                 }
                                 .onEnded { value in
                                     movedNodes[member.id] = normalized(shift(dragOrigin ?? point, by: value.translation, in: size), in: size)
                                     finishDrag()
                                 })
-                            .help(member.title + " · " + member.agent.title)
-                            .modifier(NodePosition(point: point, motion: movingNode == member.id ? motion : nil))
+                            .help("\(member.title) · \(member.agent.title)\n클릭하면 대화를 엽니다. 끌거나 방향키를 누르면 노드를 이동합니다.")
+                            .position(x: point.x, y: point.y + 11)
                         }
                     }
                 }
                 .frame(width: size.width, height: size.height)
+                .overlay { ConversationDragSurface(preview: preview).allowsHitTesting(false).accessibilityHidden(true) }
                 .coordinateSpace(name: "conversationCanvas")
             }
         }
         .onChange(of: dragging) { _, active in
-            if !active, movingNode != nil { finishDrag() }
+            if !active, dragOrigin != nil { finishDrag() }
         }
         .task(id: topology) {
             let previous = layout
             let next = await Task.detached(priority: .utility) {
                 topology.positions(startingFrom: previous)
             }.value
-            if !Task.isCancelled { layout = next }
+            if !Task.isCancelled {
+                if dragOrigin == nil { layout = next } else { deferredLayout = next }
+            }
         }
+        .onDisappear { if dragOrigin != nil { finishDrag() } }
     }
 
     private func finishDrag() {
+        preview.end()
         movingNode = nil
         dragOrigin = nil
-        motion.point = nil
+        isDragging = false
+        if let deferredLayout {
+            layout = deferredLayout
+            self.deferredLayout = nil
+        }
     }
 
     private func shift(_ point: CGPoint, by offset: CGSize, in size: CGSize) -> CGPoint {
@@ -498,35 +534,24 @@ private struct GroupConversationNodes: View {
         CGPoint(x: (point.x - 75) / (size.width - 150), y: (point.y - 48) / (size.height - 110))
     }
 
-    private struct NodePosition: ViewModifier {
-        let point: CGPoint
-        let motion: ConversationNodeMotion?
-
-        func body(content: Content) -> some View {
-            let position = motion?.point ?? point
-            content.position(x: position.x, y: position.y + 11)
-        }
-    }
-
-    private struct EdgeLayer: View {
-        let edges: [Edge]
-        let points: [UUID: CGPoint]
-        var movingNode: UUID?
-        var motion: ConversationNodeMotion?
-
-        var body: some View {
-            let position = motion?.point
-            Canvas { context, _ in
-                for edge in edges {
-                    let from = edge.link.from == movingNode ? position ?? points[edge.link.from] : points[edge.link.from]
-                    let to = edge.link.to == movingNode ? position ?? points[edge.link.to] : points[edge.link.to]
-                    guard let from, let to else { continue }
-                    GroupConversationNodes.draw(from, to, color: edge.color, count: edge.count, context: context)
-                }
+    private func nodeLabel(_ member: SessionGroupMember, highlighted: Bool) -> some View {
+        VStack(spacing: 3) {
+            ZStack {
+                Circle().fill(member.agent.graphColor.opacity(0.83))
+                Image(systemName: group.isLeader(member.id) ? "crown.fill" : "person.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
             }
-            .accessibilityHidden(true)
-            .allowsHitTesting(false)
+            .frame(width: 32, height: 32)
+            .padding(3)
+            .overlay { Circle().strokeBorder(highlighted ? Color.primary : .clear, lineWidth: 2) }
+            Text(member.title)
+                .font(.caption.weight(highlighted ? .semibold : .regular))
+                .lineLimit(1)
+                .padding(.horizontal, 4)
+                .background(Color(nsColor: .windowBackgroundColor).opacity(0.92), in: Capsule())
         }
+        .frame(width: 128, height: 61, alignment: .top)
     }
 
     private func flows(for ids: Set<UUID>) -> [ConversationGraphLayout.Link: Flow] {
@@ -546,25 +571,9 @@ private struct GroupConversationNodes: View {
         return totals
     }
 
-    private func memberColors(_ members: [SessionGroupMember]) -> [UUID: Color] {
-        var roots: [UUID: UUID] = [:]
-        var palettes: [UUID: Int] = [:]
-        var result: [UUID: Color] = [:]
-        for member in members {
-            let branch = member.parentMemberID.flatMap { parent in
-                group.isLeader(parent) ? nil : roots[parent]
-            } ?? member.id
-            roots[member.id] = branch
-            let index = palettes[branch] ?? palettes.count
-            palettes[branch] = index
-            result[member.id] = Self.palette[index % Self.palette.count]
-        }
-        return result
-    }
-
-    private static func draw(_ from: CGPoint, _ to: CGPoint, color: Color, count: Int, context: GraphicsContext) {
+    static func edgePath(_ from: CGPoint, _ to: CGPoint) -> Path? {
         let distance = hypot(to.x - from.x, to.y - from.y)
-        guard distance > 40 else { return }
+        guard distance > 40 else { return nil }
         let dx = (to.x - from.x) / distance, dy = (to.y - from.y) / distance
         let bend = min(47, max(15, distance * 0.22))
         let control = CGPoint(x: (from.x + to.x) / 2 - dy * bend,
@@ -573,7 +582,6 @@ private struct GroupConversationNodes: View {
         let endAngle = atan2(to.y - control.y, to.x - control.x)
         let start = CGPoint(x: from.x + 18 * cos(startAngle), y: from.y + 18 * sin(startAngle))
         let end = CGPoint(x: to.x - 19 * cos(endAngle), y: to.y - 19 * sin(endAngle))
-        let width = 1 + min(4, log2(CGFloat(count) + 1) * 0.65)
         var path = Path()
         path.move(to: start)
         path.addQuadCurve(to: end, control: control)
@@ -581,7 +589,116 @@ private struct GroupConversationNodes: View {
             path.move(to: end)
             path.addLine(to: CGPoint(x: end.x - 7 * cos(endAngle + offset), y: end.y - 7 * sin(endAngle + offset)))
         }
-        context.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: width, lineCap: .round))
+        return path
+    }
+}
+
+@MainActor private struct ConversationDragSurface: NSViewRepresentable {
+    let preview: ConversationDragPreview
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        preview.surface = view
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {}
+}
+
+/// The canvas and SwiftUI controls keep their layout while the pointer is held.
+/// Core Animation presents the lifted node and its incident edges at display cadence.
+@MainActor private final class ConversationDragPreview: NSObject {
+    struct Edge {
+        let anchor: CGPoint
+        let outgoing: Bool
+        let color: NSColor
+        let width: CGFloat
+    }
+
+    weak var surface: NSView?
+    private let node = CALayer()
+    private var edges: [(edge: Edge, layer: CAShapeLayer)] = []
+    private var displayLink: CADisplayLink?
+    private var pending: CGPoint?
+
+    func begin(_ label: some View, edges incident: [Edge], at point: CGPoint) -> Bool {
+        end()
+        guard let surface, let root = surface.layer else { return false }
+        let renderer = ImageRenderer(content: label)
+        renderer.scale = surface.window?.backingScaleFactor ?? 1
+        guard let image = renderer.cgImage else { return false }
+        withoutAnimations {
+            for edge in incident {
+                let layer = CAShapeLayer()
+                layer.frame = root.bounds
+                layer.fillColor = nil
+                layer.strokeColor = edge.color.cgColor
+                layer.lineWidth = edge.width
+                layer.lineCap = .round
+                root.addSublayer(layer)
+                edges.append((edge, layer))
+            }
+            node.contents = image
+            node.contentsScale = renderer.scale
+            node.bounds.size = CGSize(width: CGFloat(image.width) / renderer.scale,
+                                      height: CGFloat(image.height) / renderer.scale)
+            node.shadowColor = NSColor.black.cgColor
+            node.shadowOpacity = 0.24
+            node.shadowRadius = 4
+            node.shadowOffset = CGSize(width: 0, height: -2)
+            node.shadowPath = CGPath(ellipseIn: CGRect(x: node.bounds.midX - 18, y: node.bounds.height - 37,
+                                                       width: 36, height: 36), transform: nil)
+            root.addSublayer(node)
+            present(point, height: surface.bounds.height)
+        }
+        let link = surface.displayLink(target: self, selector: #selector(displayFrame))
+        link.isPaused = true
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+        return true
+    }
+
+    func move(to point: CGPoint) {
+        guard node.superlayer != nil else { return }
+        pending = point
+        displayLink?.isPaused = false
+    }
+
+    func end() {
+        displayLink?.invalidate()
+        displayLink = nil
+        pending = nil
+        withoutAnimations {
+            for item in edges { item.layer.removeFromSuperlayer() }
+            edges.removeAll()
+            node.removeFromSuperlayer()
+            node.contents = nil
+        }
+    }
+
+    @objc private func displayFrame() {
+        displayLink?.isPaused = true
+        guard let point = pending, let surface else { return }
+        pending = nil
+        withoutAnimations { present(point, height: surface.bounds.height) }
+    }
+
+    private func present(_ point: CGPoint, height: CGFloat) {
+        node.position = CGPoint(x: point.x, y: height - point.y - 11)
+        var flip = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: height)
+        for (edge, layer) in edges {
+            let from = edge.outgoing ? point : edge.anchor
+            let to = edge.outgoing ? edge.anchor : point
+            layer.path = GroupConversationNodes.edgePath(from, to)?.cgPath.copy(using: &flip)
+        }
+    }
+
+    private func withoutAnimations(_ changes: () -> Void) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        changes()
+        CATransaction.commit()
     }
 }
 
