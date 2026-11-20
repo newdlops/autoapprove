@@ -364,8 +364,15 @@ import AutoApproveCore
     }
     private func persist(_ next: [SessionGroup], message: String) -> Bool {
         do {
+            let before = groups
             try store.save(next, expected: groups); groups = try store.load(); error = nil; notice = message
             engine.refreshSessionGroupBadges()
+            // A new group, or members added to one, gets a single request to name the members by role.
+            for group in groups {
+                let known = Set(before.first { $0.id == group.id }?.members.map(\.id) ?? [])
+                let added = group.members.map(\.id).filter { !known.contains($0) }
+                if !added.isEmpty { _ = try? engine.requestSessionGroupNicknames(groupID: group.id, memberIDs: added) }
+            }
             return true
         }
         catch { self.error = error.localizedDescription; return false }

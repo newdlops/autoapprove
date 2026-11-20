@@ -190,6 +190,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var claudeParents: [String: String] = [:]
     private var recoveredClaudeStates = Set<String>()
     private var claudeHookObservedAt: [String: Date] = [:]
+    /// Status Claude registered for each interactive process ("idle", "busy", "waiting", "shell").
+    private var claudeRegistryStatus: [String: String] = [:]
     private struct LiveClaudeHook {
         var request: ClaudeHookRequest
         var receipt: ClaudeHookReceipt
@@ -3115,6 +3117,38 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return value
     }
 
+    /// Asks once for role nicknames: the leader names every listed member, or in a group without
+    /// a leader each listed member names itself. Members asked before are skipped. Returns the number
+    /// of requests queued. The request costs one short turn and only calls set_group_member_title.
+    @discardableResult
+    public func requestSessionGroupNicknames(groupID: UUID, memberIDs: [UUID]) throws -> Int {
+        guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }) else { return 0 }
+        func key(_ member: UUID) -> String { "groupNicknameRequested:\(groupID.uuidString):\(member.uuidString)" }
+        let targets = group.members.filter { member in memberIDs.contains(member.id) && store.value(key(member.id)) == nil }
+        guard !targets.isEmpty else { return 0 }
+        func line(_ member: SessionGroupMember) -> String {
+            "- memberID \(member.id.uuidString) · \(member.agent.title) · 작업 폴더 \(member.cwd) · 지금 이름 \(member.title.isEmpty ? "(없음)" : member.title)"
+        }
+        let instruction = "구성원마다 맡은 일을 나타내는 짧은 이름(3~20자)을 서로 겹치지 않게 지은 뒤 set_group_member_title(groupID, memberID, title)로 설정하세요. 이미 맡은 일을 나타내는 이름은 그대로 두세요. 이름을 정하는 것 말고 다른 작업은 하지 마세요."
+        let box = try groupMailbox()
+        var requests: [(recipient: UUID, text: String)] = []
+        if let leader = group.leaderMemberID, group.members.contains(where: { $0.id == leader }) {
+            requests.append((leader, "[AutoApprove 닉네임 요청] 그룹 '\(group.name)'(groupID \(group.id.uuidString))의 구성원 이름을 정해 주세요. " + instruction + "\n" + targets.map(line).joined(separator: "\n")))
+        } else {
+            for member in targets {
+                requests.append((member.id, "[AutoApprove 닉네임 요청] 그룹 '\(group.name)'(groupID \(group.id.uuidString))에서 이 세션이 맡은 일을 나타내는 짧은 이름(3~20자)을 정해 set_group_member_title(groupID, memberID \(member.id.uuidString), title)로 설정하세요. 다른 구성원과 겹치지 않게 하고, 이름을 정하는 것 말고 다른 작업은 하지 마세요.\n" + line(member)))
+            }
+        }
+        for request in requests {
+            _ = try box.enqueue(groupID: group.id, senderID: request.recipient, recipientID: request.recipient, kind: .notice, text: request.text)
+        }
+        for member in targets { try store.set(key(member.id), String(Date().timeIntervalSince1970)) }
+        log(AuditEvent(sessionID: "", summary: "세션 그룹 '\(group.name)' 닉네임 요청", outcome: "구성원 \(targets.count)명의 이름 정하기 요청",
+                       source: "세션 그룹", tool: "set_group_member_title"))
+        scheduleGroupMailboxDelivery()
+        return requests.count
+    }
+
     public func queueSessionGroupMessage(groupID: UUID, senderID: UUID, recipientID: UUID,
                                          text: String, expectsReply: Bool) throws -> UUID {
         let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3511,7 +3545,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     /// Present existing evidence on the graph without running a terminal probe.
     public func sessionGroupOperations(_ group: SessionGroup) throws -> [UUID: SessionGroupMemberOperation] {
-        let inboxes = try groupMailbox().inboxOperations(groupID: group.id)
+        sessionGroupOperations(group, inboxes: try groupMailbox().inboxOperations(groupID: group.id))
+    }
+
+    /// Combines inbox summaries (which a window may read on its own connection, off the main
+    /// thread) with the engine's in-memory session state. Reads no storage.
+    public func sessionGroupOperations(_ group: SessionGroup, inboxes: [UUID: SessionGroupMailbox.InboxOperation]) -> [UUID: SessionGroupMemberOperation] {
         let stopped = snapshot.paused || remoteInputStopped
         let clearing = groupClearActive(group.id)
         let evidence = groupConnectionObservation.map { Date().timeIntervalSince($0.at) < 120 ? $0.sessions : [] } ?? []
@@ -5266,6 +5305,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func reconcileClaudeActivities(_ registrations: [ClaudeSessionRegistration]) {
+        // Interactive sessions keep the screen as their source of truth; the registry only
+        // fills in when the screen cannot be read (see `presentPhase`).
+        var interactive: [String: String] = [:]
+        for entry in registrations where entry.kind != "bg" {
+            if let status = entry.status { interactive[entry.processID] = status }
+        }
+        claudeRegistryStatus = interactive
         var observed = Set<String>()
         for entry in registrations where entry.kind == "bg" {
             let id = entry.processID
@@ -8519,7 +8565,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// One phase per frame: a stopped turn shows as such, and asks for attention only once automation gave up.
-    private func presentPhase(_ id: String, _ activity: ActivityObservation, at now: Date) {
+    private func presentPhase(_ id: String, _ observed: ActivityObservation, at now: Date) {
+        var activity = observed
+        // A custom Claude status line hides the idle composer from the screen reader. Claude still
+        // records idle/busy for its own process, so an unreadable screen falls back to that record.
+        // Waiting is never taken from the registry: approvals and answers need the parsed request.
+        if activity.phase == .unknown, sessions[id]?.agent == .claude, let status = claudeRegistryStatus[id] {
+            switch status {
+            case "idle": activity = ActivityObservation(phase: .idle, detail: "Claude가 다음 지시를 기다리고 있습니다. (Claude 세션 기록 기준)")
+            case "busy": activity = ActivityObservation(phase: .working, detail: "Claude가 작업 중입니다. (Claude 세션 기록 기준)")
+            default: break
+            }
+        }
         guard let state = capacityStates[id], state.phase != .sent else {
             sessions[id]?.setPhase(activity.phase, detail: activity.detail, at: now, monitoring: activity.monitoring)
             return

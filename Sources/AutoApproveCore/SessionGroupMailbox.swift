@@ -3,7 +3,8 @@ import CSQLite
 import Darwin
 
 public struct SessionGroupMessage: Equatable {
-    public enum Kind: String { case question, reply, message, report, choiceQuestion, waitNotice }
+    /// `notice` is AutoApprove's own one-off request to a member (for example, naming the members).
+    public enum Kind: String { case question, reply, message, report, choiceQuestion, waitNotice, notice }
     public var sequence: Int64
     public var id: UUID
     public var groupID: UUID
@@ -152,6 +153,9 @@ public final class SessionGroupMailbox {
         } catch { sqlite3_close(db); db = nil; throw error }
     }
     deinit { sqlite3_close(db) }
+
+    /// Changes whenever another connection commits. A reader polls it to reload only after a real write.
+    public var dataVersion: Int { get throws { try scalar("PRAGMA data_version") } }
     func statement(_ sql: String, _ values: [String] = []) throws -> OpaquePointer {
         var value: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &value, nil) == SQLITE_OK, let value else { throw AppError.message("그룹 수신함을 읽거나 저장하지 못했습니다. 기존 메시지는 유지합니다.") }
@@ -254,7 +258,7 @@ public final class SessionGroupMailbox {
 
     func insertMessage(id: UUID? = nil, groupID: UUID, senderID: UUID, recipientID: UUID, kind: SessionGroupMessage.Kind,
                        text: String, sourceKey: String? = nil, at date: Date = Date(), originalReport: Bool = false) throws -> SessionGroupMessage {
-        guard !text.isEmpty, text.count <= ((originalReport || [.reply, .waitNotice].contains(kind)) ? Int.max : kind == .report || kind == .choiceQuestion ? 16000 : SessionGroupOrchestration.maximumTaskLength), !text.contains("\0"), (senderID != recipientID || kind == .waitNotice) else {
+        guard !text.isEmpty, text.count <= ((originalReport || [.reply, .waitNotice].contains(kind)) ? Int.max : kind == .report || kind == .choiceQuestion ? 16000 : SessionGroupOrchestration.maximumTaskLength), !text.contains("\0"), (senderID != recipientID || kind == .waitNotice || kind == .notice) else {
             throw RemoteHTTPError(400, "그룹 메시지 내용과 대상을 확인해주세요.")
         }
         if let sourceKey, let previous = try message(sourceKey: sourceKey) {
@@ -269,7 +273,7 @@ public final class SessionGroupMailbox {
         // Older clients omit messageID. Collapse only identical, still-unacknowledged messages.
         if id == nil, sourceKey == nil, let previous = try rows("WHERE group_id=? AND sender_id=? AND recipient_id=? AND kind=? AND body=? AND source_key IS NULL AND acknowledged IS NULL ORDER BY sequence LIMIT 1",
             [groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text]).first { return previous }
-        guard try kind == .waitNotice || pendingCount < maximumPending else { throw RemoteHTTPError(409, "미확인 그룹 메시지가 너무 많아 새 메시지를 접수하지 않았습니다. 기존 메시지를 수신 확인한 뒤 다시 보내세요.") }
+        guard try kind == .waitNotice || kind == .notice || pendingCount < maximumPending else { throw RemoteHTTPError(409, "미확인 그룹 메시지가 너무 많아 새 메시지를 접수하지 않았습니다. 기존 메시지를 수신 확인한 뒤 다시 보내세요.") }
         let key = id ?? UUID()
         try update("INSERT INTO messages(id,group_id,sender_id,recipient_id,kind,body,created,source_key) VALUES(?,?,?,?,?,?,?,NULLIF(?,''))",
                    [key.uuidString, groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text, String(date.timeIntervalSince1970), sourceKey ?? ""])
@@ -337,27 +341,27 @@ public final class SessionGroupMailbox {
 
     private static let notificationOrder = "CASE WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 0 ELSE 1 END,m.sequence"
 
-    struct InboxOperation {
-        let unacknowledgedCount: Int
-        let lastAcknowledgedAt: Date?
-        let firstPendingAt: Date?
-        let hasNotificationHead: Bool
-        let headDidNotStart: Bool
-        let lastDeliveryFailure: String?
+    public struct InboxOperation: Equatable, Sendable {
+        public let unacknowledgedCount: Int
+        public let lastAcknowledgedAt: Date?
+        public let firstPendingAt: Date?
+        public let hasNotificationHead: Bool
+        public let headDidNotStart: Bool
+        public let lastDeliveryFailure: String?
         /// A message parked after repeated lost typings; it has left the delivery queue.
-        var hasParkedMessage = false
+        public var hasParkedMessage = false
     }
 
     /// Measure the whole inbox without materializing conversation bodies. The
     /// head uses the same eligibility and priority as the delivery worker.
-    func inboxOperations(groupID: UUID) throws -> [UUID: InboxOperation] {
+    public func inboxOperations(groupID: UUID) throws -> [UUID: InboxOperation] {
         let query = try statement("""
             WITH inbox AS (
                 SELECT recipient_id, sum(acknowledged IS NULL) AS pending, max(acknowledged) AS last_ack,
                        min(CASE WHEN acknowledged IS NULL THEN created END) AS first_pending,
                        max(CASE WHEN acknowledged IS NULL AND last_result='undelivered' THEN last_error END) AS parked
                 FROM messages
-                WHERE group_id=? AND kind<>'waitNotice' AND last_result IS NOT 'superseded'
+                WHERE group_id=? AND kind NOT IN ('waitNotice','notice') AND last_result IS NOT 'superseded'
                 GROUP BY recipient_id
             ), heads AS (
                 SELECT m.recipient_id, m.last_result, m.last_error,
