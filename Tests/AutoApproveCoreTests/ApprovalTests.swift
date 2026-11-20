@@ -585,6 +585,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Background desktop: terminals, developer and security apps are blocked",tests.testBackgroundDesktopPolicyBlocksTerminalsAndSecurityApps),
             ("Background desktop: key names and text strokes",tests.testBackgroundDesktopKeysAndStrokes),
             ("Background desktop: Claude computer use denies only focus-taking actions",tests.testClaudeComputerUseRedirectDeniesOnlyFocusTakingActions),
+            ("Background desktop: Codex computer use redirect honors its guard",tests.testCodexDesktopHookDeniesDesktopActionsWithoutAffectingOtherTools),
+            ("Background desktop: Codex hook preserves other hooks and trust data",tests.testCodexDesktopHookInstallationPreservesOtherHooks),
             ("Background desktop: MCP returns window captures as image content",tests.testMCPReturnsDesktopCaptureAsImageContent),
             ("Background desktop: Claude hook redirects computer use to background tools",tests.testClaudeComputerUseIsRedirectedToBackgroundTools),
             ("Background desktop live: real apps stay behind (AUTOAPPROVE_LIVE_DESKTOP=1)",tests.testBackgroundDesktopLiveControlKeepsFocus),

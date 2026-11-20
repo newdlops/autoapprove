@@ -38,6 +38,50 @@ extension ApprovalTests {
                    "A session whose MCP server predates the desktop tools learns how to get them")
     }
 
+    func testCodexDesktopHookDeniesDesktopActionsWithoutAffectingOtherTools() throws {
+        func response(_ tool: String, _ input: JSONObject = [:], enabled: Bool = true) -> JSONObject {
+            CodexComputerUseRedirect.response(["hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": input]) { enabled }
+        }
+        for (tool, input) in [("mcp__cua_repl__js", ["code": "await app.click(1)"]),
+                              ("mcp__computer_use__computer", ["action": "left_click"]),
+                              ("mcp__remote-devices__computer_type", [:])] as [(String, JSONObject)] {
+            let result = response(tool, input)["hookSpecificOutput"] as? JSONObject
+            try expectEqual(result?["hookEventName"] as? String, "PreToolUse")
+            try expectEqual(result?["permissionDecision"] as? String, "deny")
+            try expect((result?["permissionDecisionReason"] as? String ?? "").contains("desktop_snapshot"))
+            try expect(response(tool, input, enabled: false).isEmpty)
+        }
+        for tool in ["Bash", "mcp__autoapprove__desktop_press", "mcp__computer_use__screenshot", "mcp__cua_repl__js_reset"] {
+            try expect(response(tool).isEmpty, tool)
+        }
+        try expect(response("mcp__cua_repl__js", ["completion_summary": "Checked window state"]).isEmpty)
+        try expect(CodexComputerUseRedirect.response(["hook_event_name": "PostToolUse", "tool_name": "mcp__cua_repl__js"]) { true }.isEmpty)
+    }
+
+    func testCodexDesktopHookInstallationPreservesOtherHooks() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-codex-hooks-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let config = root.appendingPathComponent("hooks.json")
+        let foreign: JSONObject = ["description": "keep", "hooks": ["PreToolUse": [["matcher": "Bash", "hooks": [["type": "command", "command": "echo keep"]]]], "Stop": []]]
+        try JSONSerialization.data(withJSONObject: foreign).write(to: config)
+        let helper = "/Applications/AutoApprove.app/Contents/MacOS/autoapprove"
+        try expect(CodexDesktopHookInstaller.update(home: root, executable: helper, applicationHome: "/tmp/a 'quoted' home"))
+        let installed = try Data(contentsOf: config)
+        let parsed = try JSONSerialization.jsonObject(with: installed) as? JSONObject
+        let groups = (parsed?["hooks"] as? JSONObject)?["PreToolUse"] as? [JSONObject]
+        try expectEqual(groups?.count, 2)
+        try expectEqual(groups?.first?["matcher"] as? String, "Bash")
+        let matcher = try NSRegularExpression(pattern: groups?.last?["matcher"] as? String ?? "$")
+        let repl = "mcp__cua_repl__js"
+        try expect(matcher.firstMatch(in: repl, range: NSRange(repl.startIndex..., in: repl)) != nil)
+        try expectFalse(CodexDesktopHookInstaller.update(home: root, executable: helper, applicationHome: "/tmp/a 'quoted' home"))
+        try expectEqual(Data(contentsOf: config), installed)
+        try expect(CodexDesktopHookInstaller.update(home: root, executable: nil, applicationHome: ""))
+        let remaining = try JSONSerialization.jsonObject(with: Data(contentsOf: config)) as? JSONObject
+        try expect(NSDictionary(dictionary: foreign).isEqual(to: remaining ?? [:]))
+    }
+
     func testMCPReturnsDesktopCaptureAsImageContent() throws {
         let names = Set(AutoApproveMCPServer.tools.compactMap { $0["name"] as? String })
         for name in ["desktop_list_apps", "desktop_open_app", "desktop_snapshot", "desktop_screenshot", "desktop_press", "desktop_set_value", "desktop_type", "desktop_key"] {

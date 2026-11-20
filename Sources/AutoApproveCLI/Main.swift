@@ -113,6 +113,26 @@ import AutoApproveCore
                     params["enabled"] = arguments[1] == "on"
                 }
                 try printJSON(SocketClient.request(path: paths.socket, message: ["method": "desktopGuard", "params": params]))
+            case "install-codex-desktop-hook", "remove-codex-desktop-hook":
+                guard arguments.count == 1 || (arguments.count == 3 && arguments[1] == "--codex-home") else {
+                    throw AppError.message("Codex 홈을 지정하려면 --codex-home PATH를 사용해주세요.")
+                }
+                let home = arguments.count == 3 ? URL(fileURLWithPath: arguments[2], isDirectory: true) : CodexDesktopHookInstaller.defaultHome
+                let installing = command == "install-codex-desktop-hook"
+                let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.resolvingSymlinksInPath()
+                let changed = try CodexDesktopHookInstaller.update(home: home, executable: installing ? executable.path : nil,
+                                                                   applicationHome: paths.directory.standardizedFileURL.path)
+                try printJSON(["changed": changed, "hooks": home.appendingPathComponent("hooks.json").path,
+                               "detail": installing ? "Codex의 /hooks에서 AutoApprove 훅을 검토하고 신뢰해주세요." : "AutoApprove의 Codex 포커스 보호 훅이 제거됐습니다."])
+            case "codex-desktop-hook":
+                let input = FileHandle.standardInput.readDataToEndOfFile()
+                guard input.count <= 1_000_000,
+                      let payload = (try? JSONSerialization.jsonObject(with: input)) as? JSONObject else { print("{}"); return }
+                let response = CodexComputerUseRedirect.response(payload) {
+                    let state = try? SocketClient.request(path: paths.socket, message: ["method": "desktopGuard"], timeout: 1)
+                    return state?["enabled"] as? Bool ?? true
+                }
+                try printJSON(response)
             case "hook":
                 do {
                     let input = FileHandle.standardInput.readDataToEndOfFile()
@@ -149,7 +169,11 @@ import AutoApproveCore
                   autoapprove serve --loopback  이 Mac의 127.0.0.1에서만 웹 열기·Mac 검색 안 함
                   autoapprove web [on|off]   웹 접속 상태·주소 확인 또는 켜기/끄기
                   autoapprove desktop-guard [on|off]
-                                            Claude computer use 조작을 막고 백그라운드 desktop_ 도구로 안내 (기본 켬)
+                                            Claude와 Codex의 포커스 보호 설정 (기본 켬)
+                  autoapprove install-codex-desktop-hook [--codex-home PATH]
+                                            Codex 포커스 보호 훅 설치 및 /hooks 신뢰 안내
+                  autoapprove remove-codex-desktop-hook [--codex-home PATH]
+                                            선택한 Codex 홈에서 AutoApprove 포커스 보호 훅 제거
                   autoapprove enable ID     연결된 세션 자동 승인 켜기
                   autoapprove disable ID    자동 승인 끄기
                   autoapprove restart ID [--no-resume]
