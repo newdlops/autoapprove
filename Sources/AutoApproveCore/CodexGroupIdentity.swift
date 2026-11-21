@@ -63,6 +63,7 @@ public enum CodexGroupIdentity {
                 result.members[index].conversationID = uuid.uuidString.lowercased()
                 result.members[index].providerHome = current.providerHome
                 if member.runtimeID != current.id { result.members[index].tabShell = current.tabShell }
+                result.members[index].cwd = current.session.cwd
                 result.members[index].runtimeID = current.id
             }
             return result

@@ -582,6 +582,24 @@ extension ApprovalTests {
         }
     }
 
+    func testClaudeLeaderResumeThenClear() throws {
+        let conversation = UUID().uuidString.lowercased()
+        let session = AgentSession(id: "process:21:new", agent: .claude, pid: 21, started: "new", tty: "/dev/ttys001", cwd: "/project", terminal: .terminal)
+        var endpoint = SessionGroupLiveSession(session: session, conversationID: conversation, providerHome: "/home/claude")
+        var member = endpoint.member
+        member.runtimeID = "process:20:old"
+        let group = SessionGroup(name: "fixture", members: [member], leaderMemberID: member.id)
+        var duplicate = endpoint
+        duplicate.session.id = "process:22:other"
+        try expectEqual(SessionGroupMatching.refreshedClaude([group], live: [endpoint, duplicate]), [group])
+        let resumed = SessionGroupMatching.refreshedClaude([group], live: [endpoint])[0]
+        try expectEqual(resumed.members[0].runtimeID, endpoint.id)
+        endpoint.conversationID = UUID().uuidString.lowercased()
+        let cleared = SessionGroupMatching.refreshedClaude([resumed], live: [endpoint])[0]
+        try expectEqual(cleared.members[0].conversationID, endpoint.conversationID)
+        try expectEqual(cleared.leaderMemberID, member.id)
+    }
+
     func testCodexGroupRefreshIsolatedFromClaude() throws {
         let old = UUID().uuidString, new = UUID().uuidString
         let session = AgentSession(id: "process:123:start", agent: .codex, pid: 123, started: "start", tty: "/dev/ttys001", cwd: "/project", terminal: .terminal)
@@ -597,6 +615,10 @@ extension ApprovalTests {
         try expectEqual(CodexGroupIdentity.refreshed([updated], live: [restarted])[0].members[0].runtimeID, restarted.id)
         restarted.session.cwd = "/resumed/elsewhere"
         try expectEqual(CodexGroupIdentity.refreshed([updated], live: [restarted])[0].members[0].runtimeID, restarted.id)
+        let moved = CodexGroupIdentity.refreshed([updated], live: [restarted])[0]
+        restarted.conversationID = UUID().uuidString
+        try expectEqual(CodexGroupIdentity.refreshed([moved], live: [restarted])[0].members[0].conversationID, restarted.conversationID?.lowercased())
+        restarted.conversationID = new
         try expectEqual(CodexGroupIdentity.refreshed([group], live: [live, restarted]), [group])
         var foreign = live; foreign.providerHome = "/home/other"
         try expectEqual(CodexGroupIdentity.refreshed([group], live: [foreign]), [group])

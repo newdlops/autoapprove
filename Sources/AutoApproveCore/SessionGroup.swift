@@ -335,10 +335,22 @@ public enum SessionGroupMatching {
 
     /// Claude /clear changes the registered conversation inside the same process.
     /// Transfer the original member record only when the old identity has no other live owner.
-    static func refreshedClaude(_ groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [SessionGroup] {
+    package static func refreshedClaude(_ groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [SessionGroup] {
         groups.map { group in
             var updated = group
             for (index, member) in group.members.enumerated() where member.agent == .claude {
+                // A resume can preserve the conversation while replacing the process.
+                // Bind that exact conversation before tracking a later /clear in its new process.
+                if let resumed = match(member, in: live), resumed.id != member.runtimeID,
+                   member.providerHome != nil, UUID(uuidString: member.conversationID) != nil,
+                   !live.contains(where: { $0.id == member.runtimeID && $0.session.phase != .ended }),
+                   !group.members.contains(where: { $0.id != member.id && $0.agent == .claude &&
+                       ($0.runtimeID == resumed.id || (UUID(uuidString: $0.conversationID) == UUID(uuidString: member.conversationID) &&
+                           ($0.providerHome == nil || $0.providerHome == resumed.providerHome))) }) {
+                    updated.members[index].runtimeID = resumed.id
+                    updated.members[index].tabShell = resumed.tabShell
+                    continue
+                }
                 guard let old = UUID(uuidString: member.conversationID),
                       let runtime = member.runtimeID,
                       let endpoint = connection(member, in: live), endpoint.id == runtime,

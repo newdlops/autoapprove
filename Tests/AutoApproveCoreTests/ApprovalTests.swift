@@ -583,6 +583,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: stale process revalidation",tests.testSessionGroupObservationRejectsExitedProcess),
             ("Session groups: leader tree validation, moves and legacy files",tests.testSessionGroupTreeValidationAndEdits),
             ("Session groups: reports only the assigned turn, one line",tests.testSessionGroupOrchestrationReportsOnlyTheAssignedTurn),
+            ("Session groups: Claude leader resume then clear", tests.testClaudeLeaderResumeThenClear),
+            ("Antigravity: hook status and tool classification", tests.testAgyHookStatusAndToolClassification),
             ("Background desktop: terminals, developer and security apps are blocked",tests.testBackgroundDesktopPolicyBlocksTerminalsAndSecurityApps),
             ("Background desktop: key names and text strokes",tests.testBackgroundDesktopKeysAndStrokes),
             ("Background desktop: Claude computer use denies only focus-taking actions",tests.testClaudeComputerUseRedirectDeniesOnlyFocusTakingActions),

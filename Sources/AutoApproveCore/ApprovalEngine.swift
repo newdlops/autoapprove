@@ -2917,6 +2917,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.codexApprovalBinding?.threadID == observation.session.codexApprovalBinding?.threadID,
                   latest.contains(where: { $0.key == observation.id && $0.agent == current.agent && "/dev/" + $0.tty == current.tty }) else { return nil }
             var result = observation
+            result.session = current
             if let process = byPID[current.pid] { result.tabShell = SessionGroupTabShell.observe(current, process: process, records: byPID) }
             let mcp = current.agent == .codex ? groupMCPIdentity(for: current, home: result.providerHome) : nil
             if let mcp, let id = mcp.conversationID {
