@@ -12,6 +12,8 @@ import AutoApproveCore
     @State private var notice: String?
     @State private var questionDelayText = ""
     @State private var questionDelayError: String?
+    @State private var groupTTLText = ""
+    @State private var groupTTLError: String?
     @State private var keepAwakeBusy = false
     @State private var keepAwakeError: String?
     @State private var mouseActivityError: String?
@@ -23,6 +25,11 @@ import AutoApproveCore
     @State private var terminalInputError: String?
     private var questionDelayValue: Int? { Int(questionDelayText.trimmingCharacters(in: .whitespacesAndNewlines)) }
     private var validQuestionDelay: Bool { questionDelayValue.map(EngineSnapshot.questionNotificationDelayRange.contains) ?? false }
+    private var groupTTLMinutes: Int? {
+        guard let value = Int(groupTTLText.trimmingCharacters(in: .whitespacesAndNewlines)),
+              ApprovalEngine.groupMessageTTLMinutesRange.contains(value) else { return nil }
+        return value
+    }
     private var helper: String { Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/autoapprove").path }
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -30,6 +37,28 @@ import AutoApproveCore
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
+                    section("그룹 메시지", icon: "tray", status: "미확인 메시지 만료 · 현재 \(engine.groupMessageTTLMinutes)분") {
+                        Text("보낸 뒤 이 시간 동안 수신이 확인되지 않으면 다시 전달하지 않습니다. 원문은 기록에 남습니다. 기존 미확인 메시지에도 적용됩니다.")
+                        HStack(spacing: 8) {
+                            Text("만료 시간").foregroundStyle(.primary)
+                            Spacer()
+                            TextField("분", text: $groupTTLText)
+                                .textFieldStyle(.roundedBorder).frame(width: 80)
+                                .accessibilityLabel("미확인 그룹 메시지 만료 시간(분)")
+                                .help("1~10,080분으로 입력합니다. 기본값은 120분입니다.")
+                                .onSubmit { saveGroupTTL() }
+                            Text("분")
+                            Button("적용") { saveGroupTTL() }
+                                .disabled(groupTTLMinutes == nil || groupTTLMinutes == engine.groupMessageTTLMinutes)
+                                .help("입력한 만료 시간을 이 Mac에 저장합니다.")
+                        }
+                        if let groupTTLError {
+                            Label(groupTTLError, systemImage: "exclamationmark.circle").foregroundStyle(.red)
+                        } else if groupTTLMinutes == nil {
+                            Text("1~10,080분으로 입력해주세요.").foregroundStyle(.red)
+                        }
+                    }
+                    Divider()
                     RemoteAccessSettings(engine: engine)
                     Divider()
                     if engine.networkIsolated {
@@ -155,7 +184,12 @@ import AutoApproveCore
             }
         }.frame(width: 600, height: 660)
             .windowUpdates(viewUpdates, sources: [engine.objectWillChange, notifications.objectWillChange])
-            .onAppear { questionDelayText = String(engine.snapshot.questionNotificationDelay); refreshTerminalPermissions() }
+            .onAppear {
+                questionDelayText = String(engine.snapshot.questionNotificationDelay)
+                groupTTLText = String(engine.groupMessageTTLMinutes)
+                refreshTerminalPermissions()
+            }
+            .onChange(of: groupTTLText) { _, _ in groupTTLError = nil }
             .onChange(of: viewUpdates.isVisible) { _, visible in if visible { refreshTerminalPermissions() } }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in if viewUpdates.isVisible { refreshTerminalPermissions() } }
             .onChange(of: questionDelayText) { _, _ in questionDelayError = nil }
@@ -231,6 +265,18 @@ import AutoApproveCore
         refreshTerminalPermissions()
         if !terminalInputStatus.available { openPrivacySettings("Privacy_Accessibility") }
     }
+    private func saveGroupTTL() {
+        guard let minutes = groupTTLMinutes else { return }
+        do {
+            try engine.setGroupMessageTTLMinutes(minutes)
+            groupTTLText = String(minutes)
+            groupTTLError = nil
+            notice = "미확인 그룹 메시지 만료 시간을 \(minutes)분으로 저장했습니다."
+        } catch {
+            groupTTLError = error.localizedDescription
+        }
+    }
+
     @ViewBuilder private func section<Content: View>(_ title: String, icon: String, status: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Label(title, systemImage: icon).font(.headline)

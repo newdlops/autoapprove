@@ -92,6 +92,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
     public var since = Date()
     public var verified = 0
     public var loginRequestID: String?
+    var priorityRequested: Bool?
     public var continuationHolds: [String:String]?
     public var resumeEnabled:Bool?
     public var resumeServerID:String?
@@ -99,6 +100,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
     public var resumeResults:[String:CodexAccountContinuationResult]?
     public var held: Bool { [.stopping, .waiting, .restarting, .reconnecting, .resuming, .review].contains(phase) }
     public var canCancel: Bool { held && ![.restarting, .reconnecting].contains(phase) }
+    var prioritizesInterruption: Bool { loginRequestID != nil || priorityRequested == true }
     public init() {}
 }
 @MainActor public final class CodexAccountTransitionCoordinator {
@@ -134,6 +136,10 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                         state.detail="이전 중단 요청의 결과 확인 중입니다. 해당 작업·Goal·백그라운드 작업이 대기 상태가 되면 기존 전환을 이어갑니다. 중단 요청은 반복하지 않습니다."
                         changed(state);return
                     }
+                }
+                if state.prioritizesInterruption, let blocker = observed.threads.first(where: { !$0.needsQuiescence && $0.blocker != nil })?.blocker {
+                    state.detail = "\(blocker)이 남아 서버를 전환하지 않았습니다. 해당 터미널에서 확인해주세요."
+                    changed(state); return
                 }
                 state.waitingThread=nil;state.phase = .stopping;state.since=now
                 state.detail="이전 중단 결과를 현재 대화에서 확인했습니다. 기존 전환을 이어서 확인합니다."
@@ -206,7 +212,7 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 }
                 next.witnesses = target.witnesses; next.since = now
                 next.continuationHolds=observed.threads.filter{!$0.active}.reduce(into:[:]){$0[$1.id]=$1.stopToken}
-                next.detail = "계정 변경 감지 · \(next.threads.count)개 대화를 순차 중단할 준비 중"
+                next.detail = "계정 변경 감지 · \(next.threads.count)개 대화의 중단을 준비 중"
                 state = next
                 // Publishing the hold comes before any side effect. The next
                 // check gives the engine time to drain its pending input jobs.
@@ -216,7 +222,45 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
             var continuationHolds=state.continuationHolds ?? [:]
             for thread in observed.threads where !thread.active {continuationHolds[thread.id]=thread.stopToken}
             if continuationHolds != state.continuationHolds {state.continuationHolds=continuationHolds;try persist()}
-            if let waiting = state.waitingThread {
+            if state.prioritizesInterruption {
+                let active = observed.threads.filter(\.needsQuiescence)
+                let newlyActive = active.filter { state.reservations[$0.id] == nil }.sorted { $0.id < $1.id }
+                if !newlyActive.isEmpty {
+                    state.since = now
+                    for thread in newlyActive {
+                        state.reservations[thread.id] = thread.stopToken
+                    }
+                    state.phase = .waiting
+                    state.detail = "현재 로그인 서버의 작업 \(state.reservations.count)개에 중단 요청 중"
+                    try persist()
+                    let server = state.serverID
+                    let interrupt = services.interrupt
+                    let target = self.target
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        for thread in newlyActive {
+                            group.addTask { @MainActor in
+                                try Task.checkCancellation()
+                                try await interrupt(target, server, thread.id, thread.stopToken)
+                            }
+                        }
+                        // Let each reserved interruption report its outcome even if another fails.
+                        var failure: Error?
+                        while let result = await group.nextResult() {
+                            if case let .failure(error) = result, failure == nil { failure = error }
+                        }
+                        if let failure { throw failure }
+                    }
+                    return
+                }
+                if !active.isEmpty {
+                    guard now.timeIntervalSince(state.since) < 30 else {
+                        throw AppError.message("30초 안에 작업 중단을 확인하지 못해 서버 전환을 보류했습니다.")
+                    }
+                    state.detail = "작업 \(active.count)개의 중단 결과를 확인하고 있습니다."
+                    changed(state); return
+                }
+                state.waitingThread = nil
+            } else if let waiting = state.waitingThread {
                 guard let thread = observed.threads.first(where: { $0.id == waiting }) else {
                     throw AppError.message("중단 중 대화 연결이 바뀌었습니다.")
                 }
@@ -244,6 +288,9 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 return
             }
             if let blocker = observed.threads.compactMap(\.blocker).first {
+                if state.prioritizesInterruption {
+                    throw AppError.message("\(blocker)이 남아 서버를 전환하지 않았습니다. 해당 터미널에서 확인해주세요.")
+                }
                 state.phase = .waiting
                 state.detail = "모든 작업 중단 확인 · \(blocker)이 남아 서버 전환을 기다립니다."
                 changed(state); return
@@ -283,6 +330,16 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
             // state remains conservative even when the disk cannot be updated.
             try? save(state); changed(state)
         }
+    }
+
+    func prioritizeExistingTransition() throws {
+        guard !checking, [.stopping, .waiting].contains(state.phase), !state.prioritizesInterruption else { return }
+        var next = state
+        next.priorityRequested = true
+        next.since = Date()
+        try save(next)
+        state = next
+        changed(next)
     }
     public func cancel() throws {
         guard state.canCancel, !checking else { throw AppError.message("진행 중인 서버 전환 결과를 먼저 기다려주세요.") }

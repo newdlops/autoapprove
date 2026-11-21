@@ -242,7 +242,7 @@ import AutoApproveCore
         let unsupported = chosen.count - now - later
         var lines = ["원래 터미널에서 CLI를 종료하고, 셸이 돌아오면 같은 대화 ID와 원래 실행 옵션으로 다시 엽니다. 자동 승인 설정은 새 세션으로 옮깁니다. '작업 이어가기'를 고르면 다시 열린 세션에 진행하던 작업을 이어가라고 입력합니다."]
         if now > 0 { lines.append("지금 다시 시작: \(now)개") }
-        if later > 0 { lines.append("작업이 끝나고 입력창이 비면 다시 시작: \(later)개 (최대 30분 대기)") }
+        if later > 0 { lines.append("현재 작업을 중단하고 다시 시작: \(later)개. 제출하지 않은 입력은 사라질 수 있습니다.") }
         if unsupported > 0 { lines.append("지원하지 않는 터미널이라 건너뜀: \(unsupported)개 (tmux, Orca, VS Code)") }
         return lines.joined(separator: "\n")
     }

@@ -3,6 +3,38 @@ import AutoApproveCore
 import CSQLite
 
 extension ApprovalTests {
+    @MainActor func testUnconfirmedGroupMessagesExpireWithoutRemovingHistory() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let box = try SessionGroupMailbox(directory: directory, maximumPending: 3)
+        let engine = try ApprovalEngine(paths: .init(directory: directory))
+        defer { engine.stop() }
+        try expectEqual(engine.groupMessageTTLMinutes, 120)
+        try expectThrows(engine.setGroupMessageTTLMinutes(0))
+        try engine.setGroupMessageTTLMinutes(180)
+        let reopened = try ApprovalEngine(paths: .init(directory: directory))
+        defer { reopened.stop() }
+        try expectEqual(reopened.groupMessageTTLMinutes, 180)
+        let group = UUID(), sender = UUID(), recipient = UUID()
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let cutoff = now.addingTimeInterval(-7200)
+        let old = try box.enqueue(groupID: group, senderID: sender, recipientID: recipient, kind: .question, text: "old", at: cutoff)
+        let read = try box.enqueue(groupID: group, senderID: sender, recipientID: recipient, kind: .message, text: "read", at: cutoff)
+        let fresh = try box.enqueue(groupID: group, senderID: sender, recipientID: recipient, kind: .message, text: "fresh", at: cutoff.addingTimeInterval(1))
+        try box.acknowledge([read.id], groupID: group, recipientID: recipient, at: now)
+        try expectEqual(try box.nextExpiration(ttl: 7200), now)
+        try box.expireUnconfirmed(createdThrough: cutoff)
+        try box.noteAttempt(old.id, result: "direct_submitted", retryAt: now)
+        try expectEqual(try box.pendingCount, 1)
+        try expectEqual(try box.heads().map(\.id), [fresh.id])
+        try expectEqual(try box.list(groupID: group, memberID: recipient).map(\.id), [fresh.id])
+        let history = try box.list(groupID: group, memberID: recipient, includeAcknowledged: true)
+        try expectEqual(history.map(\.id), [old.id, read.id, fresh.id])
+        try expectEqual(history[0].json["state"] as? String, "expired")
+        try expectEqual(history[1].acknowledgedAt, now)
+        try expectEqual(try box.conversations(groupID: group).conversations.first?.waitExpired, true)
+    }
+
     @MainActor func testGroupReportRequiresRecipientAcknowledgement() async throws {
         let directory = URL(fileURLWithPath: "/private/tmp").appendingPathComponent("aa-report-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

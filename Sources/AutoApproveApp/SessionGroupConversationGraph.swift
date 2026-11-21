@@ -453,7 +453,7 @@ import AutoApproveCore
                 }
             }
             .disclosureGroupStyle(ConversationDisclosureStyle(summary: "질문과 답변 원문"))
-            if item.answer == nil, content.group.members.contains(where: { $0.id == peer }) {
+            if item.answer == nil, !item.question.isExpired, content.group.members.contains(where: { $0.id == peer }) {
                 HStack(spacing: 12) {
                     Button("노드에 전달…") { deliveryTarget = item }
                         .disabled(deliveringQuestion != nil)
@@ -503,6 +503,7 @@ import AutoApproveCore
     private func delivery(_ message: SessionGroupMessage) -> String {
         if message.acknowledgedAt != nil { return "수신 확인" }
         switch message.lastResult {
+        case "expired": return "수신 기한 만료"
         case "direct_attempting", "direct_unknown", "unknown": return "전달 여부 미확인"
         case "direct_submitted", "submitted": return "터미널 제출"
         case "redeliver": return "다시 전달 대기"

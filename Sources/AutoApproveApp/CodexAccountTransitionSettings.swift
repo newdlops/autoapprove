@@ -79,7 +79,7 @@ struct CodexAccountTransitionSettings: View {
     private func title(_ phase: CodexAccountTransitionState.Phase) -> String {
         switch phase {
         case .ready: return "로그인 변경 대기"
-        case .stopping: return "작업 순차 중단"
+        case .stopping: return "작업 중단 준비"
         case .waiting: return "작업 대기 확인"
         case .restarting: return "공통 서버 전환"
         case .reconnecting: return "기존 대화 재연결 확인"

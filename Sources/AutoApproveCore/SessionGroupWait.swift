@@ -150,6 +150,7 @@ extension SessionGroupMailbox {
 
     private func batchResult(_ message: SessionGroupMessage, noticeKey: String) throws -> String {
         let key = message.sourceKey ?? message.id.uuidString
+        if message.isExpired { return key + " · 수신 기한 만료" }
         if message.acknowledgedAt != nil || (message.attempts > 0 && message.lastResult != "not_started") ||
             message.lastResult == "batched" {
             return key + " · 기존 수신함 원문 " + message.id.uuidString
@@ -262,6 +263,9 @@ extension SessionGroupMailbox {
             throw RemoteHTTPError(403, "원래 질문의 지정 수신자만 같은 그룹에서 답할 수 있습니다.")
         }
         let key = "answer:" + question.uuidString
+        if q.isExpired, try message(sourceKey: key) == nil {
+            throw RemoteHTTPError(409, "수신 기한이 지난 질문입니다. 필요한 내용은 새 메시지로 보내주세요.")
+        }
         if let old = try message(sourceKey: key), old.text != text || (id != nil && old.id != id) {
             throw RemoteHTTPError(409, "이미 답변된 질문입니다. 새 대화는 별도 메시지로 보내세요.")
         }
@@ -309,8 +313,10 @@ extension SessionGroupMailbox {
                 if !done && status != .working { unavailable[r.group, default: []].insert("task:" + id.uuidString) }
             }
             for q in r.questions {
-                results.append(try message(sourceKey: "answer:" + q.uuidString) != nil)
-                possible.append(true)
+                let answer = try message(sourceKey: "answer:" + q.uuidString)
+                let expired = try message(q)?.isExpired == true
+                results.append(answer != nil)
+                possible.append(answer != nil || !expired)
             }
             if r.external { results.append(row.externalReady); possible.append(true) }
             if r.matches(results) {
@@ -321,7 +327,7 @@ extension SessionGroupMailbox {
                     ? try readyBody(r, assignments: assignments) : ""
                 try transition(row, to: "ready", detail: row.state == "expired" ? "기한이 지난 뒤 필요한 응답이 도착했습니다." : "필요한 응답이 도착했습니다.", payload: body)
             }
-            else if !r.matches(possible) { try transition(row, to: "cancelled", detail: "필요한 작업이 결과 없이 교체되었습니다.") }
+            else if !r.matches(possible) { try transition(row, to: "cancelled", detail: "필요한 작업이 교체되었거나 응답 없이 메시지가 만료되었습니다.") }
             else if row.state == "waiting", now >= row.deadline { try transition(row, to: "expired", detail: "정한 기한까지 결과가 도착하지 않았습니다.") }
             else if row.state == "waiting" { active[r.group, default: []].append(row) }
         }
@@ -367,7 +373,7 @@ extension SessionGroupMailbox {
            stale.attempts == 0 || stale.lastResult == "not_started", stale.acknowledgedAt == nil {
             // Retire only the unsubmitted hint: never tried, or every try stopped before typing.
             // A reader may already know its immutable message ID.
-            try update("UPDATE messages SET last_result='superseded' WHERE id=?", [stale.id.uuidString])
+            try update("UPDATE messages SET last_result='superseded' WHERE id=? AND last_result IS NOT 'expired'", [stale.id.uuidString])
         }
         _ = try insertMessage(groupID: row.request.group, senderID: recipient, recipientID: recipient, kind: .waitNotice,
             text: body, sourceKey: key)

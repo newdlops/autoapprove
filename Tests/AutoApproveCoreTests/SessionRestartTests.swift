@@ -53,6 +53,40 @@ private final class RestartTerminal: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    @MainActor func testExplicitCodexLoginRequestsStopsBeforeWaitingForAnyTurn() async throws {
+        let target = CodexAccountTransitionTarget(home: "/fixture", executable: "/fixture/codex")
+        var threads = ["a", "b"].map { CodexAccountTransitionThread(id: $0, turnID: "turn-" + $0, active: true) }
+        var stopped: [String] = []
+        var restarts = 0
+        let services = CodexAccountTransitionServices(
+            observe: { _ in .init(savedAccount: "new", serverAccount: "old", serverID: "server", threads: threads) },
+            interrupt: { _, _, id, _ in
+                stopped.append(id)
+                if id == "a" {
+                    for _ in 0..<50 {
+                        if stopped.contains("b") { return }
+                        try await Task.sleep(for: .milliseconds(10))
+                    }
+                    throw AppError.message("The second interrupt waited for the first")
+                }
+            },
+            restart: { _, _ in restarts += 1 },
+            verify: { _, _, _ in 0 })
+        let coordinator = CodexAccountTransitionCoordinator(target: target, services: services, save: { _ in })
+        let start = Date()
+        await coordinator.check(now: start, loginRequestID: UUID().uuidString)
+        try expect(stopped.isEmpty, "The first check must publish the input hold")
+        await coordinator.check(now: start.addingTimeInterval(1))
+        try expectEqual(stopped.sorted(), ["a", "b"])
+        try expectEqual(restarts, 0)
+        await coordinator.check(now: start.addingTimeInterval(2))
+        try expectEqual(stopped.sorted(), ["a", "b"], "The same interrupt must not be sent twice")
+        threads[0].active = false
+        threads[1].active = false
+        await coordinator.check(now: start.addingTimeInterval(3))
+        try expectEqual(restarts, 1)
+    }
+
     func testSessionRestartCommandKeepsKnownOptionsOnly() throws {
         let id = UUID().uuidString
         let claude = try SessionRestartCommand.plan(agent: .claude, executable: "/opt/claude",
@@ -141,17 +175,13 @@ extension ApprovalTests {
 
         terminal.status = "busy"
         engine.restartSessions([session.id])
-        try await Task.sleep(for: .seconds(3))
-        try expectEqual(terminal.terminated, 0, "A busy Claude is never ended")
-        try expect(engine.snapshot.sessionRestart?.items.first?.message.contains("Claude가 작업 중") == true,
-                   engine.snapshot.sessionRestart?.items.first?.message ?? "no progress")
-        terminal.status = "idle"
-        let launched = try await waitForRestart(30) { !terminal.launched.isEmpty }
+        let launched = try await waitForRestart(10) { !terminal.launched.isEmpty }
         try expect(launched, "The resume command must be typed into the original shell: \(engine.snapshot.sessionRestart?.items.first?.message ?? "")")
         try expectEqual(terminal.terminated, 1, "The CLI is ended with one signal")
         try expect(terminal.typed.isEmpty, "Ending the CLI types nothing into the terminal")
         try expectEqual(terminal.launched, [["/fixture/claude", "--model", "opus", "--resume", conversation].map(HookInstaller.quote).joined(separator: " ")])
         // The app's discovery loop reports the new CLI.
+        terminal.status = "idle"
         var next = ProcessDiscovery.sessions(reopened).first { $0.agent == .claude }!
         next.terminal = .iterm; next.channel = .itermScreen; next.providerID = conversation
         engine.updateDiscovery([next], records: reopened)

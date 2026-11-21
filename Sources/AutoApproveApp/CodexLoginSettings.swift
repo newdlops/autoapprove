@@ -327,7 +327,7 @@ struct CodexLoginContent: View {
                         .font(.caption).fixedSize(horizontal:false,vertical:true)
                 }
             }
-            Text("직접 재연결하면 실행 중 Goal을 먼저 일시정지하고 작업 중단을 확인합니다. 이후 Codex를 정상 종료해 확인한 상주 도구 호스트를 정리합니다. 셸이 없으면 같은 창의 복구 탭으로 대화를 옮깁니다. 로그인 완료 후 연결이 확인된 관리형 Codex 작업을 순차 중단합니다. Goal은 일시정지하고 Codex 백그라운드 작업은 종료한 뒤 새 계정으로 전환합니다. 이 창을 닫아도 계속 진행합니다.")
+            Text("직접 재연결하면 실행 중 Goal을 먼저 일시정지하고 작업 중단을 확인합니다. 이후 Codex를 정상 종료해 확인한 상주 도구 호스트를 정리합니다. 셸이 없으면 같은 창의 복구 탭으로 대화를 옮깁니다. 로그인 완료 후 선택한 서버의 실행 중 대화에 바로 중단을 요청합니다. Goal은 일시정지하고 백그라운드 작업은 종료한 뒤 새 계정으로 전환합니다. 대기 입력이 남으면 해당 터미널을 확인해야 합니다. 이 창을 닫아도 계속 진행합니다.")
                 .font(.caption).fixedSize(horizontal: false, vertical: true)
         }
     }

@@ -202,7 +202,7 @@ struct CodexSessionAccountContent:View {
                 .help(CodexFeatureSupport.connectionInventoryUnavailable)
         }
         Button("현재 로그인으로 재연결",action:reconnect).disabled(disabled || loading)
-            .help("같은 서버의 연결된 Codex를 순차 중단하고 저장된 로그인으로 다시 연결합니다.")
+            .help("같은 서버의 진행 중인 작업에 중단을 요청하고 저장된 로그인으로 재연결합니다.")
         if let changeGroup {
             Button("로그인 그룹 변경…",action:changeGroup).disabled(disabled || loading || !CodexFeatureSupport.canMoveOpenSessions)
                 .help(CodexFeatureSupport.canMoveOpenSessions ? "같은 대화 ID와 그룹 정보를 유지해 다른 로그인 홈으로 옮깁니다.":CodexFeatureSupport.sessionMoveUnavailable)

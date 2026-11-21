@@ -245,6 +245,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var claudeGroupPrompts: [String: (prompt: String, turn: String)] = [:]
     private var groupMailboxDelegations: [String: (id: UUID, at: Date, group: String)] = [:]
     public var groupMailboxPollInterval: TimeInterval = 5
+    public static let groupMessageTTLMinutesRange = 1...10_080
+    public var groupMessageTTLMinutes: Int {
+        guard let raw = store.value("groupMessageTTLMinutes"), let minutes = Int(raw),
+              Self.groupMessageTTLMinutesRange.contains(minutes) else { return 120 }
+        return minutes
+    }
+    public func setGroupMessageTTLMinutes(_ minutes: Int) throws {
+        guard Self.groupMessageTTLMinutesRange.contains(minutes) else {
+            throw AppError.message("그룹 메시지 만료 시간은 1~10,080분으로 지정해주세요.")
+        }
+        try store.set("groupMessageTTLMinutes", String(minutes))
+        scheduleGroupMailboxDelivery()
+    }
     public var groupMailboxReminderInterval: TimeInterval = 120
     /// Retry timer for a message held because its recipient is busy; the idle signal normally comes first.
     public var groupMailboxHeldFallback: TimeInterval = 300
@@ -2732,8 +2745,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// Types /status into an empty composer and reads the fresh status card, including during Codex work.
-    package func statusConversationID(_ original: AgentSession,backgroundOnly:Bool = false, markRepeatedCard: Bool = false) async throws -> String {
-        if original.agent == .codex {try await waitForGroupStatusInput(original,backgroundOnly:backgroundOnly)}
+    package func statusConversationID(_ original: AgentSession,backgroundOnly:Bool = false, markRepeatedCard: Bool = false,
+                                      waitForInput: Bool = true) async throws -> String {
+        if original.agent == .codex, waitForInput {try await waitForGroupStatusInput(original,backgroundOnly:backgroundOnly)}
         let runtime = original.id
         guard !sendingMessages.contains(runtime), groupStatusQueries.insert(runtime).inserted else {
             throw AppError.message("이미 이 터미널의 세션 ID를 조회하고 있습니다.")
@@ -3361,18 +3375,30 @@ private struct ScreenAnalysisStorageKey: Hashable {
         groupMailboxTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
+                var delay = self.groupMailboxPollInterval
                 do {
                     let box = try self.groupMailbox()
+                    let ttl = TimeInterval(self.groupMessageTTLMinutes * 60)
+                    var expiration = try box.nextExpiration(ttl: ttl)
+                    if let due = expiration, due <= Date() {
+                        try box.expireUnconfirmed(createdThrough: Date().addingTimeInterval(-ttl))
+                        expiration = try box.nextExpiration(ttl: ttl)
+                        self.refreshGroupWaits()
+                        self.publish()
+                    }
                     let questions = try box.recoverableClaudeQuestions()
-                    guard try box.hasNotificationWork || box.hasPendingReceipts || !questions.isEmpty else { self.groupMailboxTask = nil; return }
-                    if Date().timeIntervalSince(self.groupRecoveryAt) >= 5, !questions.isEmpty,
+                    let hasDelivery = try box.hasNotificationWork || box.hasPendingReceipts || !questions.isEmpty
+                    guard hasDelivery || expiration != nil else { self.groupMailboxTask = nil; return }
+                    if !hasDelivery, let expiration { delay = max(0.1, expiration.timeIntervalSinceNow) }
+                    if !self.snapshot.paused, Date().timeIntervalSince(self.groupRecoveryAt) >= 5, !questions.isEmpty,
                        self.sessions.values.contains(where: { $0.agent == .claude && $0.phase != .ended }) {
                         self.groupRecoveryAt = Date()
                         await self.recoverClaudeGroupQuestions(questions)
                     }
-                    try await self.deliverGroupMailboxNotifications()
+                    if hasDelivery { try await self.deliverGroupMailboxNotifications() }
+                    if let expiration { delay = min(delay, max(0.1, expiration.timeIntervalSinceNow)) }
                 } catch { /* Keep durable messages; query tools surface the storage error. */ }
-                await change.waitForChange(timeout: self.groupMailboxPollInterval)
+                await change.waitForChange(timeout: delay)
             }
         }
     }
@@ -3656,6 +3682,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let box = try self.groupMailbox()
             let latest = try manualQuestion ? box.unansweredQuestion(message.id, in: message.groupID) : box.message(message.id)
             guard let latest, manualQuestion || latest.acknowledgedAt == nil,
+                  latest.acknowledgedAt != nil || Date().timeIntervalSince(latest.createdAt) < TimeInterval(self.groupMessageTTLMinutes * 60),
                   latest.lastResult == (message.deliversBody ? "direct_attempting" : "attempting") else {
                 throw RemoteHTTPError(409, "메시지가 이미 처리되었습니다.", diagnostics: ["delivery": "not_started"])
             }
@@ -3754,18 +3781,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// Restarts each session in its own terminal and reopens the same conversation, so a CLI picks up
-    /// new MCP tools and settings. Busy sessions restart once they are idle with an empty input box.
+    /// new MCP tools and settings. An explicit restart ends the selected CLI even if its turn is active.
     /// With `resume`, each restarted session is then told to go on with the work it had in progress.
     @discardableResult
     public func restartSessions(_ ids: [String], resume: Bool = true) -> SessionRestartProgress {
+        let ids = Array(Set(ids)).sorted().filter { sessionRestartTasks[$0] == nil }
         let now = Date()
+        guard !ids.isEmpty else { return snapshot.sessionRestart ?? SessionRestartProgress(items: [], startedAt: now) }
         restartResumesWork = resume
         // Retrying keeps earlier results visible; only the retried sessions start over.
         var items = (snapshot.sessionRestart?.items ?? []).filter { !ids.contains($0.id) && ($0.phase == .done || !$0.phase.isFinished) }
         for id in ids {
             guard let session = sessions[id], session.phase != .ended, session.agent == .claude || session.agent == .codex else { continue }
-            items.append(SessionRestartItem(id: id, title: session.displayedTerminalTitle, phase: .waiting, message: "대기 상태가 되면 다시 시작합니다.", at: now))
-            sessionRestartTasks[id]?.cancel()
+            items.append(SessionRestartItem(id: id, title: session.displayedTerminalTitle, phase: .waiting, message: "대화와 종료할 CLI를 확인하고 있습니다.", at: now))
             sessionRestartTasks[id] = Task { [weak self] in await self?.runSessionRestart(id, resume: resume) }
         }
         restartIdentityTask = Task { [weak self] in
@@ -3780,7 +3808,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Stops restarts that have not exited their CLI yet. A CLI that already exited still gets its resume command.
     public func cancelSessionRestarts() {
         for item in snapshot.sessionRestart?.items ?? [] where item.phase == .waiting {
-            sessionRestartTasks.removeValue(forKey: item.id)?.cancel()
+            sessionRestartTasks[item.id]?.cancel()
             updateRestart(item.id, .cancelled, "다시 시작을 취소했습니다.")
         }
     }
@@ -3847,45 +3875,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
         catch { return fail(error.localizedDescription) }
         let environment = await Task.detached(operation: { ProcessEnvironment.read(process) ?? [:] }).value
 
-        // Never cut off work. Claude registers its own status, which does not depend on reading the screen;
-        // a status line at the bottom of Claude's screen makes the screen reading report "unknown".
-        let registryReader = claudeRegistryReader, configDirectory = environment["CLAUDE_CONFIG_DIR"]
-        func claudeStatus() async -> String? {
-            await Task.detached(operation: {
-                let rows = configDirectory.map { ClaudeSessionRegistry.read(records: [process], directory: URL(fileURLWithPath: $0)) } ?? registryReader([process])
-                return rows.first { $0.processID == process.key }?.status
-            }).value
-        }
-        let waitUntil = Date().addingTimeInterval(1800)
-        while true {
-            guard !Task.isCancelled, !remoteInputStopped else { return }
-            guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
-            var idle = current.phase == .idle, reason = "현재: \(current.phaseTitle)"
-            if current.agent == .claude, let status = await claudeStatus() {
-                idle = status == "idle"
-                reason = ["busy": "Claude가 작업 중", "waiting": "Claude가 응답을 기다리는 중", "shell": "Claude의 백그라운드 셸 작업이 실행 중"][status] ?? "Claude 상태: \(status)"
-            } else if current.phase == .unknown, let frame = try? await remoteTerminal(sessionID: id, realtime: true), frame.question == nil,
-                      ActivityDetector.detect(frame.screen, agent: current.agent).phase == .idle { idle = true }
-            if idle {
-                if current.pendingInTerminal || liveClaudeHooks.values.contains(where: { $0.request.sessionID == id }) { reason = "답을 기다리는 요청이 있음" }
-                else if automaticInputBusy(id) { reason = "승인 입력을 전달하는 중" }
-                else { break }
-            }
-            guard Date() < waitUntil else { return fail("30분 동안 대기 상태가 되지 않아 다시 시작하지 않았습니다. (\(reason))") }
-            updateRestart(id, .waiting, "대기 상태가 되면 다시 시작합니다. (\(reason))")
-            try? await Task.sleep(for: .seconds(2))
-        }
-        guard !Task.isCancelled, let current = sessions[id] else { return }
-        // A Codex TUI attached to the shared daemon may not expose its rollout; its status card shows the ID.
-        if conversation == nil, current.agent == .codex {
+        guard !Task.isCancelled, !remoteInputStopped else { return }
+        guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
+        // Codex can show /status during a turn if its composer is empty.
+        if conversation == nil, current.agent == .codex, !sendingMessages.contains(id), !automaticInputBusy(id) {
             updateRestart(id, .waiting, "터미널의 /status 화면에서 대화 ID를 확인하고 있습니다.")
-            conversation = valid(try? await statusConversationID(current))
+            conversation = valid(try? await statusConversationID(current, waitForInput: false))
             if let conversation { groupStatusIdentities[id] = GroupStatusIdentity(session: current, conversationID: conversation, home: nil) }
         }
         // Last resort: the conversation the CLI was launched with. A later /clear may have started another one,
         // so the result says which ID was used.
         var launchedConversation = false
-        if conversation == nil {
+        if conversation == nil, current.phase == .idle {
             let tokens = Array(argv.dropFirst())
             let flags: Set<String> = current.agent == .claude ? ["--resume", "-r", "--session-id"] : ["resume"]
             if let index = tokens.firstIndex(where: { flags.contains($0) }), index + 1 < tokens.count, let id = valid(tokens[index + 1]) {
@@ -3903,25 +3904,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let plan: SessionRestartCommand.Plan
         do { plan = try SessionRestartCommand.plan(agent: original.agent, executable: codexContext?.executable ?? executable, argv: Array(argv.dropFirst()), conversationID: conversation) }
         catch { return fail(error.localizedDescription) }
-        // The status query may leave the CLI briefly busy; wait for it to settle again.
-        let settleUntil = Date().addingTimeInterval(20)
+        // Let an input transaction already in flight finish before ending this CLI.
+        let settleUntil = Date().addingTimeInterval(5)
         while sendingMessages.contains(id) || automaticInputBusy(id) {
-            guard Date() < settleUntil, !Task.isCancelled else { return fail("대화 ID를 확인한 뒤 CLI가 대기 상태로 돌아오지 않았습니다.") }
-            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled, !remoteInputStopped else { return }
+            guard Date() < settleUntil else { return fail("전달 중인 입력이 끝나지 않아 CLI를 종료하지 않았습니다.") }
+            updateRestart(id, .waiting, "전달 중인 입력이 끝나면 CLI를 종료합니다.")
+            try? await Task.sleep(for: .milliseconds(150))
         }
-        while restartTerminalBusy {
-            guard !Task.isCancelled else { return }
-            updateRestart(id, .waiting, "다른 세션의 다시 시작이 끝나기를 기다리고 있습니다.")
-            try? await Task.sleep(for: .milliseconds(300))
-        }
-        restartTerminalBusy = true
-        var terminalReleased = false
-        func releaseTerminal() { if !terminalReleased { terminalReleased = true; restartTerminalBusy = false } }
-        defer { releaseTerminal() }
         guard !Task.isCancelled,!remoteInputStopped else {return}
         guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
         let wasAutomatic = current.automatic
-        updateRestart(id, .exiting, "CLI를 종료하고 있습니다.")
         let command:String
         do {command=try codexContext.map{try $0.terminalInvocation(Array(plan.arguments.dropFirst())).map(HookInstaller.quote).joined(separator:" ")}
             ?? plan.command(cwd:nil,environment:environment)}
@@ -3933,6 +3926,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
               fresh.contains(where: { $0.pid == shell.pid && $0.started == shell.started && $0.tty == shell.tty }) else {
             return fail("CLI나 셸이 바뀌어 종료하지 않았습니다.")
         }
+        guard !Task.isCancelled, !remoteInputStopped else { return }
+        guard fresh.contains(where: { $0.key == process.key && ProcessDiscovery.ancestors(of: $0.parent, records: fresh)
+            .contains(where: { $0.key == shell.key }) }),
+              !sendingMessages.contains(id), !automaticInputBusy(id) else {
+            return fail("CLI와 셸의 연결 또는 입력 상태가 바뀌어 종료하지 않았습니다.")
+        }
+        updateRestart(id, .exiting, "선택한 CLI에 종료 신호를 보내고 있습니다.")
         guard log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "CLI 종료 신호 전달", source: host.title, context: AuditContext(session: current), request: command)) else {
             return fail("승인 내역을 저장하지 못해 종료하지 않았습니다.")
         }
@@ -3951,6 +3951,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let live = try? await Task.detached(operation: { try reader() }).value, context.verifiedShell(in: live) != nil else { continue }
             let screen = try? await Task.detached(operation: { try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty })?.contents }).value
             guard let prompt = screen ?? nil, SessionExitRecovery.emptyShellPrompt(prompt) else { continue }
+            guard !restartTerminalBusy else { continue }
+            restartTerminalBusy = true
+            defer { restartTerminalBusy = false }
             updateRestart(id, .launching, "같은 터미널에서 같은 대화를 다시 열고 있습니다.")
             do {
                 let delivery:TerminalDelivery=try await Task.detached {
@@ -3962,7 +3965,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             catch { return fail("다시 시작 명령을 입력하지 못했습니다: \(error.localizedDescription)." + manual) }
         }
         log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "같은 대화 다시 열기 입력", source: host.title, context: AuditContext(session: current), request: command))
-        releaseTerminal()
 
         // Find the new CLI on that terminal and carry the automatic approval choice over.
         updateRestart(id, .confirming, "새 CLI 실행을 확인하고 있습니다.")
@@ -10744,7 +10746,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if remoteInputStopped || agentAccounts.busy {throw AppError.message(codexAccountControlBlockReason()!)}
         if joinedExisting || codexAccountTransitionHeld {
             guard joinedExisting || codexAccountTransitionStates[home]?.held == true else{throw AppError.message(codexAccountControlBlockReason()!)}
-            if codexAccountTransitionStates[home]?.held == true {await checkCodexAccountTransitions()}
+            if codexAccountTransitionStates[home]?.held == true {
+                try codexAccountCoordinators[home]?.prioritizeExistingTransition()
+                await checkCodexAccountTransitions()
+            }
             codexAccountTransitionSignal.notify()
             codexAccountTransitionNotice=codexAccountTransitionStates[home]?.detail
             return true
