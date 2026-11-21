@@ -10,6 +10,8 @@ extension ApprovalTests {
         for bundle in ["com.apple.TextEdit", "com.apple.calculator", "com.apple.Notes", "com.tinyspeck.slackmacgap"] {
             try expectNil(BackgroundDesktopPolicy.blockReason(bundleID: bundle, name: bundle))
         }
+        try expectFalse(BackgroundDesktopPolicy.elementActions.contains("AXShowMenu"))
+        try expectFalse(BackgroundDesktopPolicy.elementActions.contains("AXPick"))
         try expectFalse(BackgroundDesktopPolicy.elementActions.contains("AXRaise"), "AXRaise reorders the user's windows")
     }
 
@@ -24,10 +26,11 @@ extension ApprovalTests {
 
     func testClaudeComputerUseRedirectDeniesOnlyFocusTakingActions() throws {
         for (tool, input) in [("mcp__computer-use__left_click", [:]), ("mcp__computer-use__type", [:]), ("mcp__computer-use__open_application", [:]),
+                              ("mcp__computer-use__request_access", [:]), ("mcp__computer-use__get_or_open_window", [:]),
                               ("mcp__remote-devices__computer_key", [:]), ("mcp__computer-use__computer", ["action": "scroll"]) ] as [(String, JSONObject)] {
             try expect(ClaudeComputerUseRedirect.denial(tool: tool, input: input) != nil, tool)
         }
-        for (tool, input) in [("mcp__computer-use__screenshot", [:]), ("mcp__computer-use__zoom", [:]), ("mcp__computer-use__request_access", [:]),
+        for (tool, input) in [("mcp__computer-use__screenshot", [:]), ("mcp__computer-use__zoom", [:]),
                               ("mcp__computer-use__list_granted_applications", [:]), ("mcp__computer-use__computer", ["action": "screenshot"]),
                               ("mcp__claude-in-chrome__computer", ["action": "left_click"]), ("Bash", ["command": "ls"]),
                               ("mcp__autoapprove__desktop_press", [:])] as [(String, JSONObject)] {
@@ -44,6 +47,7 @@ extension ApprovalTests {
         }
         for (tool, input) in [("mcp__cua_repl__js", ["code": "await app.click(1)"]),
                               ("mcp__computer_use__computer", ["action": "left_click"]),
+                              ("mcp__computer_use__request_access", [:]), ("mcp__computer_use__computer", ["action": "get_or_open_window"]),
                               ("mcp__remote-devices__computer_type", [:])] as [(String, JSONObject)] {
             let result = response(tool, input)["hookSpecificOutput"] as? JSONObject
             try expectEqual(result?["hookEventName"] as? String, "PreToolUse")

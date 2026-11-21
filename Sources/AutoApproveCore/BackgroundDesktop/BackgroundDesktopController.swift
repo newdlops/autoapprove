@@ -243,18 +243,29 @@ public final class BackgroundDesktopController: @unchecked Sendable {
         guard let text = object["text"] as? String, !text.isEmpty else { throw RemoteHTTPError(400, "입력할 글자를 text에 넣어주세요.") }
         guard text.count <= 4000 else { throw RemoteHTTPError(400, "한 번에 4,000자까지 입력할 수 있습니다.") }
         let before = NSWorkspace.shared.frontmostApplication
+        func focusedElement() -> AXUIElement? {
+            guard let value = Self.attribute(target.element, kAXFocusedUIElementAttribute),
+                  CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+            return (value as! AXUIElement)
+        }
+        var focused = focusedElement()
         if object["ref"] != nil {
-            let element = try element(target, object, owner: owner)
-            try Self.rejectSecure(element)
-            // Focus inside the app only; the app itself stays in the background.
-            AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-            usleep(80_000)
-            let focus = restoreIfStolen(target, before: before)
-            guard focus["frontmostUnchanged"] as? Bool == true else {
-                return target.summary.merging(["typed": false, "focus": focus, "error": "입력란에 포커스를 주자 앱이 앞으로 나와서 입력하지 않았습니다. desktop_set_value를 사용해주세요."]) { $1 }
+            let requested = try element(target, object, owner: owner)
+            try Self.rejectSecure(requested)
+            if focused.map({ CFEqual($0, requested) }) != true {
+                let status = AXUIElementSetAttributeValue(requested, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+                usleep(80_000)
+                let focus = restoreIfStolen(target, before: before)
+                guard focus["frontmostUnchanged"] as? Bool == true else {
+                    return target.summary.merging(["typed": false, "focus": focus, "error": "입력란에 포커스를 주자 앱이 앞으로 나와서 입력하지 않았습니다. desktop_set_value를 사용해주세요."]) { $1 }
+                }
+                focused = focusedElement()
+                guard status == .success, focused.map({ CFEqual($0, requested) }) == true else {
+                    throw RemoteHTTPError(409, "지정한 입력란의 포커스를 확인할 수 없습니다. desktop_snapshot으로 대상을 확인하거나 desktop_set_value를 사용해주세요.")
+                }
             }
         }
-        guard let focused = Self.attribute(target.element, kAXFocusedUIElementAttribute).map({ $0 as! AXUIElement }) else {
+        guard let focused else {
             throw RemoteHTTPError(409, "\(target.name)에 입력을 받을 요소가 없습니다. ref로 입력란을 지정해주세요.")
         }
         try Self.rejectSecure(focused)

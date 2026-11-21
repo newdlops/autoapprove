@@ -81,7 +81,7 @@ public enum AutoApproveMCPServer {
             tool("desktop_screenshot", common + "다른 창에 가려져 있어도 앱의 창 하나만 캡처해 이미지로 반환합니다. 화면 전체를 캡처하지 않습니다.",
                  ["app": app, "window": window], ["app"], true, false),
             tool("desktop_press", common + "버튼, 체크박스, 탭 같은 요소의 동작을 실행합니다. 기본 동작은 AXPress입니다. 좌표 클릭과 메뉴 실행은 백그라운드 앱에서 동작하지 않으므로 제공하지 않습니다.",
-                 ["app": app, "ref": ref, "action": ["type": "string", "enum": ["AXPress", "AXConfirm", "AXCancel", "AXIncrement", "AXDecrement", "AXShowMenu", "AXPick"]]], ["app", "ref"], false, false),
+                 ["app": app, "ref": ref, "action": ["type": "string", "enum": BackgroundDesktopPolicy.elementActions.sorted()]], ["app", "ref"], false, false),
             tool("desktop_set_value", common + "입력란, 슬라이더 같은 요소의 값을 직접 지정합니다. mode=insert는 커서 위치에 글자를 넣고 기존 내용을 유지합니다. 비밀번호 입력란은 거부합니다.",
                  ["app": app, "ref": ref, "value": ["type": ["string", "number", "boolean"]], "mode": ["type": "string", "enum": ["replace", "insert"]]], ["app", "ref", "value"], false, false),
             tool("desktop_type", common + "앱의 포커스된 입력란(ref를 지정하면 그 요소)에 글자를 키 입력으로 보냅니다. 줄바꿈은 Return, 탭 문자는 Tab 키로 보냅니다. 앱은 뒤에 남아 있습니다.",

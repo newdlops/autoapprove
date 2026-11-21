@@ -27,7 +27,7 @@ public enum BackgroundDesktopPolicy {
 
     /// Accessibility actions that act on one element without activating its app.
     /// AXRaise is excluded: it reorders windows on the user's screen.
-    public static let elementActions: Set<String> = ["AXPress", "AXConfirm", "AXCancel", "AXIncrement", "AXDecrement", "AXShowMenu", "AXPick"]
+    public static let elementActions: Set<String> = ["AXPress", "AXConfirm", "AXCancel", "AXIncrement", "AXDecrement"]
 
     public static let secureRoles: Set<String> = ["AXSecureTextField"]
 
@@ -70,9 +70,8 @@ public enum BackgroundDesktopKeys {
 /// Agent-independent classification of a computer-use action name.
 /// Observation never moves the pointer or changes the active app.
 public enum ComputerUseAction {
-    private static let observing: Set<String> = ["screenshot", "zoom", "cursor_position", "wait", "list_granted_applications", "request_access"]
+    private static let observing: Set<String> = ["screenshot", "zoom", "cursor_position", "wait", "list_granted_applications"]
     public static func isObservation(_ action: String) -> Bool {
-        let name = action.lowercased()
-        return observing.contains(name) || name.hasPrefix("get_") || name.hasPrefix("list_") || name.hasPrefix("read_")
+        observing.contains(action.lowercased())
     }
 }
