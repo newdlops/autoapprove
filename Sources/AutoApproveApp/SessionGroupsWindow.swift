@@ -156,7 +156,7 @@ import AutoApproveCore
                 Spacer()
                 Button("전체 세션 ID 갱신") { Task { await refreshAllIdentities(in: group) } }
                     .disabled(loading || group.members.isEmpty)
-                    .help("이 그룹의 구성원을 순서대로 조회합니다. 보류·실패한 세션은 기존 ID를 유지하며 다음 구성원을 계속 처리합니다.")
+                    .help("모든 구성원을 조회합니다. 그룹장만 연결되지 않으면 같은 프로젝트·에이전트·설정 홈에 남은 유일한 미연결 대화를 그룹장에 연결합니다.")
             }
             HStack {
                 Spacer()
@@ -321,6 +321,8 @@ import AutoApproveCore
         defer { loading = false; bulkRunning = false }
         var changed = 0, confirmed = 0, attempted = 0
         var merged = Set<UUID>()
+        var failedLeader: UUID?
+        var recoveredLeader = false
         for (index, member) in group.members.enumerated() {
             if bulkStopRequested || Task.isCancelled { break }
             if merged.contains(member.id) { attempted += 1; continue }
@@ -330,14 +332,30 @@ import AutoApproveCore
                 if let duplicate = result.mergedMemberID { merged.insert(duplicate) }
                 if result.changed { changed += 1 } else { confirmed += 1 }
             } catch {
+                if group.isLeader(member.id) { failedLeader = member.id }
                 bulkFailures.append("\(member.title.isEmpty ? member.agent.title : member.title): \(error.localizedDescription)")
             }
             attempted += 1
         }
+        if !bulkStopRequested, !Task.isCancelled, bulkFailures.count == 1, let leaderID = failedLeader {
+            do {
+                let observed = try await engine.sessionGroupSessions()
+                let saved = try store.load()
+                if !bulkStopRequested, !Task.isCancelled, let current = saved.first(where: { $0.id == group.id }),
+                   let target = SessionGroupMatching.remainingLeaderCandidate(leaderID, group: current, groups: saved, live: observed) {
+                    let result = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: leaderID,
+                        expectedGroup: current, selectedReplacement: target.id, expectedConversationID: target.conversationID,
+                        expectedRuntimeID: target.id, remainingLeaderOnly: true)
+                    if result.changed { changed += 1 } else { confirmed += 1 }
+                    recoveredLeader = true
+                    bulkFailures.removeAll()
+                }
+            } catch { bulkFailures = ["그룹장 복구: " + error.localizedDescription] }
+        }
         do { live = try await engine.sessionGroupSessions(); groups = try store.load() }
         catch { self.error = "조회 결과를 다시 표시하지 못했습니다. " + error.localizedDescription }
         let remaining = group.members.count - attempted
-        notice = "\(group.name) · ID 변경 \(changed)개 · 기존 ID 확인 \(confirmed)개 · 보류·실패 \(bulkFailures.count)개" + (merged.isEmpty ? "" : " · 중복 정리 \(merged.count)개") + (remaining > 0 ? " · 미조회 \(remaining)개 (중단)" : "")
+        notice = "\(group.name) · ID 변경 \(changed)개 · 기존 ID 확인 \(confirmed)개 · 보류·실패 \(bulkFailures.count)개" + (merged.isEmpty ? "" : " · 중복 정리 \(merged.count)개") + (recoveredLeader ? " · 그룹장 자동 복구" : "") + (remaining > 0 ? " · 미조회 \(remaining)개 (중단)" : "")
     }
 
     private func refreshObservation() async {

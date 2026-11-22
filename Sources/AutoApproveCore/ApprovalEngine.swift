@@ -2598,7 +2598,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (id, home, name)
     }
 
-    @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil, selectedReplacement: String? = nil, expectedConversationID: String? = nil, expectedRuntimeID: String? = nil) async throws -> SessionGroupIdentityRefresh {
+    @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil, selectedReplacement: String? = nil, expectedConversationID: String? = nil, expectedRuntimeID: String? = nil, remainingLeaderOnly: Bool = false) async throws -> SessionGroupIdentityRefresh {
         let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
         if let expectedGroup, saved.first(where: { $0.id == groupID })?.sameMembership(as: expectedGroup) != true {
             throw RemoteHTTPError(409, "그룹 구성이 바뀌어 갱신하지 않았습니다. get_session_groups로 다시 확인해주세요.")
@@ -2673,6 +2673,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         if replacing {
             let all = try await readSessionGroupSessions(reconcile: false, useStatusCache: false)
+            if remainingLeaderOnly {
+                let groups = try store.load()
+                guard let currentGroup = groups.first(where: { $0.id == groupID }), currentGroup.sameMembership(as: group),
+                      let candidate = SessionGroupMatching.remainingLeaderCandidate(memberID, group: currentGroup, groups: groups, live: all),
+                      candidate.id == runtime, candidate.conversationID.flatMap(UUID.init(uuidString:)) == uuid else {
+                    throw AppError.message("다른 세션의 연결이 바뀌어 그룹장 복구를 보류했습니다. 전체 세션 ID를 다시 갱신해주세요.")
+                }
+            }
             guard selectedReplacement != nil || !group.members.contains(where: { $0.id != memberID && $0.runtimeID != runtime && $0.tabShell?.identifies(connection.tabShell) == true }),
                   let checked = SessionGroupMatching.replacement(member, in: all, selected: selectedReplacement),
                   checked.id == runtime, checked.tabShell == connection.tabShell, checked.providerHome == home,

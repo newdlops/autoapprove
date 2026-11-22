@@ -329,6 +329,37 @@ public struct SessionGroupMemberOperation: Equatable {
 }
 
 public enum SessionGroupMatching {
+    public static func remainingLeaderCandidate(_ memberID: UUID, group: SessionGroup, groups: [SessionGroup],
+                                                live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
+        guard group.isLeader(memberID), group.members.count > 1,
+              let leader = group.members.first(where: { $0.id == memberID }),
+              connection(leader, in: live) == nil,
+              replacement(leader, in: live, selected: nil) == nil else { return nil }
+        let peers = group.members.filter { $0.id != memberID }
+        let connected = peers.compactMap { peer -> String? in
+            guard let id = UUID(uuidString: peer.conversationID), let row = match(peer, in: live),
+                  row.conversationID.flatMap(UUID.init(uuidString:)) == id else { return nil }
+            return row.id
+        }
+        let occupied = Set(connected)
+        guard occupied.count == peers.count else { return nil }
+        let home = leader.providerHome ?? (leader.agent == .claude ? TerminalProfileGroup.normalizedHome(nil, agent: "claude") : nil)
+        let otherMembers = groups.filter { $0.id != group.id }.flatMap(\.members)
+        let possible = live.filter { row in
+            guard !occupied.contains(row.id), row.session.phase != .ended, row.session.agent == leader.agent,
+                  row.session.cwd == leader.cwd, row.providerHome == nil || row.providerHome == home else { return false }
+            let id = row.conversationID.flatMap(UUID.init(uuidString:))
+            return !otherMembers.contains { other in
+                other.runtimeID == row.id || other.tabShell?.identifies(row.tabShell) == true ||
+                    (id != nil && other.agent == row.session.agent && UUID(uuidString: other.conversationID) == id &&
+                        (other.providerHome == nil || other.providerHome == row.providerHome))
+            }
+        }
+        guard possible.count == 1, let candidate = possible.first, candidate.conversationID.flatMap(UUID.init(uuidString:)) != nil,
+              replacement(leader, in: live, selected: candidate.id)?.id == candidate.id else { return nil }
+        return candidate
+    }
+
     public static func replacement(_ member: SessionGroupMember, in live: [SessionGroupLiveSession], selected: String?) -> SessionGroupLiveSession? {
         let home = member.providerHome ?? (member.agent == .claude ? TerminalProfileGroup.normalizedHome(nil, agent: "claude") : nil)
         guard member.agent != .shell, let home, let previous = UUID(uuidString: member.conversationID),

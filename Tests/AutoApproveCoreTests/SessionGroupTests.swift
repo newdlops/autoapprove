@@ -389,6 +389,25 @@ extension ApprovalTests {
         try expectNil(SessionGroupMatching.replacement(saved, in: [restarted], selected: nil))
         try expectEqual(SessionGroupMatching.replacement(saved, in: [restarted], selected: restarted.id)?.id, restarted.id)
         try expectNil(SessionGroupMatching.replacement(saved, in: [restarted, claude], selected: restarted.id))
+        var peer = restarted
+        peer.session.id = "peer"
+        peer.conversationID = UUID().uuidString
+        let team = SessionGroup(name: "team", members: [saved, peer.member], leaderMemberID: saved.id)
+        func remaining(_ rows: [SessionGroupLiveSession], _ others: [SessionGroup] = []) -> String? {
+            SessionGroupMatching.remainingLeaderCandidate(saved.id, group: team, groups: [team] + others, live: rows)?.id
+        }
+        try expectEqual(remaining([peer, restarted]), restarted.id)
+        try expectNil(remaining([restarted]))
+        let assigned = SessionGroup(name: "other", members: [restarted.member])
+        try expectNil(remaining([peer, restarted], [assigned]))
+        var extra = restarted
+        extra.session.id = "other"
+        extra.conversationID = UUID().uuidString
+        try expectNil(remaining([peer, restarted, extra]))
+        try expectEqual(remaining([peer, restarted, extra], [SessionGroup(name: "other", members: [extra.member])]), restarted.id)
+        extra.conversationID = nil
+        try expectNil(remaining([peer, restarted, extra]))
+        try expectNil(remaining([peer, extra]))
         claude.providerHome = "/different/claude-config"
         try expectNil(SessionGroupMatching.match(saved, in: [claude]))
         var unresolved = member; unresolved.conversationID = ""
