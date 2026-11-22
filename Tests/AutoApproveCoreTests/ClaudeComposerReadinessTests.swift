@@ -8,6 +8,17 @@ extension ApprovalTests {
         func framed(_ body: String, footer: String = "custom status") -> String {
             "answer\n\(rule)\n❯ \(body)\n\(rule)\n\(footer)"
         }
+        try expect(ClaudeTerminalSuggestion.matchesInk(marker: (52, 235), text: (52, 163), hint: (54, 169)))
+        try expect(!ClaudeTerminalSuggestion.matchesInk(marker: (52, 235), text: (52, 235), hint: (54, 169)))
+        try expect(!ClaudeTerminalSuggestion.matchesInk(marker: (52, 235), text: (52, 163), hint: (54, 225)))
+        let suggestion = "진행상황은?"
+        try expectEqual(ClaudeComposerReadiness.framedCandidate(framed(suggestion)), suggestion)
+        try expect(!ClaudeComposerReadiness.isEmpty(framed(suggestion)), "Plain text alone cannot authorize a suggested prompt")
+        try expectNil(ClaudeComposerReadiness.framedCandidate(framed("draft\nsecond line")))
+        try expectNil(ClaudeComposerReadiness.framedCandidate(framed(suggestion, footer: "esc to interrupt")))
+        try expect(ClaudeComposerReadiness.containsOnly("group message", screen: framed("group message")))
+        try expect(!ClaudeComposerReadiness.containsOnly("group message", screen: framed(suggestion)))
+        try expect(!ClaudeComposerReadiness.containsOnly("group message", screen: framed("group message plus draft")))
         let custom = framed("", footer: status)
         try expectEqual(ActivityDetector.detect(custom, agent: .claude).phase, .unknown,
                         "Input readiness must not change general activity or manufacture completion")
@@ -20,7 +31,7 @@ extension ApprovalTests {
         }
         for screen in [framed("user draft", footer: status), framed("\ncontinued draft", footer: status),
                        framed("\n---\nmultiline markdown", footer: status), framed("\n\(rule)\ncontinued draft", footer: status),
-                       "answer\n❯ \n" + status + "\n? for shortcuts", // No boundary: unknown text could be a draft.
+                       "answer\n❯ \n" + status + "\n? for shortcuts",
                        "❯ \n\(rule)\n" + status, "\(rule)\n❯ \n" + status,
                        framed("", footer: String(repeating: "long", count: 600)),
                        framed("", footer: Array(repeating: "status", count: 9).joined(separator: "\n")),
@@ -31,8 +42,6 @@ extension ApprovalTests {
                        "```\n" + custom + "\n```"] {
             try expect(!ClaudeComposerReadiness.isEmpty(screen), "Drafts, menus and ambiguous/clipped composers must stay blocked")
         }
-        // A renamed session shows its name inside the top border. That composer is still empty and ready,
-        // while a draft under the same labelled border, or a label that is really wrapped text, stays blocked.
         let labelled = String(repeating: "─", count: 40) + " 4번 ─"
         func named(_ body: String, top: String = labelled) -> String { "answer\n\(top)\n❯ \(body)\n\(rule)\n\(status)\n⏵⏵ auto mode on (shift+tab to cycle)" }
         for screen in [named(""), named("", top: "─── fixture 리뷰 ───"), named("Try \"fix lint errors\"")] {
@@ -42,10 +51,8 @@ extension ApprovalTests {
                        named("", top: "──name──"), named("", top: "text ─────")] {
             try expect(!ClaudeComposerReadiness.isEmpty(screen), "Drafts and text that is not a border label stay blocked")
         }
-        // A held group message names the actual reason, so the sender can tell a busy or drafting
-        // recipient apart from a composer the screen reader could not recognise.
         func reason(_ screen: String, input: String? = nil) -> String { ApprovalEngine.composerHoldReason(screen, agent: .claude, inputReason: input) }
-        try expectEqual(reason(framed("user draft", footer: status)), "입력창에 작성 중인 글이 있음")
+        try expectEqual(reason(framed("user draft", footer: status)), "Claude 추천 문구와 작성 중인 글을 구분할 수 없음")
         try expectEqual(reason(framed("", footer: "Which environment?\n❯ 1. Development\n  2. Production\nEnter to select")), "선택지나 확인 화면이 열려 있음")
         try expectEqual(reason("✻ Thinking… (12s · esc to interrupt)\n\(rule)\n❯ \n\(rule)"), "세션이 작업 중임")
         try expectEqual(reason("answer\n❯ \n" + status + "\n? for shortcuts"), "입력창 모양을 판독하지 못함")

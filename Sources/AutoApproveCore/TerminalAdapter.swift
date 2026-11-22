@@ -78,8 +78,7 @@ public struct ScreenHostAdapter: Sendable {
     public var completeResume: (@Sendable (ScreenTarget, CodexCapacityStop) throws -> ResumeDelivery)?
     /// The source is an already verified, idle original shell after an observed CLI error.
     public var restart: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)?
-    /// Types one line into the tab's terminal and submits it, without focus or key events, so it also reaches
-    /// a tab in the background. The caller verifies that the CLI is idle at its prompt.
+    var checkedTypeLine: (@Sendable (ScreenTarget, String, String) throws -> TerminalDelivery)?
     public var typeLine: (@Sendable (ScreenTarget, String) throws -> TerminalDelivery)?
     /// A direct terminal write. Must never activate a window or fall back to keyboard events.
     public var backgroundInput: (@Sendable (ScreenTarget, String, AgentKind, RemoteTerminalInput) throws -> TerminalDelivery)?
@@ -135,6 +134,7 @@ public struct ScreenHostAdapter: Sendable {
                 goalInterrupt:{try TerminalGoalInterrupt.deliver(target:$0,expected:$1)},
                 setTabLabel:{try TerminalTabLabelAdapter.apply(host:.terminal,target:$0,label:$1)})
             adapter.identityScreens = { try TerminalAdapter.screens(ttys: $0.map(\.tty), includeCursor: false, freshTitles: true) }
+            adapter.checkedTypeLine = { try TerminalAdapter.typeLine(target: $0, text: $1, expected: $2) }
             adapter.typeLine = { try TerminalAdapter.typeLine(target: $0, text: $1) }
             adapter.backgroundInput = { try TerminalDeviceInput.deliverBackground(target: $0, screen: $1, agent: $2, input: $3) }
             if let terminalReader {
@@ -283,14 +283,13 @@ public enum TerminalAdapter {
         guard let result = TerminalDelivery(rawValue:output) else { throw AppError.message("같은 대화 복구 명령의 전달 결과를 확인하지 못했습니다.") }
         return result
     }
-    /// `do script … in tab` writes the text and a newline to that tab's terminal as typed input.
-    /// The tab must still run the expected CLI (more than a login shell), and the text must be one line.
-    public static func typeLine(target: ScreenTarget, text: String) throws -> TerminalDelivery {
-        // An empty text sends only the newline, which is how a line that arrived as a paste gets submitted.
+    public static func typeLine(target: ScreenTarget, text: String, expected: String? = nil) throws -> TerminalDelivery {
         guard text.count <= 8000, !text.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
             throw AppError.message("한 줄 메시지만 입력할 수 있습니다.")
         }
-        let literal = try AutomationScript.literal(["tty": target.tty, "text": text] as JSONObject)
+        var request: JSONObject = ["tty": target.tty, "text": text]
+        request["expected"] = expected
+        let literal = try AutomationScript.literal(request)
         let output = try AutomationScript.run("""
         (() => {
           const app = Application('com.apple.Terminal'), target = \(literal);
@@ -304,6 +303,7 @@ public enum TerminalAdapter {
               if (tty !== target.tty) continue;
               const jobs = tab.processes().map(p => String(p).toLowerCase()).filter(p => p !== 'login');
               if (jobs.length === 0 || jobs.every(p => /^(?:-)?(?:zsh|bash|sh|fish|dash|ksh)$/.test(p))) return 'agentMissing';
+              if (target.expected !== undefined && String(tab.contents()).normalize('NFC').replace(/\\r\\n?/g, '\\n') !== target.expected.normalize('NFC').replace(/\\r\\n?/g, '\\n')) return 'screenChanged';
               app.doScript(String(target.text).normalize('NFC'), {in: tab});
               return 'sent';
             }

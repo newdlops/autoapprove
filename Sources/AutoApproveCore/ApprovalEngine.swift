@@ -3703,12 +3703,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                              sourceKey: key)
     }
 
-    /// Why a group message is held instead of typed, so the sender and the graph can tell a busy
-    /// recipient or a draft apart from a composer the screen reader could not recognise.
     public nonisolated static func composerHoldReason(_ screen: String, agent: AgentKind, inputReason: String?) -> String {
         if let inputReason, !inputReason.isEmpty { return "터미널이 입력을 받을 수 없음(\(inputReason))" }
         if RemoteMessageReadiness.hasMenu(screen, agent: agent) { return "선택지나 확인 화면이 열려 있음" }
         if ActivityDetector.detect(screen, agent: agent).phase == .working { return "세션이 작업 중임" }
+        if agent == .claude, ClaudeComposerReadiness.framedCandidate(screen) != nil {
+            return "Claude 추천 문구와 작성 중인 글을 구분할 수 없음"
+        }
         let marker: Character = agent == .codex ? "›" : "❯"
         if let line = ActivityDetector.nonemptyTail(screen).last(where: { $0.first == marker }),
            !String(line.dropFirst()).trimmingCharacters(in: .whitespaces).isEmpty {
@@ -3856,15 +3857,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             guard !snapshot.paused, !remoteInputStopped else { throw hold("AutoApprove가 일시정지되어 전달을 기다립니다.") }
             guard !automaticInputBusy(now.id), !inputHasPriority else { throw hold("수신 탭에서 진행 중인 입력이 끝나기를 기다립니다.") }
-            guard ![.approval, .input].contains(now.phase), !now.pendingInTerminal else { throw hold("수신 탭의 질문 또는 승인 처리를 기다립니다.") }
+            let screenDraft = now.agent == .claude && now.phase == .input && now.detail == "CLI 입력창에 내용이 있습니다. 터미널에서 확인해주세요." && live.claudeRegisteredStatus == "idle"
+            guard now.phase != .approval, now.phase != .input || screenDraft, !now.pendingInTerminal else { throw hold("수신 탭의 질문 또는 승인 처리를 기다립니다.") }
             guard !message.deliversBody || now.phase != .working else { throw hold("수신 탭의 작업이 끝나기를 기다립니다.") }
         }
         try await ready()
         let prompt = message.terminalPrompt(senderTitle: group.members.first { $0.id == message.senderID }?.title ?? "")
         try await sendGroupLine(current, text: prompt, agyTarget: live, preflight: {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
-            let empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
+            var empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
                 : current.agent == .agy ? AgyComposerReadiness.isEmpty(frame.screen) : ClaudeComposerReadiness.isEmpty(frame.screen)
+            if !empty, current.agent == .claude, current.terminal == .terminal, live.claudeRegisteredStatus == "idle",
+               frame.inputReason == nil, self.screenAdapters[.terminal]?.checkedTypeLine != nil {
+                empty = await ClaudeTerminalSuggestion.matches(screen: frame.screen, tty: current.tty)
+            }
             let busyCodex = message.deliversBody && current.agent == .codex &&
                 ActivityDetector.detect(frame.screen, agent: .codex).phase != .idle
             guard empty, !busyCodex, frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: current.agent) else {
@@ -3895,6 +3901,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     self.groupMailboxDelegations[message.id] = (current.id, prompt, Date(), context)
                 }
             }
+            return frame.screen
         })
     }
 
@@ -4563,7 +4570,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }.value
     }
 
-    private func sendGroupLine(_ session: AgentSession, text: String, agyTarget: SessionGroupLiveSession? = nil, preflight: (() async throws -> Void)? = nil) async throws {
+    private func sendGroupLine(_ session: AgentSession, text: String, agyTarget: SessionGroupLiveSession? = nil, preflight: (() async throws -> String?)? = nil) async throws {
         if session.agent == .agy {
             let conversation = agyTarget == nil ? session.providerID : agyTarget?.conversationID
             _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true) { frame in
@@ -4578,7 +4585,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                       AgyComposerReadiness.isEmpty(frame.screen) else {
                     throw RemoteHTTPError(409, "agy의 현재 대화와 빈 입력창을 확인해주세요.", diagnostics: ["delivery":"not_started"])
                 }
-                try await preflight?()
+                _ = try await preflight?()
             }
             return
         }
@@ -4595,8 +4602,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             defer { sendingMessages.remove(session.id) }
             let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: [process.pid], sourcePID: process.pid, sourceStarted: process.started)
-            try await preflight?()
-            guard try await Task.detached(operation: { try type(target, text) }).value == .sent else {
+            let expected = try await preflight?()
+            let checked = screenAdapters[host]?.checkedTypeLine
+            guard try await Task.detached(operation: { () throws -> TerminalDelivery in
+                if let expected, let checked { return try checked(target, text, expected) }
+                return try type(target, text)
+            }).value == .sent else {
                 throw RemoteHTTPError(409, "대상 터미널 탭을 찾지 못해 입력하지 않았습니다.", diagnostics: ["delivery": "not_started"])
             }
             func submitted(within seconds: Double) async -> Bool {
@@ -4608,12 +4619,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return false
             }
             if await submitted(within: 1.5) { return }
-            _ = try? await Task.detached(operation: { try type(target, "") }).value
+            if let adapter = screenAdapters[host],
+               let pending = try? await Task.detached(operation: { try adapter.readForValidation([target]) }).value.screens.first(where: { $0.tty == target.tty }),
+               sessions[session.id]?.pendingInTerminal == false, !remoteInputStopped, !snapshot.paused,
+               !RemoteMessageReadiness.hasMenu(pending.contents, agent: .claude),
+               ClaudeComposerReadiness.containsOnly(text, screen: pending.contents),
+               !(await userInputHasPriority(session.id, backgroundOnly: true)) {
+                _ = try? await Task.detached(operation: { () throws -> TerminalDelivery in
+                    if let checked { return try checked(target, "", pending.contents) }
+                    return try type(target, "")
+                }).value
+            }
             if await submitted(within: 6) { return }
             throw RemoteHTTPError(409, "터미널에 입력했지만 제출을 확인하지 못했습니다. 대상 터미널의 입력창을 확인해주세요.", diagnostics: ["delivery": "unknown"])
         }
         _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true, preflight: { _ in
-            try await preflight?()
+            _ = try await preflight?()
         })
     }
 
@@ -5112,6 +5133,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     if let conversation = assignment.workerConversationID {
                         try self.groupMailbox().recordSubmission(assignment.id, conversation: conversation, prompt: prompt)
                     }
+                    return nil
                 }
                 if var latest = try? groupOrchestration() { latest.markDelivered(assignment.id); try? saveGroupOrchestration(latest) }
             } catch {

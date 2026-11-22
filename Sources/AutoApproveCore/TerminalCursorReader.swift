@@ -4,25 +4,17 @@ import ApplicationServices
 
 /// Reads an authoritative insertion range only from the exact selected Terminal window.
 enum TerminalCursorReader {
-    /// The native Terminal predicate supplies the selected window ID. Core
-    /// Graphics supplies its current bounds without another Terminal event or
-    /// screen capture. Ambiguous AX windows are rejected below.
     static func snapshot(screen: String, windowID: UInt32) -> TerminalTextSnapshot? {
         snapshot(screen: screen, windowID: windowID, title: nil)
     }
     static func snapshot(screen: String, windowID: UInt32, title: String) -> TerminalTextSnapshot? {
         snapshot(screen: screen, windowID: windowID, title: Optional(title))
     }
-    private static func snapshot(screen: String, windowID: UInt32, title: String?) -> TerminalTextSnapshot? {
+    static func snapshot(screen: String, windowID: UInt32, title: String?, inspect: ((AXUIElement, String, Int) -> Void)? = nil) -> TerminalTextSnapshot? {
         guard AXIsProcessTrusted(), !screen.isEmpty,
               let app = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else { return nil }
-        // Native tab groups also expose hidden virtual windows as selected.
-        // Their titles/bounds can coincide. CG metadata identifies the actual
-        // on-screen window without capturing pixels or requesting recording.
         guard let currentBounds = visibleWindowBounds(windowInfo(windowID: windowID), windowID: windowID,
             ownerPID: app.processIdentifier) else { return nil }
-        // Both native and script reads use this fresh Quartz frame. A Terminal
-        // bounds Apple event can race its live resize and is unnecessary here.
         let bounds = TerminalWindowBounds(x: currentBounds.minX, y: currentBounds.minY, width: currentBounds.width, height: currentBounds.height)
         let deadline = Date().addingTimeInterval(0.35)
         func attributes(_ element: AXUIElement, _ names: [String]) -> [Any]? {
@@ -36,7 +28,7 @@ enum TerminalCursorReader {
         let application = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(application, 0.2)
         return accessibilitySnapshot(screen: screen, title: title, bounds: bounds, application: application,
-            deadline: deadline, attributes: attributes)
+            deadline: deadline, attributes: attributes, inspect: inspect)
     }
 
     static func windowInfo(windowID: UInt32) -> [[String: Any]] {
@@ -61,7 +53,7 @@ enum TerminalCursorReader {
     }
     static func accessibilitySnapshot(screen: String, title: String?, bounds: TerminalWindowBounds,
                                       application: AXUIElement, deadline: Date,
-                                      attributes: (AXUIElement, [String]) -> [Any]?) -> TerminalTextSnapshot? {
+                                      attributes: (AXUIElement, [String]) -> [Any]?, inspect: ((AXUIElement, String, Int) -> Void)? = nil) -> TerminalTextSnapshot? {
         func point(_ value: CFTypeRef?) -> CGPoint? {
             guard let value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
             var point = CGPoint.zero
@@ -87,13 +79,12 @@ enum TerminalCursorReader {
             checked += 1
             let identity = attributes(element, [kAXRoleAttribute, kAXChildrenAttribute]) ?? []
             if identity.count == 2, identity[0] as? String == kAXTextAreaRole {
-                // Codex redraws while working. One AX response keeps its visible
-                // text and insertion range on the same source snapshot.
                 let names = [kAXValueAttribute, kAXSelectedTextRangeAttribute, kAXVisibleCharacterRangeAttribute]
                 if let fields = attributes(element, names), fields.count == 3, let value = fields[0] as? String {
                     let selected = fields[1] as CFTypeRef, visible = fields[2] as CFTypeRef
                     var range = CFRange(), viewport = CFRange()
                     if CFGetTypeID(selected) == AXValueGetTypeID(), AXValueGetValue(selected as! AXValue, .cfRange, &range), range.length == 0 {
+                        inspect?(element, value, range.location)
                         if CFGetTypeID(visible) == AXValueGetTypeID(), AXValueGetValue(visible as! AXValue, .cfRange, &viewport),
                            let snapshot = TerminalTextSnapshot.fromAccessibility(value: value, insertion: range.location,
                                visible: NSRange(location: viewport.location, length: viewport.length)) {

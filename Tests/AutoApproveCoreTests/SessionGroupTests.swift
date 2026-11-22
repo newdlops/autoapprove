@@ -35,14 +35,17 @@ private final class GroupTerminalWriter: @unchecked Sendable {
     }
 }
 
-/// Terminal typing without focus, and the status Claude registers for itself.
 private final class GroupLineTerminal: @unchecked Sendable {
     private let lock = NSLock()
     private var lines: [(tty: String, text: String)] = []
+    private var pendingInputs: [String: String] = [:]
+    func screen(_ tty: String, fallback: String) -> String {
+        lock.lock(); defer { lock.unlock() }
+        guard let text = pendingInputs[tty] else { return fallback }
+        return "────────\n❯ " + text + "\n────────\n? for shortcuts"
+    }
     private var statuses: [Int32: String] = [:]
-    /// When set, Claude becomes busy only after a separate Enter, as it does for a long pasted line.
     var needsEnter = true
-    /// When set, Claude never becomes busy, as when the line was not accepted.
     var ignoresInput = false
     var typed: [String] { lock.lock(); defer { lock.unlock() }; return lines.map(\.text) }
     func status(_ pid: Int32) -> String { lock.lock(); defer { lock.unlock() }; return statuses[pid] ?? "idle" }
@@ -50,6 +53,7 @@ private final class GroupLineTerminal: @unchecked Sendable {
     func type(_ target: ScreenTarget, _ text: String, pid: Int32) -> TerminalDelivery {
         lock.lock(); defer { lock.unlock() }
         lines.append((target.tty, text))
+        pendingInputs[target.tty] = !ignoresInput && needsEnter && !text.isEmpty ? text : nil
         if !ignoresInput, text.isEmpty || !needsEnter { statuses[pid] = "busy" }
         return .sent
     }
@@ -886,7 +890,7 @@ extension ApprovalTests {
         let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
             rows.compactMap { row in ids[row.pid].map { .init(processID: row.key, kind: "interactive", sessionID: $0, status: terminal.status(row.pid)) } }
         }
-        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: "상태 줄이 있는 화면") }) },
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: terminal.screen($0.tty, fallback: "상태 줄이 있는 화면")) }) },
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, _ in .missingTarget })
         adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.terminal: adapter])
@@ -943,7 +947,7 @@ extension ApprovalTests {
         for index in sessions.indices { sessions[index].phase = .idle }
         let parentID = UUID().uuidString.lowercased(), workerID = UUID().uuidString.lowercased(), codexID = UUID().uuidString.lowercased()
         let home = "/fixture/home", terminal = GroupLineTerminal(), writer = GroupTerminalWriter()
-        var adapter = ScreenHostAdapter(screens: { targets in .init(screens: targets.map { .init(tty: $0.tty, contents: writer.screen($0.tty)) }) },
+        var adapter = ScreenHostAdapter(screens: { targets in .init(screens: targets.map { .init(tty: $0.tty, contents: terminal.screen($0.tty, fallback: writer.screen($0.tty))) }) },
             approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { target,_,_, input in writer.send(target, input) })
         adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
         writer.show("fixture\n❯ \n ? for shortcuts", on: sessions[0].tty)
@@ -1027,7 +1031,7 @@ extension ApprovalTests {
         let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
             rows.filter { $0.agent == .claude }.compactMap { row in ids[row.pid].map { .init(processID: row.key, kind: "interactive", sessionID: $0, status: terminal.status(row.pid)) } }
         }
-        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: writer.screen($0.tty)) }) },
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: terminal.screen($0.tty, fallback: writer.screen($0.tty))) }) },
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in writer.send(target, input) })
         adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
         func makeEngine() throws -> ApprovalEngine {
