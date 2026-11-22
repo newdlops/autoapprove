@@ -172,8 +172,6 @@ public enum SessionGroupGraph {
         }
     }
 
-    /// Every question and answer, message, report and choice question in the page.
-    /// Group system notices never appear in the page and so never become lines.
     public static func records(_ page: SessionGroupConversationPage) -> [Record] {
         var result: [Record] = []
         for item in page.conversations {
@@ -267,9 +265,8 @@ public enum SessionGroupGraph {
 
     // MARK: Layout
 
-    /// Tree, circle and radial place nodes; the matrix draws a sender by recipient grid instead.
     public enum Layout: String, CaseIterable, Sendable {
-        case tree, circle, radial, matrix
+        case tree, circle, radial, force, matrix
         public var drawsNodes: Bool { self != .matrix }
     }
 
@@ -283,23 +280,76 @@ public enum SessionGroupGraph {
     public static let nameBandDrop = 44.0
     public static let layerGap = 28.0
 
-    /// Points relative to an arbitrary origin, in tree order.
     public static func positions(_ order: [SessionGroupTreeEntry], hasLeader: Bool, layout: Layout,
-                                 diameters: [UUID: Double] = [:]) -> [UUID: CGPoint] {
-        positions(order.map { (id: $0.member.id, depth: $0.depth) }, hasLeader: hasLeader, layout: layout, diameters: diameters)
+                                 diameters: [UUID: Double] = [:], edges: [Edge] = []) -> [UUID: CGPoint] {
+        positions(order.map { (id: $0.member.id, depth: $0.depth) }, hasLeader: hasLeader, layout: layout, diameters: diameters, edges: edges)
     }
 
-    /// The same with member IDs and tree depths in tree order. `diameters` holds each circle's
-    /// diameter (32pt when absent). Positions depend only on the order and the diameters, so
-    /// they change only when a node's size step changes.
     public static func positions(_ order: [(id: UUID, depth: Int)], hasLeader: Bool, layout: Layout,
-                                 diameters: [UUID: Double] = [:]) -> [UUID: CGPoint] {
+                                 diameters: [UUID: Double] = [:], edges: [Edge] = []) -> [UUID: CGPoint] {
         switch layout {
         case .tree: return treePositions(order, diameters: diameters)
         case .circle: return groupedCirclePositions(order, hasLeader: hasLeader, diameters: diameters)
         case .radial: return radialPositions(order, hasLeader: hasLeader, diameters: diameters)
+        case .force: return forcePositions(order, diameters: diameters, edges: edges)
         case .matrix: return [:]
         }
+    }
+
+    private static func forcePositions(_ order: [(id: UUID, depth: Int)], diameters: [UUID: Double], edges: [Edge]) -> [UUID: CGPoint] {
+        let n = order.count
+        guard n > 1 else { return order.first.map { [$0.id: .zero] } ?? [:] }
+        let index = Dictionary(uniqueKeysWithValues: order.enumerated().map { ($1.id, $0) })
+        let spacing = radialSpacing(largestDiameter: largest(order.map(\.id), diameters))
+        var weights: [Int: Double] = [:]
+        func connect(_ i: Int, _ j: Int, weight: Double) {
+            guard i != j else { return }
+            weights[min(i, j) * n + max(i, j), default: 0] += weight
+        }
+        for (parent, children) in treeLinks(order).children {
+            for child in children { connect(parent, child, weight: 1) }
+        }
+        for edge in edges {
+            if let i = index[edge.from], let j = index[edge.to] {
+                connect(i, j, weight: 1 + floor(log2(Double(max(1, edge.count)))))
+            }
+        }
+        let links = weights.keys.sorted().map { (i: $0 / n, j: $0 % n, weight: min(8, weights[$0]!)) }
+        var points = order.indices.map { i in
+            let angle = Double(i) * .pi * (3 - sqrt(5.0)), r = spacing * sqrt(Double(i))
+            return CGPoint(x: r * cos(angle), y: r * sin(angle))
+        }
+        for step in 0..<90 {
+            var shift = points.map { CGPoint(x: -0.07 * $0.x, y: -0.07 * $0.y) }
+            func displace(_ i: Int, _ j: Int, _ scale: Double) {
+                let x = (points[i].x - points[j].x) * scale, y = (points[i].y - points[j].y) * scale
+                shift[i].x += x; shift[i].y += y
+                shift[j].x -= x; shift[j].y -= y
+            }
+            for i in points.indices {
+                for j in (i + 1)..<n {
+                    let x = points[i].x - points[j].x, y = points[i].y - points[j].y
+                    displace(i, j, spacing * spacing / max(1, x * x + y * y))
+                }
+            }
+            for link in links {
+                let d = hypot(points[link.i].x - points[link.j].x, points[link.i].y - points[link.j].y)
+                displace(link.i, link.j, -0.28 * sqrt(link.weight) * d / spacing)
+            }
+            let limit = spacing * 0.25 * Double(90 - step) / 90
+            for i in points.indices {
+                let scale = min(0.35, limit / max(0.01, hypot(shift[i].x, shift[i].y)))
+                points[i].x += shift[i].x * scale; points[i].y += shift[i].y * scale
+            }
+        }
+        var closest = Double.infinity
+        for i in points.indices {
+            for j in (i + 1)..<n {
+                closest = min(closest, hypot(points[i].x - points[j].x, points[i].y - points[j].y))
+            }
+        }
+        let scale = max(1, spacing / max(0.01, closest))
+        return Dictionary(uniqueKeysWithValues: order.indices.map { (order[$0].id, CGPoint(x: points[$0].x * scale, y: points[$0].y * scale)) })
     }
 
     /// Children of each entry and the entries without a parent, in tree order. The parent is the

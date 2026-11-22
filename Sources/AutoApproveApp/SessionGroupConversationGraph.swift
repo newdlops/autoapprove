@@ -276,7 +276,7 @@ import AutoApproveCore
             do {
                 let sent = try engine.requestSessionGroupNicknames(groupID: groupID, memberIDs: members, byUser: true)
                 nicknameNote = sent == 0 ? "요청할 구성원이 없습니다"
-                    : (members.count == 1 ? "이 구성원의 이름과 역할을 다시 정해 달라고 요청했습니다" : "전체 구성원의 이름과 역할을 다시 정해 달라고 요청했습니다")
+                    : (engine.snapshot.paused ? "최신 요청으로 등록했습니다. 일시정지를 해제하면 우선 전달합니다." : "최신 요청으로 등록했습니다. 수신 세션이 입력 가능해지면 우선 전달합니다.")
             } catch { alert = GraphAlert(title: "이름 다시 정하기를 요청하지 못했습니다", message: error.localizedDescription) }
         }
     }
@@ -537,12 +537,12 @@ import AutoApproveCore
     private func messageItem(_ item: SessionGroupMessage, member: UUID, _ content: ConversationGraphModel.Content) -> some View {
         let outgoing = item.senderID == member
         let peer = outgoing ? item.recipientID : item.senderID
-        let kind = item.kind == .report ? "보고" : item.kind == .reply ? "답변" : item.kind == .choiceQuestion ? "선택 질문" : "메시지"
+        let kind = item.isNicknameRequest ? "닉네임·역할 요청" : item.kind == .report ? "보고" : item.kind == .reply ? "답변" : item.kind == .choiceQuestion ? "선택 질문" : "메시지"
         return DisclosureGroup {
             message(kind, item)
         } label: {
             VStack(alignment: .leading, spacing: 2) {
-                Text(time(item.createdAt) + (outgoing ? " 보냄 → " : " 받음 ← ") + content.name(peer) + " · " + kind + " · " + delivery(item))
+                Text(time(item.createdAt) + (item.isNicknameRequest ? "" : (outgoing ? " 보냄 → " : " 받음 ← ") + content.name(peer)) + " · " + kind + " · " + delivery(item))
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 Text(item.text).lineLimit(2)
             }
@@ -715,6 +715,14 @@ private extension AgentKind {
     @State private var scope: SessionGroupGraph.Scope
     /// Moved positions per layout, kept in memory until the window closes.
     @State private var offsets: [SessionGroupGraph.Layout: [UUID: CGSize]] = [:]
+    private final class ForceCache {
+        var ids: [UUID] = []
+        var depths: [Int] = []
+        var sizes: [UUID: Double] = [:]
+        var edges: [SessionGroupGraph.Edge] = []
+        var points: [UUID: CGPoint] = [:]
+    }
+    @State private var forceCache = ForceCache()
     @State private var movingNode: UUID?
     @State private var preview = ConversationDragPreview()
     @GestureState private var dragging = false
@@ -881,7 +889,7 @@ private extension AgentKind {
     private func viewport(_ placement: Placement, size: CGSize) -> SessionGroupGraph.Viewport {
         switch mode {
         case let .fitted(minimum, maximum):
-            let fitCircle = (forcedLayout ?? storedLayout) == .circle
+            let fitCircle = [.circle, .force].contains(forcedLayout ?? storedLayout)
             return SessionGroupGraph.fit(placement.content, in: size, minimum: mode == .automatic && fitCircle ? SessionGroupGraph.minimumZoom : minimum, maximum: maximum, focus: placement.leader,
                                   topAligned: placement.topAligned)
         case let .manual(view): return view
@@ -930,6 +938,13 @@ private extension AgentKind {
     // MARK: Controls and legend
 
     private func controls(layout: SessionGroupGraph.Layout, moved: Bool) -> some View {
+        let layoutPicker = Picker("배치", selection: Binding(get: { layout }, set: { storedLayout = $0 })) {
+                Text("트리").tag(SessionGroupGraph.Layout.tree)
+                Text("원형").tag(SessionGroupGraph.Layout.circle)
+                Text("방사형").tag(SessionGroupGraph.Layout.radial)
+                Text("포스").tag(SessionGroupGraph.Layout.force)
+                Text("행렬").tag(SessionGroupGraph.Layout.matrix)
+            }
         let pickers = HStack(spacing: 12) {
             Picker("보기", selection: $scope) {
                 Text("최근").tag(SessionGroupGraph.Scope.recent)
@@ -938,15 +953,15 @@ private extension AgentKind {
             .pickerStyle(.segmented)
             .fixedSize()
             .help("최근은 답을 기다리는 질문과 최근 30분 동안 오간 메시지를 그립니다. 전체는 지난 기록과 만료된 질문을 흐리게 함께 그립니다.")
-            Picker("배치", selection: Binding(get: { layout }, set: { storedLayout = $0 })) {
-                Text("트리").tag(SessionGroupGraph.Layout.tree)
-                Text("원형").tag(SessionGroupGraph.Layout.circle)
-                Text("방사형").tag(SessionGroupGraph.Layout.radial)
-                Text("행렬").tag(SessionGroupGraph.Layout.matrix)
+            Group {
+                if areaSize.width < 490 {
+                    layoutPicker.pickerStyle(.menu)
+                } else {
+                    layoutPicker.pickerStyle(.segmented)
+                }
             }
-            .pickerStyle(.segmented)
             .fixedSize()
-            .help("트리는 그룹장을 맨 위에, 구성원을 상위 구성원 아래 층에 놓습니다. 원형은 그룹장을 가운데에, 나머지를 트리 순서대로 둘레에 놓습니다. 방사형은 그룹장을 가운데에 두고 깊이마다 바깥 고리에 놓으며, 하위 구성원을 상위 구성원의 부채꼴 안에 모읍니다. 행렬은 행이 보낸 구성원, 열이 받은 구성원인 표에 메시지 수를 보입니다. 고른 배치는 다음에 열 때도 유지하고, 배치를 바꾸면 전체가 보이게 맞춥니다.")
+            .help("포스는 상하 관계와 대화량에 따라 구성원을 가깝게 놓습니다. 배치 선택은 다음에 열 때도 유지합니다.")
             // Shown only while a node is moved, so a link never sits there unclickable. It keeps
             // its width while hidden, so the row does not shift when it appears. The matrix has no
             // nodes to move, so it never shows there.
@@ -1189,9 +1204,19 @@ private extension AgentKind {
         let diameters = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.size(scope).diameter) })
         let spacing = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.size(.all).diameter) })
         let largest = spacing.values.max() ?? SessionGroupGraph.standardDiameter
-        let base = SessionGroupGraph.frame(SessionGroupGraph.positions(nodes.map { (id: $0.id, depth: $0.depth) },
-                                                                       hasLeader: hasLeader, layout: layout, diameters: spacing),
-                                           largestDiameter: largest).points
+        let order = nodes.map { (id: $0.id, depth: $0.depth) }
+        let base: [UUID: CGPoint]
+        if layout == .force, forceCache.ids == order.map(\.id), forceCache.depths == order.map(\.depth),
+           forceCache.sizes == spacing, forceCache.edges == all {
+            base = forceCache.points
+        } else {
+            let positions = SessionGroupGraph.positions(order, hasLeader: hasLeader, layout: layout, diameters: spacing, edges: all)
+            base = SessionGroupGraph.frame(positions, largestDiameter: largest).points
+            if layout == .force {
+                forceCache.ids = order.map(\.id); forceCache.depths = order.map(\.depth)
+                forceCache.sizes = spacing; forceCache.edges = all; forceCache.points = base
+            }
+        }
         var points = base
         for (id, offset) in moved { if let point = base[id] { points[id] = CGPoint(x: point.x + offset.width, y: point.y + offset.height) } }
         return Placement(base: base, points: points, diameters: diameters,

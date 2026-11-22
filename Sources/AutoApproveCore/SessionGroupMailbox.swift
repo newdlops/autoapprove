@@ -34,6 +34,9 @@ public struct SessionGroupMessage: Equatable {
     /// so it carries no relay header; agents rightly refuse to take a relayed notice as the user's word.
     static let userButtonSourcePrefix = "userButton:"
     private static let userButtonMarker = " (AutoApprove 요청 ID "
+    public var isNicknameRequest: Bool {
+        kind == .notice && (sourceKey?.hasPrefix("userButton:rename:") == true || text.hasPrefix("[AutoApprove 닉네임 요청]"))
+    }
     var isUserButtonInput: Bool { kind == .notice && sourceKey?.hasPrefix(Self.userButtonSourcePrefix) == true }
 
     func terminalPrompt(senderTitle: String, recipientAgent: AgentKind? = nil) -> String {
@@ -374,6 +377,18 @@ public final class SessionGroupMailbox {
         try update("UPDATE messages SET next_attempt=? WHERE id=? AND " + Self.awaitingReceipt, [String(date.timeIntervalSince1970), id.uuidString])
     }
 
+    func enqueueNicknameRequest(group: UUID, recipient: UUID, scope: String, text: String) throws {
+        let prefix = "userButton:rename:"
+        let queued = "group_id=? AND recipient_id=? AND kind='notice' AND acknowledged IS NULL AND (last_result IS NULL OR last_result IN ('not_started','redeliver')) AND source_key LIKE ?"
+        let base = [group.uuidString, recipient.uuidString]
+        let pendingAll = try scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE " + queued + ")", base + [prefix + "all:%"]) != 0
+        let merged = pendingAll ? "all" : scope
+        let pattern = prefix + (merged == "all" ? "%" : merged + ":%")
+        try update("UPDATE messages SET last_result='superseded',last_error=NULL WHERE " + queued, base + [pattern])
+        _ = try insertMessage(id: nil, groupID: group, senderID: recipient, recipientID: recipient,
+            kind: .notice, text: pendingAll && scope != "all" ? text + " 이 구성원부터 적용한 뒤, 앞서 요청한 나머지 구성원의 닉네임과 역할도 정해 줘." : text, sourceKey: prefix + merged + ":" + UUID().uuidString)
+    }
+
     public func enqueue(id: UUID? = nil, groupID: UUID, senderID: UUID, recipientID: UUID, kind: SessionGroupMessage.Kind,
                         text: String, sourceKey: String? = nil, at date: Date = Date(), originalReport: Bool = false) throws -> SessionGroupMessage {
         try transaction {
@@ -446,7 +461,7 @@ public final class SessionGroupMailbox {
         let ordered = projected.filter { $0.answer == nil } + projected.filter { $0.answer != nil }
         let messages = try self.rows("""
             WHERE group_id=? AND last_result IS NOT 'superseded' AND
-              (kind IN ('message','report','choiceQuestion') OR
+              (kind IN ('message','report','choiceQuestion') OR (kind='notice' AND (source_key LIKE 'userButton:rename:%' OR body LIKE '[AutoApprove 닉네임 요청]%')) OR
                (kind='reply' AND (source_key IS NULL OR source_key NOT LIKE 'answer:%')))
             ORDER BY sequence DESC LIMIT 151
             """, [groupID.uuidString])
@@ -470,7 +485,7 @@ public final class SessionGroupMailbox {
         )
         """
 
-    private static let notificationOrder = "CASE WHEN m.source_key LIKE 'userButton:questionPriority:%' THEN -2 WHEN m.source_key LIKE 'userButton:rename:%' OR (m.kind='notice' AND m.body LIKE '[AutoApprove 닉네임 요청]%') THEN -1 WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 0 ELSE 1 END,m.sequence"
+    private static let notificationOrder = "CASE WHEN m.source_key LIKE 'userButton:rename:%' THEN -3 WHEN m.source_key LIKE 'userButton:questionPriority:%' THEN -2 WHEN (m.kind='notice' AND m.body LIKE '[AutoApprove 닉네임 요청]%') THEN -1 WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 0 ELSE 1 END,CASE WHEN m.source_key LIKE 'userButton:rename:%' THEN -m.sequence ELSE m.sequence END"
 
     public struct InboxOperation: Equatable, Sendable {
         public let unacknowledgedCount: Int
@@ -533,7 +548,7 @@ public final class SessionGroupMailbox {
                         ORDER BY \(Self.notificationOrder)) AS position
                     FROM messages m WHERE \(Self.notificationFilter)
                 ) WHERE position=1
-            ) ORDER BY sequence
+            ) ORDER BY CASE WHEN source_key LIKE 'userButton:rename:%' THEN -sequence ELSE sequence END
             """)
     }
 

@@ -306,8 +306,7 @@ final class GraphReadProbe: @unchecked Sendable {
     var allRoots = 0, allCanvases = 0
     var worstPreview = 0.0, worstDrop = 0.0
     var eventDeltaCarried = false
-    // The tree at three zooms, as before, then the radial layout at 100%.
-    let runs: [(Double, SessionGroupGraph.Layout?)] = [(1.0, nil), (0.6, nil), (2.0, nil), (1.0, .radial)]
+    let runs: [(Double, SessionGroupGraph.Layout?)] = [(1.0, nil), (0.6, nil), (2.0, nil), (1.0, .radial), (1.0, .force)]
     for (zoom, layout) in runs {
         // Relative to the real clock, so the recent view draws its lines and nodes have different sizes.
         let fixture = try GraphFixture.make(root: root, name: "drag-state-\(Int(zoom * 100))" + (layout.map { "-" + $0.rawValue } ?? ""),
@@ -319,7 +318,7 @@ final class GraphReadProbe: @unchecked Sendable {
         try await Task.sleep(for: .seconds(2.5))
         host.layoutSubtreeIfNeeded()
         let overlapsAtOpen = GraphProbe.overlaps()
-        if layout == .radial, !overlapsAtOpen.isEmpty { throw AppError.message("Radial nodes overlap: " + overlapsAtOpen.joined(separator: ", ")) }
+        if layout == .radial || layout == .force, !overlapsAtOpen.isEmpty { throw AppError.message("Graph nodes overlap: " + overlapsAtOpen.joined(separator: ", ")) }
         // The node nearest the middle of the graph area (left of the 320pt panel, below the controls),
         // so a 120pt by 60pt drag stays inside the visible part at every zoom.
         let middle = CGPoint(x: (size.width - 320) / 2, y: 245)
@@ -567,6 +566,7 @@ final class GraphReadProbe: @unchecked Sendable {
         ("10-zoom-200", fixture, nil, .recent, .tree, false, 2),
         ("11-size-tree", uneven, nil, .recent, .tree, false, nil),
         ("12-size-circle", uneven, nil, .recent, .circle, false, nil),
+        ("force", fixture, nil, .recent, .force, false, nil),
         ("13-radial", fixture, nil, .recent, .radial, false, nil),
         ("14-radial-selected", fixture, fixture.id["doc"], .recent, .radial, false, nil),
         ("15-radial-wide-group", wide, nil, .recent, .radial, false, nil),

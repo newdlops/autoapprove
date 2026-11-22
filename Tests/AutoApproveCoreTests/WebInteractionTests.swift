@@ -105,7 +105,7 @@ extension ApprovalTests {
         let clearMember = tools.first(where:{$0["name"] as? String=="clear_group_member"})!
         try expectEqual((clearMember["annotations"] as? JSONObject)?["destructiveHint"] as? Bool,true)
         try expectEqual((clearMember["inputSchema"] as? JSONObject)?["required"] as? [String],["groupID","memberID","requestID"])
-        for (profile, count) in [(MCPToolProfile.orchestrator, 21), (.worker, 19), (.desktop, 9)] {
+        for (profile, count) in [(MCPToolProfile.orchestrator, 21), (.worker, 20), (.desktop, 9)] {
             let list = AutoApproveMCPServer.response(["jsonrpc": "2.0", "id": 1, "method": "tools/list"], profile: profile) { _, _ in [:] }
             let visible = (list?["result"] as? JSONObject)?["tools"] as? [JSONObject] ?? []
             let names = Set(visible.compactMap { $0["name"] as? String })

@@ -11,7 +11,7 @@ public enum MCPToolProfile: String {
         case .worker:
             return name.hasPrefix("desktop_") || ["get_session_groups", "get_group_status", "reconnect_group_member",
                 "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "ack_group_messages",
-                "wait_group_dependencies", "update_group_wait", "complete_group_task"].contains(name)
+                "wait_group_dependencies", "update_group_wait", "complete_group_task", "set_group_member_title"].contains(name)
         case .desktop: return name.hasPrefix("desktop_") || name == "get_diagnostics"
         }
     }

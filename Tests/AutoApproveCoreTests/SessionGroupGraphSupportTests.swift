@@ -414,6 +414,16 @@ extension ApprovalTests {
             try expectEqual(points, SessionGroupGraph.positions(order, hasLeader: true, layout: layout, diameters: big),
                             "The same sizes give the same positions in the \(layout) layout")
         }
+        let flat = order.map { (id: $0.id, depth: 0) }
+        let edge = SessionGroupGraph.Edge(from: flat[0].id, to: flat[6].id, kind: .recent, count: 40, pendingQuestions: 0)
+        let free = SessionGroupGraph.positions(flat, hasLeader: false, layout: .force)
+        let linked = SessionGroupGraph.positions(flat, hasLeader: false, layout: .force, edges: [edge])
+        func distance(_ points: [UUID: CGPoint]) -> Double {
+            let a = points[edge.from]!, b = points[edge.to]!
+            return hypot(a.x - b.x, a.y - b.y)
+        }
+        try expect(distance(linked) < distance(free))
+        try expectEqual(linked.count, flat.count)
         let standard = SessionGroupGraph.positions(order, hasLeader: true, layout: .tree)
         let widened = SessionGroupGraph.positions(order, hasLeader: true, layout: .tree, diameters: big)
         try expectEqual(standard[members[1].id]!.y - standard[members[0].id]!.y, 104, "32pt circles keep 104pt layers")

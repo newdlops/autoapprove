@@ -276,7 +276,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var restartIdentityTask: Task<[String: String], Never>?
     /// Exiting a CLI, opening a tab and typing the resume command happen for one session at a time:
     /// Terminal opens one tab at a time, and parallel typing missed its input deadlines.
-    private var restartTerminalBusy = false
+    private var restartTerminalOwner: String?
     private var mcpInitializations: [String: (owner: String, at: Date)] = [:]
     /// How long a restarted CLI may take to accept input, and how long it must stay idle before the resume line is typed.
     public var restartResumeWait: TimeInterval = 90, restartResumeSettle: TimeInterval = 2
@@ -3246,30 +3246,30 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         guard !targets.isEmpty else { return 0 }
         let box = try groupMailbox()
-        var requests: [(recipient: UUID, text: String, sourceKey: String?)] = []
+        var requests: [(recipient: UUID, text: String, scope: String?)] = []
         let leader = group.leaderMemberID.flatMap { id in group.members.contains(where: { $0.id == id }) ? id : nil }
-        let howTo = "role에는 맡은 일을 한 줄(120자 이내)로, title에는 그 역할을 나타내는 3~20자 이름을 서로 겹치지 않게 적어. "
-            + "도구는 AutoApprove MCP의 set_group_member_title(groupID, memberID, title, role)이고 Claude Code에서는 mcp__autoapprove__set_group_member_title이야. 안 보이면 ToolSearch로 불러와. "
-            + "이름과 역할 설정 말고 다른 작업은 하지 마."
         if byUser {
-            let button = targets.count == 1 ? "'이 구성원 이름 다시 정하기'" : "'전체 다시 정하기'"
-            let scope = targets.count == 1
-                ? "구성원 '\(targets[0].title)'(memberID \(targets[0].id.uuidString)) 한 명의"
-                : "구성원 \(targets.count)명의"
+            let all = targets.count == group.members.count
+            func prompt(_ ids: [UUID], everyone: Bool) -> String {
+                let button = everyone && ids.count != 1 ? "'전체 다시 정하기'" : "'이 구성원 이름 다시 정하기'"
+                let scope = everyone ? "모든 구성원" : ids.map(\.uuidString).joined(separator: ", ")
+                return "AutoApprove 대화 그래프에서 " + button + " 버튼을 눌러 보내는 내 요청이야. groupID " + group.id.uuidString +
+                    "에서 " + scope + "의 닉네임과 역할을 먼저 정해 줘. get_group_status로 memberID와 작업을 확인하고 set_group_member_title(groupID, memberID, title, role)로 각각 저장해. title은 겹치지 않는 3~20자 이름, role은 맡은 일 한 줄이야."
+            }
             if let leader {
-                requests.append((leader, "AutoApprove 대화 그래프에서 \(button) 버튼을 눌러 보내는 내 요청이야. 그룹 '\(group.name)'(groupID \(group.id.uuidString)) \(scope) 이름과 역할을 지금 하는 일에 맞게 다시 정해 줘. get_group_status로 구성원 memberID와 지금 이름, 역할을 확인하고 구성원마다 설정해. " + howTo,
-                                 SessionGroupMessage.userButtonSourcePrefix + "rename:" + UUID().uuidString))
+                let ids = targets.map(\.id)
+                requests.append((leader, prompt(ids, everyone: all), all ? "all" : ids.map(\.uuidString).sorted().joined(separator: ",")))
             } else {
                 for member in targets {
-                    requests.append((member.id, "AutoApprove 대화 그래프에서 \(button) 버튼을 눌러 보내는 내 요청이야. 그룹 '\(group.name)'(groupID \(group.id.uuidString))에서 이 세션(memberID \(member.id.uuidString))의 이름과 역할을 지금 하는 일에 맞게 다시 정해 줘. get_group_status로 다른 구성원의 이름을 확인해 겹치지 않게 해. " + howTo,
-                                     SessionGroupMessage.userButtonSourcePrefix + "rename:" + UUID().uuidString))
+                    let text = prompt([member.id], everyone: false)
+                    requests.append((member.id, text, member.id.uuidString))
                 }
             }
         } else {
             func line(_ member: SessionGroupMember) -> String {
                 "memberID \(member.id.uuidString), \(member.agent.title), 작업 폴더 \(member.cwd), 지금 이름 \(member.title.isEmpty ? "(없음)" : member.title), 지금 역할 \(member.role ?? "(없음)")"
             }
-            let origin = "그룹에 구성원이 추가되어 AutoApprove가 한 번 보내는 요청입니다."
+            let origin = "그룹에 구성원이 추가되어 AutoApprove가 한 번 보내는 요청입니다. 이미 닉네임과 역할이 모두 설정된 구성원은 건너뜁니다."
             let tool = "도구는 AutoApprove MCP 서버의 set_group_member_title(groupID, memberID, title, role)이고, Claude Code에서는 mcp__autoapprove__set_group_member_title입니다. 목록에 보이지 않으면 ToolSearch로 불러오세요."
             let rule = "구성원마다 지금 하는 일을 확인해 role에 맡은 일을 한 줄(120자 이내)로 적고, title에는 그 역할을 나타내는 3~20자 이름을 서로 겹치지 않게 적습니다. 이름과 역할을 정하는 것 말고 다른 작업은 하지 마세요."
             if let leader {
@@ -3280,9 +3280,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
         }
-        for request in requests {
-            _ = try box.enqueue(groupID: group.id, senderID: request.recipient, recipientID: request.recipient, kind: .notice,
-                                text: request.text, sourceKey: request.sourceKey)
+        try box.transaction {
+            for request in requests {
+                if let scope = request.scope {
+                    try box.enqueueNicknameRequest(group: group.id, recipient: request.recipient, scope: scope, text: request.text)
+                } else {
+                    _ = try box.insertMessage(id: nil, groupID: group.id, senderID: request.recipient, recipientID: request.recipient,
+                                              kind: .notice, text: request.text, sourceKey: nil)
+                }
+            }
         }
         for member in targets { try store.set(key(member.id), String(Date().timeIntervalSince1970)) }
         log(AuditEvent(sessionID: "", summary: "세션 그룹 '\(group.name)' 닉네임 요청", outcome: "구성원 \(targets.count)명의 이름과 역할 정하기 요청",
@@ -3624,7 +3630,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if result == "not_started" {
                     let backoff = recipientWakesLoop(message, observed: observed) ? groupMailboxHeldFallback
                         : min(groupMailboxReminderInterval, max(groupMailboxPollInterval, Double(message.attempts + 1) * 5))
-                    let retryDelay = message.sourceKey?.hasPrefix(SessionGroupMailbox.priorityPrefix) == true ? min(backoff, groupMailboxPollInterval) : backoff
+                    let retryDelay = (message.sourceKey?.hasPrefix(SessionGroupMailbox.priorityPrefix) == true || message.sourceKey?.hasPrefix("userButton:rename:") == true) ? min(backoff, groupMailboxPollInterval) : backoff
                     try groupMailbox().noteAttempt(message.id, result: result, error: error.localizedDescription, retryAt: Date().addingTimeInterval(retryDelay), increment: -1)
                 } else {
                     try groupMailbox().noteAttempt(message.id, result: "direct_unknown", error: error.localizedDescription, retryAt: receiptDue)
@@ -4100,7 +4106,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func runSessionRestart(_ id: String, operation: SessionRestartItem.Operation) async {
         let recovery = operation == .recoverMCP || operation == .restartForMCP
         let resume = operation == .resumeWork
-        defer { sessionRestartTasks.removeValue(forKey: id) }
+        defer {
+            if restartTerminalOwner == id { restartTerminalOwner = nil }
+            if snapshot.sessionRestart?.items.contains(where: { $0.id == id && !$0.phase.isFinished }) == true {
+                updateRestart(id, .cancelled, "재시작 처리가 중단되었습니다.")
+            }
+            sessionRestartTasks.removeValue(forKey: id)
+        }
         func fail(_ message: String) { updateRestart(id, .failed, message) }
         guard let original = sessions[id] else { return fail("세션을 찾지 못했습니다.") }
         if operation == .recoverMCP && original.agent == .claude {
@@ -4196,6 +4208,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if !plan.arguments.contains(ClaudePromptBridge.plugin.path) { plan.arguments += ["--plugin-dir", ClaudePromptBridge.plugin.path] }
             environment[ClaudePromptBridge.key] = ClaudePromptBridge.channel(paths).path
         }
+        if restartTerminalOwner != nil {
+            updateRestart(id, .waiting, "앞선 탭에 재시작 명령을 전달한 뒤 이 CLI를 종료합니다.")
+        }
+        while restartTerminalOwner != nil {
+            guard !Task.isCancelled, !remoteInputStopped else { return }
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+        restartTerminalOwner = id
         let settleUntil = Date().addingTimeInterval(5)
         while sendingMessages.contains(id) || automaticInputBusy(id) {
             guard !Task.isCancelled, !remoteInputStopped else { return }
@@ -4231,31 +4251,50 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard await Task.detached(operation: { terminate(process) }).value else { return fail("CLI에 종료 신호를 보내지 못했습니다.") }
         let manual = " 터미널에서 직접 실행해주세요: \(command)"
 
-        // In place: the original shell must be back in the foreground with an empty prompt. The screen can
-        // still be settling right after the CLI exits, so a changed screen is read again instead of failing.
         let context = SessionExitRecovery(session: current, process: process, shell: shell, conversationID: conversation)
         let target = ScreenTarget(tty: current.tty, handle: current.screenHandle, jobPIDs: [shell.pid], sourcePID: shell.pid, sourceStarted: shell.started)
         let until = Date().addingTimeInterval(45)
         var sent = false
+        var reason = "원래 셸이 터미널의 포그라운드로 돌아오지 않았습니다."
+        var lastReason = ""
+
         while !sent {
-            guard Date() < until else { return fail("CLI가 종료된 뒤 셸 입력창을 확인하지 못했습니다." + manual) }
+            guard Date() < until else { return fail(reason + manual) }
+            if lastReason != reason {
+                updateRestart(id, .exiting, reason + " 같은 탭을 다시 확인합니다.")
+                lastReason = reason
+            }
+            guard !Task.isCancelled, !remoteInputStopped else { return }
             try? await Task.sleep(for: .milliseconds(500))
-            guard let live = try? await Task.detached(operation: { try reader() }).value, context.verifiedShell(in: live) != nil else { continue }
-            let screen = try? await Task.detached(operation: { try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty })?.contents }).value
-            guard let prompt = screen ?? nil, SessionExitRecovery.emptyShellPrompt(prompt) else { continue }
-            guard !restartTerminalBusy else { continue }
-            restartTerminalBusy = true
-            defer { restartTerminalBusy = false }
+            guard let live = try? await Task.detached(operation: { try reader() }).value, context.verifiedShell(in: live) != nil else {
+                reason = "원래 셸이 터미널의 포그라운드로 돌아오지 않았습니다."
+                continue
+            }
+            let frame = try? await Task.detached(operation: { try adapter.readForValidation([target]) }).value
+            guard let prompt = frame?.screens.first(where: { $0.tty == target.tty })?.contents else {
+                reason = "원래 탭의 화면을 읽지 못했습니다."
+                continue
+            }
+            guard SessionExitRecovery.restartShellPrompt(prompt) else {
+                reason = "셸은 돌아왔지만 빈 프롬프트를 확인하지 못했습니다."
+                continue
+            }
+            guard !Task.isCancelled, !remoteInputStopped else { return }
             updateRestart(id, .launching, "같은 터미널에서 같은 대화를 다시 열고 있습니다.")
             do {
                 let delivery:TerminalDelivery=try await Task.detached {
                     try codexContext?.verifyUnchanged()
                     return try restart(target,prompt,command)
                 }.value
-                sent=delivery == .sent
+                sent = delivery == .sent
+                if !sent {
+                    reason = delivery == .screenChanged ? "입력 직전에 셸 화면이 바뀌었습니다." : "터미널이 원래 셸 입력 대상을 확인하지 못했습니다."
+                    lastReason = ""
+                }
             }
             catch { return fail("다시 시작 명령을 입력하지 못했습니다: \(error.localizedDescription)." + manual) }
         }
+        restartTerminalOwner = nil
         log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "같은 대화 다시 열기 입력", source: host.title, context: AuditContext(session: current), request: command))
 
         // Find the new CLI on that terminal and carry the automatic approval choice over.

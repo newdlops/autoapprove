@@ -38,7 +38,7 @@ private final class RestartTerminal: @unchecked Sendable {
     /// The CLI ends on a signal and its shell prompt returns; nothing is typed into the terminal.
     func terminate(_ process: ProcessRecord) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        signals += 1; stage = 1; screens["/dev/" + process.tty] = "Resume this session later.\nuser@mac project %"
+        signals += 1; stage = 1; screens["/dev/" + process.tty] = "Resume this session later.\n❯ "
         return true
     }
     private var rejections = 1
@@ -220,6 +220,46 @@ extension ApprovalTests {
         try expectEqual(engine.snapshot.sessions.first { $0.id == next.id }?.automatic, true, "Automatic approval carries over")
         engine.dismissSessionRestarts()
         try expect(engine.snapshot.sessionRestart == nil)
+    }
+
+    @MainActor func testMultipleRestartsWaitForThePreviousShellLaunch() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let terminals = [0, 1].map { index -> RestartTerminal in
+            let tty = "ttys42" + String(index), shell = 101420 + index * 10, agent = shell + 1
+            let start = "Wed Oct 28 12:00:00 2026"
+            let shellRow = "\(shell) 1 \(tty) \(shell) "
+            let running = ProcessDiscovery.parse(shellRow + "\(agent) \(start) /bin/zsh\n\(agent) \(shell) \(tty) \(agent) \(agent) \(start) /fixture/claude")
+            let exited = ProcessDiscovery.parse(shellRow + "\(shell) \(start) /bin/zsh")
+            return RestartTerminal(stages: [running, exited, exited])
+        }
+        let records = terminals.flatMap(\.records)
+        let sessions = ProcessDiscovery.sessions(records).filter { $0.agent == .claude }.map { value in
+            var session = value
+            session.providerID = UUID().uuidString
+            session.terminal = .iterm
+            return session
+        }
+        let adapter = ScreenHostAdapter(screens: { targets in
+            TerminalSnapshot(screens: targets.map { target in
+                let t = terminals[target.tty.hasSuffix("0") ? 0 : 1]
+                return TerminalScreen(tty: target.tty, contents: t.screen(target.tty))
+            })
+        }, approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, restart: { target, expected, command in
+            terminals[target.tty.hasSuffix("0") ? 0 : 1].restart(target, expected: expected, command: command)
+        }, input: { _,_,_,_ in .missingTarget })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { terminals.flatMap(\.records) }, screenAdapters: [.iterm: adapter])
+        defer { engine.stop() }
+        engine.processArgumentsReader = { _ in ["/fixture/claude"] }
+        engine.processTerminator = { record in
+            let i = record.tty.hasSuffix("0") ? 0 : 1
+            if terminals[1-i].terminated > 0 && terminals[1-i].launched.isEmpty { return false }
+            return terminals[i].terminate(record)
+        }
+        engine.updateDiscovery(sessions, records: records)
+        await engine.connectScreenHost(.iterm)
+        engine.restartSessions(sessions.map(\.id), resume: false)
+        try expect(try await waitForRestart(12) { terminals.allSatisfy { $0.launched.count == 1 } })
     }
 
     @MainActor func testSessionRestartLeavesShelllessCLIUntouched() async throws {

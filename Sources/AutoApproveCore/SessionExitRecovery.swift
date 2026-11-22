@@ -48,6 +48,13 @@ public struct SessionExitRecovery: Codable {
         // Agent composers and dialogs are never shell prompts.
         return !row.hasPrefix("›") && !row.hasPrefix("❯") && !row.hasPrefix("API Error:") && !row.hasPrefix("■")
     }
+    public static func restartShellPrompt(_ screen: String) -> Bool {
+        if emptyShellPrompt(screen) { return true }
+        let lines = PromptDetector.normalizedLines(screen)
+        guard let last = lines.last?.trimmingCharacters(in: .whitespaces), ["❯", "›", "❱"].contains(last) else { return false }
+        let previous = lines.dropLast().last?.trimmingCharacters(in: .whitespaces) ?? ""
+        return !previous.hasPrefix("───") && !previous.hasPrefix("━━━")
+    }
     public static func foregroundShell(in records:[ProcessRecord],tty:String)->ProcessRecord? {
         let shells=records.filter {$0.tty==tty && $0.isForeground && isShell($0)}
         guard shells.count==1,let shell=shells.first else{return nil}
