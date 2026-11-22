@@ -84,6 +84,24 @@ public struct SessionGroupMessage: Equatable {
         return UUID(uuidString: String(prompt[prompt.index(prompt.startIndex, offsetBy: promptPrefix.count)..<end]))
     }
 
+    func preview(outbox: Bool) -> JSONObject {
+        let line = SessionGroupOrchestration.oneLine(text)
+        var snippet = "", bytes = 0
+        for character in line {
+            let size = character.utf8.count
+            guard bytes + size <= 120 else { break }
+            snippet.append(character)
+            bytes += size
+        }
+        let full = json
+        var result: JSONObject = ["messageID": id.uuidString, "sequence": sequence, "kind": kind.rawValue,
+            "textBytes": text.utf8.count, "preview": snippet, "truncated": bytes < line.utf8.count,
+            outbox ? "memberID" : "senderMemberID": (outbox ? recipientID : senderID).uuidString]
+        for key in ["state", "inReplyTo", "blocksProgress"] { result[key] = full[key] }
+        if lastError != nil { result["hasDeliveryError"] = true }
+        return result
+    }
+
     public var json: JSONObject {
         let date = ISO8601DateFormatter()
         var value: JSONObject = ["messageID": id.uuidString, "sequence": sequence, "groupID": groupID.uuidString,

@@ -24,7 +24,11 @@ import AutoApproveCore
                 guard arguments.count == 2 else { throw AppError.message("업데이트 작업 파일을 지정해주세요.") }
                 try await LANUpdateInstallation.install(jobFile: URL(fileURLWithPath: arguments[1]))
             case "mcp":
-                await Task.detached { AutoApproveMCPServer.run(paths: paths) }.value
+                guard arguments.count == 1 || (arguments.count == 3 && arguments[1] == "--profile"),
+                      let profile = MCPToolProfile(rawValue: arguments.count == 1 ? "all" : arguments[2]) else {
+                    throw AppError.message("autoapprove mcp [--profile all|orchestrator|worker|desktop]")
+                }
+                await Task.detached { AutoApproveMCPServer.run(paths: paths, profile: profile) }.value
             case "scan":
                 let records = try ProcessDiscovery.read()
                 var sessions = ProcessDiscovery.sessions(records)
@@ -185,7 +189,7 @@ import AutoApproveCore
                   autoapprove diagnostics   진단 상태 조회 (읽기 전용)
                   autoapprove local-name status  이 Mac의 autoapprove 주소 설정 확인
                   autoapprove local-name apply   관리자 권한으로 이 Mac의 로컬 주소 설정
-                  autoapprove mcp           휴대폰 질문·테스트 화면 공유 MCP (stdio)
+                  autoapprove mcp [--profile all|orchestrator|worker|desktop]   MCP (stdio)
                   autoapprove terminal-input prepare  손쉬운 사용 입력 설정 확인 (읽기 전용 JSON)
                   autoapprove terminal-input install  현재 프로세스의 손쉬운 사용 입력 권한 확인 (서비스 설치 없음)
                   autoapprove status        앱의 세션 및 승인 내역

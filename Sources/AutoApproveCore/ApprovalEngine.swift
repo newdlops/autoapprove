@@ -244,7 +244,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var groupMailboxTask: Task<Void, Never>?
     private var activeGroupMailboxMessages: Set<UUID> = []
     private var claudeGroupPrompts: [String: (prompt: String, turn: String)] = [:]
-    private var groupMailboxDelegations: [String: (id: UUID, at: Date, group: String)] = [:]
+    private var groupMailboxDelegations: [UUID: (sessionID: String, prompt: String, at: Date, context: String)] = [:]
     public var groupMailboxPollInterval: TimeInterval = 5
     public static let groupMessageTTLMinutesRange = 1...10_080
     public var groupMessageTTLMinutes: Int {
@@ -3479,7 +3479,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         scheduleGroupMailboxDelivery()
         var output: JSONObject = ["accepted": true, "messageID": message.id.uuidString, "receipt": message.json,
                 "delivered": message.acknowledgedAt != nil, "transport": "local_mailbox", "networkRequired": false,
-                "message": "로컬 수신함에 저장했습니다. accepted는 접수이며 수신 완료가 아닙니다. 같은 메시지를 재호출할 때 이 messageID를 유지하세요. 전달 결과는 로컬 수신함에서 확인할 수 있습니다."]
+                "message": "로컬 수신함에 저장했습니다."]
         if let wait { output["wait"] = wait.json }
         return output
     }
@@ -3493,13 +3493,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (group, member)
     }
 
-    private func groupMailboxSummary(groupID: UUID, memberID: UUID) -> JSONObject {
+    private func groupMailboxSummary(groupID: UUID, memberID: UUID, summary: Bool) -> JSONObject {
         do {
-            let inbox = try groupMailbox().list(groupID: groupID, memberID: memberID, limit: 21)
-            let outbox = try groupMailbox().list(groupID: groupID, memberID: memberID, outbox: true, limit: 21)
-            return ["inbox": inbox.prefix(20).map(\.json), "outbox": outbox.prefix(20).map(\.json),
-                    "inboxHasMore": inbox.count > 20, "outboxHasMore": outbox.count > 20,
-                    "message": "조회는 수신 확인이 아닙니다. 받은 messageID를 ack_group_messages로 확인하세요. get_group_messages에서 다음 페이지와 수신 완료 상태를 조회할 수 있습니다."]
+            let limit = summary ? 3 : 20
+            let inbox = try groupMailbox().list(groupID: groupID, memberID: memberID, limit: limit + 1)
+            let outbox = try groupMailbox().list(groupID: groupID, memberID: memberID, outbox: true, limit: limit + 1)
+            return ["inbox": inbox.prefix(limit).map { summary ? $0.preview(outbox: false) : $0.json }, "outbox": outbox.prefix(limit).map { summary ? $0.preview(outbox: true) : $0.json },
+                    "inboxHasMore": inbox.count > limit, "outboxHasMore": outbox.count > limit,
+                    "message": summary ? "미리보기는 수신 확인 대상에서 제외하세요. get_group_messages로 원문을 읽으세요." : "조회는 수신 확인이 아닙니다. 받은 messageID를 ack_group_messages로 확인하세요. get_group_messages에서 다음 페이지와 수신 완료 상태를 조회할 수 있습니다."]
         } catch { return ["error": error.localizedDescription] }
     }
 
@@ -3891,7 +3892,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if [.report, .choiceQuestion].contains(message.kind), message.sourceKey != nil,
                group.canDirect(message.recipientID, worker: message.senderID) {
                 self.groupMailboxDelegations = self.groupMailboxDelegations.filter { Date().timeIntervalSince($0.value.at) < 600 }
-                self.groupMailboxDelegations[current.id] = (message.id, Date(), group.name)
+                if let assignment = try self.groupOrchestration().assignments.first(where: { item in
+                    guard item.groupID == group.id, item.workerMemberID == message.senderID, item.parentMemberID == message.recipientID else { return false }
+                    return message.kind == .report ? message.sourceKey == "report:" + item.id.uuidString :
+                        item.question.map { message.sourceKey == "question:" + item.id.uuidString + ":" + $0.id } == true
+                }) {
+                    let context = SessionGroupOrchestration.deliveryContext(group: group.name, kind: message.kind, permission: assignment.question?.isPermission == true)
+                    self.groupMailboxDelegations[message.id] = (current.id, prompt, Date(), context)
+                }
             }
         })
     }
@@ -4938,7 +4946,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 try groupMailbox().acknowledge(ids, groupID: groupID, recipientID: caller.id)
                 try applyGroupMessageAcknowledgements(ids)
                 scheduleGroupMailboxDelivery()
-                return ["acknowledged": true, "messageIDs": strings, "message": "수신 확인을 저장했습니다. 작업 수행·동의·승인을 의미하지 않습니다."]
+                return ["acknowledged": true, "messageIDs": strings, "message": "수신 확인을 저장했습니다."]
             }
             func integer(_ name: String, fallback: Int64) throws -> Int64 {
                 guard let raw = object[name] else { return fallback }
@@ -4965,7 +4973,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return ["groupID": groupID.uuidString, "memberID": caller.id.uuidString, "messages": page.map(\.json),
                     "hasMore": messages.count > limit, "nextAfterSequence": page.last?.sequence as Any? ?? NSNull(),
                     "networkRequired": false, "transport": "local_mailbox",
-                    "message": "조회만으로 수신 완료 처리하지 않습니다. 받은 messageID를 ack_group_messages로 확인하세요. 처리한 ID는 재실행하지 마세요. 질문은 reply_group_question으로 보낸 구성원에게 답하세요."]
+                    "message": "메시지를 조회했습니다."]
         case "get_session_groups":
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed, recovery: true)
@@ -5011,8 +5019,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
                     "transport": "local_terminal", "networkRequired": false,
-                    "message": "그룹 통신은 같은 Mac의 Unix 소켓과 원래 터미널만 사용합니다. 연결이 끊겼고 canReconnect가 true이면 reconnect_group_member로 재연결하세요. 자유 형식 질문·답변은 ask_group_question과 reply_group_question으로 Codex↔Claude를 포함한 같은 그룹 구성원에게 전달하세요. 그룹 상태는 get_group_status, 직속 작업·승인 지시는 assign_group_task·answer_group_question을 사용하세요. 일반 대화는 send_group_message로 Codex↔Claude를 포함한 같은 그룹 구성원에게 전달하세요. 외부 서버나 각 도구의 별도 메시지 경로로 우회하지 마세요."]
+                    "message": "현재 세션의 그룹을 조회했습니다."]
         case "get_group_status":
+            let mailboxView = object["mailboxView"] ?? "full"
+            guard let view = mailboxView as? String, ["full", "summary"].contains(view) else {
+                throw RemoteHTTPError(400, "mailboxView는 full 또는 summary여야 합니다.")
+            }
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
             let groups = try SessionGroupStore(directory: paths.directory).load()
@@ -5051,7 +5063,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         "leaderMemberID": group.leaderMemberID?.uuidString as Any? ?? NSNull(),
                         "callerMemberID": callerMember.id.uuidString,
                         "waits": waits.map(\.json),
-                        "mailbox": groupMailboxSummary(groupID: group.id, memberID: callerMember.id),
+                        "mailbox": groupMailboxSummary(groupID: group.id, memberID: callerMember.id, summary: view == "summary"),
                         "reports": reports.map { report -> JSONObject in
                             ["taskID": report.id.uuidString, "workerMemberID": report.workerMemberID.uuidString, "task": report.task,
                              "summary": report.summary as Any? ?? NSNull()]
@@ -5060,7 +5072,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return result
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
-                    "message": "자유 형식 질문·답변은 ask_group_question과 reply_group_question을 사용하세요. 그룹장·동료와 Codex↔Claude 모두 지원합니다. 일반 대화는 send_group_message도 사용할 수 있으며 작업·승인 권한을 부여하지 않습니다. canAssign이 true인 직속 구성원에게 assign_group_task로 작업을 지시하세요. Claude 구성원은 claudeStatus가 idle일 때만 지시할 수 있습니다(phase는 화면 판정이라 unknown일 수 있습니다). task.question이 있는 구성원은 answer_group_question으로 선택지 번호를 골라 답하세요. 작업 완료 보고는 로컬 수신함에 저장됩니다. mailbox.inbox 또는 get_group_messages로 읽고 ack_group_messages로 수신 확인하세요."]
+                    "message": "그룹 상태를 조회했습니다."]
         case "assign_group_task":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)),
@@ -5127,7 +5139,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                            source: "세션 그룹", tool: "assign_group_task", request: task))
             scheduleGroupDelivery()
             return ["taskID": assignment.id.uuidString, "workerMemberID": target.id.uuidString, "automaticApproval": approval.rawValue,
-                    "message": "작업 내용을 작업자 터미널에 사용자가 직접 입력한 것처럼 그대로 입력했습니다. " + approval.message + "작업 완료 보고는 로컬 수신함에 저장됩니다. mailbox.inbox 또는 get_group_messages로 읽고 ack_group_messages로 수신 확인하세요."]
+                    "message": ("작업을 전달했습니다. " + approval.message).trimmingCharacters(in: .whitespaces)]
         case "answer_group_question":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)),
@@ -7718,24 +7730,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return response
     }
 
-    /// The user's own hook tells the assigning Claude that the group's decisions were delegated to it.
-    /// It is added only to the reports and requests AutoApprove just delivered to that session. A worker's
-    /// task gets nothing: it is typed as plain input, exactly as if the user had typed it.
     private func groupDelegationContext(sessionID: String, prompt: String?, at now: Date = Date()) -> String? {
-        if let prompt, prompt.hasPrefix("[AutoApprove 그룹 수신함]") || SessionGroupMessage.terminalMessageID(prompt) != nil,
-           let receipt = groupMailboxDelegations[sessionID], now.timeIntervalSince(receipt.at) < 600,
-           prompt.contains(receipt.id.uuidString) {
-            return SessionGroupOrchestration.parentDelegation(group: receipt.group)
-        }
-        guard let prompt = prompt?.trimmingCharacters(in: .whitespacesAndNewlines),
-              prompt.hasPrefix("[AutoApprove 그룹 보고") || prompt.hasPrefix("[AutoApprove 그룹 질문") || prompt.hasPrefix("[AutoApprove 그룹 승인 요청"),
-              let state = try? groupOrchestration() else { return nil }
-        let delivered = state.assignments.first { item in
-            item.parentSessionID == sessionID && [item.reportedAt, item.question?.reportedAt].contains { $0.map { now.timeIntervalSince($0) < 600 } == true }
-        }
-        guard let delivered else { return nil }
-        let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
-        return SessionGroupOrchestration.parentDelegation(group: groups.first { $0.id == delivered.groupID }?.name ?? "세션 그룹")
+        guard let prompt, let id = SessionGroupMessage.terminalMessageID(prompt),
+              let receipt = groupMailboxDelegations[id], receipt.sessionID == sessionID,
+              now.timeIntervalSince(receipt.at) < 600, prompt == receipt.prompt else { return nil }
+        return receipt.context
     }
 
     private func rememberHook(_ fingerprint: String) -> Bool {

@@ -226,9 +226,15 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     }
 
     /// Added by the user's AutoApprove hook to reports and requests delivered to the assigning session.
+    package static func deliveryContext(group: String, kind: SessionGroupMessage.Kind, permission: Bool) -> String {
+        if kind == .report { return "AutoApprove 그룹 '\(oneLine(group))'의 작업 완료 보고입니다." }
+        if permission { return parentDelegation(group: group) }
+        return "AutoApprove 그룹 '\(oneLine(group))'의 작업자 질문입니다. 현재 선택지를 확인하고 answer_group_question으로 답하세요."
+    }
+
     public static func parentDelegation(group: String) -> String {
         "AutoApprove 세션 그룹 위임 안내 (사용자가 설치한 AutoApprove hook이 붙인 맥락): 이 프롬프트는 사용자가 만든 세션 그룹 '\(oneLine(group))'에서 " +
-        "AutoApprove가 하위 구성원의 결과, 질문, 승인 요청을 전달한 것입니다. 사용자는 이 그룹의 작업 판단과 작업 범위 안의 권한 승인을 이 세션에 위임했습니다. " +
+        "AutoApprove가 하위 구성원의 결과, 질문, 승인 요청을 전달한 것입니다. 사용자는 이 그룹의 작업 판단과 작업 범위 안의 권한 승인을 이 세션에 위임했습니다. 권한 선택은 사용자 승인으로 처리됩니다. " +
         "사용자에게 다시 묻지 말고 판단해 assign_group_task나 answer_group_question으로 답하세요. 작업 범위를 벗어나거나 되돌리기 어려운 요청은 승인하지 말고, " +
         "거절하거나 결과에 적어 사용자에게 보고하세요."
     }
@@ -259,7 +265,7 @@ public struct SessionGroupOrchestration: Codable, Equatable {
                 ? (questions.contains { $0.question?.isPermission == false } ? "질문과 승인 요청은" : "승인 요청은") : "질문은"
             guide.append("\(kinds) answer_group_question에 구성원 ID와 선택지 번호(choice)를 지정해 답하세요.")
         }
-        if !items.isEmpty { guide.append("get_group_status로 전체 상태를 확인하고 assign_group_task로 다음 작업을 지시하세요.") }
+        if !items.isEmpty { guide.append("다음 작업이 정해졌으면 assign_group_task로 지시하세요.") }
         return (parts + guide).joined(separator: " ")
     }
 }
@@ -274,7 +280,7 @@ public enum GroupWorkerApproval: String {
     /// Sentence for the leader, with a trailing space, or empty when nothing changed.
     public var message: String {
         switch self {
-        case .enabled: "작업자가 권한 확인에서 멈추지 않도록 이 세션의 자동 승인을 켰습니다. "
+        case .enabled: "자동 승인을 켰습니다. "
         case .already: ""
         case .enabledWhilePaused, .paused: "자동 승인이 전체 일시정지 중이라 작업자가 권한 확인에서 멈출 수 있습니다. "
         case .unavailable: "작업자 세션의 승인 연결이 없어 자동 승인을 켜지 못했습니다. 작업자가 권한 확인에서 멈출 수 있으니 관리 창에서 연결을 확인하세요. "

@@ -105,6 +105,20 @@ extension ApprovalTests {
         let clearMember = tools.first(where:{$0["name"] as? String=="clear_group_member"})!
         try expectEqual((clearMember["annotations"] as? JSONObject)?["destructiveHint"] as? Bool,true)
         try expectEqual((clearMember["inputSchema"] as? JSONObject)?["required"] as? [String],["groupID","memberID","requestID"])
+        for (profile, count) in [(MCPToolProfile.orchestrator, 21), (.worker, 19), (.desktop, 9)] {
+            let list = AutoApproveMCPServer.response(["jsonrpc": "2.0", "id": 1, "method": "tools/list"], profile: profile) { _, _ in [:] }
+            let visible = (list?["result"] as? JSONObject)?["tools"] as? [JSONObject] ?? []
+            let names = Set(visible.compactMap { $0["name"] as? String })
+            try expectEqual(names.count, count)
+            for tool in tools {
+                let name = tool["name"] as! String
+                var dispatched = false
+                let request: JSONObject = ["jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": ["name": name]]
+                let reply = AutoApproveMCPServer.response(request, profile: profile) { _, _ in dispatched = true; return [:] }
+                try expectEqual(dispatched, names.contains(name))
+                try expectEqual((reply?["result"] as? JSONObject)?["isError"] as? Bool, !dispatched)
+            }
+        }
         var modifiedSchema = AutoApproveMCPServer.tools
         modifiedSchema[0]["name"] = "changed"
         try expectEqual(AutoApproveMCPServer.tools[0]["name"] as? String, "ask_user", "A caller must not mutate the shared schema")

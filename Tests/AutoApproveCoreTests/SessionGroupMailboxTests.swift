@@ -1,5 +1,9 @@
 import Foundation
+#if DEBUG
+@testable import AutoApproveCore
+#else
 import AutoApproveCore
+#endif
 import CSQLite
 
 extension ApprovalTests {
@@ -34,6 +38,142 @@ extension ApprovalTests {
         try expectEqual(history[1].acknowledgedAt, now)
         try expectEqual(try box.conversations(groupID: group).conversations.first?.waitExpired, true)
     }
+
+    @MainActor func testSummaryMailboxPagesAndReceipts() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp").appendingPathComponent("aa-report-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let paths = AppPaths(directory: directory); try paths.prepare()
+        let records = ProcessDiscovery.parse("""
+        101121 1 fixture211 101121 101121 Wed Oct 28 12:00:00 2026 /fixture/codex
+        101122 1 fixture212 101122 101122 Wed Oct 28 12:00:00 2026 /fixture/codex
+        """)
+        let sessions = records.map { AgentSession(id: $0.key, agent: .codex, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/project", terminal: .iterm) }
+        let ids = Dictionary(uniqueKeysWithValues: records.map { ($0.pid, UUID().uuidString.lowercased()) })
+        let members = sessions.map { session -> SessionGroupMember in
+            var member = SessionGroupMember(agent: .codex, title: "fixture", cwd: "/project", conversationID: ids[session.pid]!, providerHome: "/fixture/home")
+            member.runtimeID = session.id; return member
+        }
+        let group = SessionGroup(name: "reports", members: members, leaderMemberID: members[0].id)
+        try SessionGroupStore(directory: directory).save([group])
+        let engine = try ApprovalEngine(paths: paths, claudeRegistryReader: { _ in [] }, processReader: { records },
+            codexGroupReader: { record in ids[record.pid].map { .init(threadID: $0, database: "/fixture/home/state.sqlite") } })
+        defer { engine.stop() }
+        engine.updateDiscovery(sessions, records: records)
+        let box = try SessionGroupMailbox(directory: directory)
+        func call(_ tool: String, _ args: JSONObject = [:], caller: Int = 0) async throws -> JSONObject {
+            var object: JSONObject = ["owner": UUID().uuidString, "tool": tool, "groupID": group.id.uuidString, "sessionID": sessions[caller].id]
+            object.merge(args) { _, value in value }
+            return try await engine.mcpAction(object)
+        }
+        func mailbox(_ args: JSONObject) async throws -> JSONObject {
+            let status = try await call("get_group_status", args)
+            guard let result = (status["groups"] as? [JSONObject])?.first?["mailbox"] as? JSONObject else {
+                throw AppError.message("missing mailbox")
+            }
+            return result
+        }
+        func bytes(_ value: JSONObject) throws -> Data {
+            try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
+        }
+        var messages: [SessionGroupMessage] = []
+        var sent: [SessionGroupMessage] = []
+        for count in [0, 3, 4, 10, 20, 21] {
+            while messages.count < count {
+                let index = messages.count
+                let body = "결과 \(index)\n" + String(repeating: "👩🏽‍💻한글 ", count: 120) + "보류"
+                messages.append(try box.enqueue(groupID: group.id, senderID: members[1].id, recipientID: members[0].id,
+                    kind: index == 3 ? .question : .message, text: body))
+                sent.append(try box.enqueue(groupID: group.id, senderID: members[0].id, recipientID: members[1].id, kind: .message, text: body))
+            }
+            let full = try await mailbox(["mailboxView": "full"])
+            let normal = try await mailbox([:])
+            let summary = try await mailbox(["mailboxView": "summary"])
+            try expectEqual(try bytes(normal), try bytes(full))
+            for (key, source) in [("inbox", messages), ("outbox", sent)] {
+                let page = summary[key] as? [JSONObject] ?? []
+                try expectEqual(page.compactMap { $0["messageID"] as? String }, source.prefix(3).map { $0.id.uuidString })
+                try expectEqual(summary[key + "HasMore"] as? Bool, count > 3)
+                try expectEqual((full[key] as? [JSONObject])?.count, min(20, count))
+                try expectEqual(full[key + "HasMore"] as? Bool, count > 20)
+                if let row = page.first, let message = source.first {
+                    let preview = row["preview"] as? String ?? ""
+                    try expect(!preview.isEmpty && preview.utf8.count <= 120 && !preview.contains("\n"))
+                    try expectEqual(row["textBytes"] as? Int, message.text.utf8.count)
+                    try expectEqual(row["truncated"] as? Bool, true)
+                    try expectNil(row["text"])
+                    try expectEqual(row[key == "inbox" ? "senderMemberID" : "memberID"] as? String, members[1].id.uuidString)
+                }
+            }
+            if count == 10 { print("Mailbox fixture UTF-8 bytes full=\(try bytes(full).count) summary=\(try bytes(summary).count)") }
+            try expectEqual(try box.pendingCount, count * 2)
+        }
+        for invalid: Any in ["extra" as Any, 1, NSNull()] {
+            do { _ = try await mailbox(["mailboxView": invalid]); throw AppError.message("accepted invalid mailboxView") }
+            catch let error as RemoteHTTPError { try expectEqual(error.status, 400) }
+        }
+        let answer = try await call("get_group_messages", ["unansweredOnly": true])
+        try expectEqual((answer["messages"] as? [JSONObject])?.first?["messageID"] as? String, messages[3].id.uuidString)
+        for (direction, source) in [("inbox",messages), ("outbox",sent)] {
+            let next = try await call("get_group_messages", ["direction": direction, "afterSequence": source[2].sequence])
+            try expectEqual((next["messages"] as? [JSONObject])?.first?["messageID"] as? String, source[3].id.uuidString)
+        }
+        let id = messages[3].id.uuidString
+        _ = try await call("ack_group_messages", ["messageIDs": [id]])
+        let original = try await call("get_group_messages", ["messageID": id])
+        try expectEqual((original["messages"] as? [JSONObject])?.first?["text"] as? String, messages[3].text)
+        do { _ = try await call("get_group_messages", ["messageID": id], caller: 1); throw AppError.message("read another inbox") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status, 404) }
+        let outbox = try await call("get_group_messages", ["messageID": id, "direction": "outbox"], caller: 1)
+        try expectEqual((outbox["messages"] as? [JSONObject])?.first?["text"] as? String, messages[3].text)
+        #if DEBUG
+        try compareReportDelivery(box, group: group, members: members)
+        #endif
+    }
+
+    #if DEBUG
+    private func compareReportDelivery(_ box: SessionGroupMailbox, group: SessionGroup, members: [SessionGroupMember]) throws {
+        let result = "결과: 테스트 실패 · 배포 보류"
+        let conversation = UUID().uuidString
+        func store(_ body: String) throws -> SessionGroupMessage {
+            try box.enqueue(groupID: group.id, senderID: members[1].id, recipientID: members[0].id, kind: .report, text: body)
+        }
+        let delimiter = " · 그룹 메시지 본문 · "
+        func firstLineReference(_ message: SessionGroupMessage, direct: String) -> String {
+            guard message.kind == .report, let first = message.text.split(whereSeparator: \.isNewline).first,
+                  first.hasPrefix("결과: "), let range = direct.range(of: delimiter) else { return direct }
+            let reference = "원문 " + String(message.text.utf8.count) + "바이트 · get_group_messages(groupID: " +
+                group.id.uuidString + ", messageID: " + message.id.uuidString + ", includeAcknowledged: true)"
+            let candidate = String(direct[..<range.lowerBound]) + " · " + first + delimiter + reference
+            return candidate.utf8.count <= 4096 ? candidate : direct
+        }
+        let seed = result + "\n테스트 👩🏽‍💻\n보류"
+        let overhead = try store(seed).terminalPrompt(senderTitle: "fixture").utf8.count
+        for length in [1500, 1501, 4096, 4097] {
+            let body = seed + String(repeating: "x", count: length - overhead)
+            let message = try store(body)
+            let direct = message.terminalPrompt(senderTitle: "fixture")
+            let candidate = firstLineReference(message, direct: direct)
+            try expectEqual(message.isReferencePrompt(direct), length > 4096)
+            if length <= 4096 { try expectEqual(direct.utf8.count, length) }
+            try expect(candidate.utf8.count <= 4096 && message.isReferencePrompt(candidate))
+            for prompt in [direct, candidate] {
+                try expectEqual(SessionGroupMessage.terminalMessageID(prompt), message.id)
+                try box.recordSubmission(message.id, conversation: conversation, prompt: prompt)
+                try expect(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt))
+            }
+            let stored = try box.message(message.id)
+            try expectEqual(stored?.text, body)
+            try expectEqual(stored?.acknowledgedAt, nil)
+            print("Report fixture bytes boundary=\(length) current=\(direct.utf8.count) firstLineReference=\(candidate.utf8.count) bodyLookup=\(body.utf8.count)")
+        }
+        for body in [String(repeating: "테스트\n", count: 300) + "마지막 결과: 실패", "결과: " + String(repeating: "👩🏽‍💻", count: 500)] {
+            let message = try store(body)
+            let direct = message.terminalPrompt(senderTitle: "fixture")
+            try expectEqual(firstLineReference(message, direct: direct), direct)
+            try expectEqual(try box.message(message.id)?.text, body)
+        }
+    }
+    #endif
 
     @MainActor func testGroupReportRequiresRecipientAcknowledgement() async throws {
         let directory = URL(fileURLWithPath: "/private/tmp").appendingPathComponent("aa-report-" + UUID().uuidString)
