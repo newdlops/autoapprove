@@ -3,16 +3,21 @@ import AppKit
 import UniformTypeIdentifiers
 import AutoApproveCore
 
+extension TerminalProfileEntry {
+    var agentTitle: String { AgentKind(rawValue: agent)?.title ?? agent }
+}
+
 struct SessionProfileDraft: Identifiable {
     let id=UUID()
     var profileID: UUID
     var name: String
     var candidates: [TerminalProfileCandidate]
     var groups:[TerminalProfileGroup]=[]
+    var capturesLiveSessions=false
 }
 
 struct SessionProfileEntryFilter:Equatable {
-    enum Agent:String,CaseIterable {case all="전체",codex="Codex",claude="Claude"}
+    enum Agent:String,CaseIterable {case all="전체",codex="Codex",claude="Claude",agy="Antigravity"}
     enum Order:String,CaseIterable {case saved="저장 순서",window="창·탭",repository="레포",agent="도구",title="이름"}
     struct WindowChoice:Identifiable,Equatable {let id:String;let title:String}
     var agent:Agent = .all
@@ -44,7 +49,7 @@ struct SessionProfileEntryFilter:Equatable {
     func entries(_ entries:[TerminalProfileEntry],repositories:[String:String]) -> [TerminalProfileEntry] {
         let query=query.trimmingCharacters(in:.whitespacesAndNewlines)
         return entries.enumerated().filter {_,entry in
-            (agent == .all || entry.agent == (agent == .codex ? "codex":"claude")) &&
+            (agent == .all || entry.agent == (agent == .agy ? "agy":agent == .codex ? "codex":"claude")) &&
             (window.isEmpty || Self.windowKey(entry) == window) &&
             (repository.isEmpty || (repositories[entry.cwd] ?? entry.cwd) == repository) &&
             (query.isEmpty || [entry.title,entry.cwd,entry.conversationID,repositories[entry.cwd] ?? entry.cwd]
@@ -102,6 +107,7 @@ struct SessionProfileEntryFilter:Equatable {
     @Published private(set) var results:[UUID:TerminalProfileRestoreResult]=[:]
     private let capture:@MainActor () async throws -> [TerminalProfileCandidate]
     private let activeSessions:@MainActor () async throws -> [TerminalProfileCandidate]
+    private let refreshForSaving:@MainActor () async throws -> [TerminalProfileCandidate]
     private let captureGroups:@MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup]
     private let restoreGroups:@MainActor (TerminalSessionProfile,[TerminalProfileRestoreResult],[TerminalProfileCandidate]) async throws -> Void
     private let launch:@Sendable (TerminalProfileEntry,String?) async throws -> String
@@ -111,11 +117,13 @@ struct SessionProfileEntryFilter:Equatable {
     private var repositoryGeneration=UUID()
     init(store:TerminalProfileStore,capture:@escaping @MainActor () async throws -> [TerminalProfileCandidate],
          activeSessions:(@MainActor () async throws -> [TerminalProfileCandidate])? = nil,
+         refreshForSaving:(@MainActor () async throws -> [TerminalProfileCandidate])? = nil,
          captureGroups:@escaping @MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup] = {_ in []},
          restoreGroups:@escaping @MainActor (TerminalSessionProfile,[TerminalProfileRestoreResult],[TerminalProfileCandidate]) async throws -> Void = {_,_,_ in},
          launch:(@Sendable (TerminalProfileEntry,String?) async throws -> String)? = nil,
          selectTab:(@Sendable (String) async throws -> Void)? = nil) {
         self.store=store;self.capture=capture;self.activeSessions=activeSessions ?? capture
+        self.refreshForSaving=refreshForSaving ?? capture
         self.captureGroups=captureGroups;self.restoreGroups=restoreGroups
         self.launch=launch ?? {try await TerminalProfileLauncher.launch($0,anchorTTY:$1)}
         // A synthetic launcher cannot acquire an implicit path to real native UI.
@@ -127,6 +135,7 @@ struct SessionProfileEntryFilter:Equatable {
         self.init(store:TerminalProfileStore(directory:engine.paths.directory.appendingPathComponent("session-profiles",isDirectory:true)),
                   capture:{try await engine.terminalProfileCandidates()},
                   activeSessions:{try await engine.terminalProfileCandidates(includeLayout:false)},
+                  refreshForSaving:{try await engine.terminalProfileCandidates(includeLayout:false,refreshForSaving:true)},
                   captureGroups:{try engine.terminalProfileGroups(candidates:$0)},
                   restoreGroups:{try await engine.restoreTerminalProfileGroups($0,results:$1,previous:$2)})
     }
@@ -178,8 +187,8 @@ struct SessionProfileEntryFilter:Equatable {
         guard !busy else {return};busy=true;error=nil;message=nil;defer {busy=false}
         do {
             let candidates=try await capture()
-            guard !candidates.isEmpty else {throw AppError.message("실행 중인 Codex·Claude Code 세션이 없습니다. 터미널에서 CLI를 연 뒤 다시 저장해주세요.")}
-            draft = .init(profileID:replacing?.id ?? UUID(),name:replacing?.name ?? "",candidates:candidates,groups:try captureGroups(candidates))
+            guard !candidates.isEmpty else {throw AppError.message("실행 중인 에이전트 세션이 없습니다. 터미널에서 CLI를 연 뒤 다시 저장해주세요.")}
+            draft = .init(profileID:replacing?.id ?? UUID(),name:replacing?.name ?? "",candidates:candidates,groups:try captureGroups(candidates),capturesLiveSessions:true)
         } catch {self.error=error.localizedDescription}
     }
     func edit(_ profile:TerminalSessionProfile) {
@@ -191,7 +200,32 @@ struct SessionProfileEntryFilter:Equatable {
         guard !busy else {throw AppError.message("다른 프로필 작업을 마친 뒤 저장해주세요.")}
         busy=true;defer {busy=false};let store=store
         var value=profile
-        if let draft,draft.profileID==profile.id {value.groups=TerminalProfileGroup.selecting(draft.groups,entries:profile.entries)}
+        if let draft,draft.profileID==profile.id {
+            var groups=draft.groups
+            if draft.capturesLiveSessions {
+                let fresh=try await refreshForSaving()
+                var selected:[TerminalProfileCandidate]=[]
+                for index in value.entries.indices {
+                    let chosen=value.entries[index]
+                    guard let original=draft.candidates.first(where:{$0.entry.id==chosen.id}),
+                          var current=fresh.first(where:{$0.id==original.id}),
+                          current.entry.agent==original.entry.agent,current.entry.cwd==original.entry.cwd else {
+                        throw AppError.message("선택한 터미널이 종료되거나 변경되었습니다. 현재 창을 다시 불러와주세요.")
+                    }
+                    current.entry.id=chosen.id
+                    let followsCurrent=chosen.resumesConversation && chosen.conversationID.caseInsensitiveCompare(original.entry.conversationID) == .orderedSame
+                    if followsCurrent {
+                        guard current.entry.resumesConversation else {throw AppError.message("현재 대화 ID를 확인할 수 없습니다. 현재 창을 다시 불러와주세요.")}
+                        value.entries[index].conversationID=current.entry.conversationID
+                        if chosen.executionSettings==original.entry.executionSettings {value.entries[index].executionSettings=current.entry.executionSettings}
+                    }
+                    value.entries[index].providerHome=current.entry.providerHome
+                    selected.append(current)
+                }
+                groups=try captureGroups(selected)
+            }
+            value.groups=TerminalProfileGroup.selecting(groups,entries:value.entries)
+        }
         value.schema=4
         let saved=value
         _ = try await Task.detached(priority:.utility) {try store.save(saved)}.value

@@ -49,7 +49,7 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
     }
     public func validated() throws -> Self {
         let conversation=conversationID.trimmingCharacters(in:.whitespacesAndNewlines)
-        guard ["codex","claude"].contains(agent) else {throw AppError.message("CLI 종류는 Codex 또는 Claude Code를 선택해주세요.")}
+        guard ["codex","claude","agy"].contains(agent) else {throw AppError.message("CLI 종류는 Codex, Claude Code 또는 Antigravity를 선택해주세요.")}
         guard Self.path(cwd) else {throw AppError.message("작업 폴더의 전체 경로를 입력해주세요.")}
         guard providerHome.map(Self.path) ?? true else {throw AppError.message("CLI 설정 폴더의 전체 경로를 확인해주세요.")}
         guard conversation.isEmpty || UUID(uuidString:conversation) != nil else {throw AppError.message("대화 ID를 입력할 때는 UUID 형식을 사용해주세요. 비워 두면 새 CLI를 엽니다.")}
@@ -82,13 +82,13 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         var arguments=["env"]
         guard nativeRuntimeRoot==nil else {throw AppError.message("공식 Codex는 전용 제어 등록 경로를 사용하지 않습니다.")}
         if entry.agent == "codex" {arguments += ["-u","AUTOAPPROVE_NATIVE_RUNTIME_ROOT","-u","AUTOAPPROVE_SELECTED_TRANSITION_SOCKET"]}
-        if let home=entry.providerHome {arguments.append((agent == "codex" ? "CODEX_HOME":"CLAUDE_CONFIG_DIR")+"="+home)}
+        if entry.agent != "agy", let home=entry.providerHome {arguments.append((agent == "codex" ? "CODEX_HOME":"CLAUDE_CONFIG_DIR")+"="+home)}
         if let searchPath=compatibleCLI?.environment["PATH"] {arguments.append("PATH="+searchPath)}
         arguments.append(compatibleCLI?.executable ?? bundledRuntime?.executable ?? agent)
         if bundledRuntime != nil || compatibleCLI != nil {
             arguments += standalone ? ["-c","features.daemon_auto_start=false"]:["--remote","unix://"]
         }
-        if entry.resumesConversation {arguments += [agent == "codex" ? "resume":"--resume",entry.conversationID]}
+        if entry.resumesConversation {arguments += [agent == "codex" ? "resume":agent == "agy" ? "--conversation":"--resume",entry.conversationID]}
         arguments += try entry.executionSettings?.arguments(agent: entry.agent) ?? []
         // Keep the tab's interactive shell for both agents. A CLI that replaces its shell leaves a tab that cannot
         // run anything after the CLI exits, so the session could never be restarted in the same tab.

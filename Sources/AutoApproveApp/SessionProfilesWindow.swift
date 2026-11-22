@@ -26,7 +26,7 @@ struct SessionProfilesWindow: View {
                     if controller.profiles.isEmpty {
                         VStack(alignment:.leading,spacing:8) {
                             Text(controller.loading ? "프로필을 불러오고 있습니다…":"저장한 프로필이 없습니다").font(.headline)
-                            Text("현재 Codex·Claude Code 창을 불러와 첫 프로필을 만드세요.").font(.callout).foregroundStyle(.secondary)
+                            Text("현재 에이전트 창을 불러와 첫 프로필을 만드세요.").font(.callout).foregroundStyle(.secondary)
                         }.padding(16)
                         Spacer()
                     } else {
@@ -66,7 +66,7 @@ struct SessionProfilesWindow: View {
         .toolbar {
             ToolbarItemGroup(placement:.primaryAction) {
                 Button {Task {await controller.captureCurrent()}} label: {Label("새 프로필",systemImage:"plus")}
-                    .keyboardShortcut("n").disabled(controller.busy).help("현재 Mac의 Codex·Claude Code 창을 새 프로필 파일로 저장합니다.")
+                    .keyboardShortcut("n").disabled(controller.busy).help("현재 Mac의 에이전트 창을 새 프로필 파일로 저장합니다.")
                 Button("가져오기",systemImage:"square.and.arrow.down") {controller.importProfile()}.disabled(controller.busy)
                     .help("저장한 세션 프로필 JSON 파일을 가져옵니다. 실행 전에 내용을 확인합니다.")
                 Button("프로필 폴더",systemImage:"folder") {Task {await controller.openFolder()}}
@@ -112,8 +112,8 @@ struct SessionProfilesWindow: View {
                     Toggle(isOn:Binding(get:{controller.selectedEntries.contains(entry.id)},set:{if $0 {controller.selectedEntries.insert(entry.id)} else {controller.selectedEntries.remove(entry.id)}})) {
                         Text(entry.title.isEmpty ? entry.agent:entry.title).font(.body.weight(.medium)).lineLimit(2)
                     }.toggleStyle(.checkbox).disabled(controller.busy || controller.loading)
-                        .accessibilityLabel("\(entry.agent == "codex" ? "Codex":"Claude") · \(entry.title) · \(SessionProfileEntryFilter.windowPosition(entry)) · \(entry.cwd)")
-                    Text((entry.agent == "codex" ? "Codex":"Claude Code")+" · "+(entry.host == .iterm ? "iTerm2":"Terminal")+" · "+SessionProfileEntryFilter.windowPosition(entry))
+                        .accessibilityLabel("\(entry.agentTitle) · \(entry.title) · \(SessionProfileEntryFilter.windowPosition(entry)) · \(entry.cwd)")
+                    Text("\(entry.agentTitle) · \(entry.host == .iterm ? "iTerm2":"Terminal") · \(SessionProfileEntryFilter.windowPosition(entry))")
                         .font(.caption).foregroundStyle(.secondary)
                     Text(entry.cwd).font(.caption).foregroundStyle(.secondary).lineLimit(2).textSelection(.enabled).help(entry.cwd)
                     Text(entry.executionSettings.map { "실행 설정: " + $0.summary } ?? "실행 설정: CLI 설정 유지")
@@ -156,7 +156,7 @@ struct SessionProfilesWindow: View {
             HStack(spacing:10) {
                 Picker("복원할 도구",selection:$controller.entryFilter.agent) {
                     ForEach(SessionProfileEntryFilter.Agent.allCases,id:\.self) {Text($0.rawValue).tag($0)}
-                }.pickerStyle(.segmented).labelsHidden().accessibilityLabel("복원할 도구").frame(width:192)
+                }.pickerStyle(.menu).labelsHidden().accessibilityLabel("복원할 도구").frame(width:110)
                 Picker("저장된 창",selection:$controller.entryFilter.window) {
                     Text("모든 창").tag("")
                     ForEach(controller.windowChoices) {Text($0.title).tag($0.id)}
@@ -260,7 +260,7 @@ struct SessionProfileEditor:View {
                                 .toggleStyle(.checkbox).font(.headline)
                             VStack(alignment:.leading,spacing:8) {
                                 HStack {
-                                    Text(row.entry.agent == "codex" ? "Codex":"Claude Code").font(.callout)
+                                    Text(row.entry.agentTitle).font(.callout)
                                     Spacer(minLength:8)
                                     Picker("복원 앱",selection:$row.entry.host) {
                                         Text("Terminal").tag(TerminalProfileEntry.Host.terminal)

@@ -136,7 +136,7 @@ public enum TerminalProfileTopology {
     }
     public static func read(ttys:[String]) throws -> [TerminalProfileTabSnapshot] {
         guard !ttys.isEmpty else {return []}
-        let text=try AutomationScript.run(script(ttys:ttys),app:"Terminal",denied:.permissionDenied)
+        let text=try AutomationScript.run(script(ttys:ttys),app:"Terminal",denied:.permissionDenied,timeout:min(45,max(8,Double(ttys.count)*1.5)))
         let rows=try JSONDecoder().decode([TerminalProfileTabSnapshot].self,from:Data(text.utf8))
         let owner=try TerminalProcessLookup.running(),reader=try TerminalNativeTabReader.terminal(owner:owner)
         var keyboard=TerminalKeyboard.Environment.live

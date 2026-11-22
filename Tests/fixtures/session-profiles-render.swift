@@ -9,7 +9,7 @@ import AutoApproveCore
         let store=TerminalProfileStore(directory:root.appendingPathComponent("render-data"))
         var entries:[TerminalProfileEntry]=[]
         for i in 0..<24 {
-            let agent=i%2==0 ? "codex":"claude"
+            let agent=i==1 ? "agy" : i%2==0 ? "codex":"claude"
             let conversation=i<2 ? "":String(format:"00000000-0000-4000-8000-%012d",i+1)
             var entry=TerminalProfileEntry(title:"긴 프로젝트 작업 \(i+1) · Codex와 Claude 대화 복원",agent:agent,cwd:"/fixture/여러 프로젝트/긴 작업 폴더 이름/프로젝트-\(i)",conversationID:conversation)
             if i==0 {entry.providerHome="/fixture/CLI 설정을 따로 보관하는 긴 폴더 이름/.codex"}

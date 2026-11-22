@@ -123,6 +123,39 @@ private actor LaunchLog {
         try check(savedSettings.schema == 4 && savedSettings.entries[0].executionSettings == configured.entries[0].executionSettings,"Production editor save preserves schema 4 execution settings")
         await controller.waitForRepositories(); await controller.restoreSelection()
         try check(await log.opened.contains { $0.id == configured.entries[0].id && $0.executionSettings == configured.entries[0].executionSettings },"Controller restore forwards model, reasoning and speed to the launcher")
+        var current=entry(20,"agy",plain,"Antigravity")
+        let original=current
+        var member=SessionGroupMember(agent:.agy,title:"그룹장",cwd:plain,conversationID:current.conversationID)
+        member.runtimeID="runtime"
+        let group=SessionGroup(name:"Current",members:[member],leaderMemberID:member.id)
+        let live=SessionProfilesController(store:store,capture:{[.init(id:"runtime",entry:current)]},
+            captureGroups:{TerminalProfileGroup.capture([group],candidates:$0)})
+        await live.captureCurrent()
+        let capture=live.draft!
+        let chosen=TerminalSessionProfile(id:capture.profileID,name:"Current",entries:[original])
+        current.conversationID=UUID().uuidString.lowercased()
+        try await live.save(chosen)
+        let persisted=try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(chosen.id)))
+        try check(persisted.entries[0].conversationID==current.conversationID,"Save follows a conversation changed after capture")
+        try check(persisted.groups?.first?.group.members.first?.agent == .agy,"Antigravity group role survives selection")
+        let command=try persisted.entries[0].resumeCommand()
+        try check(command.contains("'agy' '--conversation' '"+current.conversationID+"'") && !command.contains("CLAUDE_CONFIG_DIR"),"Antigravity resume uses its CLI grammar")
+        await live.captureCurrent()
+        let manual=live.draft!
+        var selected=manual.candidates[0].entry
+        selected.conversationID=UUID().uuidString.lowercased()
+        try await live.save(.init(id:manual.profileID,name:"Manual",entries:[selected]))
+        let savedManual=try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(manual.profileID)))
+        try check(savedManual.entries[0].conversationID==selected.conversationID,"Manual conversation choice survives fresh capture")
+        let records=ProcessDiscovery.parse("100501 1 profile1 100501 100501 Wed Oct 28 12:00:00 2026 /fixture/codex")
+        let record=records[0],conversation=UUID().uuidString.lowercased()
+        let engine=try ApprovalEngine(paths:.init(directory:root.appendingPathComponent("engine")),processReader:{records},
+            codexGroupReader:{_ in .init(threadID:conversation,database:"/fixture/.codex/state_5.sqlite")})
+        defer {engine.stop()}
+        let session=AgentSession(id:record.key,agent:.codex,pid:record.pid,started:record.started,tty:"/dev/"+record.tty,cwd:plain,terminal:.iterm)
+        engine.updateDiscovery([session],records:records)
+        let candidates=try await engine.terminalProfileCandidates()
+        try check(candidates.first?.entry.conversationID==conversation,"Profile capture uses the verified conversation from group discovery")
         print("PASS \(checks) profile selection checks; production controller/restorer, exact repo roots, hidden-row exclusion, draft-free filter state, no real Terminal launch")
     }
 }

@@ -1164,45 +1164,40 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     /// Prefer the exact live rollout. A daemon-backed TUI can also bind a unique
     /// full server name to its current terminal title; unresolved rows keep a picker.
-    public func terminalProfileCandidates(includeLayout:Bool = true) async throws -> [TerminalProfileCandidate] {
+    public func terminalProfileCandidates(includeLayout:Bool = true, refreshForSaving:Bool = false) async throws -> [TerminalProfileCandidate] {
         guard !remoteInputStopped else {throw AppError.message("앱이 종료 중입니다.")}
         let targets=snapshot.sessions.filter {$0.agent != .shell && $0.phase != .ended && $0.pid>0}
         guard targets.count<=128 else {throw AppError.message("프로필에는 최대 128개 세션을 저장합니다.")}
-        let reader=processReader,registry=claudeRegistryReader
-        let live=try await Task.detached(priority:.utility) {try reader()}.value
+        let reader=processReader
+        let observed=try await readSessionGroupSessions(reconcile:false)
+        let identities=Dictionary(uniqueKeysWithValues:observed.map {($0.id,$0)})
         var result:[TerminalProfileCandidate]=[]
-        // The same exact identities are needed for saving and deduplicating
-        // restoration. Share only this operation's home/folder lookup.
         var conversationLists:[String:[String:[CodexQueueConversation]]]=[:]
         var namedCodexBindings:[String:String]=[:]
         var layoutNamedBindings=Set<String>()
         var explicitCodexBindings:[String:String]=[:]
         for session in targets {
             try Task.checkCancellation()
-            guard let record=live.first(where:{$0.key == session.id && $0.agent == session.agent && "/dev/"+$0.tty == session.tty}) else {
+            guard let identity=identities[session.id], identity.session.tty==session.tty, identity.session.cwd==session.cwd else {
                 throw AppError.message("세션 목록이 바뀌었습니다. 현재 창을 다시 불러와주세요.")
             }
-            let environment=await Task.detached(priority:.utility) {ProcessEnvironment.read(record) ?? [:]}.value
             let title=String(session.displayedTerminalTitle.components(separatedBy:.newlines).joined(separator:" ").unicodeScalars.filter {!CharacterSet.controlCharacters.contains($0)}.map(String.init).joined().prefix(256))
             var entry=TerminalProfileEntry(title:title,agent:session.agent.rawValue,cwd:session.cwd,conversationID:"",
-                providerHome:environment[session.agent == .codex ? "CODEX_HOME":"CLAUDE_CONFIG_DIR"],host:session.terminal == .iterm ? .iterm:.terminal)
+                providerHome:identity.providerHome,host:session.terminal == .iterm ? .iterm:.terminal)
             var choices:[CodexProfileConversation]=[],detail:String?
+            if let id=identity.conversationID.flatMap(UUID.init(uuidString:)) {entry.conversationID=id.uuidString.lowercased()}
             if session.agent == .codex {
-                let location=try? await Task.detached(priority:.utility) {
-                    try CodexThreadLocation.locate(paths:ProcessOpenFiles.codexRolloutPaths(pid:record.pid,expectedStart:record.started))
-                }.value
-                if let location {
-                    entry.conversationID=location.threadID
-                    entry.providerHome=URL(fileURLWithPath:location.database).deletingLastPathComponent().path
-                } else {
+                if entry.conversationID.isEmpty {
                     do {
                         let target=try await questionTransport.queueHome(session)
                         entry.providerHome=target.home
                         if let thread=session.codexApprovalBinding?.threadID,UUID(uuidString:thread) != nil {
                             var bound=target;bound.threadID=thread
-                            try await codexQueue.validate(bound,session.cwd)
-                            entry.conversationID=thread
-                            explicitCodexBindings[session.id]=thread
+                            do {
+                                try await codexQueue.validate(bound,session.cwd)
+                                entry.conversationID=thread
+                                explicitCodexBindings[session.id]=thread
+                            } catch {detail="현재 대화를 확인하지 못했습니다: "+error.localizedDescription}
                         }
                         if entry.conversationID.isEmpty || includeLayout {
                             let conversations:[CodexQueueConversation]
@@ -1217,18 +1212,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                 namedCodexBindings[session.id]=name.precomposedStringWithCanonicalMapping
                             }
                         }
-                        if entry.conversationID.isEmpty {detail="현재 대화를 확인하지 못했습니다. 이어갈 대화를 선택하거나 새 CLI 실행을 명시적으로 선택해주세요."}
-                    } catch {detail="현재 대화를 확인하지 못했습니다: "+error.localizedDescription}
+                        if !entry.conversationID.isEmpty {detail=nil}
+                        else if detail==nil {detail="현재 대화를 확인하지 못했습니다. 이어갈 대화를 선택하거나 새 CLI 실행을 명시적으로 선택해주세요."}
+                    } catch {if detail==nil {detail="현재 대화를 확인하지 못했습니다: "+error.localizedDescription}}
                 }
-            } else {
-                let home=entry.providerHome
-                let rows=await Task.detached(priority:.utility) {
-                    home.map {ClaudeSessionRegistry.read(records:[record],directory:URL(fileURLWithPath:$0))} ?? registry([record])
-                }.value
-                let identities=Set(rows.filter {$0.processID == session.id}.compactMap(\.conversationID))
-                if identities.count == 1,let id=identities.first,UUID(uuidString:id) != nil {entry.conversationID=id}
-                else if let id=session.providerID,UUID(uuidString:id) != nil {entry.conversationID=id}
-                else {detail="대화 ID는 선택 사항입니다. 비워 두면 이 폴더에서 새 Claude Code를 엽니다."}
+                if includeLayout || refreshForSaving, entry.conversationID.isEmpty, let named=await groupNamedConversation(session) {
+                    entry.conversationID=named.id;entry.providerHome=named.home;detail=nil
+                }
+            } else if entry.conversationID.isEmpty {
+                if let id=sessions[session.id]?.providerID.flatMap(UUID.init(uuidString:)) {
+                    entry.conversationID=id.uuidString.lowercased()
+                } else {detail="현재 대화 ID를 확인하지 못했습니다. 대화 ID를 입력하거나 새 CLI 실행을 선택해주세요."}
             }
             if ![TerminalKind.terminal,.iterm].contains(session.terminal) {
                 detail=(detail.map {$0+" "} ?? "")+"이 세션은 새 Terminal 창에서 복원합니다."
@@ -1260,7 +1254,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
         }
-        if includeLayout {
+        if includeLayout || refreshForSaving {
             let settingsReader = profileExecutionSettingsReader
             for index in result.indices {
                 let entry = result[index].entry

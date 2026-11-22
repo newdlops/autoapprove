@@ -17,7 +17,7 @@ public struct TerminalProfileGroup: Codable, Equatable, Sendable {
             normalizedHome(member.providerHome,agent:entry.agent)==normalizedHome(entry.providerHome,agent:entry.agent)
     }
     static func normalizedHome(_ home:String?,agent:String) -> String {
-        URL(fileURLWithPath:home ?? NSHomeDirectory()+"/."+agent).standardizedFileURL.resolvingSymlinksInPath().path
+        URL(fileURLWithPath:home ?? (agent=="agy" ? AgyHookInstaller.file.deletingLastPathComponent().path : NSHomeDirectory()+"/."+agent)).standardizedFileURL.resolvingSymlinksInPath().path
     }
     public func validated(entries:[TerminalProfileEntry]) throws -> Self {
         var copy=self;copy.group=try group.validated()
@@ -41,10 +41,11 @@ public struct TerminalProfileGroup: Codable, Equatable, Sendable {
             var group=original,links:[Link]=[]
             for index in group.members.indices {
                 let member=group.members[index]
-                let matches=candidates.filter {
-                    ($0.id==member.runtimeID && $0.entry.agent==member.agent.rawValue && $0.entry.cwd==member.cwd &&
-                     normalizedHome($0.entry.providerHome,agent:$0.entry.agent)==normalizedHome(member.providerHome,agent:$0.entry.agent)) || sameConversation(member,$0.entry)
+                let terminal=candidates.filter {
+                    $0.id==member.runtimeID && $0.entry.agent==member.agent.rawValue && $0.entry.cwd==member.cwd &&
+                    (member.providerHome==nil || normalizedHome($0.entry.providerHome,agent:$0.entry.agent)==normalizedHome(member.providerHome,agent:$0.entry.agent))
                 }
+                let matches=terminal.isEmpty ? candidates.filter {sameConversation(member,$0.entry)} : terminal
                 if matches.count==1,let entry=matches.first?.entry {
                     group.members[index].conversationID=entry.conversationID
                     group.members[index].providerHome=entry.providerHome
@@ -63,7 +64,8 @@ public struct TerminalProfileGroup: Codable, Equatable, Sendable {
             guard !value.links.isEmpty else{return nil}
             for link in value.links {
                 guard let entry=entries.first(where:{$0.id==link.entryID}),let index=value.group.members.firstIndex(where:{$0.id==link.memberID}) else{continue}
-                value.group.members[index].agent=entry.agent=="codex" ? .codex:.claude
+                guard let agent=AgentKind(rawValue:entry.agent) else {continue}
+                value.group.members[index].agent=agent
                 value.group.members[index].cwd=entry.cwd
                 value.group.members[index].conversationID=entry.conversationID
                 value.group.members[index].providerHome=entry.providerHome
