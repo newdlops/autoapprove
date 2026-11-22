@@ -9,7 +9,7 @@ enum AgyTranscript {
         let date: Date
     }
 
-    static func finalTurn(path: String? = nil, conversation: String) -> Turn? {
+    static func finalTurn(path: String? = nil, conversation: String, messageID: UUID? = nil) -> Turn? {
         guard UUID(uuidString: conversation) != nil else { return nil }
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gemini/antigravity-cli/brain")
         let directory = root.appendingPathComponent(conversation).appendingPathComponent(".system_generated/logs").standardizedFileURL
@@ -29,10 +29,11 @@ enum AgyTranscript {
                   let bytes = try? handle.read(upToCount: 1_048_576) else { return nil }
             var lines = bytes.split(separator: 10)[...]
             if start > 0 { lines = lines.dropFirst() }
-            var prompt: String?, turn: Turn?
+            var prompt: String?, turn: Turn?, matched: Turn?
             for line in lines {
                 guard let row = (try? JSONSerialization.jsonObject(with: Data(line))) as? JSONObject else { return nil }
                 if row["source"] as? String == "USER_EXPLICIT", row["type"] as? String == "USER_INPUT" {
+                    if let messageID, let turn, SessionGroupMessage.terminalMessageID(turn.prompt) == messageID { matched = turn }
                     prompt = nil
                     turn = nil
                     guard row["truncated_fields"] == nil, let content = row["content"] as? String,
@@ -49,6 +50,7 @@ enum AgyTranscript {
                     turn = Turn(prompt: prompt, step: step, answer: answer, date: date)
                 }
             }
+            if let messageID { return turn.flatMap { SessionGroupMessage.terminalMessageID($0.prompt) == messageID ? $0 : nil } ?? matched }
             return turn
         }
         return read(file) ?? read(directory.appendingPathComponent("transcript_full.jsonl"))

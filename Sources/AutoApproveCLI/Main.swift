@@ -150,11 +150,14 @@ import AutoApproveCore
                     var call: JSONObject = ["name":name]
                     if let args = tool["args"] as? JSONObject {
                         let keys = ["run_command": "CommandLine", "list_dir": "DirectoryPath", "view_file": "AbsolutePath", "read_file": "AbsolutePath"]
-                        if let key = keys[name], let value = args[key] as? String { call["args"] = [key: value] }
+                        if let key = keys[name] {
+                            let allowed = name == "read_file" ? [key, "Path"] : [key]
+                            call["args"] = args.filter { allowed.contains($0.key) }
+                        }
                     }
                     observation["toolCall"] = call
                 }
-                let response = try? SocketClient.request(path: paths.socket, message: ["method":"agyHook","params":observation], timeout: 3)
+                let response = try? SocketClient.request(path: paths.socket, message: ["method":"agyHook","params":observation], timeout: payload["hookEventName"] as? String == "PreToolUse" ? 20 : 7)
                 try printJSON(response ?? fallback)
             case "hook":
                 do {

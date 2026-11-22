@@ -3715,7 +3715,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if session.agent == .agy {
             guard let conversation = live.conversationID,
                   let turn = await Task.detached(priority: .utility, operation: {
-                      AgyTranscript.finalTurn(conversation: conversation)
+                      AgyTranscript.finalTurn(conversation: conversation, messageID: message.id)
                   }).value, SessionGroupMessage.terminalMessageID(turn.prompt) == message.id,
                   let box = try? groupMailbox() else { return .unknown }
             do {
@@ -3885,6 +3885,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         return Dictionary(uniqueKeysWithValues: group.members.map { member in
             let live = UUID(uuidString: member.conversationID) == nil ? nil : SessionGroupMatching.match(member, in: current)
+            let terminal = member.runtimeID.flatMap { sessions[$0] }.flatMap { session -> AgentSession? in
+                guard [.agy, .codex].contains(member.agent), session.agent == member.agent,
+                      session.phase != .ended, session.cwd == member.cwd else { return nil }
+                return session
+            }
+            let observedTerminal = live?.session ?? terminal
+            var displayPhase = observedTerminal?.phase
+            if let observedTerminal, observedTerminal.agent == .codex, let activity = observedTerminal.codexActivity,
+               Date().timeIntervalSince(activity.observedAt) < 12 {
+                displayPhase = activity.phase
+            }
             let inbox = inboxes[member.id]
             let input = groupOperationInput(live, stopped: stopped, clearing: clearing)
             let count = inbox?.unacknowledgedCount ?? 0
@@ -3895,7 +3906,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 lastAcknowledgedAt: inbox?.lastAcknowledgedAt, firstPendingAt: inbox?.firstPendingAt,
                 lastDeliveryFailure: inbox?.lastDeliveryFailure,
                 isDeliveryBlocked: count > 0 && (inbox?.hasParkedMessage == true ||
-                    inbox?.hasNotificationHead == true && (blocked || inbox?.headDidNotStart == true))))
+                    inbox?.hasNotificationHead == true && (blocked || inbox?.headDidNotStart == true)), terminalPhase: displayPhase))
         })
     }
 
@@ -8131,6 +8142,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     applyAgyState(state, to: &session)
                     sessions[agent.key] = session
                     if event.hookEventName == .stop, state.isIdle {
+                        groupMailboxIdleSessions.insert(agent.key)
                         scheduleGroupMailboxDelivery()
                         if event.terminationReason == "NO_TOOL_CALL", let path = event.transcriptPath,
                            let groups = try? SessionGroupStore(directory: paths.directory).load(),
@@ -8365,7 +8377,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if (!screenContentsUnchanged && !ScreenTextEquality.equal(previousFrame?.raw, raw)) || previousFrame?.generation != generation || previousFrame?.cursor != cursor || previousFrame?.appearance != appearance || previousFrame?.display != display { remoteTerminalChanges[sessionID]?.notify() }
         }
         remoteObservedScreens[sessionID] = RemoteObservedScreen(raw: raw, generation: generation, observedAt: now, appearance: appearance?.validated(for: raw), cursor: cursor?.validated(for: raw), display: display?.validated())
-        if session.agent == .agy { return }
+        if session.agent == .agy {
+            if agyEvents[sessionID] == nil {
+                let idle = AgyComposerReadiness.isEmpty(raw)
+                let next: SessionPhase = idle ? .idle : .unknown
+                if session.phase != next {
+                    presentPhase(sessionID, ActivityObservation(phase: next, detail: idle ? "agy 입력 대기" : "agy 작업 상태를 확인하고 있습니다."), at: now)
+                    publish()
+                }
+            }
+            return
+        }
         // The original hook is still waiting in this app; screen input would be a second response path.
         guard !liveClaudeHooks.values.contains(where: { $0.request.sessionID == sessionID }) else { return }
         // A parked main terminal renders the child PTY. Its pixels cannot identify

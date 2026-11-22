@@ -423,7 +423,7 @@ import AutoApproveCore
             case let .deferred(reason): valueRow("터미널 입력", reason, attention: blocked)
             }
             // The only place that tells approval from input; everywhere else both are "응답 필요".
-            valueRow("대화 연결", operation.phase.map { "대화 확인 · " + SessionGroupGraph.detailTitle($0) } ?? "대화 미확인")
+            valueRow("대화 연결", operation.phase.map { "대화 확인 · " + SessionGroupGraph.detailTitle($0) } ?? (operation.terminalPhase != nil ? "터미널 연결 · 대화 ID 미확인" : "대화 미확인"))
             VStack(alignment: .leading, spacing: 2) {
                 Text("마지막 수신 확인 " + formatOperationDate(operation.lastAcknowledgedAt))
                 if let first = operation.firstPendingAt {

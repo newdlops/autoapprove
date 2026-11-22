@@ -326,6 +326,7 @@ public struct SessionGroupMemberOperation: Equatable {
     public let firstPendingAt: Date?
     public let lastDeliveryFailure: String?
     public let isDeliveryBlocked: Bool
+    public var terminalPhase: SessionPhase? = nil
 }
 
 public enum SessionGroupMatching {

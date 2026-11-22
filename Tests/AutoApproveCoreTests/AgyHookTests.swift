@@ -53,6 +53,9 @@ extension ApprovalTests {
             return event.permission(automatic: enabled, cwd: directory.path)["decision"] as? String
         }
         try expectEqual(try decision("view_file", ["AbsolutePath": config.path]), "auto_approve")
+        try expectEqual(try decision("read_file", ["Path": config.path]), "auto_approve")
+        try expectEqual(try decision("read_file", ["Path": config.path, "AbsolutePath": "/outside"]), "ask")
+        try expectEqual(try decision("read_file", ["Path": "/outside"]), "ask")
         try expectEqual(try decision("list_dir", ["DirectoryPath": directory.path]), "auto_approve")
         try expectEqual(try decision("view_file", ["AbsolutePath": config.path], enabled: false), "ask")
         try expectEqual(try decision("view_file", ["AbsolutePath": "/outside"]), "ask")

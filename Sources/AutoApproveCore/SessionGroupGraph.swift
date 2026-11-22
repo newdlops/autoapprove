@@ -47,7 +47,7 @@ public enum SessionGroupGraph {
         case .unknown, .ended, nil: shape = .unknown
         }
         let detail = phase.map(detailTitle) ?? "상태 미확인"
-        return NodeStatus(shape: shape, blocked: blocked, phaseTitle: shape == .attention ? needsResponseTitle : detail, detailTitle: detail)
+        return NodeStatus(shape: shape, blocked: blocked, phaseTitle: phase == .unknown ? "연결됨" : shape == .attention ? needsResponseTitle : detail, detailTitle: detail)
     }
 
     /// "승인 대기" and "입력 대기" are told apart only in the panel's session details.

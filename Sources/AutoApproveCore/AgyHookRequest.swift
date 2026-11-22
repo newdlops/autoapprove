@@ -18,7 +18,7 @@ public struct AgyHookRequest: Decodable {
         public let targetPath: String?
 
         private enum CodingKeys: String, CodingKey { case id, name, args }
-        private enum ArgumentKey: String, CodingKey { case commandLine = "CommandLine", file = "AbsolutePath", directory = "DirectoryPath" }
+        private enum ArgumentKey: String, CodingKey { case commandLine = "CommandLine", file = "AbsolutePath", path = "Path", directory = "DirectoryPath" }
 
         public init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
@@ -26,7 +26,9 @@ public struct AgyHookRequest: Decodable {
             name = try fields.decode(String.self, forKey: .name)
             let args = try fields.contains(.args) ? fields.nestedContainer(keyedBy: ArgumentKey.self, forKey: .args) : nil
             commandLine = name == "run_command" ? try args?.decodeIfPresent(String.self, forKey: .commandLine) : nil
-            targetPath = try args?.decodeIfPresent(String.self, forKey: name == "list_dir" ? .directory : .file)
+            let legacy = try args?.decodeIfPresent(String.self, forKey: name == "list_dir" ? .directory : .file)
+            let path = name == "read_file" ? try args?.decodeIfPresent(String.self, forKey: .path) : nil
+            targetPath = path == nil || legacy == nil || path == legacy ? (path ?? legacy) : nil
         }
     }
 

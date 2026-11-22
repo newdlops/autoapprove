@@ -11,13 +11,14 @@ struct GraphMemberOperation: Equatable {
     var firstPendingAt: Date?
     var lastDeliveryFailure: String?
     var isDeliveryBlocked: Bool
+    var terminalPhase: SessionPhase? = nil
 }
 
 extension GraphMemberOperation {
     init(_ operation: SessionGroupMemberOperation) {
         self.init(phase: operation.phase, input: operation.input, unacknowledgedCount: operation.unacknowledgedCount,
                   lastAcknowledgedAt: operation.lastAcknowledgedAt, firstPendingAt: operation.firstPendingAt,
-                  lastDeliveryFailure: operation.lastDeliveryFailure, isDeliveryBlocked: operation.isDeliveryBlocked)
+                  lastDeliveryFailure: operation.lastDeliveryFailure, isDeliveryBlocked: operation.isDeliveryBlocked, terminalPhase: operation.terminalPhase)
     }
 }
 
@@ -250,7 +251,7 @@ actor ConversationGraphReader {
         let nodes = group.treeOrder.map { entry -> GraphNode in
             let member = entry.member
             let operation = operations[member.id]
-            let status = SessionGroupGraph.status(phase: operation?.phase, blocked: operation?.isDeliveryBlocked == true)
+            let status = SessionGroupGraph.status(phase: operation?.terminalPhase ?? operation?.phase, blocked: operation?.isDeliveryBlocked == true)
             return GraphNode(id: member.id, name: plainNames[member.id] ?? member.title, provisional: names[member.id]?.provisional ?? true,
                              agent: member.agent, isLeader: group.isLeader(member.id), depth: entry.depth, status: status,
                              unacknowledged: operation?.unacknowledgedCount ?? 0,
