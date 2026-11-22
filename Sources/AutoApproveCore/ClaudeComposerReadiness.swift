@@ -1,6 +1,24 @@
 import Foundation
 
 public enum ClaudeComposerReadiness {
+    static let submitLineEndings = ["\r", "\n", "\r\n"]
+
+    @MainActor package static func matchesBridgeDraft(_ text: String, visibleMatch: Bool,
+                                                      read: (String) async -> String?) async -> Bool {
+        let first = await read(text)
+        if first == "matchingDraft" { return true }
+        guard visibleMatch else { return false }
+        if first == "draft" { return true }
+        guard first == "differentDraft" else { return false }
+        for ending in submitLineEndings {
+            guard !Task.isCancelled else { return false }
+            let state = await read(text + ending)
+            if state == "matchingDraft" { return true }
+            if state != "differentDraft" { return false }
+        }
+        return false
+    }
+
     package static func containsOnly(_ text: String, screen: String) -> Bool {
         let rows = PromptDetector.normalizedLines(screen).map { $0.trimmingCharacters(in: .whitespaces) }
         guard let i = rows.lastIndex(where: { $0.hasPrefix("❯") }), i > 0, rows[i - 1].hasPrefix("───"),

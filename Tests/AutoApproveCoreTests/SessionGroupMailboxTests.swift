@@ -177,7 +177,9 @@ extension ApprovalTests {
                 try expect(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt))
                 try expect(!(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt + "\n")))
                 try expect(try box.claimSubmitEnter(message.id, conversation: conversation, prompt: prompt, manualQuestion: false))
-                try expect(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt + "\n"))
+                for ending in ["\r", "\n", "\r\n"] {
+                    try expect(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt + ending))
+                }
                 try expect(!(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt + "\n추가")))
                 try expect(!(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt + "\n\n")))
             }

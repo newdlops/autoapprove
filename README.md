@@ -1,5 +1,7 @@
 # AutoApprove
 
+**Claude 입력창의 CR 줄 끝 제출 복구 · 0.2.389 빌드 416** [변경 사항](docs/releases/v0.2.389.md)
+
 **Claude 설정 홈별 MCP 등록 복구 · 0.2.388 빌드 415** [변경 사항](docs/releases/v0.2.388.md)
 
 **MCP 복구와 세션 재시작 단축 · 0.2.387 빌드 414** [변경 사항](docs/releases/v0.2.387.md)

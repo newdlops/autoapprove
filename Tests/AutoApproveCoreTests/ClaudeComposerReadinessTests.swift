@@ -2,7 +2,19 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
-    func testClaudeMailboxComposerSeparatesCustomStatusFromDrafts() throws {
+    @MainActor func testClaudeMailboxComposerSeparatesCustomStatusFromDrafts() async throws {
+        let original = "AutoApprove 요청 " + UUID().uuidString
+        for ending in ["", "\r", "\n", "\r\n", "\r\r", "\n\n", " 편집", "\r편집"] {
+            let buffer = original + ending
+            let accepted = await ClaudeComposerReadiness.matchesBridgeDraft(original, visibleMatch: true) {
+                $0 == buffer ? "matchingDraft" : "differentDraft"
+            }
+            try expectEqual(accepted, ["", "\r", "\n", "\r\n"].contains(ending))
+        }
+        try expect(!(await ClaudeComposerReadiness.matchesBridgeDraft(original, visibleMatch: false) {
+            $0 == original + "\r" ? "matchingDraft" : "differentDraft"
+        }))
+        try expect(!(await ClaudeComposerReadiness.matchesBridgeDraft(original, visibleMatch: true) { _ in nil }))
         let rule = String(repeating: "─", count: 30)
         let status = "user@host project (main) | Opus 4.7 | ctx 32% | 5h 12% (resets 23:00) | 7d 53% (resets Tue 18:00)"
         func framed(_ body: String, footer: String = "custom status") -> String {

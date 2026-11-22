@@ -603,7 +603,9 @@ public final class SessionGroupMailbox {
         defer { sqlite3_finalize(query) }
         guard sqlite3_step(query) == SQLITE_ROW, let stored = sqlite3_column_text(query, 0) else { return false }
         let expected = String(cString: stored)
-        return prompt == expected || (sqlite3_column_int(query, 1) != 0 && prompt == expected + "\n")
+        if prompt == expected { return true }
+        guard sqlite3_column_int(query, 1) != 0 else { return false }
+        return ClaudeComposerReadiness.submitLineEndings.contains { prompt == expected + $0 }
     }
 
     func claimTurn(_ id: UUID, turn: String) throws -> Bool {

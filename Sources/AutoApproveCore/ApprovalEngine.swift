@@ -4725,12 +4725,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
               !RemoteMessageReadiness.hasMenu(frame.contents, agent: .claude) else { return nil }
         var matches = ClaudeComposerReadiness.containsOnly(text, screen: frame.contents)
         if let channel = live?.claudePromptChannel, adapter.checkedTypeLine != nil {
-            let result = await ClaudePromptBridge.state(path: channel, paths: paths, conversation: live?.conversationID, expectedDraft: text)
-            if result == "differentDraft", matches {
-                let withNewline = await ClaudePromptBridge.state(path: channel, paths: paths, conversation: live?.conversationID, expectedDraft: text + "\n")
-                matches = withNewline == "matchingDraft"
-            } else {
-                matches = result == "matchingDraft" || (result == "draft" && matches)
+            matches = await ClaudeComposerReadiness.matchesBridgeDraft(text, visibleMatch: matches) { candidate in
+                await ClaudePromptBridge.state(path: channel, paths: paths, conversation: live?.conversationID, expectedDraft: candidate)
             }
         }
         guard matches, let status = await claudeStatuses([session])[session.id], ClaudeSessionRegistration.acceptsPrompt(status),
