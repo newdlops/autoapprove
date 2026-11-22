@@ -283,6 +283,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public var processArgumentsReader: @Sendable (ProcessRecord) -> [String]? = { ProcessEnvironment.arguments($0) }
     public var processPathReader: @Sendable (ProcessRecord) -> String? = { ProcessEnvironment.executablePath($0) }
     /// Ends a CLI for a restart. A signal needs no terminal input, which a changing screen can reject.
+    package var repairClaudeMCPRegistration: @Sendable (String, String, [String: String]) throws -> Void = { try ClaudeMCPRegistration.repair(executable: $0, cwd: $1, environment: $2) }
     public var processTerminator: @Sendable (ProcessRecord) -> Bool = { kill($0.pid, SIGTERM) == 0 }
     private var sessionGroupBadges: [String: SessionGroupBadge] = [:]
     private var groupBadgeTask: Task<Void, Never>?
@@ -1182,7 +1183,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             let title=String(session.displayedTerminalTitle.components(separatedBy:.newlines).joined(separator:" ").unicodeScalars.filter {!CharacterSet.controlCharacters.contains($0)}.map(String.init).joined().prefix(256))
             var entry=TerminalProfileEntry(title:title,agent:session.agent.rawValue,cwd:session.cwd,conversationID:"",
-                providerHome:identity.providerHome,host:session.terminal == .iterm ? .iterm:.terminal)
+                providerHome:identity.inheritsClaudeConfigHome ? nil : identity.providerHome,host:session.terminal == .iterm ? .iterm:.terminal)
             var choices:[CodexProfileConversation]=[],detail:String?
             if let id=identity.conversationID.flatMap(UUID.init(uuidString:)) {entry.conversationID=id.uuidString.lowercased()}
             if session.agent == .codex {
@@ -2978,6 +2979,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
                   current.phase != .ended else { continue }
             var observation = SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName)
+            observation.inheritsClaudeConfigHome = original.agent == .claude && environment != nil && environment?["CLAUDE_CONFIG_DIR"] == nil
             observation.claudePromptChannel = environment?[ClaudePromptBridge.key]
             observation.claudeRegisteredStatus = claudeStatus
             observation.claudeRegisteredActivity = claudeActivity
@@ -4191,6 +4193,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         do { plan = try SessionRestartCommand.plan(agent: original.agent, executable: codexContext?.executable ?? executable, argv: Array(argv.dropFirst()), conversationID: conversation) }
         catch { return fail(error.localizedDescription) }
         if original.agent == .claude {
+            if recovery && !plan.arguments.contains("--strict-mcp-config") {
+                updateRestart(id, .waiting, "현재 Claude 설정 홈의 AutoApprove MCP 등록을 확인합니다.")
+                let repair = repairClaudeMCPRegistration, config = environment
+                do { try await Task.detached { try repair(executable, original.cwd, config) }.value }
+                catch { return fail(error.localizedDescription) }
+            }
             if !plan.arguments.contains(ClaudePromptBridge.plugin.path) { plan.arguments += ["--plugin-dir", ClaudePromptBridge.plugin.path] }
             environment[ClaudePromptBridge.key] = ClaudePromptBridge.channel(paths).path
         }

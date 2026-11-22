@@ -140,7 +140,9 @@ extension ApprovalTests {
         let normalized=try codex.validated()
         try expectEqual(normalized.conversationID,"");try expect(!normalized.resumesConversation)
         try expectEqual(try normalized.resumeCommand(),"cd -- '/tmp/fresh-workspace' && 'env' '-u' 'AUTOAPPROVE_NATIVE_RUNTIME_ROOT' '-u' 'AUTOAPPROVE_SELECTED_TRANSITION_SOCKET' 'codex'")
-        var claude=normalized;claude.id=UUID();claude.agent="claude";claude.providerHome="/tmp/provider with space"
+        var claude=normalized;claude.id=UUID();claude.agent="claude"
+        try expect(try claude.resumeCommand().contains("'env' '-u' 'CLAUDE_CONFIG_DIR'"))
+        claude.providerHome="/tmp/provider with space"
         try expect(try claude.resumeCommand().contains("'CLAUDE_CONFIG_DIR=/tmp/provider with space' 'AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE=") && claude.resumeCommand().contains("'claude' '--plugin-dir'"),
                         "Claude restoration must retain the interactive shell so the session can restart in its own tab")
         var another=normalized;another.id=UUID()

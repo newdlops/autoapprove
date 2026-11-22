@@ -297,6 +297,7 @@ public struct SessionGroupLiveSession: Identifiable, Equatable {
     public var messagingName: String?
     var tabShell: SessionGroupTabShell?
     var codexIdentityFromMCP = false
+    var inheritsClaudeConfigHome = false
     var claudePromptChannel: String?
     var claudeRegisteredStatus: String?
     var claudeRegisteredActivity: ClaudeSessionActivity?

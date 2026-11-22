@@ -1,5 +1,7 @@
 # AutoApprove
 
+**Claude 설정 홈별 MCP 등록 복구 · 0.2.388 빌드 415** [변경 사항](docs/releases/v0.2.388.md)
+
 **MCP 복구와 세션 재시작 단축 · 0.2.387 빌드 414** [변경 사항](docs/releases/v0.2.387.md)
 
 **Claude 입력창에 남은 그룹 메시지 제출 · 0.2.386 빌드 413** [변경 사항](docs/releases/v0.2.386.md)

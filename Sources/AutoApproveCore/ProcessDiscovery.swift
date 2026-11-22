@@ -14,13 +14,14 @@ public enum CommandRunner {
     /// Complete results are bounded by raw and decoded UTF-8 bytes; overflow is
     /// an error, never a truncated successful response. One deadline covers all pipes.
     public static func run(_ executable: String, _ arguments: [String], timeout: TimeInterval = 8, environment: [String: String] = [:], inheritEnvironment: Bool = true, input: Data? = nil,
-                           outputLimit: Int = maximumOutputBytes, errorLimit: Int = maximumErrorBytes) throws -> CommandResult {
+                           outputLimit: Int = maximumOutputBytes, errorLimit: Int = maximumErrorBytes, directory: URL? = nil) throws -> CommandResult {
         guard timeout.isFinite, timeout <= Double(Int.max / 1_000_000_000 - 1),
               (0...maximumOutputBytes).contains(outputLimit), (0...maximumErrorBytes).contains(errorLimit) else {
             throw AppError.message("명령 시간 또는 출력 크기 제한이 올바르지 않습니다.")
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
+        process.currentDirectoryURL = directory
         process.arguments = arguments
         process.environment = (inheritEnvironment ? ProcessInfo.processInfo.environment : [:]).merging(environment) { _, value in value }
         let stdout = Pipe(), stderr = Pipe(), stdin = input.map { _ in Pipe() }

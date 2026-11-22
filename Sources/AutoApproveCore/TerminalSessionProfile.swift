@@ -82,6 +82,7 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         var arguments=["env"]
         guard nativeRuntimeRoot==nil else {throw AppError.message("공식 Codex는 전용 제어 등록 경로를 사용하지 않습니다.")}
         if entry.agent == "codex" {arguments += ["-u","AUTOAPPROVE_NATIVE_RUNTIME_ROOT","-u","AUTOAPPROVE_SELECTED_TRANSITION_SOCKET"]}
+        if entry.agent == "claude", entry.providerHome == nil { arguments += ["-u", "CLAUDE_CONFIG_DIR"] }
         if entry.agent != "agy", let home=entry.providerHome {arguments.append((agent == "codex" ? "CODEX_HOME":"CLAUDE_CONFIG_DIR")+"="+home)}
         if let searchPath=compatibleCLI?.environment["PATH"] {arguments.append("PATH="+searchPath)}
         if entry.agent == "claude" { arguments.append(ClaudePromptBridge.key + "=" + ClaudePromptBridge.channel(AppPaths()).path) }

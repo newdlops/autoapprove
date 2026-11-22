@@ -140,6 +140,27 @@ extension ApprovalTests {
     }
 
     @MainActor func testMCPRecoveryRequiresInitializationFromReopenedSession() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let fixture = root.appendingPathComponent("claude")
+        let script = """
+        #!/bin/sh
+        test "$1" = mcp && test "$PWD" -ef "$CLAUDE_CONFIG_DIR" || exit 2
+        case "$2" in
+        get) test -e registered && exit 0
+             echo 'No MCP server named "autoapprove".' >&2
+             exit 1 ;;
+        add) test "$3 $4 $5 $6 $7 $8 $9" = "--transport stdio --scope user autoapprove -- /bin/echo" || exit 3
+             echo added >> registered ;;
+        esac
+        """
+        try script.write(to: fixture, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fixture.path)
+        for _ in 0..<2 {
+            try ClaudeMCPRegistration.repair(executable: fixture.path, cwd: root.path, environment: ["CLAUDE_CONFIG_DIR":root.path], relay: "/bin/echo")
+        }
+        try expectEqual(try String(contentsOf: root.appendingPathComponent("registered"), encoding: .utf8), "added\n")
         try await exerciseRestart(recoverMCP: true)
     }
 
@@ -172,6 +193,11 @@ extension ApprovalTests {
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { terminal.records },
                                         screenAdapters: [.iterm: adapter], singleProcessReader: { pid in terminal.records.filter { $0.pid == pid } })
         defer { engine.stop() }
+        let sessionDirectory = ProcessDiscovery.sessions(running).first { $0.agent == .claude }!.cwd
+        engine.repairClaudeMCPRegistration = { executable, cwd, _ in
+            try expectEqual(executable, "/fixture/claude")
+            try expectEqual(cwd, sessionDirectory)
+        }
         engine.processTerminator = { terminal.terminate($0) }
         engine.restartResumeSettle = 0.5
         engine.processArgumentsReader = { record in record.pid == 100601 ? ["/fixture/claude", "--model", "opus", "처음 프롬프트"] : nil }
