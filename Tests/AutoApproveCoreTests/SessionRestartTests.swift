@@ -100,7 +100,9 @@ extension ApprovalTests {
         try expectEqual(codex.dropped, ["--last", "-i", "a.png", "b.png", "다음 작업"])
         try expectEqual(try SessionRestartCommand.plan(agent: .codex, executable: "/opt/codex", argv: ["--model=o3"], conversationID: id).arguments,
                         ["/opt/codex", "resume", "--model=o3", id.lowercased()])
-        for (agent, argv) in [(AgentKind.claude, ["--unknown-option", "x"]), (.claude, ["-p", "요약"]), (.codex, ["exec", "작업"]), (.codex, ["--mystery"])] {
+        let agy = try SessionRestartCommand.plan(agent: .agy, executable: "/opt/agy", argv: ["--model=m1", "--effort", "high", "--sandbox", "--conversation", UUID().uuidString], conversationID: id)
+        try expectEqual(agy.arguments, ["/opt/agy", "--model", "m1", "--effort", "high", "--sandbox", "--conversation", id.lowercased()])
+        for (agent, argv) in [(AgentKind.agy, ["--model"]), (.agy, ["--conversation", "invalid"]), (.claude, ["--unknown-option", "x"]), (.claude, ["-p", "요약"]), (.codex, ["exec", "작업"]), (.codex, ["--mystery"])] {
             try expectThrows(try SessionRestartCommand.plan(agent: agent, executable: "/opt/cli", argv: argv, conversationID: id))
         }
         try expectThrows(try SessionRestartCommand.plan(agent: .claude, executable: "/opt/claude", argv: [], conversationID: "not-a-uuid"))
@@ -134,6 +136,14 @@ extension ApprovalTests {
     }
 
     @MainActor func testSessionRestartExitsAndReopensTheSameConversation() async throws {
+        try await exerciseRestart(recoverMCP: false)
+    }
+
+    @MainActor func testMCPRecoveryRequiresInitializationFromReopenedSession() async throws {
+        try await exerciseRestart(recoverMCP: true)
+    }
+
+    @MainActor private func exerciseRestart(recoverMCP: Bool) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("session-restart-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let started = "Wed Oct 28 12:00:00 2026"
@@ -156,12 +166,11 @@ extension ApprovalTests {
             input: { target, _, _, input in terminal.send(target, input) })
         adapter.typeLine = { _, text in terminal.type(text) }
         let conversation = UUID().uuidString.lowercased()
-        // Claude's own registered status decides when the session is idle; the screen is not consulted.
         let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
             rows.filter { $0.pid == 100601 || $0.pid == 100602 }.map { .init(processID: $0.key, kind: "interactive", sessionID: conversation, status: terminal.status) }
         }
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { terminal.records },
-                                        screenAdapters: [.iterm: adapter])
+                                        screenAdapters: [.iterm: adapter], singleProcessReader: { pid in terminal.records.filter { $0.pid == pid } })
         defer { engine.stop() }
         engine.processTerminator = { terminal.terminate($0) }
         engine.restartResumeSettle = 0.5
@@ -174,7 +183,10 @@ extension ApprovalTests {
         _ = try await waitForRestart(10) { await engine.refreshScreens(); return phase() == .idle }
 
         terminal.status = "busy"
-        engine.restartSessions([session.id])
+        if recoverMCP {
+            let result = engine.recoverMCPConnections([session.id, session.id, "missing"], restartCLI: true)
+            try expectEqual(result.items.map(\.id), [session.id])
+        } else { engine.restartSessions([session.id]) }
         let launched = try await waitForRestart(10) { !terminal.launched.isEmpty }
         try expect(launched, "The resume command must be typed into the original shell: \(engine.snapshot.sessionRestart?.items.first?.message ?? "")")
         try expectEqual(terminal.terminated, 1, "The CLI is ended with one signal")
@@ -183,18 +195,28 @@ extension ApprovalTests {
         let command = terminal.launched[0]
         try expect(command.hasPrefix("env 'AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE="))
         try expect(command.contains(["/fixture/claude", "--model", "opus", "--resume", conversation, "--plugin-dir"].map(HookInstaller.quote).joined(separator: " ")))
-        // The app's discovery loop reports the new CLI.
         terminal.status = "idle"
         var next = ProcessDiscovery.sessions(reopened).first { $0.agent == .claude }!
         next.terminal = .iterm; next.channel = .itermScreen; next.providerID = conversation
         engine.updateDiscovery([next], records: reopened)
+        if recoverMCP {
+            let owner = UUID().uuidString
+            _ = try await engine.mcpAction(["tool": "connection_initialized", "owner": owner, "parentPID": 100601])
+            try expect(engine.snapshot.sessionRestart?.items.first?.phase != .done)
+            _ = try await engine.mcpAction(["tool": "connection_initialized", "owner": owner, "parentPID": 100602])
+        }
         let finished = try await waitForRestart(10) { engine.snapshot.sessionRestart?.items.first?.phase == .done }
         try expect(finished, engine.snapshot.sessionRestart?.items.first?.message ?? "no progress")
         let item = try unwrapRestart(engine.snapshot.sessionRestart?.items.first)
         try expectEqual(item.newSessionID, next.id)
-        try expect(item.message.contains("처음 프롬프트"), "Dropped arguments are reported")
-        try expectEqual(terminal.lines, [SessionRestartCommand.resumePrompt], "The restarted session is told once to go on with its work")
-        try expect(item.message.contains("이어가도록 입력했습니다"), item.message)
+        if recoverMCP {
+            try expectEqual(terminal.lines, [])
+            try expect(item.isMCPRecovery && item.message.contains("MCP 초기화"))
+        } else {
+            try expect(item.message.contains("처음 프롬프트"), "Dropped arguments are reported")
+            try expectEqual(terminal.lines, [SessionRestartCommand.resumePrompt], "The restarted session is told once to go on with its work")
+            try expect(item.message.contains("이어가도록 입력했습니다"), item.message)
+        }
         try expectEqual(engine.snapshot.sessions.first { $0.id == next.id }?.automatic, true, "Automatic approval carries over")
         engine.dismissSessionRestarts()
         try expect(engine.snapshot.sessionRestart == nil)

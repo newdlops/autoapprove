@@ -167,6 +167,7 @@ public enum AutoApproveMCPServer {
         let slots = DispatchSemaphore(value: 16), output = NSLock()
         func reply(_ value: JSONObject) { output.lock(); defer { output.unlock() }; write(value) }
         defer { tools.sync {}; queries.waitUntilAllOperationsAreFinished() }
+        var reportedInitialization = false
         let input = MCPInputReader(descriptor: STDIN_FILENO)
         while autoreleasepool(invoking: { () -> Bool in
             guard let frame = try? input.next() else { return false }
@@ -175,6 +176,15 @@ public enum AutoApproveMCPServer {
             guard case .message(let data) = frame, !data.contains(0), String(data: data, encoding: .utf8) != nil,
                   let message = (try? JSONSerialization.jsonObject(with: data)) as? JSONObject else {
                 reply(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Parse error"]]); return true
+            }
+            if !reportedInitialization, message["jsonrpc"] as? String == "2.0", message["id"] == nil,
+               message["method"] as? String == "notifications/initialized" {
+                reportedInitialization = true
+                let parent = getppid()
+                queries.addOperation {
+                    _ = try? SocketClient.request(path: paths.socket, message: ["method": "mcp", "params": [
+                        "tool": "connection_initialized", "owner": owner, "parentPID": Int(parent)]], timeout: 3)
+                }
             }
             let handle = {
             if let value = response(message, profile: profile, call: { tool, arguments in

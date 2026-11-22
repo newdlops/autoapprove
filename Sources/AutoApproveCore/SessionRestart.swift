@@ -64,10 +64,27 @@ public enum SessionRestartCommand {
             throw AppError.message("CLI 실행 파일 경로를 확인하지 못했습니다.")
         }
         if agent == .agy {
-            guard argv.isEmpty || argv == ["--sandbox"] || argv == ["--conversation", id] || argv == ["--continue"] || argv == ["-c"] else {
-                throw AppError.message("현재 agy 실행 옵션을 보존할 수 없어 자동으로 다시 시작하지 않습니다.")
+            var options: [String] = [], index = 0
+            while index < argv.count {
+                let token = argv[index]
+                index += 1
+                if token == "--sandbox" { options.append(token); continue }
+                if ["-c", "--continue"].contains(token) { continue }
+                let parts = token.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                let name = String(parts.first ?? "")
+                guard ["--conversation", "--model", "--effort", "--agent", "--add-dir"].contains(name),
+                      parts.count == 2 || index < argv.count else {
+                    throw AppError.message("현재 agy 실행 옵션을 보존할 수 없어 자동으로 다시 시작하지 않습니다.")
+                }
+                let value = parts.count == 2 ? String(parts[1]) : argv[index]
+                if parts.count != 2 { index += 1 }
+                guard !value.isEmpty, !value.hasPrefix("-"), !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                      name != "--conversation" || UUID(uuidString: value) != nil else {
+                    throw AppError.message("agy 실행 옵션 값을 확인하지 못했습니다.")
+                }
+                if name != "--conversation" { options += [name, value] }
             }
-            return Plan(arguments: [executable] + (argv == ["--sandbox"] ? ["--sandbox"] : []) + ["--conversation", id], dropped: [])
+            return Plan(arguments: [executable] + options + ["--conversation", id], dropped: [])
         }
         var tokens = argv
         if agent == .codex, let first = tokens.firstIndex(where: { !$0.hasPrefix("-") }) {
@@ -132,6 +149,9 @@ public struct SessionRestartItem: Codable, Equatable, Identifiable {
     public var title: String
     public var phase: Phase
     public var message: String
+    public enum Operation: String, Codable { case restart, resumeWork, recoverMCP, restartForMCP }
+    public var operation: Operation?
+    public var isMCPRecovery: Bool { operation == .recoverMCP || operation == .restartForMCP }
     public var newSessionID: String?
     public var updatedAt: Date
     public init(id: String, title: String, phase: Phase, message: String, at date: Date = Date()) {

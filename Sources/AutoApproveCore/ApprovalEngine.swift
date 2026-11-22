@@ -277,7 +277,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Exiting a CLI, opening a tab and typing the resume command happen for one session at a time:
     /// Terminal opens one tab at a time, and parallel typing missed its input deadlines.
     private var restartTerminalBusy = false
-    private var restartResumesWork = true
+    private var mcpInitializations: [String: (owner: String, at: Date)] = [:]
     /// How long a restarted CLI may take to accept input, and how long it must stay idle before the resume line is typed.
     public var restartResumeWait: TimeInterval = 90, restartResumeSettle: TimeInterval = 2
     /// Reads a CLI's original arguments for a restart. Tests replace it; it never runs for other processes.
@@ -4015,21 +4015,26 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if !sessionGroupBadges.isEmpty { publish() }
     }
 
-    /// Restarts each session in its own terminal and reopens the same conversation, so a CLI picks up
-    /// new MCP tools and settings. An explicit restart ends the selected CLI even if its turn is active.
-    /// With `resume`, each restarted session is then told to go on with the work it had in progress.
     @discardableResult
     public func restartSessions(_ ids: [String], resume: Bool = true) -> SessionRestartProgress {
+        startSessionOperation(ids, operation: resume ? .resumeWork : .restart)
+    }
+
+    @discardableResult
+    public func recoverMCPConnections(_ ids: [String], restartCLI: Bool = false) -> SessionRestartProgress {
+        startSessionOperation(ids, operation: restartCLI ? .restartForMCP : .recoverMCP)
+    }
+
+    private func startSessionOperation(_ ids: [String], operation: SessionRestartItem.Operation) -> SessionRestartProgress {
         let ids = Array(Set(ids)).sorted().filter { sessionRestartTasks[$0] == nil }
         let now = Date()
         guard !ids.isEmpty else { return snapshot.sessionRestart ?? SessionRestartProgress(items: [], startedAt: now) }
-        restartResumesWork = resume
-        // Retrying keeps earlier results visible; only the retried sessions start over.
         var items = (snapshot.sessionRestart?.items ?? []).filter { !ids.contains($0.id) && ($0.phase == .done || !$0.phase.isFinished) }
         for id in ids {
             guard let session = sessions[id], session.phase != .ended, session.agent != .shell else { continue }
             items.append(SessionRestartItem(id: id, title: session.displayedTerminalTitle, phase: .waiting, message: "대화와 종료할 CLI를 확인하고 있습니다.", at: now))
-            sessionRestartTasks[id] = Task { [weak self] in await self?.runSessionRestart(id, resume: resume) }
+            items[items.count - 1].operation = operation
+            sessionRestartTasks[id] = Task { [weak self] in await self?.runSessionRestart(id, operation: operation) }
         }
         restartIdentityTask = Task { [weak self] in
             guard let self, let live = try? await self.sessionGroupSessions() else { return [:] }
@@ -4052,7 +4057,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func retryFailedSessionRestarts() {
         let failed = snapshot.sessionRestart?.items.filter { $0.phase == .failed && sessions[$0.id]?.phase != .ended && sessions[$0.id] != nil }.map(\.id) ?? []
         guard !failed.isEmpty else { return }
-        restartSessions(failed, resume: restartResumesWork)
+        let rows = snapshot.sessionRestart?.items ?? []
+        for (mode, items) in Dictionary(grouping: rows.filter { failed.contains($0.id) && !$0.isMCPRecovery }, by: { $0.operation ?? .resumeWork }) {
+            _ = startSessionOperation(items.map(\.id), operation: mode)
+        }
     }
 
     public func dismissSessionRestarts() {
@@ -4068,10 +4076,51 @@ private struct ScreenAnalysisStorageKey: Hashable {
         snapshot.sessionRestart = progress
     }
 
-    private func runSessionRestart(_ id: String, resume: Bool) async {
+    private func codexMCPConnected(_ process: ProcessRecord, thread: String, home: String?) async -> Bool {
+        guard let home else { return false }
+        return await Task.detached(priority: .utility) {
+            guard let verified = CodexServerLocation.connectedHome(pid: process.pid, hints: [home]),
+                  let reply = try? CodexQueueConnection(home: verified).request("mcpServerStatus/list",
+                    ["threadId": thread, "serverName": "autoapprove", "detail": "toolsAndAuthOnly"]),
+                  let rows = reply["data"] as? [JSONObject] else { return false }
+            return rows.contains { $0["name"] as? String == "autoapprove" && $0["runtimeStatus"] as? String == "connected" &&
+                ($0["serverInfo"] as? JSONObject)?["name"] as? String == "autoapprove" }
+        }.value
+    }
+
+    private func confirmedMCPInitialization(_ id: String, since start: Date) async -> Bool {
+        let deadline = Date().addingTimeInterval(15)
+        while !Task.isCancelled, Date() < deadline {
+            if let seen = mcpInitializations[id], seen.at >= start { return true }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return false
+    }
+
+    private func runSessionRestart(_ id: String, operation: SessionRestartItem.Operation) async {
+        let recovery = operation == .recoverMCP || operation == .restartForMCP
+        let resume = operation == .resumeWork
         defer { sessionRestartTasks.removeValue(forKey: id) }
         func fail(_ message: String) { updateRestart(id, .failed, message) }
         guard let original = sessions[id] else { return fail("세션을 찾지 못했습니다.") }
+        if operation == .recoverMCP && original.agent == .claude {
+            let start = Date()
+            updateRestart(id, .confirming, "Claude Code에서 AutoApprove MCP를 다시 연결하고 있습니다.")
+            do {
+                _ = try await sendOriginalTerminalMessage(original, object: ["text": "/mcp reconnect autoapprove", "revision": "mcp-recovery"], textOnly: true, backgroundOnly: true) { frame in
+                    guard let current = self.sessions[id], current.phase != .working, !current.pendingInTerminal,
+                          ClaudeComposerReadiness.isEmpty(frame.screen),
+                          let status = await self.claudeStatuses([current])[id], ClaudeSessionRegistration.acceptsPrompt(status),
+                          !(await self.userInputHasPriority(id, backgroundOnly: true)) else {
+                        throw AppError.message("Claude의 빈 입력창과 대기 상태를 확인한 후 다시 시도해주세요.")
+                    }
+                }
+            } catch { return fail(error.localizedDescription) }
+            if await confirmedMCPInitialization(id, since: start) {
+                updateRestart(id, .done, "같은 Claude 세션에서 AutoApprove MCP 초기화를 확인했습니다.")
+            } else { fail("AutoApprove MCP 초기화를 확인하지 못했습니다. 서버 등록 상태를 확인하거나 같은 대화로 다시 시작해주세요.") }
+            return
+        }
         guard let host = ScreenHost(kind: original.terminal), host == .terminal || host == .iterm || host == .pty,
               screenConnections[host]?.enabled == true, let adapter = screenAdapters[host], let restart = adapter.restart else {
             return fail("이 터미널(\(original.hostTitle))은 다시 시작 입력을 지원하지 않습니다. Terminal, iTerm2, AutoApprove PTY에서만 다시 시작합니다.")
@@ -4121,7 +4170,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // Last resort: the conversation the CLI was launched with. A later /clear may have started another one,
         // so the result says which ID was used.
         var launchedConversation = false
-        if conversation == nil, current.phase == .idle {
+        if !recovery, conversation == nil, current.phase == .idle {
             let tokens = Array(argv.dropFirst())
             let flags: Set<String> = current.agent == .claude ? ["--resume", "-r", "--session-id"] : ["resume"]
             if let index = tokens.firstIndex(where: { flags.contains($0) }), index + 1 < tokens.count, let id = valid(tokens[index + 1]) {
@@ -4136,6 +4185,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try Task.checkCancellation()
         } catch is CancellationError {return}
         catch {return fail(error.localizedDescription)}
+        let codexHome = codexContext.flatMap { CodexGroupIdentity.home(environment: $0.environment) }
+        if recovery, original.agent == .codex, await codexMCPConnected(process, thread: conversation, home: codexHome) {
+            return updateRestart(id, .done, "현재 Codex 대화에서 AutoApprove MCP 연결을 확인했습니다.")
+        }
         var plan: SessionRestartCommand.Plan
         do { plan = try SessionRestartCommand.plan(agent: original.agent, executable: codexContext?.executable ?? executable, argv: Array(argv.dropFirst()), conversationID: conversation) }
         catch { return fail(error.localizedDescription) }
@@ -4170,6 +4223,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
               !sendingMessages.contains(id), !automaticInputBusy(id) else {
             return fail("CLI와 셸의 연결 또는 입력 상태가 바뀌어 종료하지 않았습니다.")
         }
+        let recoveryStarted = Date()
         updateRestart(id, .exiting, "선택한 CLI에 종료 신호를 보내고 있습니다.")
         guard log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "CLI 종료 신호 전달", source: host.title, context: AuditContext(session: current), request: command)) else {
             return fail("승인 내역을 저장하지 못해 종료하지 않았습니다.")
@@ -4228,6 +4282,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
             publish()
             let note = plan.dropped.isEmpty ? "" : " 다시 적용하지 않은 실행 인자: \(plan.dropped.joined(separator: " "))"
             let source = launchedConversation ? " 현재 대화 ID를 찾지 못해 처음 실행할 때의 대화 ID(\(conversation.prefix(8)))로 열었습니다." : ""
+            if recovery {
+                updateRestart(id, .confirming, "같은 대화에서 AutoApprove MCP 초기화를 기다립니다.", newSessionID: next.key)
+                var ready = original.agent == .codex ? await codexMCPConnected(next, thread: conversation, home: codexHome) : false
+                if !ready { ready = await confirmedMCPInitialization(next.key, since: recoveryStarted) }
+                if !ready, original.agent == .codex { ready = await codexMCPConnected(next, thread: conversation, home: codexHome) }
+                return updateRestart(id, ready ? .done : .failed, ready ? "같은 대화를 다시 열고 AutoApprove MCP 초기화를 확인했습니다." : "대화를 다시 열었지만 이 세션의 MCP 초기화를 확인하지 못했습니다. autoapprove 서버 등록과 클라이언트의 MCP 상태를 확인해주세요.", newSessionID: next.key)
+            }
             var resumed = ""
             if resume {
                 updateRestart(id, .confirming, "진행하던 작업을 이어가도록 입력하고 있습니다.", newSessionID: next.key)
@@ -4912,6 +4973,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func mcpAction(_ object: JSONObject) async throws -> JSONObject {
         guard let owner = object["owner"] as? String, UUID(uuidString: owner) != nil,
               let tool = object["tool"] as? String else { throw RemoteHTTPError(400, "MCP 연결 정보가 필요합니다.") }
+        if tool == "connection_initialized" {
+            guard snapshot.sessionRestart?.items.contains(where: { $0.isMCPRecovery && !$0.phase.isFinished }) == true,
+                  let number = object["parentPID"] as? Int, let pid = Int32(exactly: number), pid > 1 else { return [:] }
+            let seen = Date()
+            let reader = singleProcessReader
+            if let agent = try? await Task.detached(operation: { try ProcessDiscovery.enclosingAgent(of: pid, reader: reader) }).value {
+                mcpInitializations = mcpInitializations.filter { seen.timeIntervalSince($0.value.at) < 120 }
+                mcpInitializations[agent.key] = (owner, seen)
+            }
+            return [:]
+        }
         observeGroupMCPIdentity(object, owner: owner)
         func encoded<T: Encodable>(_ value: T) throws -> Any {
             let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
@@ -5314,6 +5386,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         case let name where name.hasPrefix("desktop_"):
             return try await backgroundDesktop.handle(tool: name, object, owner: owner)
         case "disconnect":
+            mcpInitializations = mcpInitializations.filter { $0.value.owner != owner }
             groupMCPIdentities.removeValue(forKey: owner); backgroundDesktop.release(owner: owner)
             testScreens.stopAll(owner: owner); webQuestions.cancel(owner: owner); return ["ok": true]
         default: throw RemoteHTTPError(400, "지원하지 않는 MCP 도구입니다.")

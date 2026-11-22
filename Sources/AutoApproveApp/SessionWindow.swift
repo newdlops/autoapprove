@@ -27,6 +27,8 @@ import AutoApproveCore
     /// Collapsed group and member rows, kept across launches. Everything starts expanded.
     @AppStorage("sessionListCollapsed") private var collapsedRows = ""
     @State private var confirmingRestart: [String]?
+    @State private var confirmingMCP: [String]?
+    @State private var restartForMCP = false
     @State private var showingRestartDetails = false
     private var liveQuestionIDs: Set<QuestionReplyKey> {
         Set(engine.snapshot.sessions.filter { $0.phase != .ended }.flatMap { session in
@@ -193,6 +195,9 @@ import AutoApproveCore
                                 Button("이 세션 다시 시작", systemImage: "arrow.triangle.2.circlepath") { confirmingRestart = [session.id] }
                                     .disabled(restartableIDs([session]).isEmpty)
                                     .help("원래 터미널에서 CLI를 종료하고 같은 대화를 다시 엽니다. 작업 중이면 작업이 끝난 뒤 다시 시작합니다.")
+                                Button("이 세션 MCP 연결 복구", systemImage: "link") {
+                                    requestMCPRecovery([session.id])
+                                }.disabled(restartableIDs([session]).isEmpty)
                                 Button("표시 이름·메모·색상 편집", systemImage: "pencil") { editingSession = session }
                                     .help("이 세션의 표시 이름, 메모와 식별 색상을 편집합니다.")
                                 Button("알림 읽음으로 표시", systemImage: "checkmark.circle") {
@@ -230,9 +235,25 @@ import AutoApproveCore
         }
     }
     private func restartableIDs(_ sessions: [AgentSession]) -> [String] {
-        let running = Set(engine.snapshot.sessionRestart?.items.filter { !$0.phase.isFinished }.map(\.id) ?? [])
+        let active = engine.snapshot.sessionRestart?.items.filter { !$0.phase.isFinished } ?? []
+        let running = Set(active.flatMap { [$0.id, $0.newSessionID].compactMap { $0 } })
         return sessions.filter { $0.agent != .shell && $0.phase != .ended && !running.contains($0.id) }.map(\.id)
     }
+    private func requestMCPRecovery(_ ids: [String], restart: Bool = false) {
+        guard !ids.isEmpty else { return }
+        restartForMCP = restart
+        confirmingMCP = ids
+    }
+
+    private var mcpRecoveryMessage: String {
+        let chosen = engine.snapshot.sessions.filter { confirmingMCP?.contains($0.id) == true }
+        let direct = restartForMCP ? 0 : chosen.filter { $0.agent == .claude }.count
+        var parts: [String] = []
+        if direct > 0 { parts.append("Claude Code 세션 " + String(direct) + "개에서 /mcp reconnect autoapprove를 실행합니다.") }
+        if chosen.count > direct { parts.append("세션 " + String(chosen.count - direct) + "개는 필요하면 CLI를 종료한 뒤 같은 탭에서 같은 대화로 다시 엽니다. 진행 중인 작업이 중단되고 작성 중인 입력이 사라질 수 있습니다.") }
+        return parts.joined(separator: "\n")
+    }
+
     private var selectedRestartIDs: [String] {
         restartableIDs(engine.snapshot.sessions.filter { selection.contains($0.id) })
     }
@@ -250,6 +271,12 @@ import AutoApproveCore
         return lines.joined(separator: "\n")
     }
     @ViewBuilder private func restartBanner(_ progress: SessionRestartProgress) -> some View {
+        let operations = progress.isActive ? progress.items.filter { !$0.phase.isFinished } : progress.items
+        let title = operations.allSatisfy(\.isMCPRecovery) ? "MCP 연결 복구" :
+            operations.contains(where: \.isMCPRecovery) ? "세션 작업" : "세션 다시 시작"
+        let retryMCP = restartableIDs(engine.snapshot.sessions.filter { session in
+            progress.items.contains { $0.isMCPRecovery && $0.phase == .failed && ($0.newSessionID ?? $0.id) == session.id }
+        })
         let done = progress.count(.done), failed = progress.count(.failed), cancelled = progress.count(.cancelled)
         let waiting = progress.count(.waiting), working = progress.items.count - done - failed - cancelled - waiting
         VStack(alignment: .leading, spacing: 8) {
@@ -257,14 +284,15 @@ import AutoApproveCore
                 if progress.isActive { ProgressView().controlSize(.small) } else {
                     Image(systemName: failed > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle.fill").foregroundStyle(failed > 0 ? .orange : .green)
                 }
-                Text(progress.isActive ? "세션 다시 시작 중" : failed == 0 ? "세션 다시 시작 완료" : "세션 다시 시작 결과").font(.callout.weight(.semibold))
+                Text(title + (progress.isActive ? " 중" : failed > 0 ? " 결과" : " 완료")).font(.callout.weight(.semibold))
                 Text(["완료 \(done)", working > 0 ? "진행 \(working)" : nil, waiting > 0 ? "작업 끝나길 기다림 \(waiting)" : nil,
                       failed > 0 ? "실패 \(failed)" : nil, cancelled > 0 ? "취소 \(cancelled)" : nil].compactMap { $0 }.joined(separator: " · "))
                     .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                 Spacer(minLength: 8)
                 Button(showingRestartDetails ? "접기" : "자세히") { showingRestartDetails.toggle() }.buttonStyle(.borderless)
                 if waiting > 0 { Button("대기 취소") { engine.cancelSessionRestarts() }.help("아직 종료하지 않은 세션의 다시 시작을 취소합니다.") }
-                if failed > 0 { Button("실패한 세션 다시 시도") { engine.retryFailedSessionRestarts() }.help("실패한 세션 가운데 원래 CLI가 아직 실행 중인 세션만 다시 시작합니다. 이미 다시 시작한 세션은 건드리지 않습니다.") }
+                if !retryMCP.isEmpty { Button("재시작으로 복구…") { requestMCPRecovery(retryMCP, restart: true) } }
+                if progress.items.contains(where: { $0.phase == .failed && !$0.isMCPRecovery }) { Button("실패한 세션 다시 시도") { engine.retryFailedSessionRestarts() }.help("실패한 세션 가운데 원래 CLI가 아직 실행 중인 세션만 다시 시작합니다. 이미 다시 시작한 세션은 건드리지 않습니다.") }
                 if !progress.isActive { Button("닫기") { engine.dismissSessionRestarts(); showingRestartDetails = false } }
             }
             if showingRestartDetails {
@@ -328,12 +356,19 @@ import AutoApproveCore
                     .help(AppHelp.guide)
                 Button { openWindow(id: "history") } label: { Label("승인 내역", systemImage: "clock.arrow.circlepath") }
                     .help(AppHelp.history)
-                Button { openWindow(id: "settings") } label: { Label("연결 설정", systemImage: "point.3.connected.trianglepath.dotted") }
+                Button { openWindow(id: "settings") } label: { Label("연결 설정", systemImage: "link") }
                     .help(AppHelp.connections)
                 Button {openWindow(id:"profiles")} label: {Label("세션 프로필",systemImage:"rectangle.stack")}
                     .help("창별 대화를 이름 있는 여러 프로필 파일로 저장하고 재부팅 후 복원합니다.")
                 Button {openWindow(id:"session-groups")} label: {Label("세션 그룹",systemImage:"person.2")}
                     .help("Codex와 Claude Code 세션을 그룹으로 묶고 구성원을 관리합니다.")
+                Menu {
+                    Button("선택한 세션 복구…") { requestMCPRecovery(selectedRestartIDs) }.disabled(selectedRestartIDs.isEmpty)
+                    Button("전체 세션 복구…") { requestMCPRecovery(restartableIDs(engine.snapshot.sessions)) }
+                } label: { Label("MCP 연결 복구", systemImage: "network").accessibilityLabel("MCP 연결 복구") }
+                    .accessibilityLabel("MCP 연결 복구")
+                    .disabled(restartableIDs(engine.snapshot.sessions).isEmpty)
+                    .help("선택한 세션 또는 이 Mac의 전체 세션에서 AutoApprove MCP 연결을 복구합니다.")
                 Button { confirmingRestart = selectedRestartIDs } label: {
                     Label("세션 다시 시작", systemImage: "arrow.triangle.2.circlepath")
                 }.disabled(selectedRestartIDs.isEmpty)
@@ -356,6 +391,13 @@ import AutoApproveCore
                 }.help(AppHelp.pause(engine.snapshot.paused))
             }
         }
+        .confirmationDialog("AutoApprove MCP 연결 복구 · 세션 " + String(confirmingMCP?.count ?? 0) + "개", isPresented: Binding(get: { confirmingMCP != nil }, set: { if !$0 { confirmingMCP = nil } }), titleVisibility: .visible) {
+            Button(restartForMCP ? "같은 대화로 다시 시작하고 복구" : "복구 시작") {
+                if let ids = confirmingMCP { engine.recoverMCPConnections(ids, restartCLI: restartForMCP); showingRestartDetails = true }
+                confirmingMCP = nil
+            }
+            Button("취소", role: .cancel) { confirmingMCP = nil }
+        } message: { Text(mcpRecoveryMessage) }
         .confirmationDialog(restartTitle, isPresented: Binding(get: { confirmingRestart != nil }, set: { if !$0 { confirmingRestart = nil } }),
                             titleVisibility: .visible) {
             Button("다시 시작하고 작업 이어가기") { if let ids = confirmingRestart { engine.restartSessions(ids) }; confirmingRestart = nil }
