@@ -2425,6 +2425,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let conversationId: String
         let isIdle: Bool
         let modelName: String?
+        let modelRecordedAt: Date?
     }
     private var agyEvents: [String: AgyState] = [:]
 
@@ -4758,7 +4759,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }.value
         for live in targets where live.session.agent == .agy {
             if let event = agyEvents[live.id], event.conversationId == live.conversationID?.lowercased(), let name = event.modelName {
-                var setting = SessionGroupModelSettings(model: nil, reasoningEffort: nil, source: "agy_hook")
+                if let recorded = settings[live.id], recorded.model == name ||
+                    (recorded.recordedAt ?? .distantPast) >= (event.modelRecordedAt ?? .distantPast) { continue }
+                var setting = SessionGroupModelSettings(model: nil, reasoningEffort: nil, source: "agy_hook", recordedAt: event.modelRecordedAt)
                 setting.model = String(name.prefix(160)).components(separatedBy: .controlCharacters).joined()
                 settings[live.id] = setting
             }
@@ -8157,7 +8160,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let conversation = event.conversationId.lowercased()
                 let previous = agyEvents[agent.key]
                 let model = event.modelName ?? (previous?.conversationId == conversation ? previous?.modelName : nil)
-                let state = AgyState(conversationId: conversation, isIdle: event.isIdle, modelName: model)
+                let recorded = event.modelName == nil ? (previous?.conversationId == conversation ? previous?.modelRecordedAt : nil) : Date()
+                let state = AgyState(conversationId: conversation, isIdle: event.isIdle, modelName: model, modelRecordedAt: recorded)
                 agyEvents[agent.key] = state
                 if var session = sessions[agent.key], session.phase != .ended {
                     applyAgyState(state, to: &session)

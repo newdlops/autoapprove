@@ -7,6 +7,27 @@ import AutoApproveCore
 #endif
 
 extension ApprovalTests {
+    func testAgyTranscriptModelRecovery() throws {
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID().uuidString.lowercased()
+        let logs = root.appendingPathComponent("antigravity-cli/brain/" + id + "/.system_generated/logs")
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let file = logs.appendingPathComponent("transcript.jsonl")
+        let session = AgentSession(id: "fixture", agent: .agy, pid: 1, started: "fixture", tty: "/dev/fixture", cwd: "/project", terminal: .terminal)
+        var live = SessionGroupLiveSession(session: session, conversationID: id.uppercased(), providerHome: root.appendingPathComponent("config").path)
+        let reader = SessionGroupModelSettingsReader()
+        let first = #"{"source":"MODEL","type":"PLANNER_RESPONSE","model":"gemini-4-neon-medium"}"#
+        let user = #"{"source":"USER_EXPLICIT","type":"USER_INPUT","model":"wrong"}"#
+        try (first + "\n" + user + "\n").write(to: file, atomically: true, encoding: .utf8)
+        try expectEqual(reader.read(live)?.reasoningEffort, "medium")
+        try first.replacingOccurrences(of: "medium", with: "high").appending("\n").write(to: file, atomically: true, encoding: .utf8)
+        try expectEqual(reader.read(live)?.model, "gemini-4-neon-high")
+        try expectEqual(reader.read(live)?.source, "agy_transcript")
+        live.conversationID = UUID().uuidString
+        try expectNil(reader.read(live))
+    }
+
     func testGroupModelSettingsUseExactConversationAndFreshMetadata() throws {
         let home = URL(fileURLWithPath: "/private/tmp/aa-group-model-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)

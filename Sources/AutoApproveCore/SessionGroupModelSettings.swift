@@ -54,7 +54,50 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
               home.hasPrefix("/") else { return nil }
         let id = uuid.uuidString.lowercased()
         if live.session.agent == .codex { return codex(home: home, id: id) }
+        if live.session.agent == .agy {
+            let brain = URL(fileURLWithPath: home).deletingLastPathComponent().appendingPathComponent("antigravity-cli/brain")
+            return agy(brain: brain, id: id)
+        }
         return claude(live, home: home, id: id, includeCompletion: false)?.value
+    }
+
+    private func agy(brain: URL, id: String) -> SessionGroupModelSettings? {
+        let directory = brain.appendingPathComponent(id + "/.system_generated/logs").standardizedFileURL
+        guard directory.resolvingSymlinksInPath().path == directory.path else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        for filename in ["transcript.jsonl", "transcript_full.jsonl"] {
+            let path = directory.appendingPathComponent(filename).path
+            guard let identity = Identity(path) else { continue }
+            if let cached = cache[path], cached.identity == identity {
+                if let value = cached.value { return value }
+                continue
+            }
+            let fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+            guard fd >= 0 else { continue }
+            let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+            defer { try? handle.close() }
+            var info = stat()
+            guard fstat(fd, &info) == 0, info.st_dev == identity.device, info.st_ino == identity.inode else { continue }
+            let start = max(0, info.st_size - 4_194_304)
+            guard (try? handle.seek(toOffset: UInt64(start))) != nil,
+                  let bytes = try? handle.read(upToCount: 4_194_304), Identity(path) == identity else { continue }
+            var lines = bytes.split(separator: 10, omittingEmptySubsequences: false).dropLast()
+            if start > 0 { lines = lines.dropFirst() }
+            var value: SessionGroupModelSettings?
+            for line in lines.reversed() {
+                guard let row = (try? JSONSerialization.jsonObject(with: Data(line))) as? JSONObject,
+                      row["source"] as? String == "MODEL", row["type"] as? String == "PLANNER_RESPONSE",
+                      let model = row["model"] as? String else { continue }
+                let effort = model.hasPrefix("gemini-4-neon-") ? String(model.dropFirst("gemini-4-neon-".count)) : ""
+                let settings = SessionGroupModelSettings(model: model, reasoningEffort: ["low","medium","high"].contains(effort) ? effort : nil,
+                    source: "agy_transcript", recordedAt: (row["created_at"] as? String).flatMap(Self.date))
+                if settings.model != nil { value = settings; break }
+            }
+            cache[path] = Cached(groupTurns: [:], path: path, identity: identity, value: value, finalTurn: nil, completionLoaded: false)
+            if let value { return value }
+        }
+        return nil
     }
 
     public func completion(_ live: SessionGroupLiveSession, after: Date, task: String? = nil) -> WorkCompletion? {
