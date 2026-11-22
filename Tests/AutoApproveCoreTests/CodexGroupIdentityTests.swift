@@ -412,7 +412,7 @@ extension ApprovalTests {
         let row = ((listed["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject])?.first
         try expectEqual(row?["isCaller"] as? Bool, true)
         try expectEqual(row?["canReconnect"] as? Bool, true)
-        try expectEqual(try store.load()[0].members[0].conversationID, oldID)
+        try expectEqual(try store.load()[0].members[0].conversationID, newID)
         let repaired = try await call("reconnect_group_member", restored)
         try expectEqual(repaired["conversationID"] as? String, newID)
         try expectEqual(try store.load()[0].leaderMemberID, member.id)
@@ -649,7 +649,36 @@ extension ApprovalTests {
         try expect(SessionGroupMatching.identityWarnings(fixed, live: [old, child]).isEmpty)
     }
 
-    func testGroupRefreshRejectsSplitTabAndConversation() throws {
+    @MainActor func testBulkRefreshSwappedTerminals() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("""
+        100801 1 fixture81 100801 100801 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100802 1 fixture82 100802 100802 Wed Oct 28 12:00:00 2026 /fixture/codex
+        """)
+        let ids = records.map { _ in UUID().uuidString.lowercased() }
+        let current = Dictionary(uniqueKeysWithValues: zip(records.map(\.pid), ids))
+        let engine = try ApprovalEngine(paths: .init(directory: directory), processReader: { records },
+            codexGroupReader: { record in current[record.pid].map { .init(threadID: $0, database: "/fixture/home/state.sqlite") } },
+            codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home"] })
+        defer { engine.stop() }
+        let sessions = records.map { AgentSession(id: $0.key, agent: .codex, pid: $0.pid, started: $0.started,
+            tty: "/dev/" + $0.tty, cwd: "/project", terminal: .terminal) }
+        engine.updateDiscovery(sessions, records: records)
+        let members = zip(sessions, ids.reversed()).map { SessionGroupLiveSession(session: $0.0, conversationID: $0.1, providerHome: "/fixture/home").member }
+        let original = SessionGroup(name: "fixture", members: members, leaderMemberID: members[0].id)
+        let store = SessionGroupStore(directory: directory)
+        try store.save([original])
+        let updated = try await engine.refreshGroupTerminals(original)
+        try expectEqual(updated.members.map(\.conversationID), ids)
+        try expectEqual(updated.members.map(\.id), members.map(\.id))
+        try expectEqual(updated.leaderMemberID, original.leaderMemberID)
+        try expectEqual(try store.load(), [updated])
+        let repeated = try await engine.refreshGroupTerminals(updated)
+        try expectEqual(repeated, updated)
+    }
+
+    func testGroupRefreshFollowsCurrentTerminal() throws {
         for agent in [AgentKind.codex, .claude, .agy] {
             let oldID = UUID(), freshID = UUID()
             let original = AgentSession(id: "original", agent: agent, pid: 10, started: "a", tty: "/dev/a", cwd: "/project", terminal: .terminal)
@@ -662,9 +691,16 @@ extension ApprovalTests {
             let group = SessionGroup(name: "group", members: [member])
             let both = [sameTab, other]
             try expectFalse(SessionGroupMatching.permitsIdentityRefresh(member, candidate: other, conversation: oldID, live: both))
-            try expectFalse(SessionGroupMatching.permitsIdentityRefresh(member, candidate: sameTab, conversation: freshID, live: both))
+            try expect(SessionGroupMatching.permitsIdentityRefresh(member, candidate: sameTab, conversation: freshID, live: both))
             let auto = agent == .codex ? CodexGroupIdentity.refreshed([group], live: both) : SessionGroupMatching.refreshedClaude([group], live: both)
-            try expectEqual(auto, [group])
+            try expectEqual(auto[0].members[0].conversationID, freshID.uuidString.lowercased())
+            try expectEqual(auto[0].members[0].runtimeID, sameTab.id)
+            var peer = other.member
+            peer.conversationID = freshID.uuidString
+            let swapped = SessionGroup(name: "swap", members: [member, peer], leaderMemberID: member.id)
+            let repaired = agent == .codex ? CodexGroupIdentity.refreshed([swapped], live: both) : SessionGroupMatching.refreshedClaude([swapped], live: both)
+            try expectEqual(repaired[0].members.map { UUID(uuidString: $0.conversationID) }, [freshID, oldID])
+            try expectEqual(repaired[0].leaderMemberID, member.id)
             try expect(SessionGroupMatching.permitsIdentityRefresh(member, candidate: sameTab, conversation: freshID, live: [sameTab]))
             other.conversationID = freshID.uuidString
             try expectFalse(SessionGroupMatching.permitsIdentityRefresh(member, candidate: sameTab, conversation: freshID, live: [sameTab, other]))

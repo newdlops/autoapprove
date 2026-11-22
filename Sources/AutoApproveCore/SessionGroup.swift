@@ -336,6 +336,7 @@ public enum SessionGroupMatching {
         guard candidate.session.agent == member.agent, candidate.session.phase != .ended else { return false }
         if member.runtimeID == candidate.id, let savedTab = member.tabShell?.terminalSessionID,
            let currentTab = candidate.tabShell?.terminalSessionID, savedTab != currentTab { return false }
+        let anchored = ownsTerminal(member, candidate)
         let previous = UUID(uuidString: member.conversationID)
         return !live.contains { other in
             guard other.id != candidate.id, other.session.phase != .ended else { return false }
@@ -343,8 +344,30 @@ public enum SessionGroupMatching {
             guard other.session.agent == member.agent,
                   other.providerHome == nil || candidate.providerHome == nil || other.providerHome == candidate.providerHome,
                   let observed = other.conversationID.flatMap(UUID.init(uuidString:)) else { return false }
-            return observed == conversation || observed == previous
+            return observed == conversation || (!anchored && observed == previous)
         }
+    }
+
+    static func currentTerminal(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
+        let matches = live.filter {
+            $0.session.phase != .ended && ownsTerminal(member, $0) && $0.session.cwd == member.cwd &&
+                (member.providerHome == nil || $0.providerHome == nil || member.providerHome == $0.providerHome)
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    static func followingTerminals(_ group: SessionGroup, live: [SessionGroupLiveSession], agents: Set<AgentKind>) -> SessionGroup {
+        var result = group
+        for (index, member) in group.members.enumerated() where agents.contains(member.agent) {
+            guard let row = currentTerminal(member, in: live), let home = row.providerHome,
+                  let conversation = row.conversationID.flatMap(UUID.init(uuidString:)),
+                  permitsIdentityRefresh(member, candidate: row, conversation: conversation, live: live) else { continue }
+            result.members[index].runtimeID = row.id
+            result.members[index].conversationID = conversation.uuidString.lowercased()
+            result.members[index].providerHome = home
+            if row.tabShell != nil || member.runtimeID != row.id { result.members[index].tabShell = row.tabShell }
+        }
+        return (try? result.validated()) != nil ? result : group
     }
 
     public static func identityWarnings(_ group: SessionGroup, live: [SessionGroupLiveSession]) -> [UUID: String] {
@@ -448,7 +471,8 @@ public enum SessionGroupMatching {
     }
 
     package static func refreshedClaude(_ groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [SessionGroup] {
-        groups.map { group in
+        groups.map { saved in
+            let group = followingTerminals(saved, live: live, agents: [.claude, .agy])
             var updated = group
             for (index, member) in group.members.enumerated() where member.agent == .claude || member.agent == .agy {
                 if let resumed = match(member, in: live), resumed.id != member.runtimeID,
@@ -490,6 +514,7 @@ public enum SessionGroupMatching {
     /// Process connectivity is separate from conversation identity. This is only
     /// for presentation and explicit identity refresh, never task delivery.
     public static func connection(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
+        if let tab = currentTerminal(member, in: live) { return tab }
         let candidates = live.filter {
             $0.id == member.runtimeID && $0.session.agent == member.agent &&
             $0.session.phase != .ended && $0.session.cwd == member.cwd &&

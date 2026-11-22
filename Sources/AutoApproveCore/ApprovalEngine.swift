@@ -2654,7 +2654,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 conversation: connection.conversationID.flatMap(UUID.init(uuidString:)), live: observed) {
             throw AppError.message("원래 탭과 대화 ID가 서로 다른 실행 세션을 가리켜 갱신을 보류했습니다.")
         }
-        if selectedReplacement != nil && !replacing { throw AppError.message("기존 연결 또는 선택한 대화가 바뀌었습니다. 목록을 다시 확인해주세요.") }
+        if let selectedReplacement, !replacing && (connection?.id != selectedReplacement || connection.map { SessionGroupMatching.ownsTerminal(member, $0) } != true) { throw AppError.message("기존 연결 또는 선택한 대화가 바뀌었습니다. 목록을 다시 확인해주세요.") }
         guard let connection, let original = sessions[connection.id] else {
             throw AppError.message("원래 터미널 연결을 확인해주세요. 다시 실행한 세션은 실행 중인 세션에 연결한 뒤 갱신할 수 있습니다.")
         }
@@ -2743,8 +2743,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var next = latest
         next[gi].members[mi] = confirmedMember
         if !conflicts.isEmpty {
-            guard replacing, latest[gi].sameMembership(as: group), conflicts.count == 1, let duplicate = conflicts.first,
-                  duplicate.runtimeID == runtime, duplicate.agent == .codex, duplicate.providerHome == home,
+            guard replacing || SessionGroupMatching.ownsTerminal(member, checked), latest[gi].sameMembership(as: group), conflicts.count == 1, let duplicate = conflicts.first,
+                  duplicate.runtimeID == runtime, duplicate.agent == member.agent, duplicate.providerHome == home,
                   UUID(uuidString: duplicate.conversationID) == uuid,
                   !group.isLeader(duplicate.id), group.children(of: duplicate.id).isEmpty,
                   duplicate.parentMemberID == nil || duplicate.parentMemberID == member.parentMemberID else {
@@ -2885,6 +2885,24 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     /// Resolve only each already-discovered process. This never uses thread/list.
+    public func refreshGroupTerminals(_ expected: SessionGroup) async throws -> SessionGroup {
+        let observed = try await readSessionGroupSessions(reconcile: false, useStatusCache: false)
+        let store = SessionGroupStore(directory: paths.directory)
+        let groups = try store.load()
+        guard !groupClearActive(expected.id), let index = groups.firstIndex(where: { $0.id == expected.id }),
+              groups[index].sameMembership(as: expected) else {
+            throw AppError.message("그룹 구성이 바뀌었습니다. 현재 그룹에서 다시 갱신해주세요.")
+        }
+        let updated = SessionGroupMatching.followingTerminals(groups[index], live: observed, agents: [.codex, .claude, .agy])
+        if updated != groups[index] {
+            var next = groups
+            next[index] = updated
+            try store.save(next, expected: groups)
+            refreshSessionGroupBadges()
+        }
+        return updated
+    }
+
     public func sessionGroupSessions() async throws -> [SessionGroupLiveSession] {
         if let pending = groupIdentityObservationTask { return try await pending.value }
         let pending = Task { try await readSessionGroupSessions() }

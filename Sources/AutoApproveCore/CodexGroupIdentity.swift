@@ -35,10 +35,9 @@ public enum CodexGroupIdentity {
             (turn?["thread_source"] == nil || turn?["thread_source"] as? String == "user")
     }
 
-    /// Follow /new and process restarts only with a unique, freshly observed Codex identity.
-    /// Claude members are deliberately returned byte-for-byte unchanged.
     public static func refreshed(_ groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [SessionGroup] {
-        groups.map { group in
+        groups.map { saved in
+            let group = SessionGroupMatching.followingTerminals(saved, live: live, agents: [.codex])
             var result = group
             for index in group.members.indices {
                 let member = group.members[index]

@@ -352,10 +352,16 @@ import AutoApproveCore
         } catch { notice = nil; self.error = error.localizedDescription }
     }
 
-    private func refreshAllIdentities(in group: SessionGroup) async {
+    private func refreshAllIdentities(in original: SessionGroup) async {
         guard !loading else { return }
         loading = true; bulkRunning = true; bulkStopRequested = false; bulkFailures = []; error = nil
         defer { loading = false; bulkRunning = false }
+        let group: SessionGroup
+        do {
+            group = try await engine.refreshGroupTerminals(original)
+            groups = try store.load()
+        } catch { self.error = error.localizedDescription; return }
+        let previous = Dictionary(uniqueKeysWithValues: original.members.map { ($0.id, $0) })
         var changed = 0, confirmed = 0, attempted = 0
         var merged = Set<UUID>()
         var failedLeader: UUID?
@@ -367,7 +373,7 @@ import AutoApproveCore
             do {
                 let result = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id, expectedMember: member)
                 if let duplicate = result.mergedMemberID { merged.insert(duplicate) }
-                if result.changed { changed += 1 } else { confirmed += 1 }
+                if result.changed || previous[member.id]?.conversationID != member.conversationID || previous[member.id]?.runtimeID != member.runtimeID { changed += 1 } else { confirmed += 1 }
             } catch {
                 if group.isLeader(member.id) { failedLeader = member.id }
                 bulkFailures.append("\(member.title.isEmpty ? member.agent.title : member.title): \(error.localizedDescription)")
