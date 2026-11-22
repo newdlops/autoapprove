@@ -15,6 +15,7 @@ if (!objects.length || new Set(objects).size!==objects.length) throw new Error('
 await Promise.all(objects.map(object=>access(object)));
 const verifyRefresh=process.argv.includes('--verify-refresh');
 const verifyDrag=process.argv.includes('--verify-drag');
+const verifyOpen=process.argv.includes('--verify-open');
 const verifyGraphRefresh=process.argv.includes('--verify-graph-refresh');
 const graphScenes=process.argv.includes('--graph');
 let source='Sources/AutoApproveApp/SessionGroupsWindow.swift';
@@ -29,7 +30,7 @@ if(verifyRefresh) {
 let graph=option('graph-source')||'Sources/AutoApproveApp/SessionGroupConversationGraph.swift';
 let model='Sources/AutoApproveApp/SessionGroupConversationGraphModel.swift';
 const hasModel=existsSync(model);
-if(verifyDrag||verifyGraphRefresh) {
+if(verifyOpen||verifyDrag||verifyGraphRefresh) {
   let text=await readFile(graph,'utf8');
   const body='    var body: some View {';
   const rootStart=text.indexOf('struct SessionGroupConversationGraph');
@@ -73,9 +74,9 @@ if(verifyDrag||verifyGraphRefresh) {
     await writeFile(model,original.replace(marker,'        GraphReadProbe.shared.check()\n'+marker));
   }
 }
-const app=['Sources/AutoApproveApp/WindowViewUpdates.swift',graph,...(hasModel?[model]:[]),source];
+const app=['Sources/AutoApproveApp/TerminalNavigator.swift','Sources/AutoApproveApp/TerminalHighlighter.swift','Sources/AutoApproveApp/WindowViewUpdates.swift',graph,...(hasModel?[model]:[]),source];
 execFileSync('/usr/bin/xcrun',['swiftc','-parse-as-library','-I',build+'/Modules','-I',path.resolve('Sources/CSQLite'),'-lsqlite3',...await coreLinkArguments(build),...objects,...app,'Tests/fixtures/session-groups-render.swift','-o',binary],{stdio:'inherit',timeout:180000});
-const mode=verifyRefresh?'--verify-refresh':verifyDrag?'--verify-drag':verifyGraphRefresh?'--verify-graph-refresh':graphScenes?'--graph':null;
+const mode=verifyOpen?'--verify-open':verifyRefresh?'--verify-refresh':verifyDrag?'--verify-drag':verifyGraphRefresh?'--verify-graph-refresh':graphScenes?'--graph':null;
 if(mode)console.log(execFileSync(binary,[out,mode],{encoding:'utf8',timeout:300000}).trim());
 else if (process.argv.includes('--interactive')) {
   execFileSync(binary,[out,'--interactive'],{stdio:'inherit',timeout:3600000});

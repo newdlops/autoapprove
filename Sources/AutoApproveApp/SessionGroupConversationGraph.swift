@@ -12,6 +12,8 @@ import AutoApproveCore
     @StateObject private var model: ConversationGraphModel
     @StateObject private var viewUpdates = WindowViewUpdates()
     @State private var selected: UUID?
+    @State private var revealTask: Task<Void, Never>?
+    let openTerminal: (AgentSession, ApprovalEngine) async throws -> Void
     @State private var replyTarget: SessionGroupConversation?
     @State private var deliveryTarget: SessionGroupConversation?
     @State private var deliveringQuestion: UUID?
@@ -30,9 +32,10 @@ import AutoApproveCore
         let message: String
     }
 
-    /// `sources`, `initialScope`, `layout` and `zoom` exist for the render harness; the app uses the defaults.
     init(groupID: UUID, engine: ApprovalEngine, sources: ConversationGraphModel.Sources? = nil, initialSelection: UUID? = nil,
-         initialScope: SessionGroupGraph.Scope = .recent, layout: SessionGroupGraph.Layout? = nil, zoom: Double? = nil) {
+         initialScope: SessionGroupGraph.Scope = .recent, layout: SessionGroupGraph.Layout? = nil, zoom: Double? = nil,
+         openTerminal: @escaping (AgentSession, ApprovalEngine) async throws -> Void = TerminalNavigator.open) {
+        self.openTerminal = openTerminal
         self.groupID = groupID
         self.engine = engine
         self.initialScope = initialScope
@@ -76,7 +79,7 @@ import AutoApproveCore
                         ConversationGraphCanvas(nodes: content.nodes, recent: content.recentEdges, all: content.allEdges,
                                                 fresh: model.freshEdges, hasLeader: !content.group.leaderMemberIDs.isEmpty,
                                                 selection: $selected, initialScope: initialScope, forcedLayout: forcedLayout,
-                                                initialZoom: initialZoom)
+                                                initialZoom: initialZoom, openNode: openNode)
                             .frame(minWidth: 390, maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                         Divider()
                         inspector(content)
@@ -113,6 +116,7 @@ import AutoApproveCore
             guard viewUpdates.isVisible else { return }
             await model.observe()
         }
+        .onDisappear { revealTask?.cancel() }
         .onExitCommand { selected = nil }
         .onChange(of: content?.group.members.map(\.id)) { _, ids in
             if let selected, ids?.contains(selected) != true { self.selected = nil }
@@ -217,6 +221,28 @@ import AutoApproveCore
             .help(menuHelp)
             .accessibilityLabel("\(title) \(members.count)명")
             .accessibilityHint("구성원을 고르는 메뉴를 엽니다.")
+        }
+    }
+
+    private func openNode(_ id: UUID) {
+        selected = id
+        revealTask?.cancel()
+        revealTask = Task {
+            do {
+                let live = try await engine.sessionGroupSessions()
+                try Task.checkCancellation()
+                guard selected == id else { return }
+                let group = try SessionGroupStore(directory: engine.paths.directory).load().first { $0.id == groupID }
+                guard let member = group?.members.first(where: { $0.id == id }),
+                      let target = SessionGroupMatching.connection(member, in: live),
+                      member.conversationID.isEmpty || target.conversationID == nil ||
+                        member.conversationID.caseInsensitiveCompare(target.conversationID ?? "") == .orderedSame else {
+                    throw AppError.message("현재 이 구성원에 연결된 터미널을 확인할 수 없습니다. 그룹에서 세션 연결을 확인해주세요.")
+                }
+                try await openTerminal(target.session, engine)
+            } catch {
+                if !Task.isCancelled { alert = GraphAlert(title: "터미널을 열 수 없습니다", message: error.localizedDescription) }
+            }
         }
     }
 
@@ -674,6 +700,7 @@ private extension AgentKind {
     let recent: [SessionGroupGraph.Edge]
     let all: [SessionGroupGraph.Edge]
     let fresh: Set<SessionGroupGraph.EdgeKey>
+    let openNode: (UUID) -> Void
     let hasLeader: Bool
     @Binding var selection: UUID?
     let forcedLayout: SessionGroupGraph.Layout?
@@ -716,7 +743,8 @@ private extension AgentKind {
 
     init(nodes: [GraphNode], recent: [SessionGroupGraph.Edge], all: [SessionGroupGraph.Edge], fresh: Set<SessionGroupGraph.EdgeKey>,
          hasLeader: Bool, selection: Binding<UUID?>, initialScope: SessionGroupGraph.Scope, forcedLayout: SessionGroupGraph.Layout?,
-         initialZoom: Double? = nil) {
+         initialZoom: Double? = nil, openNode: @escaping (UUID) -> Void) {
+        self.openNode = openNode
         self.nodes = nodes; self.recent = recent; self.all = all; self.fresh = fresh; self.hasLeader = hasLeader
         _selection = selection
         self.forcedLayout = forcedLayout
@@ -1391,6 +1419,7 @@ private extension AgentKind {
             .accessibilityValue(node.modelLabel + ", " + (scope == .recent ? node.accessibilityRecent : node.accessibilityAll))
             .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
             .accessibilityAction { selection = node.id }
+            .accessibilityAction(named: Text("터미널 열기")) { openNode(node.id) }
             .focusable()
             .focused($focused, equals: node.id)
             .focusEffectDisabled()
@@ -1443,10 +1472,11 @@ private extension AgentKind {
                     }
                     finishDrag()
                 })
+            .simultaneousGesture(TapGesture(count: 2).onEnded { openNode(node.id) })
             .help("\(node.name) · \(node.agent.title) · \(node.status.title)"
                   + (node.provisional ? "\n임시 이름입니다. 닉네임이 정해지면 바뀝니다." : "")
                   + "\n" + node.modelLabel + "\n주고받은 메시지 \(node.messages(scope))건(지금 보기 기준)"
-                  + "\n클릭하면 세션 상태와 대화를 엽니다. 끌거나 방향키를 누르면 노드를 옮깁니다.")
+                  + "\n클릭하면 세션 상태와 대화를 봅니다. 더블클릭하면 연결된 터미널을 엽니다. 끌거나 방향키를 누르면 노드를 옮깁니다.")
             .position(x: shown.x, y: shown.y + GraphNodeView.centerOffset * scale)
     }
 

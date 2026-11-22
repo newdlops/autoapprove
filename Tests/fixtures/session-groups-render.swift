@@ -246,9 +246,9 @@ final class GraphReadProbe: @unchecked Sendable {
     return (window, host)
 }
 
-@MainActor func mouse(_ type: NSEvent.EventType, _ point: CGPoint, _ window: NSWindow, delta: CGVector = .zero) -> NSEvent {
+@MainActor func mouse(_ type: NSEvent.EventType, _ point: CGPoint, _ window: NSWindow, delta: CGVector = .zero, clicks: Int = 1) -> NSEvent {
     let base = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
-                                  windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+                                  windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clicks,
                                   pressure: type == .leftMouseUp ? 0 : 1)!
     // Drag events also carry the movement deltas a real mouse reports.
     guard type == .leftMouseDragged, let copy = base.cgEvent?.copy() else { return base }
@@ -787,6 +787,36 @@ final class GraphReadProbe: @unchecked Sendable {
     print("PASS graph refresh: new message in \(Int(latency * 1000)) ms, 0 root bodies while unchanged, reads off the main thread, no checks while hidden, nodes kept their positions, a user zoom survived a new message, a new member and a size step change, no overlaps after the step change, switching 최근 and 전체 kept every node in place, drags and scrolls on the zoom buttons left the graph alone\n" + String(decoding: data, as: UTF8.self))
 }
 
+@MainActor func verifyNodeOpen(root: URL) async throws {
+    let fixture = try GraphFixture.make(root: root, name: "click-fixture")
+    let size = CGSize(width: 1040, height: 680)
+    var opened: [String] = []
+    let graph = SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine, sources: fixedSources(fixture), layout: .circle, openTerminal: { session, _ in opened.append(session.id) })
+    let (window, host) = hiddenHarnessWindow(graph.frame(width: size.width, height: size.height), size: size)
+    defer { window.close(); fixture.engine.stop() }
+    try await Task.sleep(for: .seconds(1))
+    let name = "문서 검토"
+    guard let point = GraphProbe.center(name, in: host), let member = fixture.group.members.first(where: { $0.id == fixture.id["doc"] }) else { throw AppError.message("fixture node missing") }
+    func click(_ count: Int, at point: CGPoint) async throws {
+        NSApp.postEvent(mouse(.leftMouseDown, point, window, clicks: count), atStart: false)
+        try await Task.sleep(for: .milliseconds(30))
+        NSApp.postEvent(mouse(.leftMouseUp, point, window, clicks: count), atStart: false)
+        try await Task.sleep(for: .milliseconds(55))
+    }
+    try await click(1, at: point)
+    guard GraphProbe.selectedName == name, opened.isEmpty else { throw AppError.message("single click revealed terminal") }
+    try await click(2, at: point)
+    try await Task.sleep(for: .seconds(1))
+    guard let expected = member.runtimeID, opened == [expected] else { throw AppError.message("expected one reveal of the exact node; received " + String(opened.count)) }
+    guard let offline = GraphProbe.center("로그 정리", in: host) ?? GraphProbe.places.keys.first(where: { $0.contains("logs") }).flatMap({ GraphProbe.center($0, in: host) }) else { throw AppError.message("offline node missing") }
+    try await click(1, at: offline)
+    try await click(2, at: offline)
+    try await Task.sleep(for: .milliseconds(500))
+    guard opened == [expected] else { throw AppError.message("offline node revealed a different terminal") }
+    print("PASS single click selects, double click opens the matching terminal once, offline node opens none")
+
+}
+
 func percentile(_ values: [Double], _ p: Double) -> Double {
     guard !values.isEmpty else { return 0 }
     let sorted = values.sorted()
@@ -807,9 +837,13 @@ func percentile(_ values: [Double], _ p: Double) -> Double {
             }
             NSApp.run(); return
         }
-        if CommandLine.arguments.contains("--verify-drag") {
+        if CommandLine.arguments.contains("--verify-drag") || CommandLine.arguments.contains("--verify-open") {
             Task { @MainActor in
-                do { try await verifyDrag(root: root); NSApp.terminate(nil) }
+                do {
+                    if CommandLine.arguments.contains("--verify-open") { try await verifyNodeOpen(root: root) }
+                    else { try await verifyDrag(root: root) }
+                    NSApp.terminate(nil)
+                }
                 catch { fputs("Graph drag QA: \(error)\n", stderr); exit(1) }
             }
             NSApp.run(); return
