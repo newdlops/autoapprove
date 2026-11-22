@@ -4737,8 +4737,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private func groupModelSettings(_ groups: [SessionGroup], observed: [SessionGroupLiveSession]) async -> [String: SessionGroupModelSettings] {
         let targets = groups.flatMap(\.members).compactMap { SessionGroupMatching.match($0, in: observed) }
+        return await sessionModelSettings(targets)
+    }
+
+    public func modelDisplaySessions() async throws -> [SessionGroupLiveSession] {
+        if let cached = groupConnectionObservation, Date().timeIntervalSince(cached.at) < 5 { return cached.sessions }
+        if let pending = groupIdentityObservationTask { return try await pending.value }
+        return try await readSessionGroupSessions(reconcile: false)
+    }
+
+    public func sessionModelSettings(_ targets: [SessionGroupLiveSession]) async -> [String: SessionGroupModelSettings] {
         let reader = groupModelSettingsReader
-        return await Task.detached(priority: .utility) {
+        var settings = await Task.detached(priority: .utility) {
             var result: [String: SessionGroupModelSettings] = [:]
             for live in targets where result[live.id] == nil {
                 guard live.conversationID.flatMap(UUID.init(uuidString:)) != nil else { continue }
@@ -4746,6 +4756,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             return result
         }.value
+        for live in targets where live.session.agent == .agy {
+            if let event = agyEvents[live.id], event.conversationId == live.conversationID?.lowercased(), let name = event.modelName {
+                var setting = SessionGroupModelSettings(model: nil, reasoningEffort: nil, source: "agy_hook")
+                setting.model = String(name.prefix(160)).components(separatedBy: .controlCharacters).joined()
+                settings[live.id] = setting
+            }
+        }
+        return settings
     }
 
     public func mcpAction(_ object: JSONObject) async throws -> JSONObject {
@@ -4915,7 +4933,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
                             "reconnectBlockedReason": unresolved.flatMap { $0.session.agent == .codex ? Self.missingCodexGroupIdentity : nil } as Any? ?? NSNull(),
                             "messagingName": live?.messagingName as Any? ?? NSNull(),
-                            "model": live.flatMap { agyEvents[$0.id]?.modelName ?? modelSettings[$0.id]?.model } as Any? ?? NSNull(),
+                            "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
                             "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),
                             "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),
                             "modelSettingsRecordedAt": live.flatMap { modelSettings[$0.id]?.recordedAt }.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
@@ -4959,7 +4977,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let phase = live.flatMap { sessions[$0.id]?.phase }
                     return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "role": member.role as Any? ?? NSNull(), "cwd": member.cwd,
                             "claudeStatus": live.flatMap { memberStatuses[$0.id] } as Any? ?? NSNull(),
-                            "model": live.flatMap { agyEvents[$0.id]?.modelName ?? modelSettings[$0.id]?.model } as Any? ?? NSNull(),
+                            "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
                             "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),
                             "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),
                             "modelSettingsRecordedAt": live.flatMap { modelSettings[$0.id]?.recordedAt }.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
@@ -8136,7 +8154,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                       agent.agent == .agy, agent.tty != "??" else { throw AppError.message("agy 터미널을 확인할 수 없습니다.") }
                 let event = try JSONDecoder().decode(AgyHookRequest.self, from: JSONSerialization.data(withJSONObject: params))
                 guard UUID(uuidString: event.conversationId) != nil else { throw AppError.message("agy 대화 ID를 확인할 수 없습니다.") }
-                let state = AgyState(conversationId: event.conversationId.lowercased(), isIdle: event.isIdle, modelName: event.modelName)
+                let conversation = event.conversationId.lowercased()
+                let previous = agyEvents[agent.key]
+                let model = event.modelName ?? (previous?.conversationId == conversation ? previous?.modelName : nil)
+                let state = AgyState(conversationId: conversation, isIdle: event.isIdle, modelName: model)
                 agyEvents[agent.key] = state
                 if var session = sessions[agent.key], session.phase != .ended {
                     applyAgyState(state, to: &session)

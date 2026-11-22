@@ -12,10 +12,11 @@ import AutoApproveCore
         original.queuedQuestions = [.init(id: "question", threadID: "fixture", title: "합성 질문", options: ["개발", "시험"])]
         original.notices = [try JSONDecoder().decode(SessionNotice.self, from: Data(#"{"id":"notice","sourceKey":"fixture","kind":"question","summary":"합성 알림","date":0,"isRead":false}"#.utf8))]
         let saved = original, actions = SessionRowActions()
-        func display(_ session: AgentSession, paused: Bool = false, selected: Bool = false, owner: SessionRowActions? = nil) -> SessionRowDisplay {
-            SessionRowDisplay(session: session, paused: paused, selected: selected, actions: owner ?? actions)
+        func display(_ session: AgentSession, modelLabel: String = "gpt-6-sol · 추론 high", paused: Bool = false, selected: Bool = false, owner: SessionRowActions? = nil) -> SessionRowDisplay {
+            SessionRowDisplay(session: session, modelLabel: modelLabel, paused: paused, selected: selected, actions: owner ?? actions)
         }
         let before = display(original)
+        precondition(before != display(original, modelLabel: "gpt-6-sol · 추론 low"))
         var timestamps = original
         timestamps.lastActivity = Date(timeIntervalSince1970: 5_000)
         timestamps.codexQuestionsObservedAt = Date(timeIntervalSince1970: 6_000)

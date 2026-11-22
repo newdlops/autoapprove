@@ -44,7 +44,12 @@ import AutoApproveCore
     }
 
     var body: some View {
-        let content = model.content
+        let content = model.content.map { stored in
+            var value = stored
+            let labels = Dictionary(uniqueKeysWithValues: stored.group.members.map { ($0.id, viewUpdates.modelLabel($0)) })
+            for i in value.nodes.indices { value.nodes[i].modelLabel = labels[value.nodes[i].id] ?? "" }
+            return value
+        }
         VStack(alignment: .leading, spacing: 0) {
             header(content)
             if let content, !content.group.members.isEmpty { summary(content) }
@@ -101,6 +106,9 @@ import AutoApproveCore
         .frame(minWidth: 720, idealWidth: 860, minHeight: 460, idealHeight: 590)
         .navigationTitle(content.map { "\($0.group.name) · 대화 그래프" } ?? "대화 그래프")
         .windowUpdates(viewUpdates, sources: [AnyPublisher<Void, Never>]())
+        .task(id: viewUpdates.isVisible) {
+            if viewUpdates.isVisible { await viewUpdates.observeModels(engine) }
+        }
         .task(id: viewUpdates.isVisible) {
             guard viewUpdates.isVisible else { return }
             await model.observe()
@@ -341,6 +349,7 @@ import AutoApproveCore
                 .help("구성원 목록으로 돌아갑니다. Esc 키를 누르거나 그래프의 빈 곳을 클릭해도 됩니다.")
                 VStack(alignment: .leading, spacing: 3) {
                     Text(node.name).font(.headline).lineLimit(2).help(node.name)
+                    Text(node.modelLabel).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                     Text(node.status.title).foregroundStyle(statusColor(node.status))
                     Text("\(node.agent.title) · \(node.isLeader ? "그룹장" : "구성원")")
                         .font(.caption).foregroundStyle(.secondary)
@@ -668,7 +677,7 @@ private extension AgentKind {
     let hasLeader: Bool
     @Binding var selection: UUID?
     let forcedLayout: SessionGroupGraph.Layout?
-    @AppStorage("sessionGroupGraph.layout") private var storedLayout: SessionGroupGraph.Layout = .tree
+    @AppStorage("sessionGroupGraph.layout") private var storedLayout: SessionGroupGraph.Layout = .circle
     @State private var scope: SessionGroupGraph.Scope
     /// Moved positions per layout, kept in memory until the window closes.
     @State private var offsets: [SessionGroupGraph.Layout: [UUID: CGSize]] = [:]
@@ -837,9 +846,10 @@ private extension AgentKind {
     private func viewport(_ placement: Placement, size: CGSize) -> SessionGroupGraph.Viewport {
         switch mode {
         case let .fitted(minimum, maximum):
-            SessionGroupGraph.fit(placement.content, in: size, minimum: minimum, maximum: maximum, focus: placement.leader,
+            let multiCircle = (forcedLayout ?? storedLayout) == .circle && nodes.lazy.filter(\.isLeader).prefix(2).count == 2
+            return SessionGroupGraph.fit(placement.content, in: size, minimum: mode == .automatic && multiCircle ? SessionGroupGraph.minimumZoom : minimum, maximum: maximum, focus: placement.leader,
                                   topAligned: placement.topAligned)
-        case let .manual(view): view
+        case let .manual(view): return view
         }
     }
 
@@ -1210,11 +1220,15 @@ private extension AgentKind {
             selected = chosen == row
             related = selected
             probeName = (column ? "col:" : "row:") + member.name
-            label = "\(member.name), \(member.status.title)"
+            label = "\(member.name), \(member.status.title), \(member.modelLabel)"
             hint = column ? "받은 메시지 열의 머리입니다. 누르면 이 구성원을 고릅니다." : "보낸 메시지 행의 머리입니다. 누르면 이 구성원을 고릅니다."
             let symbol = GraphNodeSymbol(agent: member.agent, status: member.status, role: member.isLeader ? .leader : .member, diameter: 18 * scale)
                 .frame(width: 26 * scale, height: 26 * scale)
-            let name = Text(member.name)
+            let name = VStack(alignment: column ? .center : .leading, spacing: scale) {
+                Text(member.name).lineLimit(1)
+                Text(member.modelLabel).font(.system(size: 10 * scale)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            .help(member.modelLabel)
                 .font(.system(size: Self.captionSize * scale, weight: selected ? .semibold : .regular))
                 .foregroundStyle(member.provisional ? .secondary : .primary)
                 .truncationMode(.middle)
@@ -1374,7 +1388,7 @@ private extension AgentKind {
             .equatable()
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("\(node.name), \(node.agent.title), \(node.isLeader ? "그룹장" : "구성원")")
-            .accessibilityValue(scope == .recent ? node.accessibilityRecent : node.accessibilityAll)
+            .accessibilityValue(node.modelLabel + ", " + (scope == .recent ? node.accessibilityRecent : node.accessibilityAll))
             .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
             .accessibilityAction { selection = node.id }
             .focusable()
@@ -1431,7 +1445,7 @@ private extension AgentKind {
                 })
             .help("\(node.name) · \(node.agent.title) · \(node.status.title)"
                   + (node.provisional ? "\n임시 이름입니다. 닉네임이 정해지면 바뀝니다." : "")
-                  + "\n주고받은 메시지 \(node.messages(scope))건(지금 보기 기준)"
+                  + "\n" + node.modelLabel + "\n주고받은 메시지 \(node.messages(scope))건(지금 보기 기준)"
                   + "\n클릭하면 세션 상태와 대화를 엽니다. 끌거나 방향키를 누르면 노드를 옮깁니다.")
             .position(x: shown.x, y: shown.y + GraphNodeView.centerOffset * scale)
     }
@@ -1642,6 +1656,14 @@ private struct GraphNodeView: View, Equatable {
                 .overlay(Capsule().strokeBorder(hovering ? node.agent.graphColor : Color(nsColor: .separatorColor), lineWidth: hovering ? 1 : 0.5))
                 .frame(maxWidth: Self.width * scale)
                 .contentShape(Capsule())
+            Text(node.modelLabel)
+                .font(.system(size: 10 * scale))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 2 * scale)
+                .background(Color(nsColor: .windowBackgroundColor))
+                .help(node.modelLabel)
         }
         .frame(width: Self.width * scale, height: Self.height(diameter: diameter) * scale, alignment: .top)
         .opacity(lifted ? 0.15 : dimmed ? 0.24 : 1)

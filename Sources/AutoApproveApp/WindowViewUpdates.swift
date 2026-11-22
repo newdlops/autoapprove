@@ -1,11 +1,38 @@
 import AppKit
 import Combine
 import SwiftUI
+import AutoApproveCore
 
 /// Gates view invalidation only. Models, approvals, notifications and networking
 /// keep running, and the view reads their live values on the next visible frame.
 @MainActor final class WindowViewUpdates: ObservableObject {
     @Published private(set) var isVisible = false
+    private var modelSessions: [SessionGroupLiveSession] = []
+    private var settings: [String: SessionGroupModelSettings] = [:]
+
+    func observeModels(_ engine: ApprovalEngine) async {
+        while !Task.isCancelled {
+            let observed = (try? await engine.modelDisplaySessions()) ?? []
+            let values = await engine.sessionModelSettings(observed)
+            guard !Task.isCancelled else { return }
+            if settings != values || !modelSessions.elementsEqual(observed, by: { $0.hasSamePresentation(as: $1) }) {
+                objectWillChange.send()
+                modelSessions = observed
+                settings = values
+            }
+            do { try await Task.sleep(for: .seconds(15)) } catch { return }
+        }
+    }
+
+    func modelLabel(_ sessionID: String?) -> String {
+        let value = sessionID.flatMap { settings[$0] }
+        return (value?.model ?? "모델 미확인") + " · 추론 " + (value?.reasoningEffort ?? "미확인")
+    }
+
+    func modelLabel(_ member: SessionGroupMember) -> String {
+        modelLabel(SessionGroupMatching.match(member, in: modelSessions)?.id)
+    }
+
     private weak var window: NSWindow?
     private var windowID: ObjectIdentifier?
     private var sources: [AnyCancellable] = []

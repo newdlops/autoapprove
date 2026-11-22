@@ -39,6 +39,7 @@ struct GraphNode: Equatable, Identifiable {
     let allMessages: Int
     /// What the member works on, as its leader set it with the nickname.
     var role: String? = nil
+    var modelLabel = ""
 
     func messages(_ scope: SessionGroupGraph.Scope) -> Int { scope == .recent ? recentMessages : allMessages }
     func size(_ scope: SessionGroupGraph.Scope) -> SessionGroupGraph.NodeSize { SessionGroupGraph.nodeSize(forMessages: messages(scope)) }

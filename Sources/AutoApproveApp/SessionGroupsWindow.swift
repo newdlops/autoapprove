@@ -113,6 +113,9 @@ import AutoApproveCore
             }
         }
         .task(id: viewUpdates.isVisible) {
+            if viewUpdates.isVisible { await viewUpdates.observeModels(engine) }
+        }
+        .task(id: viewUpdates.isVisible) {
             guard viewUpdates.isVisible else { return }
             if !observed { await refresh() }
             else { await refreshObservation() }
@@ -190,6 +193,7 @@ import AutoApproveCore
                         }
                         Text("\(member.agent.title) · \(connection == nil ? "연결 확인 필요" : "실행 중") · \(roleText(member, in: group))")
                             .font(.caption).foregroundStyle(.secondary)
+                        Text(viewUpdates.modelLabel(member)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                         if let task = currentTask(member, in: group) {
                             Label(taskText(task), systemImage: task.question?.isPermission == true ? "hand.raised" : task.question != nil ? "questionmark.bubble" : task.status == .working ? "hourglass" : "checkmark.circle")
                                 .font(.caption).foregroundStyle(task.deliveryError == nil && task.question == nil ? Color.secondary : Color.orange)

@@ -89,7 +89,7 @@ import AutoApproveCore
             List(selection: $model.selection) {
                 ForEach(model.sessions()) { session in
                     let index = Int(session.pid) - 900_000
-                    SessionRow(session: session, paused: false, selected: model.selection.contains(session.id),
+                    SessionRow(session: session, modelLabel: "gpt-6-sol · 추론 high", paused: false, selected: model.selection.contains(session.id),
                         setAutomatic: { model.setAutomatic($0, index: index, capturedGeneration: generation) },
                         reveal: { model.lastAction = "합성 행 \(index) · 열기 콜백 갱신 \(generation)" })
                         .tag(session.id).padding(.vertical, 6)

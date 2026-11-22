@@ -276,10 +276,8 @@ public enum SessionGroupGraph {
 
     /// The circle diameter every spacing rule was first written for; a larger node widens the spacing.
     public static let standardDiameter = 32.0
-    /// Below a circle centre: the circle, a 6pt gap and the 20pt name band.
-    public static let nameBandDrop = 26.0
-    /// Room between one layer's name bands and the next layer's circles, for lines and arrowheads.
-    public static let layerGap = 46.0
+    public static let nameBandDrop = 44.0
+    public static let layerGap = 28.0
 
     /// Points relative to an arbitrary origin, in tree order.
     public static func positions(_ order: [SessionGroupTreeEntry], hasLeader: Bool, layout: Layout,
@@ -294,9 +292,8 @@ public enum SessionGroupGraph {
                                  diameters: [UUID: Double] = [:]) -> [UUID: CGPoint] {
         switch layout {
         case .tree: return treePositions(order, diameters: diameters)
-        case .circle: return circlePositions(order.map(\.id), centered: hasLeader, diameters: diameters)
+        case .circle: return groupedCirclePositions(order, hasLeader: hasLeader, diameters: diameters)
         case .radial: return radialPositions(order, hasLeader: hasLeader, diameters: diameters)
-        // The matrix places no nodes; `matrixCellRect` and the header rects place its grid.
         case .matrix: return [:]
         }
     }
@@ -428,8 +425,44 @@ public enum SessionGroupGraph {
         return result
     }
 
-    /// The first leader is in the middle; the rest start at 12 o'clock and go clockwise in tree order.
-    /// The whole ring is spaced for its largest circle, and the radius grows by the same amount.
+    private static func groupedCirclePositions(_ order: [(id: UUID, depth: Int)], hasLeader: Bool,
+                                               diameters: [UUID: Double]) -> [UUID: CGPoint] {
+        let roots = order.indices.filter { order[$0].depth == 0 }
+        guard hasLeader, roots.count > 1 else {
+            return circlePositions(order.map(\.id), centered: hasLeader, diameters: diameters)
+        }
+        let columns = Int(ceil(sqrt(Double(roots.count))))
+        let rings = roots.enumerated().map { index, start in
+            let end = index + 1 < roots.count ? roots[index + 1] : order.endIndex
+            let ids = order[start..<end].map(\.id)
+            let points = circlePositions(ids, centered: true, diameters: diameters)
+            let radius = points.values.map { hypot($0.x, $0.y) }.max() ?? 0
+            return (points: points, radius: radius)
+        }
+        var widths = Array(repeating: CGFloat.zero, count: columns)
+        var heights = Array(repeating: CGFloat.zero, count: (rings.count + columns - 1) / columns)
+        for (index, ring) in rings.enumerated() {
+            widths[index % columns] = max(widths[index % columns], ring.radius)
+            heights[index / columns] = max(heights[index / columns], ring.radius)
+        }
+        func centers(_ radii: [CGFloat]) -> [CGFloat] {
+            var positions: [CGFloat] = []
+            var edge: CGFloat = 0
+            for radius in radii {
+                positions.append(edge + radius)
+                edge += 2 * radius + leafSpacing
+            }
+            return positions
+        }
+        let xs = centers(widths), ys = centers(heights)
+        var result: [UUID: CGPoint] = [:]
+        for (index, ring) in rings.enumerated() {
+            let x = xs[index % columns], y = ys[index / columns]
+            for (id, point) in ring.points { result[id] = CGPoint(x: x + point.x, y: y + point.y) }
+        }
+        return result
+    }
+
     private static func circlePositions(_ ids: [UUID], centered: Bool, diameters: [UUID: Double]) -> [UUID: CGPoint] {
         guard let first = ids.first else { return [:] }
         let ring = centered ? Array(ids.dropFirst()) : ids
@@ -788,8 +821,6 @@ public enum SessionGroupGraph {
                 result[second.key] = -(result[second.key] ?? 1)
             }
         }
-        // A line through another member's circle or name band reads as a line to that member,
-        // so it bends further on its own side, or to the other side when no reverse line uses it.
         let pairs = Set(edges.map { "\($0.from.uuidString)>\($0.to.uuidString)" })
         for edge in edges {
             guard let from = points[edge.from], let to = points[edge.to] else { continue }
@@ -802,7 +833,7 @@ public enum SessionGroupGraph {
             }
             let sign = result[edge.key] ?? 1
             guard count(sign) > 0 else { continue }
-            let steps = [1.5, 2, 3, 4, 6, 8]
+            let steps = [1.5, 2, 3, 4, 6, 8, 10]
             var candidates = steps.map { $0 * sign }
             if !pairs.contains("\(edge.to.uuidString)>\(edge.from.uuidString)") { candidates += ([1] + steps).map { -$0 * sign } }
             var best = (bend: sign, count: Int.max)

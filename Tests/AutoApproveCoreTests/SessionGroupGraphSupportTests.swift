@@ -223,6 +223,20 @@ extension ApprovalTests {
         let first = group.treeOrder[1].member.id, second = group.treeOrder[2].member.id
         try expectEqual(circle[first], CGPoint(x: 0, y: -160), "The ring starts at 12 o'clock with the minimum radius")
         try expect((circle[second]?.x ?? 0) > 0, "The ring goes clockwise")
+        let forest = group.addingLeader(members[4].id)
+        let circles = SessionGroupGraph.positions(forest.treeOrder, hasLeader: true, layout: .circle)
+        let left = circles[members[0].id]!, right = circles[members[4].id]!
+        try expectEqual(circles.count, members.count)
+        try expect(right.x - left.x >= 2 * 160 + 144)
+        for i in [1, 2, 3] {
+            let point = circles[members[i].id]!
+            try expectEqual(hypot(point.x - left.x, point.y - left.y).rounded(), 160)
+        }
+        try expectEqual(circles[members[5].id], CGPoint(x: right.x, y: right.y - 160))
+        let three = forest.addingLeader(members[5].id)
+        let threeRings = SessionGroupGraph.positions(three.treeOrder, hasLeader: true, layout: .circle)
+        try expectEqual(threeRings.count, members.count)
+        try expect(threeRings[members[5].id]!.y > threeRings[members[0].id]!.y)
         let large = SessionGroup(name: "large", members: (0..<15).map { member("m\($0)") })
         let ring = SessionGroupGraph.positions(large.treeOrder, hasLeader: false, layout: .circle)
         let radius = hypot(ring[large.members[0].id]!.x, ring[large.members[0].id]!.y)

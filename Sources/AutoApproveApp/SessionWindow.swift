@@ -285,7 +285,7 @@ import AutoApproveCore
         })
     }
     private func sessionRow(_ session: AgentSession, grouped: Bool) -> some View {
-        SessionRow(session: session, paused: engine.snapshot.paused, selected: selection.contains(session.id),
+        SessionRow(session: session, modelLabel: viewUpdates.modelLabel(session.id), paused: engine.snapshot.paused, selected: selection.contains(session.id),
             setAutomatic: { enabled in perform { try engine.setAutomatic(session.id, enabled: enabled) } },
             reveal: { reveal(session) })
             .tag(session.id)
@@ -370,6 +370,9 @@ import AutoApproveCore
     }
     var body: some View {
         windowContent
+        .task(id: viewUpdates.isVisible) {
+            if viewUpdates.isVisible { await viewUpdates.observeModels(engine) }
+        }
         .onChange(of: visible.map(\.id)) { _, ids in
             selection.formIntersection(ids)
             if selection.isEmpty, let first = ids.first { selection = [first] }
@@ -478,6 +481,7 @@ import AutoApproveCore
 
 private struct SessionRow: View {
     let session: AgentSession
+    let modelLabel: String
     let paused: Bool
     let selected: Bool
     let setAutomatic: (Bool) -> Void
@@ -488,7 +492,7 @@ private struct SessionRow: View {
         // Update the live handlers even when the display value is unchanged.
         // The box belongs to this row, not to the parent captured by a handler.
         let _ = actions.update(automatic: setAutomatic, reveal: reveal)
-        SessionRowDisplay(session: session, paused: paused, selected: selected, actions: actions).equatable()
+        SessionRowDisplay(session: session, modelLabel: modelLabel, paused: paused, selected: selected, actions: actions).equatable()
     }
 }
 
@@ -509,11 +513,13 @@ private final class SessionRowActions: ObservableObject, Equatable {
 /// row label, control or help text reads are removed from the display value.
 private struct SessionRowDisplay: View, Equatable {
     let session: AgentSession
+    let modelLabel: String
     let paused: Bool
     let selected: Bool
     let actions: SessionRowActions
 
-    init(session: AgentSession, paused: Bool, selected: Bool, actions: SessionRowActions) {
+    init(session: AgentSession, modelLabel: String, paused: Bool, selected: Bool, actions: SessionRowActions) {
+        self.modelLabel = modelLabel
         var display = session
         display.lastActivity = .distantPast
         display.codexQuestionsObservedAt = nil
@@ -545,6 +551,9 @@ private struct SessionRowDisplay: View, Equatable {
                 if let note = session.customization?.note, !note.isEmpty {
                     Label(note, systemImage: "note.text").font(.caption).foregroundStyle(.secondary)
                         .lineLimit(1).help(note)
+                }
+                if session.agent != .shell {
+                    Text(modelLabel).font(.caption).foregroundStyle(.secondary).lineLimit(2).help(modelLabel)
                 }
                 GitBranchLabel(session: session, compact: true)
                 HStack(spacing: 6) {
