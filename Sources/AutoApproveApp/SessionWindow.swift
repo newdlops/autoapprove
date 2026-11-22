@@ -247,10 +247,10 @@ import AutoApproveCore
 
     private var mcpRecoveryMessage: String {
         let chosen = engine.snapshot.sessions.filter { confirmingMCP?.contains($0.id) == true }
-        let direct = restartForMCP ? 0 : chosen.filter { $0.agent == .claude }.count
+        let direct = restartForMCP ? 0 : chosen.filter { $0.agent == .claude && ![.terminal, .iterm, .pty].contains($0.terminal) }.count
         var parts: [String] = []
         if direct > 0 { parts.append("Claude Code 세션 " + String(direct) + "개에서 /mcp reconnect autoapprove를 실행합니다.") }
-        if chosen.count > direct { parts.append("세션 " + String(chosen.count - direct) + "개는 필요하면 CLI를 종료한 뒤 같은 탭에서 같은 대화로 다시 엽니다. 진행 중인 작업이 중단되고 작성 중인 입력이 사라질 수 있습니다.") }
+        if chosen.count > direct { parts.append("세션 " + String(chosen.count - direct) + "개는 지원되는 터미널에서 Esc로 작업 중단을 요청한 뒤 같은 탭에서 같은 대화를 다시 엽니다. 진행 중인 작업이 중단되고 작성 중인 입력이 사라질 수 있습니다.") }
         return parts.joined(separator: "\n")
     }
 
@@ -264,7 +264,7 @@ import AutoApproveCore
         let now = chosen.filter { supported.contains($0.terminal) && $0.phase == .idle }.count
         let later = chosen.filter { supported.contains($0.terminal) && $0.phase != .idle }.count
         let unsupported = chosen.count - now - later
-        var lines = ["원래 터미널에서 CLI를 종료하고, 셸이 돌아오면 같은 대화 ID와 원래 실행 옵션으로 다시 엽니다. 자동 승인 설정은 새 세션으로 옮깁니다. '작업 이어가기'를 고르면 다시 열린 세션에 진행하던 작업을 이어가라고 입력합니다."]
+        var lines = ["원래 터미널에 Esc로 중단을 요청한 뒤 CLI를 종료하고, 셸이 돌아오면 같은 대화 ID와 원래 실행 옵션으로 다시 엽니다. 자동 승인 설정은 새 세션으로 옮깁니다. '작업 이어가기'를 고르면 다시 열린 세션에 진행하던 작업을 이어가라고 입력합니다."]
         if now > 0 { lines.append("지금 다시 시작: \(now)개") }
         if later > 0 { lines.append("현재 작업을 중단하고 다시 시작: \(later)개. 제출하지 않은 입력은 사라질 수 있습니다.") }
         if unsupported > 0 { lines.append("지원하지 않는 터미널이라 건너뜀: \(unsupported)개 (tmux, Orca, VS Code)") }
@@ -285,7 +285,7 @@ import AutoApproveCore
                     Image(systemName: failed > 0 ? "exclamationmark.triangle.fill" : "checkmark.circle.fill").foregroundStyle(failed > 0 ? .orange : .green)
                 }
                 Text(title + (progress.isActive ? " 중" : failed > 0 ? " 결과" : " 완료")).font(.callout.weight(.semibold))
-                Text(["완료 \(done)", working > 0 ? "진행 \(working)" : nil, waiting > 0 ? "작업 끝나길 기다림 \(waiting)" : nil,
+                Text(["완료 \(done)", working > 0 ? "진행 \(working)" : nil, waiting > 0 ? "재시작 준비 \(waiting)" : nil,
                       failed > 0 ? "실패 \(failed)" : nil, cancelled > 0 ? "취소 \(cancelled)" : nil].compactMap { $0 }.joined(separator: " · "))
                     .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                 Spacer(minLength: 8)

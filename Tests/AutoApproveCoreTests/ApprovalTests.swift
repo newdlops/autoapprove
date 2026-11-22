@@ -610,7 +610,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session restart: process arguments parse only argv",tests.testProcessArgumentsParseOnlyArgv),
             ("Claude registry keeps the conversation for an unknown status",tests.testClaudeRegistryKeepsConversationForUnknownStatus),
             ("MCP recovery: only the reopened session handshake confirms recovery",tests.testMCPRecoveryRequiresInitializationFromReopenedSession),
-            ("Session restart: a queued CLI stays open until the previous shell relaunches",tests.testMultipleRestartsWaitForThePreviousShellLaunch),
+            ("Session restart: independent tabs receive Escape before their own shell relaunches",tests.testMultipleRestartsLaunchIndependentShells),
             ("Session restart: exits and reopens the same conversation",tests.testSessionRestartExitsAndReopensTheSameConversation),
             ("Session restart: explicit Codex login interrupts every active conversation before waiting",tests.testExplicitCodexLoginRequestsStopsBeforeWaitingForAnyTurn),
             ("Session restart: a shell-less CLI is left untouched",tests.testSessionRestartLeavesShelllessCLIUntouched),

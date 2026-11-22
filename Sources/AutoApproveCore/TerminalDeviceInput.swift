@@ -49,6 +49,15 @@ public enum TerminalDeviceInput {
         return delivered
     }
 
+    static func restartEscape(target: ScreenTarget, agent: AgentKind) throws -> TerminalDelivery {
+        guard let pid = target.sourcePID, let identity = try? TTYInputIdentity.capture(pid: pid),
+              identity.processStart == target.sourceStarted, identity.processGroup == identity.foregroundGroup,
+              identity.uid == getuid(), identity.effectiveUID == geteuid() else { return .agentMissing }
+        let environment = try TerminalKeyboard.Environment.live(sourcePID: pid)
+        return try TerminalKeyboard.deliver(target: target, expected: "", agent: agent, input: .init(kind: .escape, relay: true),
+            environment: environment, timeout: 0.8, allowActivation: false)
+    }
+
     public static let unavailableBeforeInputMessage = "Mac의 손쉬운 사용에서 AutoApprove의 직접 입력 권한을 허용해주세요."
     public static func deliver(target: ScreenTarget, agent: AgentKind, input: RemoteTerminalInput, screen: String = "",
                                environment: TerminalKeyboard.Environment? = nil,

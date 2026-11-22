@@ -183,6 +183,16 @@ private final class NativeProbe: @unchecked Sendable {
             try require(writes.count == changedIdentityRead-1,"Replaced app must receive no further activation writes")
         }
         checks.append("activation uses exact-PID Accessibility attributes without cooperative AppKit activation; errors and replacements stop immediately")
+        for selected in [true, false] {
+            let probe = NativeProbe()
+            probe.mutate { $0.frontmost = false; $0.window.selected = selected }
+            let delivery = try TerminalKeyboard.deliver(target: probe.target, expected: "", agent: .codex,
+                input: .init(kind: .escape, relay: true), environment: probe.environment, allowActivation: false)
+            try require(delivery == (selected ? .sent : .missingTarget), "Restart Escape must target only the selected tab")
+            try require(probe.read { $0.activations == 0 && $0.prepares == 0 && $0.pairs.map(\.key) == (selected ? [53] : []) },
+                "Restart Escape must never select a different tab or activate Terminal")
+        }
+        checks.append("restart Escape reaches only the exact selected tab without activation")
         let unicode = NativeProbe(), text = "한글 🧪 e\u{301} " + String(repeating: "a", count: 19) + "🧪" + String(repeating: "끝", count: 30)
         let unicodeInput = RemoteTerminalInput(kind: .characters, text: text, relay: true)
         try require(try TerminalKeyboard.deliver(target: unicode.target, expected: "screen", agent: .codex, input: unicodeInput, environment: unicode.environment) == .sent,

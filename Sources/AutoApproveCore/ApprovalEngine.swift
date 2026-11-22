@@ -273,10 +273,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public var groupStallNoticeAfter: TimeInterval = 600
     private var sessionRestartTasks: [String: Task<Void, Never>] = [:]
     /// Conversation IDs read the way session groups read them, once per restart request.
-    private var restartIdentityTask: Task<[String: String], Never>?
     /// Exiting a CLI, opening a tab and typing the resume command happen for one session at a time:
     /// Terminal opens one tab at a time, and parallel typing missed its input deadlines.
-    private var restartTerminalOwner: String?
+    private var restartTerminalOwners: [String: String] = [:]
     private var mcpInitializations: [String: (owner: String, at: Date)] = [:]
     /// How long a restarted CLI may take to accept input, and how long it must stay idle before the resume line is typed.
     public var restartResumeWait: TimeInterval = 90, restartResumeSettle: TimeInterval = 2
@@ -4033,10 +4032,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             items[items.count - 1].operation = operation
             sessionRestartTasks[id] = Task { [weak self] in await self?.runSessionRestart(id, operation: operation) }
         }
-        restartIdentityTask = Task { [weak self] in
-            guard let self, let live = try? await self.sessionGroupSessions() else { return [:] }
-            return Dictionary(live.compactMap { item in item.conversationID.map { (item.id, $0) } }, uniquingKeysWith: { first, _ in first })
-        }
         let progress = SessionRestartProgress(items: items, startedAt: now)
         snapshot.sessionRestart = progress
         return progress
@@ -4098,7 +4093,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let recovery = operation == .recoverMCP || operation == .restartForMCP
         let resume = operation == .resumeWork
         defer {
-            if restartTerminalOwner == id { restartTerminalOwner = nil }
+            restartTerminalOwners = restartTerminalOwners.filter { $0.value != id }
             if snapshot.sessionRestart?.items.contains(where: { $0.id == id && !$0.phase.isFinished }) == true {
                 updateRestart(id, .cancelled, "재시작 처리가 중단되었습니다.")
             }
@@ -4106,7 +4101,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         func fail(_ message: String) { updateRestart(id, .failed, message) }
         guard let original = sessions[id] else { return fail("세션을 찾지 못했습니다.") }
-        if operation == .recoverMCP && original.agent == .claude {
+        if operation == .recoverMCP && original.agent == .claude && ![.terminal, .iterm, .pty].contains(original.terminal) {
             let start = Date()
             updateRestart(id, .confirming, "Claude Code에서 AutoApprove MCP를 다시 연결하고 있습니다.")
             do {
@@ -4133,7 +4128,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if conversation == nil, let status = groupStatusIdentities[id], status.session.started == original.started, status.session.tty == original.tty {
             conversation = valid(status.conversationID)
         }
-        if conversation == nil { conversation = valid(await restartIdentityTask?.value[id]) }
+        if conversation == nil {
+            let observed = try? await readSessionGroupSessions(runtimeID: id, reconcile: false)
+            conversation = valid(observed?.first?.conversationID)
+        }
         let reader = processReader
         guard let records = try? await Task.detached(operation: { try reader() }).value,
               let process = records.first(where: { $0.key == id && $0.agent == original.agent }) else {
@@ -4189,9 +4187,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         } catch is CancellationError {return}
         catch {return fail(error.localizedDescription)}
         let codexHome = codexContext.flatMap { CodexGroupIdentity.home(environment: $0.environment) }
-        if recovery, original.agent == .codex, await codexMCPConnected(process, thread: conversation, home: codexHome) {
-            return updateRestart(id, .done, "현재 Codex 대화에서 AutoApprove MCP 연결을 확인했습니다.")
-        }
         var plan: SessionRestartCommand.Plan
         do { plan = try SessionRestartCommand.plan(agent: original.agent, executable: codexContext?.executable ?? executable, argv: Array(argv.dropFirst()), conversationID: conversation) }
         catch { return fail(error.localizedDescription) }
@@ -4199,14 +4194,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if !plan.arguments.contains(ClaudePromptBridge.plugin.path) { plan.arguments += ["--plugin-dir", ClaudePromptBridge.plugin.path] }
             environment[ClaudePromptBridge.key] = ClaudePromptBridge.channel(paths).path
         }
-        if restartTerminalOwner != nil {
-            updateRestart(id, .waiting, "앞선 탭에 재시작 명령을 전달한 뒤 이 CLI를 종료합니다.")
-        }
-        while restartTerminalOwner != nil {
-            guard !Task.isCancelled, !remoteInputStopped else { return }
-            try? await Task.sleep(for: .milliseconds(150))
-        }
-        restartTerminalOwner = id
         let settleUntil = Date().addingTimeInterval(5)
         while sendingMessages.contains(id) || automaticInputBusy(id) {
             guard !Task.isCancelled, !remoteInputStopped else { return }
@@ -4221,7 +4208,25 @@ private struct ScreenAnalysisStorageKey: Hashable {
         do {command=try codexContext.map{try $0.terminalInvocation(Array(plan.arguments.dropFirst())).map(HookInstaller.quote).joined(separator:" ")}
             ?? plan.command(cwd:nil,environment:environment)}
         catch {return fail(error.localizedDescription)}
-        // The PID must still be the same CLI and its shell must still be its ancestor before a signal is sent.
+        if process.isForeground {
+            let job = records.filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
+            let target = ScreenTarget(tty: original.tty, handle: original.screenHandle, jobPIDs: job, sourcePID: process.pid, sourceStarted: process.started)
+            updateRestart(id, .waiting, "원래 CLI에 Esc로 중단을 요청하고 같은 대화로 다시 시작합니다.")
+            _ = try? await Task.detached {
+                if host == .terminal {
+                    return try TerminalDeviceInput.restartEscape(target: target, agent: original.agent)
+                }
+                guard let frame = try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty }),
+                      try reader().contains(where: { $0.key == id && $0.tty == process.tty && $0.isForeground }) else { return TerminalDelivery.agentMissing }
+                return try adapter.input(target, frame.contents, original.agent, .init(kind: .escape))
+            }.value
+        }
+        let slot = host == .terminal ? "Terminal.app" : current.tty
+        while restartTerminalOwners[slot] != nil || restartTerminalOwners.count >= 2 {
+            guard !Task.isCancelled, !remoteInputStopped else { return }
+            try? await Task.sleep(for: .milliseconds(80))
+        }
+        restartTerminalOwners[slot] = id
         let terminate = processTerminator
         guard let fresh = try? await Task.detached(operation: { try reader() }).value,
               fresh.contains(where: { $0.pid == process.pid && $0.started == process.started && $0.agent == original.agent && $0.tty == process.tty }),
@@ -4249,6 +4254,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var reason = "원래 셸이 터미널의 포그라운드로 돌아오지 않았습니다."
         var lastReason = ""
 
+        var firstShellCheck = true
         while !sent {
             guard Date() < until else { return fail(reason + manual) }
             if lastReason != reason {
@@ -4256,7 +4262,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 lastReason = reason
             }
             guard !Task.isCancelled, !remoteInputStopped else { return }
-            try? await Task.sleep(for: .milliseconds(500))
+            if !firstShellCheck { try? await Task.sleep(for: .milliseconds(Date().timeIntervalSince(recoveryStarted) < 2 ? 150 : 500)) }
+            firstShellCheck = false
             guard let live = try? await Task.detached(operation: { try reader() }).value, context.verifiedShell(in: live) != nil else {
                 reason = "원래 셸이 터미널의 포그라운드로 돌아오지 않았습니다."
                 continue
@@ -4285,7 +4292,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             catch { return fail("다시 시작 명령을 입력하지 못했습니다: \(error.localizedDescription)." + manual) }
         }
-        restartTerminalOwner = nil
+        restartTerminalOwners.removeValue(forKey: slot)
         log(AuditEvent(sessionID: id, summary: "세션 다시 시작", outcome: "같은 대화 다시 열기 입력", source: host.title, context: AuditContext(session: current), request: command))
 
         // Find the new CLI on that terminal and carry the automatic approval choice over.

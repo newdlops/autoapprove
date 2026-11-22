@@ -201,7 +201,7 @@ public enum TerminalKeyboard {
     }
 
     public static func deliver(target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput,
-                               environment: Environment = .live, timeout: TimeInterval = 8, goalWorkingComparison: Bool = false) throws -> TerminalDelivery {
+                               environment: Environment = .live, timeout: TimeInterval = 8, goalWorkingComparison: Bool = false, allowActivation: Bool = true) throws -> TerminalDelivery {
         try input.validate()
         guard agent != .shell, timeout.isFinite, timeout > 0 else { throw RemoteHTTPError(400, "이 직접 입력 방식은 지원하지 않습니다.") }
         let deadline = environment.clock() + min(timeout, 8)
@@ -225,20 +225,14 @@ public enum TerminalKeyboard {
             let initialRecords = try environment.processes()
             guard let original = source(target, agent: agent, records: initialRecords) else { return .agentMissing }
             let window: TerminalWindowMetadata
-            // Live keys already bind the source lifetime, rather than a screen
-            // revision. A fresh selected-TTY query and exact focused window can
-            // prepare them without launching osascript for every keystroke.
-            // Changing focus/selection and revision-bound sends retain JXA.
-            if input.isRelay, ![.message,.choice].contains(input.kind), environment.frontmost(),
+            if input.isRelay, ![.message,.choice].contains(input.kind), (!allowActivation || environment.frontmost()),
                let current = try environment.metadata(target.tty), current.tty == target.tty,
                current.windowID > 0, current.ownerPID > 0, current.ownerBundleID == "com.apple.Terminal",
                current.selected, !current.minimized, environment.focused(current) {
                 window = current
                 RemoteTerminalPerformance.shared.increment(.nativeInputPreparations)
             } else {
-                // Wake the existing app before asking its scripting interface
-                // for windows. A background read can time out before JXA's
-                // later activate command ever runs.
+                guard allowActivation else { return .missingTarget }
                 try environment.activate()
                 try checkPermissionAndTime()
                 let current:TerminalWindowMetadata

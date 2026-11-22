@@ -184,13 +184,13 @@ extension ApprovalTests {
 
         terminal.status = "busy"
         if recoverMCP {
-            let result = engine.recoverMCPConnections([session.id, session.id, "missing"], restartCLI: true)
+            let result = engine.recoverMCPConnections([session.id, session.id, "missing"], restartCLI: false)
             try expectEqual(result.items.map(\.id), [session.id])
         } else { engine.restartSessions([session.id]) }
         let launched = try await waitForRestart(10) { !terminal.launched.isEmpty }
         try expect(launched, "The resume command must be typed into the original shell: \(engine.snapshot.sessionRestart?.items.first?.message ?? "")")
         try expectEqual(terminal.terminated, 1, "The CLI is ended with one signal")
-        try expect(terminal.typed.isEmpty, "Ending the CLI types nothing into the terminal")
+        try expectEqual(terminal.typed, ["\u{1b}"], "Send exactly one Escape before restarting")
         try expectEqual(terminal.launched.count, 1)
         let command = terminal.launched[0]
         try expect(command.hasPrefix("env 'AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE="))
@@ -222,7 +222,7 @@ extension ApprovalTests {
         try expect(engine.snapshot.sessionRestart == nil)
     }
 
-    @MainActor func testMultipleRestartsWaitForThePreviousShellLaunch() async throws {
+    @MainActor func testMultipleRestartsLaunchIndependentShells() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let terminals = [0, 1].map { index -> RestartTerminal in
@@ -247,13 +247,13 @@ extension ApprovalTests {
             })
         }, approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, restart: { target, expected, command in
             terminals[target.tty.hasSuffix("0") ? 0 : 1].restart(target, expected: expected, command: command)
-        }, input: { _,_,_,_ in .missingTarget })
+        }, input: { target,_,_,input in terminals[target.tty.hasSuffix("0") ? 0 : 1].send(target, input) })
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { terminals.flatMap(\.records) }, screenAdapters: [.iterm: adapter])
         defer { engine.stop() }
         engine.processArgumentsReader = { _ in ["/fixture/claude"] }
         engine.processTerminator = { record in
             let i = record.tty.hasSuffix("0") ? 0 : 1
-            if terminals[1-i].terminated > 0 && terminals[1-i].launched.isEmpty { return false }
+            if terminals[i].typed != ["\u{1b}"] { return false }
             return terminals[i].terminate(record)
         }
         engine.updateDiscovery(sessions, records: records)
