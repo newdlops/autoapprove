@@ -3308,7 +3308,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw AppError.message("현재 그룹 구성원의 대화 연결과 AutoApprove 실행 상태를 확인해주세요.")
         }
         let box = try groupMailbox()
-        let (request, fresh) = try box.requestPriorityReplies(group: groupID, member: memberID, conversation: conversation)
+        let (request, fresh) = try box.requestPriorityReplies(group: groupID, member: memberID, conversation: conversation, senders: group.members.map(\.id))
         defer { scheduleGroupMailboxDelivery() }
         guard fresh else { return "이미 이 구성원에게 우선 회신을 요청했습니다." }
         guard session.phase == .working || live.claudeRegisteredStatus == "busy" else {
@@ -3329,7 +3329,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                       !self.nativeUserInputHasPriority(live.id),
                       try SessionGroupStore(directory: self.paths.directory).load().first(where: { $0.id == groupID })?.members.contains(member) == true,
                       try box.message(request.id)?.acknowledgedAt == nil,
-                      try !box.pendingReplies(group: groupID, member: memberID, limit: 1).isEmpty else {
+                      try !box.pendingReplies(group: groupID, member: memberID, senders: group.members.map(\.id), limit: 1).isEmpty else {
                     throw AppError.message("대상 세션 또는 입력 상태가 바뀌었습니다.")
                 }
             }, authorizationSource: "미응답 질문 우선 회신", backgroundOnly: true)
@@ -3470,7 +3470,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         self.publish()
                     }
                     let questions = try box.outstandingQuestions()
-                    let hasDelivery = try box.hasNotificationWork || box.hasPendingReceipts || !questions.isEmpty
+                    let hasDelivery = try box.hasNotificationWork || box.hasPendingReceipts || box.hasAbsentSenders || !questions.isEmpty
                     guard hasDelivery || expiration != nil else { self.groupMailboxTask = nil; return }
                     if !hasDelivery, let expiration { delay = max(0.1, expiration.timeIntervalSinceNow) }
                     if !self.snapshot.paused, Date().timeIntervalSince(self.groupRecoveryAt) >= 5, !questions.isEmpty {
@@ -3491,8 +3491,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let reader = groupTranscriptReader
         let destinations = Dictionary(grouping: questions, by: \.recipientID)
         for group in groups {
+            let members = Set(group.members.map(\.id))
             for member in group.members {
-                guard let pending = destinations[member.id]?.filter({ $0.groupID == group.id }), !pending.isEmpty,
+                guard let pending = destinations[member.id]?.filter({ $0.groupID == group.id && members.contains($0.senderID) }), !pending.isEmpty,
                       let candidate = SessionGroupMatching.match(member, in: live),
                       let conversation = candidate.conversationID else { continue }
                 if candidate.session.agent == .claude {
@@ -3596,14 +3597,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return [.working, .approval, .input].contains(session.phase) || session.pendingInTerminal
     }
 
-    /// A recipient that left its group can never be matched to a terminal, so its messages used to be
-    /// retried forever. They are parked instead: kept in the mailbox, out of the delivery queue, and the
-    /// result is reported once to the sender, or to a leader when the sender left too.
     private func parkMessagesForRemovedMembers() {
-        // An empty store is not taken as proof that every group was deleted.
         guard let box = try? groupMailbox(), let groups = try? SessionGroupStore(directory: paths.directory).load(),
               !groups.isEmpty else { return }
         let members = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, Set($0.members.map(\.id))) })
+        for (groupID, memberIDs) in members { try? box.reconcileSenders(group: groupID, members: memberIDs) }
         guard let orphaned = try? box.queuedForMissingRecipients(members: members), !orphaned.isEmpty else { return }
         for message in orphaned {
             let group = groups.first { $0.id == message.groupID }
@@ -3757,18 +3755,23 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func sendGroupMailboxNotice(_ message: SessionGroupMessage, observed: [SessionGroupLiveSession],
                                         manualQuestion: Bool = false) async throws {
         guard !groupClearActive(message.groupID) else { throw RemoteHTTPError(409, "그룹 초기화 중이어서 메시지를 수신함에 보관합니다.", diagnostics: ["delivery": "not_started"]) }
-        guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == message.groupID }),
-              group.members.contains(where: { $0.id == message.senderID }),
-              let recipient = group.members.first(where: { $0.id == message.recipientID }),
-              let live = SessionGroupMatching.match(recipient, in: observed),
-              Self.canAddressGroupMember(recipient, live: live),
+        guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == message.groupID }) else {
+            throw RemoteHTTPError(409, "메시지의 원래 그룹이 없습니다.", diagnostics: ["delivery": "not_started"])
+        }
+        guard group.members.contains(where: { $0.id == message.senderID }) else {
+            throw RemoteHTTPError(409, "보낸 구성원이 그룹에 없어 전달을 보류했습니다.", diagnostics: ["delivery": "not_started"])
+        }
+        guard let recipient = group.members.first(where: { $0.id == message.recipientID }) else {
+            throw RemoteHTTPError(409, "받을 구성원이 그룹에 없어 전달을 보류했습니다.", diagnostics: ["delivery": "not_started"])
+        }
+        guard let live = SessionGroupMatching.match(recipient, in: observed), Self.canAddressGroupMember(recipient, live: live),
               let current = sessions[live.id] else {
-            throw RemoteHTTPError(409, "원래 그룹 구성원과 현재 터미널을 확인하지 못해 메시지를 보관하고 있습니다.", diagnostics: ["delivery": "not_started"])
+            throw RemoteHTTPError(409, "수신 구성원의 대화 ID와 현재 터미널 연결을 확인하지 못했습니다.", diagnostics: ["delivery": "not_started"])
         }
         if let key = message.sourceKey, key.hasPrefix(SessionGroupMailbox.priorityPrefix),
            let original = key.dropFirst(SessionGroupMailbox.priorityPrefix.count).split(separator: ":").first,
            try live.conversationID.flatMap(UUID.init(uuidString:)) != UUID(uuidString: String(original)) ||
-            groupMailbox().pendingReplies(group: group.id, member: recipient.id, limit: 1).isEmpty {
+            groupMailbox().pendingReplies(group: group.id, member: recipient.id, senders: group.members.map(\.id), limit: 1).isEmpty {
             try groupMailbox().noteAttempt(message.id, result: "superseded", retryAt: Date())
             throw RemoteHTTPError(409, "우선 회신을 요청한 대화가 교체되었습니다.", diagnostics: ["delivery": "not_started"])
         }
@@ -4820,7 +4823,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return try await groupWaitAction(tool, object: object)
         case "get_group_messages", "ack_group_messages":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)) else { throw RemoteHTTPError(400, "그룹 ID를 지정해주세요.") }
-            let (_, caller) = try await groupMailboxCaller(object, groupID: groupID)
+            let (group, caller) = try await groupMailboxCaller(object, groupID: groupID)
             if tool == "ack_group_messages" {
                 guard let strings = object["messageIDs"] as? [String] else { throw RemoteHTTPError(400, "수신 확인할 messageIDs를 지정해주세요.") }
                 let ids = strings.compactMap(UUID.init(uuidString:))
@@ -4849,7 +4852,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             let unanswered = try GroupWaitRequest.flag(object, "unansweredOnly")
             guard !unanswered || direction == "inbox" else { throw RemoteHTTPError(400, "미응답 질문은 수신함에서 조회해주세요.") }
-            let messages = try unanswered ? groupMailbox().pendingReplies(group: groupID, member: caller.id, after: after, limit: limit + 1) : groupMailbox().list(groupID: groupID, memberID: caller.id, outbox: direction == "outbox",
+            let messages = try unanswered ? groupMailbox().pendingReplies(group: groupID, member: caller.id, senders: group.members.map(\.id), after: after, limit: limit + 1) : groupMailbox().list(groupID: groupID, memberID: caller.id, outbox: direction == "outbox",
                 includeAcknowledged: object["includeAcknowledged"] as? Bool == true, after: after, limit: limit + 1)
             let page = Array(messages.prefix(limit))
             return ["groupID": groupID.uuidString, "memberID": caller.id.uuidString, "messages": page.map(\.json),

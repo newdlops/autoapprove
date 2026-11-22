@@ -238,6 +238,26 @@ public final class SessionGroupMailbox {
     public func message(sourceKey: String) throws -> SessionGroupMessage? { try rows("WHERE source_key=?", [sourceKey]).first }
     private static let pendingFilter = "acknowledged IS NULL AND last_result IS NOT 'answered' AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'"
 
+    var hasAbsentSenders: Bool { get throws {
+        try scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE acknowledged IS NULL AND last_result='sender_absent')") != 0
+    } }
+
+    package func reconcileSenders(group: UUID, members: Set<UUID>) throws {
+        let ids = String(decoding: try JSONEncoder().encode(members), as: UTF8.self)
+        try transaction {
+            try update("""
+                UPDATE messages SET last_result='sender_absent',last_error='보낸 구성원이 그룹에 없어 전달을 보류했습니다.'
+                WHERE group_id=? AND acknowledged IS NULL AND (last_result IS NULL OR last_result IN ('not_started','redeliver'))
+                  AND sender_id NOT IN (SELECT value FROM json_each(?)) AND recipient_id IN (SELECT value FROM json_each(?))
+                """, [group.uuidString, ids, ids])
+            try update("""
+                UPDATE messages SET last_result=NULL,last_error=NULL,next_attempt=0
+                WHERE group_id=? AND acknowledged IS NULL AND last_result='sender_absent'
+                  AND sender_id IN (SELECT value FROM json_each(?)) AND recipient_id IN (SELECT value FROM json_each(?))
+                """, [group.uuidString, ids, ids])
+        }
+    }
+
     public var pendingCount: Int { get throws { try scalar("SELECT count(*) FROM messages WHERE " + Self.pendingFilter) } }
 
     package func nextExpiration(ttl: TimeInterval) throws -> Date? {
@@ -402,7 +422,7 @@ public final class SessionGroupMailbox {
     private static let notificationFilter = """
         m.acknowledged IS NULL
         AND (m.last_result IS NULL OR m.last_result NOT IN
-            ('answered','superseded','expired','direct_attempting','direct_submitted','direct_unknown','late','batched','undelivered'))
+            ('sender_absent','answered','superseded','expired','direct_attempting','direct_submitted','direct_unknown','late','batched','undelivered'))
         AND NOT EXISTS (
             SELECT 1 FROM group_waits w
             WHERE w.group_id=m.group_id AND w.state IN ('waiting','ready','expired')
@@ -520,9 +540,9 @@ public final class SessionGroupMailbox {
             """)
     }
 
-    package func pendingReplies(group: UUID, member: UUID, after: Int64 = 0, limit: Int = 51) throws -> [SessionGroupMessage] {
+    package func pendingReplies(group: UUID, member: UUID, senders: [UUID], after: Int64 = 0, limit: Int = 51) throws -> [SessionGroupMessage] {
         try rows("""
-            WHERE group_id=? AND recipient_id=? AND sequence>? AND kind='question'
+            WHERE group_id=? AND recipient_id=? AND sequence>? AND kind='question' AND sender_id IN (SELECT value FROM json_each(?))
               AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'
               AND NOT EXISTS(SELECT 1 FROM messages a WHERE a.source_key='answer:' || messages.id)
               AND NOT EXISTS(SELECT 1 FROM group_waits w WHERE w.group_id=messages.group_id
@@ -532,14 +552,14 @@ public final class SessionGroupMailbox {
                    OR EXISTS(SELECT 1 FROM group_waits w,json_each(w.request,'$.questions') q
                        WHERE w.group_id=messages.group_id AND w.state='waiting' AND q.value=messages.id))
             ORDER BY sequence LIMIT ?
-            """, [group.uuidString, member.uuidString, String(after), String(limit)])
+            """, [group.uuidString, member.uuidString, String(after), String(decoding: try JSONEncoder().encode(senders), as: UTF8.self), String(limit)])
     }
 
     static let priorityPrefix = "userButton:questionPriority:"
 
-    func requestPriorityReplies(group: UUID, member: UUID, conversation: UUID) throws -> (SessionGroupMessage, Bool) {
+    func requestPriorityReplies(group: UUID, member: UUID, conversation: UUID, senders: [UUID]) throws -> (SessionGroupMessage, Bool) {
         try transaction {
-            let questions = try pendingReplies(group: group, member: member, limit: -1)
+            let questions = try pendingReplies(group: group, member: member, senders: senders, limit: -1)
             guard let last = questions.last else { throw AppError.message("지금 회신할 미응답 질문이 없습니다.") }
             let prefix = Self.priorityPrefix + conversation.uuidString + ":"
             if let previous = try rows("WHERE group_id=? AND recipient_id=? AND source_key LIKE ? AND " + Self.pendingFilter + " ORDER BY sequence DESC LIMIT 1",
@@ -563,7 +583,7 @@ public final class SessionGroupMailbox {
                   try message(sourceKey: "followup:" + question.id.uuidString) == nil,
                   try scalar("""
                     SELECT EXISTS(SELECT 1 FROM messages WHERE group_id=? AND recipient_id=?
-                        AND source_key LIKE 'followup:%' AND (created>? OR (\(Self.pendingFilter))))
+                        AND source_key LIKE 'followup:%' AND last_result IS NOT 'sender_absent' AND (created>? OR (\(Self.pendingFilter))))
                     """, [question.groupID.uuidString, question.recipientID.uuidString, String(cutoff.timeIntervalSince1970)]) == 0 else { return false }
             _ = try insertMessage(id: nil, groupID: question.groupID, senderID: question.senderID,
                 recipientID: question.recipientID, kind: .notice,

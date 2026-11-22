@@ -259,7 +259,7 @@ extension ApprovalTests {
             _ = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "reply_group_question", "sessionID": sessions[1].id,
                 "groupID": group.id.uuidString, "memberID": members[0].id.uuidString, "inReplyTo": item.id.uuidString, "text": "fixture reply"])
         }
-        try expect(try box.pendingReplies(group: group.id, member: members[1].id).isEmpty)
+        try expect(try box.pendingReplies(group: group.id, member: members[1].id, senders: members.map(\.id)).isEmpty)
         try expectEqual(try box.conversations(groupID: group.id).conversations.filter { $0.answer != nil }.count, 2)
 
 

@@ -188,13 +188,25 @@ extension ApprovalTests {
         try expect(!(try reopened.remindIfDue(second, before: Date())))
         let followup = try reopened.message(sourceKey: "followup:" + question.id.uuidString)
         guard let followup else { throw AppError.message("Missing question follow-up") }
+        try reopened.noteAttempt(followup.id, result: "not_started", retryAt: .distantFuture)
+        let currentSender = UUID()
+        let next = try reopened.enqueue(groupID: group, senderID: currentSender, recipientID: recipient, kind: .question, text: "queued behind reminder")
+        try reopened.reconcileSenders(group: group, members: [currentSender, recipient])
+        try expectEqual(try reopened.message(followup.id)?.lastResult, "sender_absent")
+        try expectNil(try reopened.message(followup.id)?.acknowledgedAt)
+        try expectEqual(try reopened.heads().first { $0.recipientID == recipient }?.id, next.id)
+        try expectEqual(try reopened.pendingReplies(group: group, member: recipient, senders: [currentSender]).map(\.id), [next.id])
+        try reopened.acknowledge([next.id], groupID: group, recipientID: recipient)
+        try expect(try reopened.remindIfDue(next, before: Date()))
+        try reopened.reconcileSenders(group: group, members: [currentSender, sender, recipient])
+        try expectNil(try reopened.message(followup.id)?.lastResult)
         let retryPrompt = "[AutoApprove 그룹 전달 " + followup.id.uuidString + "] follow up"
         try addSubmission(id: followup.id, prompt: retryPrompt)
         hook("UserPromptSubmit", conversation: conversation, field: "prompt", value: retryPrompt)
         hook("Stop", conversation: conversation, field: "last_assistant_message", value: "Recovered answer")
         let resolved = try reopened.conversations(groupID: group).conversations
         try expectEqual(resolved.first { $0.id == question.id }?.answer?.text, "Recovered answer")
-        try expectEqual(resolved.filter { $0.answer == nil }.count, 0)
+        try expectEqual(resolved.filter { $0.answer == nil }.map(\.id), [next.id])
         try expectEqual(try reopened.inboxOperations(groupID: group)[recipient]?.unacknowledgedCount, 0)
     }
 
