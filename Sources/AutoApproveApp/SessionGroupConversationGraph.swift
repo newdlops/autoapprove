@@ -15,6 +15,7 @@ import AutoApproveCore
     @State private var replyTarget: SessionGroupConversation?
     @State private var deliveryTarget: SessionGroupConversation?
     @State private var deliveringQuestion: UUID?
+    @State private var prioritizing: Set<UUID> = []
     @State private var deliveryFeedback: String?
     @State private var alert: GraphAlert?
     @State private var requestingNicknames = false
@@ -346,6 +347,22 @@ import AutoApproveCore
                     if let role = node.role {
                         Text("역할: " + role).font(.callout).lineLimit(3).padding(.top, 2).help(role)
                     }
+                    Button {
+                        guard prioritizing.insert(id).inserted else { return }
+                        Task {
+                            defer { prioritizing.remove(id); model.reload() }
+                            do { deliveryFeedback = try await engine.prioritizeSessionGroupReplies(groupID: groupID, memberID: id) }
+                            catch { alert = GraphAlert(title: "우선 회신을 요청할 수 없습니다", message: error.localizedDescription) }
+                        }
+                    } label: {
+                        Label(prioritizing.contains(id) ? "우선 회신 요청 중…" : "미응답 질문 먼저 회신", systemImage: "arrowshape.turn.up.left")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(prioritizing.contains(id) || (!content.page.hasMore && !conversations.contains {
+                        $0.question.recipientID == id && $0.answer == nil && !$0.waitExpired
+                    }))
+                    .help("이 구성원의 작업을 보류하고 오래된 질문부터 답한 뒤 원래 작업을 이어가도록 요청합니다.")
                     Button("이 구성원 이름 다시 정하기") { requestNicknames([node.id]) }
                         .buttonStyle(.bordered)
                         .controlSize(.small)

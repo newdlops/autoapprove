@@ -3289,6 +3289,46 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return answer.id
     }
 
+    public func prioritizeSessionGroupReplies(groupID: UUID, memberID: UUID) async throws -> String {
+        guard !remoteInputStopped, !snapshot.paused, !groupClearActive(groupID),
+              let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
+              let member = group.members.first(where: { $0.id == memberID }),
+              let conversation = UUID(uuidString: member.conversationID),
+              let live = SessionGroupMatching.match(member, in: try await sessionGroupSessions()),
+              live.conversationID.flatMap(UUID.init(uuidString:)) == conversation,
+              let session = sessions[live.id], session.phase != .ended else {
+            throw AppError.message("현재 그룹 구성원의 대화 연결과 AutoApprove 실행 상태를 확인해주세요.")
+        }
+        let box = try groupMailbox()
+        let (request, fresh) = try box.requestPriorityReplies(group: groupID, member: memberID, conversation: conversation)
+        defer { scheduleGroupMailboxDelivery() }
+        guard fresh else { return "이미 이 구성원에게 우선 회신을 요청했습니다." }
+        guard session.phase == .working || live.claudeRegisteredStatus == "busy" else {
+            return "우선 회신을 예약했습니다. 입력할 수 있게 되면 오래된 질문부터 처리합니다."
+        }
+        do {
+            let frame = try await remoteTerminal(sessionID: live.id, realtime: true, textOnly: true)
+            guard !(await userInputHasPriority(live.id, backgroundOnly: true)), !session.pendingInTerminal, frame.inputReason == nil,
+                  !RemoteMessageReadiness.hasMenu(frame.screen, agent: session.agent),
+                  ActivityDetector.nonemptyTail(frame.screen).suffix(8).contains(where: {
+                      $0.localizedCaseInsensitiveContains("esc to interrupt") || $0.localizedCaseInsensitiveContains("esc to cancel")
+                  }) else { return "우선 회신을 예약했습니다. 현재 턴의 중단 키를 확인할 수 있어야 작업을 멈출 수 있습니다." }
+            _ = try await remoteInput(["sessionID": live.id, "revision": frame.revision, "kind": "escape"], automaticAuthorization: {
+                guard !self.snapshot.paused, !self.groupClearActive(groupID),
+                      let now = self.sessions[live.id], now.started == session.started, now.tty == session.tty,
+                      ![.input, .approval, .ended].contains(now.phase), !now.pendingInTerminal,
+                      !self.codexAccountInputHeld(live.id), !self.changingGoals.contains(live.id),
+                      !self.nativeUserInputHasPriority(live.id),
+                      try SessionGroupStore(directory: self.paths.directory).load().first(where: { $0.id == groupID })?.members.contains(member) == true,
+                      try box.message(request.id)?.acknowledgedAt == nil,
+                      try !box.pendingReplies(group: groupID, member: memberID, limit: 1).isEmpty else {
+                    throw AppError.message("대상 세션 또는 입력 상태가 바뀌었습니다.")
+                }
+            }, authorizationSource: "미응답 질문 우선 회신", backgroundOnly: true)
+            return "작업 중단을 요청했습니다. 입력 대기가 확인되면 미응답 질문부터 처리합니다."
+        } catch { return "우선 회신은 예약했습니다. 작업 중단을 확인하지 못했습니다. " + error.localizedDescription }
+    }
+
     /// One operator-initiated terminal attempt using the original question and receipt ID.
     public func deliverSessionGroupQuestion(groupID: UUID, questionID: UUID) async throws {
         guard !snapshot.paused, !remoteInputStopped else {
@@ -3518,13 +3558,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             } catch {
                 let result = (error as? RemoteHTTPError)?.diagnostics?["delivery"] ?? "unknown"
                 if result == "not_started" {
-                    // Nothing was typed, so this try does not count toward the parking limit. A recipient
-                    // that is working or waiting for an answer wakes the loop itself when it turns idle,
-                    // so the timer is only a fallback for a missed event. Other holds (a draft in the
-                    // composer, an unreadable screen) have no event and keep the short backoff.
                     let backoff = recipientWakesLoop(message, observed: observed) ? groupMailboxHeldFallback
                         : min(groupMailboxReminderInterval, max(groupMailboxPollInterval, Double(message.attempts + 1) * 5))
-                    try groupMailbox().noteAttempt(message.id, result: result, error: error.localizedDescription, retryAt: Date().addingTimeInterval(backoff), increment: -1)
+                    let retryDelay = message.sourceKey?.hasPrefix(SessionGroupMailbox.priorityPrefix) == true ? min(backoff, groupMailboxPollInterval) : backoff
+                    try groupMailbox().noteAttempt(message.id, result: result, error: error.localizedDescription, retryAt: Date().addingTimeInterval(retryDelay), increment: -1)
                 } else {
                     try groupMailbox().noteAttempt(message.id, result: "direct_unknown", error: error.localizedDescription, retryAt: receiptDue)
                 }
@@ -3719,6 +3756,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
               Self.canAddressGroupMember(recipient, live: live),
               let current = sessions[live.id] else {
             throw RemoteHTTPError(409, "원래 그룹 구성원과 현재 터미널을 확인하지 못해 메시지를 보관하고 있습니다.", diagnostics: ["delivery": "not_started"])
+        }
+        if let key = message.sourceKey, key.hasPrefix(SessionGroupMailbox.priorityPrefix),
+           let original = key.dropFirst(SessionGroupMailbox.priorityPrefix.count).split(separator: ":").first,
+           try live.conversationID.flatMap(UUID.init(uuidString:)) != UUID(uuidString: String(original)) ||
+            groupMailbox().pendingReplies(group: group.id, member: recipient.id, limit: 1).isEmpty {
+            try groupMailbox().noteAttempt(message.id, result: "superseded", retryAt: Date())
+            throw RemoteHTTPError(409, "우선 회신을 요청한 대화가 교체되었습니다.", diagnostics: ["delivery": "not_started"])
         }
         func ready() throws {
             guard try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == group.id }) == group,
@@ -4795,7 +4839,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                       (direction == "outbox" ? message.senderID : message.recipientID) == caller.id else { throw RemoteHTTPError(404, "자기 수신함·발신함에 해당 메시지가 없습니다.") }
                 return ["messages": [message.json], "hasMore": false, "direction": direction, "groupID": groupID.uuidString]
             }
-            let messages = try groupMailbox().list(groupID: groupID, memberID: caller.id, outbox: direction == "outbox",
+            let unanswered = try GroupWaitRequest.flag(object, "unansweredOnly")
+            guard !unanswered || direction == "inbox" else { throw RemoteHTTPError(400, "미응답 질문은 수신함에서 조회해주세요.") }
+            let messages = try unanswered ? groupMailbox().pendingReplies(group: groupID, member: caller.id, after: after, limit: limit + 1) : groupMailbox().list(groupID: groupID, memberID: caller.id, outbox: direction == "outbox",
                 includeAcknowledged: object["includeAcknowledged"] as? Bool == true, after: after, limit: limit + 1)
             let page = Array(messages.prefix(limit))
             return ["groupID": groupID.uuidString, "memberID": caller.id.uuidString, "messages": page.map(\.json),

@@ -414,7 +414,7 @@ public final class SessionGroupMailbox {
         )
         """
 
-    private static let notificationOrder = "CASE WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 0 ELSE 1 END,m.sequence"
+    private static let notificationOrder = "CASE WHEN m.source_key LIKE 'userButton:questionPriority:%' THEN -1 WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 0 ELSE 1 END,m.sequence"
 
     public struct InboxOperation: Equatable, Sendable {
         public let unacknowledgedCount: Int
@@ -518,6 +518,40 @@ public final class SessionGroupMailbox {
               AND NOT EXISTS(SELECT 1 FROM messages answer WHERE answer.source_key='answer:' || messages.id)
             ORDER BY sequence
             """)
+    }
+
+    package func pendingReplies(group: UUID, member: UUID, after: Int64 = 0, limit: Int = 51) throws -> [SessionGroupMessage] {
+        try rows("""
+            WHERE group_id=? AND recipient_id=? AND sequence>? AND kind='question'
+              AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'
+              AND NOT EXISTS(SELECT 1 FROM messages a WHERE a.source_key='answer:' || messages.id)
+              AND NOT EXISTS(SELECT 1 FROM group_waits w WHERE w.group_id=messages.group_id
+                  AND json_extract(w.request,'$.decision')=messages.id AND w.state IN ('waiting','ready','expired'))
+              AND (NOT EXISTS(SELECT 1 FROM group_waits w,json_each(w.request,'$.questions') q
+                       WHERE w.group_id=messages.group_id AND w.state='expired' AND q.value=messages.id)
+                   OR EXISTS(SELECT 1 FROM group_waits w,json_each(w.request,'$.questions') q
+                       WHERE w.group_id=messages.group_id AND w.state='waiting' AND q.value=messages.id))
+            ORDER BY sequence LIMIT ?
+            """, [group.uuidString, member.uuidString, String(after), String(limit)])
+    }
+
+    static let priorityPrefix = "userButton:questionPriority:"
+
+    func requestPriorityReplies(group: UUID, member: UUID, conversation: UUID) throws -> (SessionGroupMessage, Bool) {
+        try transaction {
+            let questions = try pendingReplies(group: group, member: member, limit: -1)
+            guard let last = questions.last else { throw AppError.message("지금 회신할 미응답 질문이 없습니다.") }
+            let prefix = Self.priorityPrefix + conversation.uuidString + ":"
+            if let previous = try rows("WHERE group_id=? AND recipient_id=? AND source_key LIKE ? AND " + Self.pendingFilter + " ORDER BY sequence DESC LIMIT 1",
+                [group.uuidString, member.uuidString, prefix + "%"]).first { return (previous, false) }
+            let text = "진행 중인 작업과 진행 지점을 보존하고 잠시 보류해 줘. 그룹 " + group.uuidString +
+                "에서 get_group_messages(groupID, unansweredOnly: true)로 받은 질문을 오래된 순서대로 확인해 줘. " +
+                "sequence " + String(last.sequence) + "까지 각 질문의 senderMemberID에 reply_group_question으로 답하고 inReplyTo에 원래 messageID를 지정해 줘. " +
+                "hasMore이면 nextAfterSequence로 다음 페이지를 읽어 줘. 답변을 마치면 이 대화에서 보류했던 작업을 이어서 진행해 줘."
+            let message = try insertMessage(id: nil, groupID: group, senderID: member, recipientID: member, kind: .notice,
+                text: text, sourceKey: prefix + UUID().uuidString)
+            return (message, true)
+        }
     }
 
     package func remindIfDue(_ question: SessionGroupMessage, before cutoff: Date) throws -> Bool {

@@ -213,7 +213,7 @@ extension ApprovalTests {
         let rule = String(repeating: "─", count: 30)
         for session in sessions { writer.show("answer\n\(rule)\n❯ \n\(rule)\nuser@host project (main) | fixture status line", on: session.tty) }
         var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: writer.screen($0.tty)) }) },
-            approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { _,_,_,_ in .missingTarget })
+            approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in writer.send(target, input) })
         adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.iterm: adapter], isolateByDefault: true)
         defer { engine.stop() }
@@ -236,6 +236,33 @@ extension ApprovalTests {
                                "agentPID": records[0].pid, "agentStarted": records[0].started, "prompt": typed])
         try expectEqual(try box.message(request.id)?.lastResult, "observed", "The observed prompt is the receipt, so it is never typed again")
         try expectEqual(terminal.typed.count, 1)
+        let question = try box.enqueue(groupID: group.id, senderID: members[0].id, recipientID: members[1].id,
+                                       kind: .question, text: "first pending question")
+        let later = try box.enqueue(groupID: group.id, senderID: members[0].id, recipientID: members[1].id,
+                                    kind: .question, text: "second pending question")
+        try box.acknowledge([question.id], groupID: group.id, recipientID: members[1].id)
+        terminal.setStatus(records[1].pid, "busy")
+        writer.show("Working… (esc to interrupt)\n❯ ", on: sessions[1].tty)
+        let feedback = try await engine.prioritizeSessionGroupReplies(groupID: group.id, memberID: members[1].id)
+        try expect(feedback.contains("작업 중단을 요청"), feedback)
+        try expectEqual(writer.writes(to: sessions[1].tty), ["\u{1b}"])
+        _ = try await engine.prioritizeSessionGroupReplies(groupID: group.id, memberID: members[1].id)
+        try expectEqual(writer.writes(to: sessions[1].tty).count, 1)
+        let list = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "get_group_messages", "sessionID": sessions[1].id,
+            "groupID": group.id.uuidString, "unansweredOnly": true])
+        try expectEqual((list["messages"] as? [JSONObject])?.compactMap { $0["messageID"] as? String }, [question.id.uuidString, later.id.uuidString])
+        terminal.setStatus(records[1].pid, "idle")
+        writer.show("done\n" + rule + "\n❯ \n" + rule + "\nfixture status", on: sessions[1].tty)
+        engine.updateDiscovery(sessions, records: records); await engine.refreshScreens()
+        try expect(try await waitForGroup(12) { terminal.typed.contains { $0.contains("unansweredOnly") && $0.contains("이어서 진행") } })
+        for item in [question, later] {
+            _ = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "reply_group_question", "sessionID": sessions[1].id,
+                "groupID": group.id.uuidString, "memberID": members[0].id.uuidString, "inReplyTo": item.id.uuidString, "text": "fixture reply"])
+        }
+        try expect(try box.pendingReplies(group: group.id, member: members[1].id).isEmpty)
+        try expectEqual(try box.conversations(groupID: group.id).conversations.filter { $0.answer != nil }.count, 2)
+
+
     }
 
     func testSessionGroupTerminalStatusRequiresFreshCard() throws {
