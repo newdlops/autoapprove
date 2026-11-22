@@ -192,16 +192,23 @@ extension ApprovalTests {
         let currentSender = UUID()
         let next = try reopened.enqueue(groupID: group, senderID: currentSender, recipientID: recipient, kind: .question, text: "queued behind reminder")
         try reopened.reconcileSenders(group: group, members: [currentSender, recipient])
-        try expectEqual(try reopened.message(followup.id)?.lastResult, "sender_absent")
+        try expectEqual(try reopened.message(followup.id)?.lastResult, "superseded")
         try expectNil(try reopened.message(followup.id)?.acknowledgedAt)
         try expectEqual(try reopened.heads().first { $0.recipientID == recipient }?.id, next.id)
         try expectEqual(try reopened.pendingReplies(group: group, member: recipient, senders: [currentSender]).map(\.id), [next.id])
         try reopened.acknowledge([next.id], groupID: group, recipientID: recipient)
         try expect(try reopened.remindIfDue(next, before: Date()))
         try reopened.reconcileSenders(group: group, members: [currentSender, sender, recipient])
-        try expectNil(try reopened.message(followup.id)?.lastResult)
-        let retryPrompt = "[AutoApprove 그룹 전달 " + followup.id.uuidString + "] follow up"
-        try addSubmission(id: followup.id, prompt: retryPrompt)
+        try expectNil(try reopened.message(sourceKey: "followup:" + question.id.uuidString))
+        let stale = try reopened.enqueue(groupID: group, senderID: sender, recipientID: sender, kind: .notice, text: "delay", sourceKey: "stalled:" + second.id.uuidString)
+        try reopened.reconcileSenders(group: group, members: [currentSender, sender, recipient])
+        try expectEqual(try reopened.message(stale.id)?.lastResult, "superseded")
+        let nextReminder = try reopened.message(sourceKey: "followup:" + next.id.uuidString)
+        if let nextReminder { try reopened.acknowledge([nextReminder.id], groupID: group, recipientID: recipient) }
+        try expect(try reopened.remindIfDue(question, before: Date()))
+        guard let renewed = try reopened.message(sourceKey: "followup:" + question.id.uuidString) else { throw AppError.message("Missing renewed reminder") }
+        let retryPrompt = "[AutoApprove 그룹 전달 " + renewed.id.uuidString + "] follow up"
+        try addSubmission(id: renewed.id, prompt: retryPrompt)
         hook("UserPromptSubmit", conversation: conversation, field: "prompt", value: retryPrompt)
         hook("Stop", conversation: conversation, field: "last_assistant_message", value: "Recovered answer")
         let resolved = try reopened.conversations(groupID: group).conversations

@@ -3790,16 +3790,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try groupMailbox().noteAttempt(message.id, result: "superseded", retryAt: Date())
             throw RemoteHTTPError(409, "우선 회신을 요청한 대화가 교체되었습니다.", diagnostics: ["delivery": "not_started"])
         }
-        func ready() throws {
-            guard try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == group.id }) == group,
-                  let now = sessions[current.id], !snapshot.paused, !remoteInputStopped,
-                  !automaticInputBusy(current.id), !userInputHasPriority(current.id),
-                  ![.approval, .input, .ended].contains(now.phase), !now.pendingInTerminal,
-                  !message.deliversBody || now.phase != .working else {
-                throw RemoteHTTPError(409, "그룹 연결·입력 상태가 바뀌어 메시지를 보관하고 있습니다.", diagnostics: ["delivery": "not_started"])
+        func ready() async throws {
+            let inputHasPriority = await userInputHasPriority(current.id, backgroundOnly: true)
+            func hold(_ reason: String) -> RemoteHTTPError {
+                RemoteHTTPError(409, reason, diagnostics: ["delivery": "not_started"])
             }
+            guard try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == group.id }) == group,
+                  let now = sessions[current.id], now.phase != .ended else {
+                throw hold("그룹 구성이나 수신 터미널이 변경되어 다시 확인하고 있습니다.")
+            }
+            guard !snapshot.paused, !remoteInputStopped else { throw hold("AutoApprove가 일시정지되어 전달을 기다립니다.") }
+            guard !automaticInputBusy(now.id), !inputHasPriority else { throw hold("수신 탭에서 진행 중인 입력이 끝나기를 기다립니다.") }
+            guard ![.approval, .input].contains(now.phase), !now.pendingInTerminal else { throw hold("수신 탭의 질문 또는 승인 처리를 기다립니다.") }
+            guard !message.deliversBody || now.phase != .working else { throw hold("수신 탭의 작업이 끝나기를 기다립니다.") }
         }
-        try ready()
+        try await ready()
         let prompt = message.terminalPrompt(senderTitle: group.members.first { $0.id == message.senderID }?.title ?? "")
         try await sendGroupLine(current, text: prompt, agyTarget: live, preflight: {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
@@ -3811,7 +3816,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let reason = Self.composerHoldReason(frame.screen, agent: current.agent, inputReason: frame.inputReason)
                 throw RemoteHTTPError(409, "대상의 빈 입력창을 확인하지 못해 메시지를 보관하고 있습니다. 사유: \(reason).", diagnostics: ["delivery": "not_started"])
             }
-            try ready()
+            try await ready()
             let box = try self.groupMailbox()
             let latest = try manualQuestion ? box.unansweredQuestion(message.id, in: message.groupID) : box.message(message.id)
             guard let latest, manualQuestion || latest.acknowledgedAt == nil,

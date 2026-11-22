@@ -246,6 +246,16 @@ public final class SessionGroupMailbox {
         let ids = String(decoding: try JSONEncoder().encode(members), as: UTF8.self)
         try transaction {
             try update("""
+                UPDATE messages SET last_result='superseded',last_error=NULL,source_key='retired:' || source_key || ':' || id
+                WHERE group_id=? AND kind='notice' AND acknowledged IS NULL
+                  AND (last_result IS NULL OR last_result IN ('not_started','redeliver','sender_absent'))
+                  AND ((source_key LIKE 'followup:%' AND sender_id NOT IN (SELECT value FROM json_each(?)))
+                    OR (source_key LIKE 'stalled:%' AND EXISTS (
+                        SELECT 1 FROM messages original WHERE original.id=substr(messages.source_key,9)
+                          AND original.group_id=messages.group_id AND (original.acknowledged IS NOT NULL
+                            OR original.last_result IN ('expired','answered','superseded')))))
+                """, [group.uuidString, ids])
+            try update("""
                 UPDATE messages SET last_result='sender_absent',last_error='보낸 구성원이 그룹에 없어 전달을 보류했습니다.'
                 WHERE group_id=? AND acknowledged IS NULL AND (last_result IS NULL OR last_result IN ('not_started','redeliver'))
                   AND sender_id NOT IN (SELECT value FROM json_each(?)) AND recipient_id IN (SELECT value FROM json_each(?))
