@@ -4711,7 +4711,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var matches = ClaudeComposerReadiness.containsOnly(text, screen: frame.contents)
         if let channel = live?.claudePromptChannel, adapter.checkedTypeLine != nil {
             let result = await ClaudePromptBridge.state(path: channel, paths: paths, conversation: live?.conversationID, expectedDraft: text)
-            matches = result == "matchingDraft" || (result == "draft" && matches)
+            if result == "differentDraft", matches {
+                let withNewline = await ClaudePromptBridge.state(path: channel, paths: paths, conversation: live?.conversationID, expectedDraft: text + "\n")
+                matches = withNewline == "matchingDraft"
+            } else {
+                matches = result == "matchingDraft" || (result == "draft" && matches)
+            }
         }
         guard matches, let status = await claudeStatuses([session])[session.id], ClaudeSessionRegistration.acceptsPrompt(status),
               !(await userInputHasPriority(session.id, backgroundOnly: true)),

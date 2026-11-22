@@ -8,7 +8,8 @@ public enum ClaudeComposerReadiness {
         let footer = rows.dropFirst(end + 1).filter { !$0.isEmpty }
         guard footer.count <= 8, !footer.contains(where: { $0.hasPrefix("───") }) else { return false }
         let first = String(rows[i].dropFirst()).trimmingCharacters(in: .whitespaces)
-        let parts = [first] + Array(rows[(i + 1)..<end])
+        var parts = [first] + Array(rows[(i + 1)..<end])
+        if parts.count > 1, parts.last == "" { parts.removeLast() }
         var remaining = text[...]
         for (index, part) in parts.enumerated() {
             guard !part.isEmpty else { return false }

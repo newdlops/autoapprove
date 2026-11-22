@@ -595,11 +595,15 @@ public final class SessionGroupMailbox {
     }
 
     func confirmedPrompt(_ id: UUID, conversation: String, prompt: String) throws -> Bool {
-        let query = try statement("SELECT prompt FROM group_submissions WHERE message_id=? AND conversation=?",
+        let query = try statement("""
+            SELECT s.prompt, EXISTS(SELECT 1 FROM group_submit_enters e WHERE e.message_id=s.message_id AND e.submitted=s.submitted)
+            FROM group_submissions s WHERE s.message_id=? AND s.conversation=?
+            """,
                                   [id.uuidString, conversation.lowercased()])
         defer { sqlite3_finalize(query) }
         guard sqlite3_step(query) == SQLITE_ROW, let stored = sqlite3_column_text(query, 0) else { return false }
-        return String(cString: stored) == prompt
+        let expected = String(cString: stored)
+        return prompt == expected || (sqlite3_column_int(query, 1) != 0 && prompt == expected + "\n")
     }
 
     func claimTurn(_ id: UUID, turn: String) throws -> Bool {

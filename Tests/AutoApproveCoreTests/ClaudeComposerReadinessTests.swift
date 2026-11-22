@@ -21,6 +21,10 @@ extension ApprovalTests {
         try expect(!ClaudeComposerReadiness.containsOnly("group message", screen: framed("group message plus draft")))
         try expect(ClaudeComposerReadiness.containsOnly("group message 전달", screen: framed("group mes\nsage\n전달")))
         try expect(!ClaudeComposerReadiness.containsOnly("group message 전달", screen: framed("group mes\nsage\n수정 전달")))
+        try expect(ClaudeComposerReadiness.containsOnly("group message 전달", screen: framed("group mes\nsage\n전달\n")))
+        try expect(!ClaudeComposerReadiness.containsOnly("group message 전달", screen: framed("group mes\n\nsage\n전달\n")))
+        try expect(!ClaudeComposerReadiness.containsOnly("group message 전달", screen: framed("group message 전달\n사용자 입력\n")))
+        try expect(!ClaudeComposerReadiness.containsOnly("group message 전달", screen: framed("group message 전달\n\n")))
         let custom = framed("", footer: status)
         try expectEqual(ActivityDetector.detect(custom, agent: .claude).phase, .unknown,
                         "Input readiness must not change general activity or manufacture completion")

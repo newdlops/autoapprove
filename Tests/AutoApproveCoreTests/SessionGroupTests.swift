@@ -42,7 +42,7 @@ private final class GroupLineTerminal: @unchecked Sendable {
     func screen(_ tty: String, fallback: String) -> String {
         lock.lock(); defer { lock.unlock() }
         guard let text = pendingInputs[tty] else { return fallback }
-        return "────────\n❯ " + text + "\n────────\n? for shortcuts"
+        return "────────\n❯ " + text + "\n\n────────\n? for shortcuts"
     }
     private var statuses: [Int32: String] = [:]
     var needsEnter = true

@@ -175,6 +175,11 @@ extension ApprovalTests {
                 try expectEqual(SessionGroupMessage.terminalMessageID(prompt), message.id)
                 try box.recordSubmission(message.id, conversation: conversation, prompt: prompt)
                 try expect(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt))
+                try expect(!(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt + "\n")))
+                try expect(try box.claimSubmitEnter(message.id, conversation: conversation, prompt: prompt, manualQuestion: false))
+                try expect(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt + "\n"))
+                try expect(!(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt + "\n추가")))
+                try expect(!(try box.confirmedPrompt(message.id, conversation: conversation, prompt: prompt + "\n\n")))
             }
             let stored = try box.message(message.id)
             try expectEqual(stored?.text, body)
