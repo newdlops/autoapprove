@@ -231,7 +231,7 @@ import AutoApproveCore
     }
     private func restartableIDs(_ sessions: [AgentSession]) -> [String] {
         let running = Set(engine.snapshot.sessionRestart?.items.filter { !$0.phase.isFinished }.map(\.id) ?? [])
-        return sessions.filter { ($0.agent == .claude || $0.agent == .codex) && $0.phase != .ended && !running.contains($0.id) }.map(\.id)
+        return sessions.filter { $0.agent != .shell && $0.phase != .ended && !running.contains($0.id) }.map(\.id)
     }
     private var restartTitle: String { (confirmingRestart?.count ?? 0) == 1 ? "이 세션을 다시 시작할까요?" : "세션 \(confirmingRestart?.count ?? 0)개를 다시 시작할까요?" }
     private var restartMessage: String {

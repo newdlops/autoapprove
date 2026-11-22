@@ -1,9 +1,9 @@
 import Foundation
 
 public enum AgentKind: String, Codable, CaseIterable, Sendable {
-    case claude, codex, shell
+    case claude, codex, agy, shell
     public var title: String {
-        switch self { case .claude: return "Claude Code"; case .codex: return "Codex"; case .shell: return "일반 터미널" }
+        switch self { case .claude: return "Claude Code"; case .codex: return "Codex"; case .agy: return "Antigravity"; case .shell: return "일반 터미널" }
     }
 }
 

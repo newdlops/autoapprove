@@ -845,6 +845,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     static func connectionGuide(_ session: AgentSession) -> String {
+        if session.agent == .agy { return "연결 설정에서 agy 훅을 설치하고 agy 대화를 이어가세요." }
         if let host = ScreenHost(kind: session.terminal) { return "연결 설정에서 \(host.title) 연결 또는 Claude 훅을 설정하세요." }
         switch session.terminal {
         case .vscode: return "VS Code 확장을 연결하세요. 이미 실행 중인 Claude는 훅으로도 연결할 수 있습니다."
@@ -2418,6 +2419,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let conversationID: UUID?
         let observedAt: TimeInterval
     }
+    private struct AgyState {
+        let conversationId: String
+        let isIdle: Bool
+        let modelName: String?
+    }
+    private var agyEvents: [String: AgyState] = [:]
+
+    private func applyAgyState(_ event: AgyState, to session: inout AgentSession) {
+        session.channel = .hook
+        session.providerID = event.conversationId
+        session.setPhase(event.isIdle ? .idle : .working,
+                         detail: event.isIdle ? "agy 입력 대기" : "agy 작업 중")
+    }
+
     private var groupMCPIdentities: [String: GroupMCPIdentity] = [:]
     private static let groupMCPIdentityLifetime: TimeInterval = 120
     private static let missingCodexGroupIdentity = "로컬 대화 기록과 MCP 호출 정보로 이 터미널의 ID를 확인할 수 없습니다. 세션 ID 갱신을 실행하면 원래 탭의 새 /status 응답을 확인합니다."
@@ -2628,6 +2643,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             verifiedName = named.name
             verifiedInTab = true
         } else {
+            if original.agent == .agy { throw AppError.message("연결 설정에서 agy 훅을 설치하고 해당 대화의 다음 이벤트를 기다려주세요.") }
             if !isCodex && (original.phase != .idle || original.pendingInTerminal || automaticInputBusy(runtime) || userInputHasPriority(runtime)) {
                 throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 상태를 확인해주세요.")
             }
@@ -2860,7 +2876,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try Task.checkCancellation()
             guard let record = records.first(where: { $0.key == original.id && $0.agent == original.agent && "/dev/" + $0.tty == original.tty }) else { continue }
             let environment = await Task.detached(priority: .utility) {
-                original.agent == .codex ? codexEnvironment(record) : ProcessEnvironment.read(record)
+                original.agent == .codex ? codexEnvironment(record) : (original.agent == .claude ? ProcessEnvironment.read(record) : nil)
             }.value
             var home: String?, conversation: String?, messagingName: String?, claudeStatus: String?
             if original.agent == .codex {
@@ -2872,6 +2888,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     conversation = location.threadID
                     home = URL(fileURLWithPath: location.database).deletingLastPathComponent().resolvingSymlinksInPath().path
                 }
+            } else if original.agent == .agy {
+                home = AgyHookInstaller.file.deletingLastPathComponent().path
+                conversation = agyEvents[original.id]?.conversationId
             } else {
                 if let environment {
                     let path = environment["CLAUDE_CONFIG_DIR"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude").path
@@ -2918,6 +2937,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   latest.contains(where: { $0.key == observation.id && $0.agent == current.agent && "/dev/" + $0.tty == current.tty }) else { return nil }
             var result = observation
             result.session = current
+            if current.agent == .agy { result.conversationID = agyEvents[current.id]?.conversationId }
             if let process = byPID[current.pid] { result.tabShell = SessionGroupTabShell.observe(current, process: process, records: byPID) }
             let mcp = current.agent == .codex ? groupMCPIdentity(for: current, home: result.providerHome) : nil
             if let mcp, let id = mcp.conversationID {
@@ -2998,7 +3018,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             return (direct, "process")
         }
-        guard let claimed, let uuid = UUID(uuidString: claimed),
+        guard object["agentKind"] as? String != AgentKind.agy.rawValue, let claimed, let uuid = UUID(uuidString: claimed),
               let kindText = object["agentKind"] as? String, let kind = AgentKind(rawValue: kindText), kind != .shell else {
             throw RemoteHTTPError(409, "공유 서버에서 현재 세션을 자동 확인하지 못했습니다. 현재 대화 UUID를 지정해주세요.")
         }
@@ -3672,7 +3692,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try await sendGroupLine(current, text: prompt, preflight: {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
             let empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
-                : ClaudeComposerReadiness.isEmpty(frame.screen)
+                : current.agent == .agy ? AgyComposerReadiness.isEmpty(frame.screen) : ClaudeComposerReadiness.isEmpty(frame.screen)
             let busyCodex = message.deliversBody && current.agent == .codex &&
                 ActivityDetector.detect(frame.screen, agent: .codex).phase != .idle
             guard empty, !busyCodex, frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: current.agent) else {
@@ -3793,7 +3813,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // Retrying keeps earlier results visible; only the retried sessions start over.
         var items = (snapshot.sessionRestart?.items ?? []).filter { !ids.contains($0.id) && ($0.phase == .done || !$0.phase.isFinished) }
         for id in ids {
-            guard let session = sessions[id], session.phase != .ended, session.agent == .claude || session.agent == .codex else { continue }
+            guard let session = sessions[id], session.phase != .ended, session.agent != .shell else { continue }
             items.append(SessionRestartItem(id: id, title: session.displayedTerminalTitle, phase: .waiting, message: "대화와 종료할 CLI를 확인하고 있습니다.", at: now))
             sessionRestartTasks[id] = Task { [weak self] in await self?.runSessionRestart(id, resume: resume) }
         }
@@ -3843,7 +3863,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return fail("이 터미널(\(original.hostTitle))은 다시 시작 입력을 지원하지 않습니다. Terminal, iTerm2, AutoApprove PTY에서만 다시 시작합니다.")
         }
         func valid(_ value: String?) -> String? { value.flatMap { UUID(uuidString: $0) != nil ? $0 : nil } }
-        var conversation = valid(original.agent == .claude ? original.providerID : questionThreadBySession[id] ?? original.codexApprovalBinding?.threadID)
+        var conversation = valid(original.agent != .codex ? original.providerID : questionThreadBySession[id] ?? original.codexApprovalBinding?.threadID)
         if conversation == nil, let status = groupStatusIdentities[id], status.session.started == original.started, status.session.tty == original.tty {
             conversation = valid(status.conversationID)
         }
@@ -4359,6 +4379,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// For Claude in a host that can type without focus, the line also reaches a background tab, and the
     /// change of Claude's status away from "idle" proves that it was submitted.
     private func sendGroupLine(_ session: AgentSession, text: String, preflight: (() async throws -> Void)? = nil) async throws {
+        if session.agent == .agy {
+            let conversation = agyEvents[session.id]?.conversationId
+            _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true) { frame in
+                try await preflight?()
+                guard let state = self.agyEvents[session.id], state.conversationId == conversation, state.isIdle,
+                      AgyComposerReadiness.isEmpty(frame.screen) else {
+                    throw RemoteHTTPError(409, "agy의 현재 대화와 빈 입력창을 확인해주세요.", diagnostics: ["delivery":"not_started"])
+                }
+            }
+            return
+        }
         if session.agent == .claude, let host = ScreenHost(kind: session.terminal), screenConnections[host]?.enabled == true,
            let type = screenAdapters[host]?.typeLine, let before = await claudeStatuses([session])[session.id] {
             guard ClaudeSessionRegistration.acceptsPrompt(before) else {
@@ -4462,7 +4493,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private func clearFrameReady(_ raw: String, agent: AgentKind) -> Bool {
         guard !RemoteMessageReadiness.hasMenu(raw, agent: agent), ActivityDetector.detect(raw, agent: agent).phase != .working else { return false }
-        return agent == .codex ? CodexProgressScreen.ready(raw) : ClaudeComposerReadiness.isEmpty(raw)
+        return agent == .codex ? CodexProgressScreen.ready(raw) : agent == .agy ? AgyComposerReadiness.isEmpty(raw) : ClaudeComposerReadiness.isEmpty(raw)
     }
     private func advanceGroupClear(_ job: SessionGroupClearOperation, target initial: SessionGroupClearTarget) async {
         var target = initial
@@ -4488,7 +4519,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if target.phase == "waiting" {
                 if target.verifiedAt.map({ Date().timeIntervalSince($0) > 10 }) ?? true {
                     let id: String
-                    if current.agent == .claude, let live = try await sessionGroupSessions().first(where: { $0.id == current.id }), let fresh = live.conversationID { id = fresh }
+                    if current.agent == .claude || current.agent == .agy, let live = try await sessionGroupSessions().first(where: { $0.id == current.id }), let fresh = live.conversationID { id = fresh }
                     else { id = try await statusConversationID(current,backgroundOnly:true) }
                     target.beforeID = id; target.verifiedAt = Date(); target.identityAttempts = 0; try saveGroupClearTarget(job.id, target)
                     if current.agent == .codex { try await waitForGroupStatusInput(current,backgroundOnly:true) }
@@ -4497,7 +4528,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 // uncertain writes can never cause an automatic second /clear.
                 target.phase = "issued"; target.detail = "초기화 전달 후 새 세션 ID를 확인합니다."; try saveGroupClearTarget(job.id, target)
                 do {
-                    _ = try await sendOriginalTerminalMessage(current, object: ["text": "/clear", "revision": frame.revision], textOnly: true, backgroundOnly: true, preflight: { _ in
+                    _ = try await sendOriginalTerminalMessage(current, object: ["text": current.agent == .agy ? "/new" : "/clear", "revision": frame.revision], textOnly: true, backgroundOnly: true, preflight: { _ in
                         let latest = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
                         let userPriority=await self.userInputHasPriority(current.id,backgroundOnly:true)
                         let latestGroup = try SessionGroupStore(directory: self.paths.directory).load().first { $0.id == job.groupID }
@@ -4527,7 +4558,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             guard !Task.isCancelled, !remoteInputStopped else { return }
             let newID: String?
-            if current.agent == .claude { newID = try await sessionGroupSessions().first(where: { $0.id == current.id })?.conversationID }
+            if current.agent == .claude || current.agent == .agy { newID = try await sessionGroupSessions().first(where: { $0.id == current.id })?.conversationID }
             else { newID = try await statusConversationID(current,backgroundOnly:true) }
             guard let newID, UUID(uuidString: newID) != nil, UUID(uuidString: newID) != UUID(uuidString: target.beforeID) else {
                 target.identityAttempts += 1
@@ -4741,7 +4772,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
                             "reconnectBlockedReason": unresolved.flatMap { $0.session.agent == .codex ? Self.missingCodexGroupIdentity : nil } as Any? ?? NSNull(),
                             "messagingName": live?.messagingName as Any? ?? NSNull(),
-                            "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
+                            "model": live.flatMap { agyEvents[$0.id]?.modelName ?? modelSettings[$0.id]?.model } as Any? ?? NSNull(),
                             "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),
                             "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),
                             "modelSettingsRecordedAt": live.flatMap { modelSettings[$0.id]?.recordedAt }.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
@@ -4774,7 +4805,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let phase = live.flatMap { sessions[$0.id]?.phase }
                     return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "role": member.role as Any? ?? NSNull(), "cwd": member.cwd,
                             "claudeStatus": live.flatMap { memberStatuses[$0.id] } as Any? ?? NSNull(),
-                            "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
+                            "model": live.flatMap { agyEvents[$0.id]?.modelName ?? modelSettings[$0.id]?.model } as Any? ?? NSNull(),
                             "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),
                             "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),
                             "modelSettingsRecordedAt": live.flatMap { modelSettings[$0.id]?.recordedAt }.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
@@ -6566,7 +6597,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.records = records
         // Ordinary terminals do not belong in the inventory or its status counts.
         let managed = found.filter { value in
-            guard value.agent == .claude || value.agent == .codex else { return false }
+            guard value.agent != .shell else { return false }
             // A discovery read started before close may finish after it. Keep
             // the exact binding while the final screen is retained so that
             // stale records cannot revive that terminated CLI.
@@ -6624,6 +6655,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 session.detail = Self.connectionGuide(session)
             }
+            if session.agent == .agy, let event = agyEvents[session.id] { applyAgyState(event, to: &session) }
             sessions[session.id] = session
             rememberExitContext(session,records:records,byPID:&recoveryProcesses)
         }
@@ -6633,6 +6665,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             sessions[key]?.setPhase(.ended, detail: "프로세스가 종료되었습니다."); sessions[key]?.channel = .none; sessions[key]?.automatic = false
             if sessions[key]?.queuedQuestions?.isEmpty == false { invalidateDuplicateQuestionIDs() }
             sessions[key]?.queuedQuestions = []; sessions[key]?.codexQuestionsError = nil
+            agyEvents.removeValue(forKey: key)
             claudeWorkIDs.removeValue(forKey: key)
             clearScreen(key); capacityStates.removeValue(forKey: key)
             if newlyEnded, sessions[key]?.interruption != nil { persistInterruption(key); saveExitRecoveries() }
@@ -7275,6 +7308,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if event == "UserPromptSubmit" || claudeWorkIDs[key] == nil { claudeWorkIDs[key] = UUID().uuidString }
             session.completion = nil
         } else if event == "SessionStart" || event == "SessionEnd" {
+            agyEvents.removeValue(forKey: key)
             claudeWorkIDs.removeValue(forKey: key); session.completion = nil
         }
         if event == "UserPromptSubmit" {
@@ -7925,7 +7959,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             case "restart":
                 // The same request as the session window's context menu, for one named session.
                 guard let id = params["sessionID"] as? String, let session = sessions[id], session.phase != .ended,
-                      session.agent == .claude || session.agent == .codex else { throw AppError.message("실행 중인 Claude Code 또는 Codex 세션 ID가 필요합니다.") }
+                      session.agent != .shell else { throw AppError.message("실행 중인 에이전트 세션 ID가 필요합니다.") }
                 let progress = restartSessions([id], resume: params["resume"] as? Bool ?? true)
                 result = try JSONSerialization.jsonObject(with: JSONEncoder().encode(progress)) as? JSONObject ?? [:]
             case "web":
@@ -7937,6 +7971,37 @@ private struct ScreenAnalysisStorageKey: Hashable {
             case "isolation":
                 if let enabled = params["enabled"] as? Bool { try setNetworkIsolation(enabled) }
                 result = ["enabled": networkIsolated]
+            case "agyHook":
+                guard let pid = peer.processID, let agent = try ProcessDiscovery.enclosingAgent(of: pid),
+                      agent.agent == .agy, agent.tty != "??" else { throw AppError.message("agy 터미널을 확인할 수 없습니다.") }
+                let event = try JSONDecoder().decode(AgyHookRequest.self, from: JSONSerialization.data(withJSONObject: params))
+                guard UUID(uuidString: event.conversationId) != nil else { throw AppError.message("agy 대화 ID를 확인할 수 없습니다.") }
+                let state = AgyState(conversationId: event.conversationId.lowercased(), isIdle: event.isIdle, modelName: event.modelName)
+                agyEvents[agent.key] = state
+                if var session = sessions[agent.key], session.phase != .ended {
+                    applyAgyState(state, to: &session)
+                    sessions[agent.key] = session
+                    if event.hookEventName == .stop, state.isIdle {
+                        scheduleGroupMailboxDelivery()
+                        if event.terminationReason == "NO_TOOL_CALL", let path = event.transcriptPath,
+                           let groups = try? SessionGroupStore(directory: paths.directory).load(),
+                           groups.contains(where: { group in group.members.contains { $0.agent == .agy && $0.conversationID.lowercased() == state.conversationId } }),
+                           let turn = AgyTranscript.finalTurn(path: path, conversation: state.conversationId) {
+                            let id = state.conversationId + ":" + String(turn.step)
+                            receiveGroupTurn(conversation: state.conversationId, turn: id, prompt: turn.prompt, response: turn.answer)
+                            noteGroupCompletion(agent.key, WorkCompletion(id: id, date: turn.date, summary: turn.answer),
+                                                conversation: state.conversationId, prompt: turn.prompt, turn: id)
+                        }
+                    }
+                    publish()
+                }
+                if event.hookEventName == .preToolUse {
+                    if let command = event.toolCall?.commandLine, let risk = SystemCommandRisk.detect(command) {
+                        result = ["decision":"deny","reason":risk.detail]
+                    } else if sessions[agent.key]?.automatic == true, !snapshot.paused, event.toolCall?.name == "read_file" {
+                        result = ["decision":"allow"]
+                    } else { result = ["decision":"ask"] }
+                }
             case "desktopGuard":
                 if let enabled = params["enabled"] as? Bool { try setBackgroundComputerUseGuard(enabled) }
                 result = ["enabled": backgroundComputerUseGuard]
@@ -8153,6 +8218,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if (!screenContentsUnchanged && !ScreenTextEquality.equal(previousFrame?.raw, raw)) || previousFrame?.generation != generation || previousFrame?.cursor != cursor || previousFrame?.appearance != appearance || previousFrame?.display != display { remoteTerminalChanges[sessionID]?.notify() }
         }
         remoteObservedScreens[sessionID] = RemoteObservedScreen(raw: raw, generation: generation, observedAt: now, appearance: appearance?.validated(for: raw), cursor: cursor?.validated(for: raw), display: display?.validated())
+        if session.agent == .agy { return }
         // The original hook is still waiting in this app; screen input would be a second response path.
         guard !liveClaudeHooks.values.contains(where: { $0.request.sessionID == sessionID }) else { return }
         // A parked main terminal renders the child PTY. Its pixels cannot identify

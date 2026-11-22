@@ -64,7 +64,7 @@ public struct TerminalChoiceQuestion: Codable, Equatable, Sendable {
 
     static func detect(_ screen: String, agent: AgentKind, prepared: DetectionLines,
                        permissionPrompt: ApprovalPrompt?, request: PendingScreenRequest?, allowPermission: Bool = false) -> Self? {
-        guard agent != .shell, allowPermission || permissionPrompt == nil else { return nil }
+        guard agent != .agy, agent != .shell, allowPermission || permissionPrompt == nil else { return nil }
         guard allowPermission || request?.phase != .approval else { return nil }
         let suffix = prepared.normalizedSuffix(300), raw = suffix.rows
         let lines = raw.map { $0.trimmingCharacters(in: .whitespaces) }

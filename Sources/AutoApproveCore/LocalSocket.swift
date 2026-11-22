@@ -25,6 +25,13 @@ private func configureSocket(_ fd: Int32, timeout: Int) {
 
 public final class SocketConnection: @unchecked Sendable {
     public let id = UUID().uuidString
+    var processID: pid_t? {
+        lock.lock(); defer { lock.unlock() }
+        var pid: pid_t = 0
+        var size = socklen_t(MemoryLayout.size(ofValue: pid))
+        guard !closed, getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &size) == 0, pid > 0 else { return nil }
+        return pid
+    }
     private let fd: Int32
     private let lock = NSLock()
     private var closed = false

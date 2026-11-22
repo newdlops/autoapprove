@@ -9,6 +9,7 @@ import AutoApproveCore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openWindow) private var openWindow
     @State private var busy = false
+    @State private var agyInstalled = AgyHookInstaller.isInstalled()
     @State private var notice: String?
     @State private var questionDelayText = ""
     @State private var questionDelayError: String?
@@ -150,6 +151,17 @@ import AutoApproveCore
                     Divider()
                     screenSection(.orca, icon: "square.grid.2x2",
                         text: "Orca에 포함된 명령줄 도구로 각 터미널의 현재 화면을 읽고 해당 터미널에만 승인 입력을 전달합니다. 별도 권한은 필요하지 않으며 Orca가 실행 중이어야 합니다. tmux 안의 세션은 위의 tmux 연결을 사용합니다.")
+                    Divider()
+                    section("Antigravity (agy)", icon: "terminal", status: agyInstalled ? "훅 설치됨" : "훅 미설치") {
+                        Text("실행 중인 agy 터미널의 대화 ID와 작업 상태를 세션 그룹에 연결합니다.")
+                        Button(agyInstalled ? "agy 훅 제거" : "agy 훅 설치") {
+                            do {
+                                try AgyHookInstaller.update(executable: agyInstalled ? nil : helper, home: engine.paths.directory.path)
+                                agyInstalled = AgyHookInstaller.isInstalled()
+                                notice = agyInstalled ? "설치했습니다. 상태가 표시되지 않으면 agy 세션을 다시 열어주세요." : "agy 훅을 제거했습니다."
+                            } catch { notice = error.localizedDescription }
+                        }.disabled(!agyInstalled && !FileManager.default.isExecutableFile(atPath: helper))
+                    }
                     Divider()
                     section("Claude Code", icon: "bolt.horizontal", status: engine.snapshot.health.claude) {
                         Text("Terminal·iTerm2·Orca·VS Code 등 모든 터미널에서 권한 요청을 직접 받습니다. 기존 설정을 백업하고 AutoApprove 훅만 추가합니다.")

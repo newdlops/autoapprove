@@ -13,7 +13,7 @@ public enum TerminalDeviceInput {
         let codexReady = agent == .codex && CodexProgressScreen.emptyComposer(screen)
         let claudeClear = agent == .claude && input.text == "/clear" &&
             ClaudeComposerReadiness.isEmpty(screen) && ActivityDetector.detect(screen,agent:agent).phase != .working
-        guard [.message, .submit].contains(input.kind), codexReady || claudeClear,
+        guard [.message, .submit].contains(input.kind), codexReady || claudeClear || (agent == .agy && AgyComposerReadiness.isEmpty(screen)),
               !RemoteMessageReadiness.hasMenu(screen, agent: agent),
               let pid = target.sourcePID, target.jobPIDs.contains(pid), let original = target.sourceIdentity,
               original.pid == pid, original.processStart == target.sourceStarted,

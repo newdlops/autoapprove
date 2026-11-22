@@ -34,7 +34,7 @@ public enum ActivityDetector {
     static func detect(_ screen: String, agent: AgentKind, preparedTail tail: [String],
                        permissionPrompt: () -> Bool) -> ActivityObservation {
         let unknown = ActivityObservation(phase: .unknown, detail: "현재 화면에서 작업 중인지 입력 대기 중인지 확인하지 못했습니다.")
-        guard agent != .shell, !tail.isEmpty else { return unknown }
+        guard agent != .agy, agent != .shell, !tail.isEmpty else { return unknown }
         let bottom = tail.suffix(8).joined(separator: "\n")
         if matches(bottom, #"(?i)(?:esc|ctrl\+c) to (?:interrupt|stop)|tab to queue"#) {
             return ActivityObservation(phase: .working, detail: "CLI 화면에 실행 중인 작업 또는 중단 안내가 표시되어 있습니다.")
@@ -141,7 +141,7 @@ public enum ActivityDetector {
             return matches(line, #"^[^|\r\n]{1,200}\|[^|\r\n]{1,200}\|\s*(?:Opus|Sonnet|Haiku) [0-9]+(?:\.[0-9]+){0,2}(?:\s*\|\s*ctx (?:100|[0-9]{1,2})%(?:\s*\|\s*(?:5h (?:100|[0-9]{1,2})%\s+)?7d (?:100|[0-9]{1,2})%)?)?\s*$"#)
         case .codex:
             return line.hasPrefix("⚠") && matches(line, #"^⚠\s*[1-9][0-9]{0,2} warnings? · f2 to view$"#)
-        case .shell: return false
+        case .agy, .shell: return false
         }
     }
 

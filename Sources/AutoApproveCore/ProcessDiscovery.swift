@@ -80,6 +80,7 @@ public struct ProcessRecord: Codable, Equatable, Sendable {
         // retain the old relative-path resolution; never cache across exec/PID reuse.
         let candidate: AgentKind?
         if executable == "codex" { candidate = .codex }
+        else if executable == "agy" || executable.hasSuffix("/agy") { candidate = .agy }
         else if executable == "claude" { candidate = .claude }
         else {
             // Restricted-process fallbacks can contain unrelated bare names.

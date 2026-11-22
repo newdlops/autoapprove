@@ -171,8 +171,8 @@ public enum AutoApproveMCPServer {
                     // when its MCP parent is a shared daemon, not a terminal CLI.
                     // A Claude child launched from Codex may inherit its exec
                     // environment. Keep Claude's existing attribution path.
-                    let callID = groupTool && agent?.agent != .claude ? try CodexGroupIdentity.conversationID(in: message) : nil
-                    let codexID = callID ?? (groupTool && agent?.agent != .claude ?
+                    let callID = groupTool && agent?.agent != .agy && agent?.agent != .claude ? try CodexGroupIdentity.conversationID(in: message) : nil
+                    let codexID = callID ?? (groupTool && agent?.agent != .agy && agent?.agent != .claude ?
                         environment["CODEX_THREAD_ID"].flatMap(UUID.init(uuidString:))?.uuidString.lowercased() : nil)
                     if let id = codexID {
                         if let claimed = params["conversationID"] as? String, UUID(uuidString: claimed) != UUID(uuidString: id) {

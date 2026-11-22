@@ -633,6 +633,7 @@ private extension AgentKind {
         switch self {
         case .codex: .blue
         case .claude: .purple
+        case .agy: .teal
         case .shell: .gray
         }
     }
@@ -983,7 +984,7 @@ private extension AgentKind {
     /// Only the agents, states and line kinds on screen, then the width steps. The matrix draws no
     /// lines or sized circles, so it shows its cell shades and the "?N" mark instead.
     private func legend(_ edges: [SessionGroupGraph.Edge], everything: Bool, matrix: Bool) -> some View {
-        let agents = [AgentKind.claude, .codex, .shell].filter { agent in nodes.contains { $0.agent == agent } }
+        let agents = [AgentKind.claude, .codex, .agy, .shell].filter { agent in nodes.contains { $0.agent == agent } }
         let idle = SessionGroupGraph.status(phase: .idle, blocked: false)
         let states: [(SessionGroupGraph.NodeStatus, String)] = [
             (SessionGroupGraph.status(phase: .working, blocked: false), "작업 중"), (idle, "대기"),

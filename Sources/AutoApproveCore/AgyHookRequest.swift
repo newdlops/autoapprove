@@ -48,3 +48,15 @@ public struct AgyHookRequest: Decodable {
         }
     }
 }
+
+/// The idle CLI puts one prompt row between horizontal rules followed by its model footer.
+public enum AgyComposerReadiness {
+    public static func isEmpty(_ screen: String) -> Bool {
+        let rows = PromptDetector.normalizedLines(screen).suffix(30).map { $0.trimmingCharacters(in: .whitespaces) }
+        func rule(_ s: String) -> Bool { s.count >= 4 && s.allSatisfy { $0 == "─" } }
+        guard let bottom = rows.lastIndex(where: rule), bottom >= 2,
+              rule(rows[bottom-2]), rows.dropFirst(bottom+1).first(where: { !$0.isEmpty })?.contains(" | ") == true else { return false }
+        let prompt = rows[bottom-1]
+        return prompt == ">" || prompt == "> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
+    }
+}

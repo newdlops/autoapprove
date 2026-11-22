@@ -63,6 +63,12 @@ public enum SessionRestartCommand {
         guard executable.hasPrefix("/"), !executable.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else {
             throw AppError.message("CLI 실행 파일 경로를 확인하지 못했습니다.")
         }
+        if agent == .agy {
+            guard argv.isEmpty || argv == ["--sandbox"] || argv == ["--conversation", id] || argv == ["--continue"] || argv == ["-c"] else {
+                throw AppError.message("현재 agy 실행 옵션을 보존할 수 없어 자동으로 다시 시작하지 않습니다.")
+            }
+            return Plan(arguments: [executable] + (argv == ["--sandbox"] ? ["--sandbox"] : []) + ["--conversation", id], dropped: [])
+        }
         var tokens = argv
         if agent == .codex, let first = tokens.firstIndex(where: { !$0.hasPrefix("-") }) {
             // A subcommand can only come before any of its own options' values, so check the first bare word

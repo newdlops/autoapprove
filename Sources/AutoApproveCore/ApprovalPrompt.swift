@@ -30,7 +30,7 @@ public enum PromptDetector {
     }
 
     static func detect(_ screen: String, agent: AgentKind, prepared: DetectionLines) -> ApprovalPrompt? {
-        guard agent != .shell else { return nil }
+        guard agent != .agy, agent != .shell else { return nil }
         // Ordinary frames inspect only a bounded tail. A complete current Codex
         // menu may need its heading above that tail when the request is long.
         let rawLines: [String], lines: [String]

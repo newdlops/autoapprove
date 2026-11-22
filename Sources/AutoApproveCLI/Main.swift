@@ -38,6 +38,7 @@ import AutoApproveCore
                 var versions: [String: Any] = [
                     "socket": paths.socket,
                     "appRunning": (try? SocketClient.request(path: paths.socket, message: ["method": "status"])) != nil,
+                    "agyHookInstalled": AgyHookInstaller.isInstalled(),
                     "claudeHookInstalled": HookInstaller.isInstalled(),
                     "codexSharedSocketExists": FileManager.default.fileExists(atPath: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/app-server-control/app-server-control.sock").path)
                 ]
@@ -133,6 +134,27 @@ import AutoApproveCore
                     return state?["enabled"] as? Bool ?? true
                 }
                 try printJSON(response)
+            case "install-agy", "remove-agy":
+                let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path
+                try AgyHookInstaller.update(executable: command == "install-agy" ? executable : nil, home: paths.directory.path)
+                print("agy 훅 설정을 갱신했습니다. 실행 중인 agy 세션에서 반영되지 않으면 다시 열어주세요.")
+            case "hook" where arguments.dropFirst().contains("--agy"):
+                let input = FileHandle.standardInput.readDataToEndOfFile()
+                guard input.count <= 1_000_000, let payload = (try? JSONSerialization.jsonObject(with: input)) as? JSONObject else {
+                    try printJSON(["decision":"ask"]); return
+                }
+                let fallback: JSONObject = payload["hookEventName"] as? String == "PreToolUse" ? ["decision":"ask"] : [:]
+                let fields = ["hookEventName","conversationId","fullyIdle","terminationReason","modelName","transcriptPath"]
+                var observation = payload.filter { fields.contains($0.key) }
+                if let tool = payload["toolCall"] as? JSONObject, let name = tool["name"] as? String {
+                    var call: JSONObject = ["name":name]
+                    if name == "run_command", let args = tool["args"] as? JSONObject, let line = args["CommandLine"] as? String {
+                        call["args"] = ["CommandLine":line]
+                    }
+                    observation["toolCall"] = call
+                }
+                let response = try? SocketClient.request(path: paths.socket, message: ["method":"agyHook","params":observation], timeout: 3)
+                try printJSON(response ?? fallback)
             case "hook":
                 do {
                     let input = FileHandle.standardInput.readDataToEndOfFile()
@@ -170,6 +192,7 @@ import AutoApproveCore
                   autoapprove web [on|off]   웹 접속 상태·주소 확인 또는 켜기/끄기
                   autoapprove desktop-guard [on|off]
                                             Claude와 Codex의 포커스 보호 설정 (기본 켬)
+                  autoapprove install-agy / remove-agy    Antigravity 터미널 훅 설치·제거
                   autoapprove install-codex-desktop-hook [--codex-home PATH]
                                             Codex 포커스 보호 훅 설치 및 /hooks 신뢰 안내
                   autoapprove remove-codex-desktop-hook [--codex-home PATH]

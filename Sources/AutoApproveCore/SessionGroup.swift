@@ -338,30 +338,32 @@ public enum SessionGroupMatching {
     package static func refreshedClaude(_ groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [SessionGroup] {
         groups.map { group in
             var updated = group
-            for (index, member) in group.members.enumerated() where member.agent == .claude {
+            for (index, member) in group.members.enumerated() where member.agent == .claude || member.agent == .agy {
                 // A resume can preserve the conversation while replacing the process.
                 // Bind that exact conversation before tracking a later /clear in its new process.
                 if let resumed = match(member, in: live), resumed.id != member.runtimeID,
                    member.providerHome != nil, UUID(uuidString: member.conversationID) != nil,
                    !live.contains(where: { $0.id == member.runtimeID && $0.session.phase != .ended }),
-                   !group.members.contains(where: { $0.id != member.id && $0.agent == .claude &&
+                   !group.members.contains(where: { $0.id != member.id && $0.agent == member.agent &&
                        ($0.runtimeID == resumed.id || (UUID(uuidString: $0.conversationID) == UUID(uuidString: member.conversationID) &&
                            ($0.providerHome == nil || $0.providerHome == resumed.providerHome))) }) {
+                    updated.members[index].cwd = resumed.session.cwd
                     updated.members[index].runtimeID = resumed.id
                     updated.members[index].tabShell = resumed.tabShell
                     continue
                 }
-                guard let old = UUID(uuidString: member.conversationID),
+                let old = UUID(uuidString: member.conversationID)
+                guard old != nil || (member.agent == .agy && member.conversationID.isEmpty),
                       let runtime = member.runtimeID,
                       let endpoint = connection(member, in: live), endpoint.id == runtime,
                       let fresh = endpoint.conversationID.flatMap(UUID.init(uuidString:)), fresh != old,
                       member.providerHome == nil || member.providerHome == endpoint.providerHome,
                       !live.contains(where: { other in
-                          other.id != runtime && other.session.agent == .claude && other.providerHome == endpoint.providerHome &&
+                          other.id != runtime && other.session.agent == member.agent && other.providerHome == endpoint.providerHome &&
                           other.conversationID.flatMap(UUID.init(uuidString:)).map { [old, fresh].contains($0) } == true
                       }),
                       !group.members.contains(where: {
-                          $0.id != member.id && $0.agent == .claude &&
+                          $0.id != member.id && $0.agent == member.agent &&
                           ($0.runtimeID == runtime || (UUID(uuidString: $0.conversationID) == fresh &&
                               ($0.providerHome == nil || $0.providerHome == endpoint.providerHome)))
                       }) else { continue }
@@ -389,7 +391,7 @@ public enum SessionGroupMatching {
     public static func match(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
         let matches = live.filter { observation in
             guard observation.session.agent == member.agent, observation.session.phase != .ended else { return false }
-            if member.agent == .codex, let id = UUID(uuidString: member.conversationID) {
+            if member.agent == .codex || member.agent == .agy, let id = UUID(uuidString: member.conversationID) {
                 // cwd, PID and TTY may change while resuming the same saved
                 // conversation. They locate an input endpoint, not membership.
                 return id == observation.conversationID.flatMap(UUID.init(uuidString:)) &&

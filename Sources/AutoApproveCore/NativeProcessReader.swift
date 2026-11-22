@@ -4,6 +4,7 @@ import Darwin
 /// Read-only, fresh kernel metadata. No process, environment or executable-path
 /// cache crosses reads; callers still verify the original before sending input.
 enum NativeProcessReader {
+    private static let agyName = Array("agy".utf8)
     private static let codexName = Array("codex".utf8)
     private static let claudeName = Array("claude".utf8)
     private static let claudeExeName = Array("claude.exe".utf8)
@@ -146,7 +147,7 @@ enum NativeProcessReader {
         // Inspect the fixed-size kernel name directly. Building a Swift String
         // (and lowercased copy) for every process on every discovery pass is
         // unnecessary; detailed argv/path data is fetched only for matches.
-        if shortNameMatches(process, codexName) || shortNameMatches(process, claudeName) || shortNameMatches(process, claudeExeName) { return true }
+        if shortNameMatches(process, agyName) || shortNameMatches(process, codexName) || shortNameMatches(process, claudeName) || shortNameMatches(process, claudeExeName) { return true }
         // Claude's versioned CLI can appear under its Node runtime name. Limit
         // this fallback to TTY processes; unrelated background Node services
         // do not need argv reads or ancestry enrichment.

@@ -29,14 +29,14 @@ public struct CodexCapacityStop: Codable, Equatable, Sendable {
     /// Only the newest cell above a ready, empty composer counts. Codex wraps the cell without
     /// indentation in a narrow window.
     public static func detect(_ screen: String, agent: AgentKind) -> CodexCapacityStop? {
-        guard agent != .shell else { return nil }
+        guard agent != .agy, agent != .shell else { return nil }
         return detect(screen, agent: agent, activity: ActivityDetector.detect(screen, agent: agent), prepared: DetectionLines(screen))
     }
 
     /// A frame's activity and permission analysis are shared by the engine's detectors.
     static func detect(_ screen: String, agent: AgentKind, activity: ActivityObservation,
                        prepared: @autoclosure () -> DetectionLines) -> CodexCapacityStop? {
-        guard agent != .shell, activity.phase == .idle else { return nil }
+        guard agent != .agy, agent != .shell, activity.phase == .idle else { return nil }
         let frame = prepared(), raw = frame.raw, lines = frame.trimmed
         guard !CodexResumeCheck.blocked(lines), let composer = lines.lastIndex(where: CodexResumeCheck.isComposer) else { return nil }
         guard agent != .codex || !CodexResumeCheck.goalHeld(lines) else { return nil }
