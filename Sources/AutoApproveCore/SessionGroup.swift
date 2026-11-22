@@ -331,6 +331,72 @@ public struct SessionGroupMemberOperation: Equatable {
 }
 
 public enum SessionGroupMatching {
+    package static func permitsIdentityRefresh(_ member: SessionGroupMember, candidate: SessionGroupLiveSession,
+                                               conversation: UUID?, live: [SessionGroupLiveSession]) -> Bool {
+        guard candidate.session.agent == member.agent, candidate.session.phase != .ended else { return false }
+        if member.runtimeID == candidate.id, let savedTab = member.tabShell?.terminalSessionID,
+           let currentTab = candidate.tabShell?.terminalSessionID, savedTab != currentTab { return false }
+        let previous = UUID(uuidString: member.conversationID)
+        return !live.contains { other in
+            guard other.id != candidate.id, other.session.phase != .ended else { return false }
+            if other.id == member.runtimeID || member.tabShell?.identifies(other.tabShell) == true { return true }
+            guard other.session.agent == member.agent,
+                  other.providerHome == nil || candidate.providerHome == nil || other.providerHome == candidate.providerHome,
+                  let observed = other.conversationID.flatMap(UUID.init(uuidString:)) else { return false }
+            return observed == conversation || observed == previous
+        }
+    }
+
+    public static func identityWarnings(_ group: SessionGroup, live: [SessionGroupLiveSession]) -> [UUID: String] {
+        var warnings: [UUID: String] = [:]
+        var named: [String: [UUID]] = [:]
+        for member in group.members {
+            let terminals = live.filter { $0.session.phase != .ended && ownsTerminal(member, $0) }
+            if terminals.count > 1 { warnings[member.id] = "구성원에 해당하는 실행 중인 터미널이 여러 개입니다." }
+            let endpoint = connection(member, in: live) ?? (terminals.count == 1 ? terminals.first : nil)
+            if let endpoint, let name = endpoint.messagingName, !name.isEmpty {
+                named[name, default: []].append(member.id)
+            }
+            if let endpoint, let saved = UUID(uuidString: member.conversationID),
+               endpoint.conversationID.flatMap(UUID.init(uuidString:)) != nil,
+               (endpoint.conversationID.flatMap(UUID.init(uuidString:)) != saved ||
+                !permitsIdentityRefresh(member, candidate: endpoint, conversation: saved, live: live)) {
+                warnings[member.id] = "저장된 대화 ID와 실행 중인 탭이 일치하지 않습니다."
+            }
+        }
+        for ids in named.values where ids.count > 1 {
+            for id in ids where warnings[id] == nil { warnings[id] = "같은 메시징 이름을 쓰는 구성원이 있습니다. 터미널과 대화 ID를 확인해주세요." }
+        }
+        return warnings
+    }
+
+    public static func ownsTerminal(_ member: SessionGroupMember, _ candidate: SessionGroupLiveSession) -> Bool {
+        member.agent == candidate.session.agent && (member.runtimeID == candidate.id || member.tabShell?.identifies(candidate.tabShell) == true)
+    }
+
+    public static func restoringLeader(_ leaderID: UUID, from childID: UUID, in group: SessionGroup,
+                                       target: SessionGroupLiveSession) throws -> SessionGroup {
+        guard group.isLeader(leaderID), !group.isLeader(childID), group.parentID(of: childID) == leaderID,
+              group.children(of: childID).isEmpty,
+              let li = group.members.firstIndex(where: { $0.id == leaderID }),
+              let ci = group.members.firstIndex(where: { $0.id == childID }),
+              let id = target.conversationID.flatMap(UUID.init(uuidString:)),
+              UUID(uuidString: group.members[ci].conversationID) == id,
+              let home = target.providerHome,
+              [group.members[li], group.members[ci]].allSatisfy({ $0.agent == target.session.agent &&
+                  $0.cwd == target.session.cwd && ($0.providerHome == nil || $0.providerHome == home) })
+        else { throw AppError.message("선택한 대화와 그룹장 또는 직속 구성원의 연결이 바뀌었습니다.") }
+        var result = group
+        result.members[li].runtimeID = target.id
+        result.members[li].conversationID = id.uuidString.lowercased()
+        result.members[li].tabShell = target.tabShell
+        result.members[li].providerHome = home
+        result.members[ci].runtimeID = nil
+        result.members[ci].conversationID = ""
+        result.members[ci].tabShell = nil
+        return try result.validated()
+    }
+
     public static func remainingLeaderCandidate(_ memberID: UUID, group: SessionGroup, groups: [SessionGroup],
                                                 live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
         guard group.isLeader(memberID), group.members.count > 1,
@@ -358,6 +424,8 @@ public enum SessionGroupMatching {
             }
         }
         guard possible.count == 1, let candidate = possible.first, candidate.conversationID.flatMap(UUID.init(uuidString:)) != nil,
+              !(leader.tabShell?.terminalSessionID.flatMap { saved in candidate.tabShell?.terminalSessionID.map { $0 != saved } } ?? false),
+              permitsIdentityRefresh(leader, candidate: candidate, conversation: candidate.conversationID.flatMap(UUID.init(uuidString:)), live: live),
               replacement(leader, in: live, selected: candidate.id)?.id == candidate.id else { return nil }
         return candidate
     }
@@ -384,6 +452,7 @@ public enum SessionGroupMatching {
             var updated = group
             for (index, member) in group.members.enumerated() where member.agent == .claude || member.agent == .agy {
                 if let resumed = match(member, in: live), resumed.id != member.runtimeID,
+                   permitsIdentityRefresh(member, candidate: resumed, conversation: UUID(uuidString: member.conversationID), live: live),
                    (member.providerHome != nil || (member.agent == .claude && resumed.providerHome != nil)), UUID(uuidString: member.conversationID) != nil,
                    !live.contains(where: { $0.id == member.runtimeID && $0.session.phase != .ended }),
                    !group.members.contains(where: { $0.id != member.id && $0.agent == member.agent &&
@@ -400,6 +469,7 @@ public enum SessionGroupMatching {
                       let runtime = member.runtimeID,
                       let endpoint = connection(member, in: live), endpoint.id == runtime,
                       let fresh = endpoint.conversationID.flatMap(UUID.init(uuidString:)), fresh != old,
+                      permitsIdentityRefresh(member, candidate: endpoint, conversation: fresh, live: live),
                       member.providerHome == nil || member.providerHome == endpoint.providerHome,
                       !live.contains(where: { other in
                           other.id != runtime && other.session.agent == member.agent && other.providerHome == endpoint.providerHome &&
@@ -453,7 +523,9 @@ public enum SessionGroupMatching {
                   let observedID = observation.conversationID.flatMap(UUID.init(uuidString:)) else { return false }
             return id == observedID && home == observedHome && member.cwd == observation.session.cwd
         }
-        return matches.count == 1 ? matches[0] : nil
+        guard matches.count == 1, let candidate = matches.first,
+              permitsIdentityRefresh(member, candidate: candidate, conversation: UUID(uuidString: member.conversationID), live: live) else { return nil }
+        return candidate
     }
 }
 

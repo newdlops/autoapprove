@@ -1,5 +1,7 @@
 # AutoApprove
 
+**전체 세션 ID 갱신 검증 · 0.2.374 빌드 401** [변경 사항](docs/releases/v0.2.374.md)
+
 **그룹 세션 상태 동기화 · 0.2.373 빌드 400** [변경 사항](docs/releases/v0.2.373.md)
 
 **Antigravity 모델 복구 · 0.2.372 빌드 399** [변경 사항](docs/releases/v0.2.372.md)

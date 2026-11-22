@@ -44,7 +44,8 @@ public enum CodexGroupIdentity {
                 let member = group.members[index]
                 guard member.agent == .codex else { continue }
                 if let endpoint = live.first(where: { $0.id == member.runtimeID && $0.session.agent == .codex && $0.session.cwd == member.cwd }),
-                   let shell = endpoint.tabShell {
+                   let shell = endpoint.tabShell,
+                   SessionGroupMatching.permitsIdentityRefresh(member, candidate: endpoint, conversation: endpoint.conversationID.flatMap(UUID.init(uuidString:)), live: live) {
                     result.members[index].tabShell = shell
                 }
                 let candidates = live.filter {
@@ -56,13 +57,14 @@ public enum CodexGroupIdentity {
                 }
                 guard candidates.count == 1, let current = candidates.first,
                       let uuid = current.conversationID.flatMap(UUID.init(uuidString:)),
+                      SessionGroupMatching.permitsIdentityRefresh(member, candidate: current, conversation: uuid, live: live),
                       live.filter({ $0.session.agent == .codex && $0.providerHome == current.providerHome &&
                           $0.conversationID.flatMap(UUID.init(uuidString:)) == uuid }).count == 1,
                       !group.members.contains(where: { $0.id != member.id && $0.agent == .codex &&
                           ($0.runtimeID == current.id || ($0.providerHome == current.providerHome && UUID(uuidString: $0.conversationID) == uuid)) }) else { continue }
                 result.members[index].conversationID = uuid.uuidString.lowercased()
                 result.members[index].providerHome = current.providerHome
-                if member.runtimeID != current.id { result.members[index].tabShell = current.tabShell }
+                if current.tabShell != nil || member.runtimeID != current.id { result.members[index].tabShell = current.tabShell }
                 result.members[index].cwd = current.session.cwd
                 result.members[index].runtimeID = current.id
             }

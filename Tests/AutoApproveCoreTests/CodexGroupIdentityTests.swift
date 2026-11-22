@@ -631,6 +631,46 @@ extension ApprovalTests {
         }
     }
 
+    func testLeaderDuplicateNameRepair() throws {
+        let session = AgentSession(id: "old", agent: .claude, pid: 10, started: "before", tty: "/dev/t1", cwd: "/fixture", terminal: .terminal)
+        let old = SessionGroupLiveSession(session: session, conversationID: UUID().uuidString.lowercased(), providerHome: "/home", messagingName: "leader")
+        var child = old
+        child.session.id = "new"
+        child.session.tty = "/dev/t2"
+        child.conversationID = UUID().uuidString.lowercased()
+        let leader = old.member, duplicate = child.member
+        let group = SessionGroup(name: "fixture", members: [leader, duplicate], leaderMemberID: leader.id)
+        try expectEqual(SessionGroupMatching.identityWarnings(group, live: [old, child]).count, 2)
+        let fixed = try SessionGroupMatching.restoringLeader(leader.id, from: duplicate.id, in: group, target: child)
+        try expectEqual(fixed.leaderMemberIDs, [leader.id])
+        try expectEqual(SessionGroupMatching.match(fixed.members[0], in: [old, child])?.id, child.id)
+        try expectNil(SessionGroupMatching.match(fixed.members[1], in: [old, child]))
+        try expectEqual(fixed.members[1].id, duplicate.id)
+        try expect(SessionGroupMatching.identityWarnings(fixed, live: [old, child]).isEmpty)
+    }
+
+    func testGroupRefreshRejectsSplitTabAndConversation() throws {
+        for agent in [AgentKind.codex, .claude, .agy] {
+            let oldID = UUID(), freshID = UUID()
+            let original = AgentSession(id: "original", agent: agent, pid: 10, started: "a", tty: "/dev/a", cwd: "/project", terminal: .terminal)
+            let sameTab = SessionGroupLiveSession(session: original, conversationID: freshID.uuidString, providerHome: "/home")
+            var member = sameTab.member
+            member.conversationID = oldID.uuidString
+            var other = sameTab
+            other.session.id = "another"
+            other.conversationID = oldID.uuidString
+            let group = SessionGroup(name: "group", members: [member])
+            let both = [sameTab, other]
+            try expectFalse(SessionGroupMatching.permitsIdentityRefresh(member, candidate: other, conversation: oldID, live: both))
+            try expectFalse(SessionGroupMatching.permitsIdentityRefresh(member, candidate: sameTab, conversation: freshID, live: both))
+            let auto = agent == .codex ? CodexGroupIdentity.refreshed([group], live: both) : SessionGroupMatching.refreshedClaude([group], live: both)
+            try expectEqual(auto, [group])
+            try expect(SessionGroupMatching.permitsIdentityRefresh(member, candidate: sameTab, conversation: freshID, live: [sameTab]))
+            other.conversationID = freshID.uuidString
+            try expectFalse(SessionGroupMatching.permitsIdentityRefresh(member, candidate: sameTab, conversation: freshID, live: [sameTab, other]))
+        }
+    }
+
     func testClaudeLeaderResumeThenClear() throws {
         let conversation = UUID().uuidString.lowercased()
         let session = AgentSession(id: "process:21:new", agent: .claude, pid: 21, started: "new", tty: "/dev/ttys001", cwd: "/project", terminal: .terminal)

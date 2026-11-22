@@ -2601,7 +2601,34 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (id, home, name)
     }
 
-    @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil, selectedReplacement: String? = nil, expectedConversationID: String? = nil, expectedRuntimeID: String? = nil, remainingLeaderOnly: Bool = false) async throws -> SessionGroupIdentityRefresh {
+    public func restoreGroupLeader(_ group: SessionGroup, leaderID: UUID, childID: UUID, target: SessionGroupLiveSession) async throws {
+        let live = try await readSessionGroupSessions(reconcile: false, useStatusCache: false)
+        let store = SessionGroupStore(directory: paths.directory)
+        var groups = try store.load()
+        guard !groupClearActive(group.id), let gi = groups.firstIndex(where: { $0.id == group.id }), groups[gi] == group,
+              let child = group.members.first(where: { $0.id == childID }),
+              let fresh = SessionGroupMatching.match(child, in: live), fresh.id == target.id,
+              fresh.conversationID == target.conversationID, fresh.providerHome == target.providerHome,
+              fresh.tabShell == target.tabShell else { throw AppError.message("선택한 그룹 또는 터미널이 바뀌었습니다. 다시 확인해주세요.") }
+        let ids = Set([leaderID, childID])
+        let tasks = try groupOrchestration().assignments
+        guard !tasks.contains(where: { $0.groupID == group.id && ($0.status == .working || $0.status == .completed) &&
+            (ids.contains($0.workerMemberID) || ids.contains($0.parentMemberID)) }) else {
+            throw AppError.message("관련 작업 또는 보고 전달이 끝난 뒤 그룹장 연결을 복구해주세요.")
+        }
+        let mailbox = try groupMailbox()
+        let inbox = try mailbox.inboxOperations(groupID: group.id)[childID]
+        guard (inbox?.unacknowledgedCount ?? 0) == 0,
+              try !mailbox.visibleWaits(group.id).contains(where: { $0.request.member == childID && $0.state == "waiting" }) else {
+            throw AppError.message("하위 구성원의 미수신 메시지와 대기 요청을 처리한 뒤 복구해주세요.")
+        }
+        let before = groups
+        groups[gi] = try SessionGroupMatching.restoringLeader(leaderID, from: childID, in: group, target: fresh)
+        try store.save(groups, expected: before)
+        refreshSessionGroupBadges()
+    }
+
+    @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil, expectedMember: SessionGroupMember? = nil, selectedReplacement: String? = nil, expectedConversationID: String? = nil, expectedRuntimeID: String? = nil, remainingLeaderOnly: Bool = false) async throws -> SessionGroupIdentityRefresh {
         let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
         if let expectedGroup, saved.first(where: { $0.id == groupID })?.sameMembership(as: expectedGroup) != true {
             throw RemoteHTTPError(409, "그룹 구성이 바뀌어 갱신하지 않았습니다. get_session_groups로 다시 확인해주세요.")
@@ -2611,20 +2638,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw AppError.message("갱신할 그룹 구성원을 찾지 못했습니다.")
         }
         guard !groupClearActive(groupID) else { throw AppError.message("이 그룹의 초기화가 끝난 뒤 ID를 갱신해주세요.") }
-        let isCodex = member.agent == .codex
-        var connection: SessionGroupLiveSession?
-        if let runtime = member.runtimeID {
-            let observed = try await readSessionGroupSessions(runtimeID: runtime, reconcile: false, useStatusCache: !isCodex)
-            connection = SessionGroupMatching.connection(member, in: observed)
+        if var expectedMember {
+            if expectedMember.tabShell == nil { expectedMember.tabShell = member.tabShell }
+            guard expectedMember == member else { throw AppError.message("전체 갱신 도중 구성원 연결이 변경되어 이 항목을 보류했습니다.") }
         }
+        let isCodex = member.agent == .codex
+        let observed = try await readSessionGroupSessions(reconcile: false, useStatusCache: false)
+        var connection = SessionGroupMatching.connection(member, in: observed)
         var replacing = false
         if connection == nil {
-            let observed = try await readSessionGroupSessions(reconcile: false, useStatusCache: !isCodex)
-            connection = SessionGroupMatching.match(member, in: observed)
-            if connection == nil {
-                connection = SessionGroupMatching.replacement(member, in: observed, selected: selectedReplacement)
-                replacing = connection != nil
-            }
+            connection = SessionGroupMatching.replacement(member, in: observed, selected: selectedReplacement)
+            replacing = connection != nil
+        }
+        if let connection, !SessionGroupMatching.permitsIdentityRefresh(member, candidate: connection,
+                conversation: connection.conversationID.flatMap(UUID.init(uuidString:)), live: observed) {
+            throw AppError.message("원래 탭과 대화 ID가 서로 다른 실행 세션을 가리켜 갱신을 보류했습니다.")
         }
         if selectedReplacement != nil && !replacing { throw AppError.message("기존 연결 또는 선택한 대화가 바뀌었습니다. 목록을 다시 확인해주세요.") }
         guard let connection, let original = sessions[connection.id] else {
@@ -2663,19 +2691,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         guard let uuid = UUID(uuidString: id) else { throw AppError.message("올바른 세션 ID를 확인하지 못했습니다.") }
         let home = namedHome ?? connection.providerHome ?? member.providerHome
-        if isCodex, verifiedInTab {
-            let live = try await readSessionGroupSessions(runtimeID: runtime, reconcile: false, useStatusCache: false)
-            guard let observed = live.first(where: { $0.id == runtime }),
-                  observed.conversationID.map({ UUID(uuidString: $0) == uuid }) ?? true,
-                  !groupClearActive(groupID) else {
-                throw AppError.message("조회 중 대상 탭의 대화가 바뀌었습니다. 세션 ID를 다시 갱신해주세요.")
-            }
+        let all = try await readSessionGroupSessions(reconcile: false, useStatusCache: false)
+        guard let checked = all.first(where: { $0.id == runtime }), checked.session.tty == original.tty,
+              checked.session.cwd == original.cwd, checked.providerHome == connection.providerHome,
+              checked.conversationID.map({ UUID(uuidString: $0) == uuid }) ?? verifiedInTab,
+              connection.tabShell.map({ $0.identifies(checked.tabShell) }) ?? true,
+              SessionGroupMatching.permitsIdentityRefresh(member, candidate: checked, conversation: uuid, live: all) else {
+            throw AppError.message("조회 중 원래 탭 또는 대화 ID가 바뀌었거나 다른 세션과 겹쳐 갱신을 보류했습니다.")
         }
         if let expectedConversationID, UUID(uuidString: expectedConversationID) != uuid {
             throw AppError.message("선택한 뒤 대상 대화가 바뀌었습니다. 다시 선택해주세요.")
         }
         if replacing {
-            let all = try await readSessionGroupSessions(reconcile: false, useStatusCache: false)
             if remainingLeaderOnly {
                 let groups = try store.load()
                 guard let currentGroup = groups.first(where: { $0.id == groupID }), currentGroup.sameMembership(as: group),
@@ -2693,7 +2720,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         var confirmedMember = member
-        if replacing { confirmedMember.tabShell = connection.tabShell }
+        if replacing || checked.tabShell != nil { confirmedMember.tabShell = checked.tabShell }
         confirmedMember.conversationID = uuid.uuidString.lowercased()
         confirmedMember.runtimeID = runtime
         confirmedMember.providerHome = home
@@ -4928,6 +4955,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let matching = groups.compactMap { group in recoveryMember(in: group, caller: caller, observed: observed).map { (group, $0) } }
             let modelSettings = await groupModelSettings(matching.map { $0.0 }, observed: observed)
             let output: [JSONObject] = matching.map { group, callerMember in
+                let warnings = SessionGroupMatching.identityWarnings(group, live: observed)
                 let members: [JSONObject] = group.members.map { member in
                     let live = SessionGroupMatching.match(member, in: observed)
                     let unresolved = live == nil ? SessionGroupMatching.connection(member, in: observed) : nil
@@ -4936,7 +4964,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "providerHome": member.providerHome as Any? ?? NSNull(), "connected": live != nil,
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
                             "reconnectBlockedReason": unresolved.flatMap { $0.session.agent == .codex ? Self.missingCodexGroupIdentity : nil } as Any? ?? NSNull(),
-                            "messagingName": live?.messagingName as Any? ?? NSNull(),
+                            "messagingName": (warnings[member.id] == nil ? live?.messagingName : nil) as Any? ?? NSNull(),
+                            "identityWarning": warnings[member.id] as Any? ?? NSNull(), "tty": live?.session.tty as Any? ?? NSNull(),
                             "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
                             "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),
                             "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),
@@ -4976,10 +5005,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let includeGraph = try GroupWaitRequest.flag(object, "includeWaitGraph")
             let output: [JSONObject] = try groups.compactMap { group in
                 guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else { return nil }
+                let warnings = SessionGroupMatching.identityWarnings(group, live: observed)
                 let members: [JSONObject] = group.treeOrder.map { entry in
                     let member = entry.member, live = SessionGroupMatching.match(member, in: observed)
                     let phase = live.flatMap { row in sessions[row.id].map { groupDisplayPhase($0, observation: row) } }
                     return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "role": member.role as Any? ?? NSNull(), "cwd": member.cwd,
+                            "identityWarning": warnings[member.id] as Any? ?? NSNull(), "tty": live?.session.tty as Any? ?? NSNull(),
                             "claudeStatus": live.flatMap { memberStatuses[$0.id] } as Any? ?? NSNull(),
                             "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
                             "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),
@@ -10707,7 +10738,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             ["id":"event_posting","label":"키 입력 권한","state":posting ? "ok":"attention","detail":posting ? "키 이벤트 게시가 허용되어 있습니다.":"이 앱의 키 이벤트 게시 허용을 확인해주세요."],
             ["id":"direct_input","label":"Terminal 직접 입력","state":direct ? "ok":"unavailable","detail":direct ? "손쉬운 사용 권한으로 원본 터미널에 입력합니다.":"Mac의 손쉬운 사용에서 AutoApprove를 허용해주세요. 별도 입력 서비스를 설치하지 않습니다."]]
         var report = RemoteDiagnostics.report(nodeID:nodeID ?? store.value("webNodeID") ?? "local",name:name ?? Host.current().localizedName ?? "Mac",sessions:sessionCopy,records:rows,targets:targets,servers:statuses,attachments:journal,transitions:transitions,events:eventCopy,permissions:permissions,errors:failures)
-        if let delivery = groupDeliveryCheck() {
+        if let delivery = await groupDeliveryCheck() {
             report["checks"] = ((report["checks"] as? [JSONObject]) ?? []) + [delivery]
             if delivery["state"] as? String == "attention", var summary = report["summary"] as? JSONObject, summary["level"] as? String == "ok" {
                 summary["level"] = "attention"; report["summary"] = summary
@@ -10718,25 +10749,31 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     /// Session-group delivery for every agent, Claude included: a member whose first queued message
     /// could not be typed, or that holds a parked message, is reported with the last hold reason.
-    private func groupDeliveryCheck() -> JSONObject? {
+    private func groupDeliveryCheck() async -> JSONObject? {
         guard let groups = try? SessionGroupStore(directory: paths.directory).load(), !groups.isEmpty,
               let box = try? groupMailbox() else { return nil }
+        let observations = try? await modelDisplaySessions()
+        let live = observations ?? []
+        var conflicts: [String] = observations == nil ? ["실행 중인 세션 조회 실패"] : []
         var held: [String] = [], pending = 0
         for group in groups {
+            let warnings = SessionGroupMatching.identityWarnings(group, live: live)
+            conflicts += group.members.compactMap { member in warnings[member.id].map { "\(member.id.uuidString.prefix(8)) · " + $0 } }
+
             guard let inboxes = try? box.inboxOperations(groupID: group.id) else { continue }
             for member in group.members {
                 guard let inbox = inboxes[member.id] else { continue }
                 pending += inbox.unacknowledgedCount
                 guard inbox.unacknowledgedCount > 0, inbox.headDidNotStart || inbox.hasParkedMessage else { continue }
                 let since = inbox.firstPendingAt.map { " · 가장 오래된 메시지 " + $0.formatted(date: .omitted, time: .shortened) } ?? ""
-                // Names are left out: a diagnostic snapshot may be handed to an analysis model.
                 let role = group.isLeader(member.id) ? "그룹장" : "구성원"
                 held.append("\(role) \(member.id.uuidString.prefix(8)): 미전달 \(inbox.unacknowledgedCount)건\(since) · \(inbox.lastDeliveryFailure ?? "사유 미기록")")
             }
         }
         let detail = held.isEmpty ? "그룹 \(groups.count)개 · 수신 미확인 \(pending)건 · 전달이 막힌 구성원 없음"
             : "전달이 막힌 구성원 \(held.count)명 · " + held.prefix(6).joined(separator: " / ") + (held.count > 6 ? " 외 \(held.count - 6)명" : "")
-        return ["id": "group_delivery", "label": "세션 그룹 메시지 전달", "state": held.isEmpty ? "ok" : "attention", "detail": detail]
+        return ["id": "group_delivery", "label": "세션 그룹 메시지 전달", "state": held.isEmpty && conflicts.isEmpty ? "ok" : "attention",
+                "detail": detail + (conflicts.isEmpty ? "" : " · 구성원 연결 확인: " + conflicts.prefix(6).joined(separator: " / "))]
     }
     public func diagnosticCodexAction(_ object:JSONObject,nodeID:String,name:String) async throws -> JSONObject {
         guard let action=object["action"] as? String,let request=object["requestID"] as? String,UUID(uuidString:request) != nil else{throw RemoteHTTPError(400,"진단 요청 ID를 확인해주세요.")}

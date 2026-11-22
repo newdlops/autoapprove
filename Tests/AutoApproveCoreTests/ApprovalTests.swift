@@ -521,6 +521,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: tab labels target exact members and preserve active work",tests.testGroupTabLabelUsesExactMemberAndPreservesWork),
             ("Session groups: native tab label scripts never type input or change body colors",tests.testNativeTabLabelScriptsDoNotWriteInputOrChangeAppearance),
             ("Session groups: clear recovery queries identity without replaying clear",tests.testGroupClearRecoveryQueriesIdentityWithoutReplayingClear),
+            ("Session groups: all agents reject conflicting tab and conversation",tests.testGroupRefreshRejectsSplitTabAndConversation),
+            ("Session groups: duplicate name leader repair",tests.testLeaderDuplicateNameRepair),
             ("Session groups: current phase after report",tests.testGroupCurrentPhaseAfterReport),
             ("Session groups: Antigravity model recovery",tests.testAgyTranscriptModelRecovery),
             ("Session groups: model settings match the exact conversation and refresh",tests.testGroupModelSettingsUseExactConversationAndFreshMetadata),

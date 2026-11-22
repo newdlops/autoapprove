@@ -18,6 +18,13 @@ import AutoApproveCore
     @State private var notice: String?
     @State private var composeGroup: SessionGroup?
     @Environment(\.openWindow) private var openWindow
+    private struct LeaderRepair {
+        let group: SessionGroup
+        let leader: UUID
+        let child: UUID
+        let target: SessionGroupLiveSession
+    }
+    @State private var leaderRepair: LeaderRepair?
     @State private var deleteConfirm = false
     @State private var bulkRunning = false
     @State private var bulkStopRequested = false
@@ -125,13 +132,21 @@ import AutoApproveCore
             }
         }
         .onChange(of: selectedID) { _, id in name = groups.first { $0.id == id }?.name ?? ""; notice = nil; bulkFailures = [] }
+        .confirmationDialog("선택한 터미널을 기존 그룹장에 연결할까요?", isPresented: Binding(
+            get: { leaderRepair != nil }, set: { if !$0 { leaderRepair = nil } }), presenting: leaderRepair) { repair in
+                Button("그룹장 연결 복구") { Task { await restoreLeader(repair) } }
+                Button("취소", role: .cancel) {}
+            } message: { repair in
+                Text("\(repair.target.session.tty) · \(repair.target.conversationID ?? "")\n이 대화가 기존 그룹장 역할을 이어받습니다. 하위 구성원은 연결을 해제하고 작업 이력은 유지합니다.")
+            }
         .confirmationDialog("이 그룹을 삭제할까요?", isPresented: $deleteConfirm) {
             Button("그룹 삭제", role: .destructive) { deleteSelected() }
         } message: { Text("그룹만 삭제하며 원본 세션과 대화는 유지됩니다.") }
     }
 
     private func detail(_ group: SessionGroup) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let warnings = SessionGroupMatching.identityWarnings(group, live: live)
+        return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("그룹 이름").font(.headline)
@@ -191,8 +206,26 @@ import AutoApproveCore
                             roleMenu(member, in: group)
                             Button("제거") { remove(member, from: group) }.disabled(loading)
                         }
-                        Text("\(member.agent.title) · \(connection == nil ? "연결 확인 필요" : "실행 중") · \(roleText(member, in: group))")
+                        Text("\(member.agent.title) · \(match != nil ? "실행 중" : connection == nil ? "연결 확인 필요" : "대화 확인 필요") · \(roleText(member, in: group))")
                             .font(.caption).foregroundStyle(.secondary)
+                        if let warning = warnings[member.id] {
+                            Label(warning, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                            if let connection { Text(connection.session.tty).font(.caption.monospaced()).textSelection(.enabled) }
+                        }
+                        if group.isLeader(member.id) {
+                            let targets = group.children(of: member.id).compactMap { child -> LeaderRepair? in
+                                guard let target = SessionGroupMatching.match(child, in: live),
+                                      (try? SessionGroupMatching.restoringLeader(member.id, from: child.id, in: group, target: target)) != nil else { return nil }
+                                return LeaderRepair(group: group, leader: member.id, child: child.id, target: target)
+                            }
+                            if !targets.isEmpty {
+                                Menu("하위 구성원에서 그룹장 연결 복구…") {
+                                    ForEach(targets, id: \.child) { item in
+                                        Button("\(item.target.session.displayedTerminalTitle) · \(item.target.session.tty) · \(item.target.conversationID ?? "")") { leaderRepair = item }
+                                    }
+                                }.disabled(loading)
+                            }
+                        }
                         Text(viewUpdates.modelLabel(member)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                         if let task = currentTask(member, in: group) {
                             Label(taskText(task), systemImage: task.question?.isPermission == true ? "hand.raised" : task.question != nil ? "questionmark.bubble" : task.status == .working ? "hourglass" : "checkmark.circle")
@@ -332,7 +365,7 @@ import AutoApproveCore
             if merged.contains(member.id) { attempted += 1; continue }
             notice = "\(group.name) · \(index + 1)/\(group.members.count) 조회 중 · \(member.title.isEmpty ? member.agent.title : member.title)"
             do {
-                let result = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
+                let result = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id, expectedMember: member)
                 if let duplicate = result.mergedMemberID { merged.insert(duplicate) }
                 if result.changed { changed += 1 } else { confirmed += 1 }
             } catch {
@@ -415,16 +448,37 @@ import AutoApproveCore
         guard !loading else { return }; loading = true; defer { loading = false }
         do {
             let current = try await engine.sessionGroupSessions(); live = current
-            guard let fresh = current.first(where: { $0.id == candidate.id }),
+            groups = try store.load()
+            guard let fresh = current.first(where: { $0.id == candidate.id }), fresh.conversationID == candidate.conversationID,
                   fresh.session.cwd == candidate.session.cwd, fresh.session.agent == candidate.session.agent,
                   let latest = groups.first(where: { $0.id == group.id }) else {
                 throw AppError.message("세션 또는 그룹이 변경되었습니다. 현재 목록을 다시 확인해주세요.")
             }
             guard !latest.members.contains(where: { SessionGroupMatching.match($0, in: current)?.id == fresh.id }) else { return }
+            let owners = latest.members.filter { SessionGroupMatching.ownsTerminal($0, fresh) }
+            guard owners.count <= 1 else { throw AppError.message("같은 터미널에 연결된 구성원을 먼저 확인해주세요.") }
+            if let owner = owners.first {
+                _ = try await engine.refreshSessionGroupMemberID(groupID: latest.id, memberID: owner.id, expectedMember: owner,
+                    expectedConversationID: fresh.conversationID, expectedRuntimeID: fresh.id)
+                groups = try store.load()
+                notice = "기존 구성원의 대화 ID를 갱신했습니다."
+                return
+            }
             var changed = latest; changed.members.append(fresh.member)
             _ = persist(groups.map { $0.id == latest.id ? changed : $0 }, message: "세션을 그룹에 추가했습니다.")
         } catch { self.error = error.localizedDescription }
     }
+    private func restoreLeader(_ repair: LeaderRepair) async {
+        guard !loading else { return }
+        loading = true
+        defer { loading = false }
+        do {
+            try await engine.restoreGroupLeader(repair.group, leaderID: repair.leader, childID: repair.child, target: repair.target)
+            groups = try store.load()
+            notice = "선택한 대화를 기존 그룹장에 연결했습니다."
+        } catch { self.error = error.localizedDescription }
+    }
+
     private func remove(_ member: SessionGroupMember, from group: SessionGroup) {
         let changed = group.removing(member.id)
         _ = persist(groups.map { $0.id == group.id ? changed : $0 },
