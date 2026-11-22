@@ -233,6 +233,9 @@ import AutoApproveCore
         let running = Set(engine.snapshot.sessionRestart?.items.filter { !$0.phase.isFinished }.map(\.id) ?? [])
         return sessions.filter { $0.agent != .shell && $0.phase != .ended && !running.contains($0.id) }.map(\.id)
     }
+    private var selectedRestartIDs: [String] {
+        restartableIDs(engine.snapshot.sessions.filter { selection.contains($0.id) })
+    }
     private var restartTitle: String { (confirmingRestart?.count ?? 0) == 1 ? "이 세션을 다시 시작할까요?" : "세션 \(confirmingRestart?.count ?? 0)개를 다시 시작할까요?" }
     private var restartMessage: String {
         let chosen = engine.snapshot.sessions.filter { confirmingRestart?.contains($0.id) == true }
@@ -331,10 +334,10 @@ import AutoApproveCore
                     .help("창별 대화를 이름 있는 여러 프로필 파일로 저장하고 재부팅 후 복원합니다.")
                 Button {openWindow(id:"session-groups")} label: {Label("세션 그룹",systemImage:"person.2")}
                     .help("Codex와 Claude Code 세션을 그룹으로 묶고 구성원을 관리합니다.")
-                Button { confirmingRestart = restartableIDs(engine.snapshot.sessions) } label: {
+                Button { confirmingRestart = selectedRestartIDs } label: {
                     Label("세션 다시 시작", systemImage: "arrow.triangle.2.circlepath")
-                }.disabled(restartableIDs(engine.snapshot.sessions).isEmpty)
-                    .help("모든 Claude Code·Codex 세션을 원래 터미널에서 종료하고 같은 대화로 다시 엽니다. 새 MCP 도구와 설정을 적용할 때 씁니다. 작업 중인 세션은 작업이 끝난 뒤 다시 시작합니다.")
+                }.disabled(selectedRestartIDs.isEmpty)
+                    .help("선택한 세션만 원래 터미널에서 같은 대화로 다시 엽니다.")
                 Button {
                     do { allAutomationResetMessage = try engine.resetAllAutomation().message }
                     catch { self.error = error.localizedDescription }
@@ -344,9 +347,10 @@ import AutoApproveCore
                     .help("이 Mac의 모든 세션에 쌓인 자동화 대기와 감지 상태를 비우고 다시 감지합니다. 원본 터미널·초안·자동 승인 설정은 유지합니다.")
                 Button {
                     refreshing = true
-                    Task { await engine.refresh(); refreshing = false }
+                    let ids = selection
+                    Task { await engine.refresh(sessionIDs: ids); refreshing = false }
                 } label: { Label("새로고침", systemImage: "arrow.clockwise") }
-                .disabled(refreshing).keyboardShortcut("r").help(refreshing ? "세션과 연결 상태를 확인하고 있습니다." : "실행 중인 세션과 연결 상태를 지금 다시 확인합니다. ⌘R")
+                .disabled(refreshing || selection.isEmpty).keyboardShortcut("r").help(refreshing ? "세션과 연결 상태를 확인하고 있습니다." : "선택한 세션의 화면과 질문 상태를 다시 확인합니다. ⌘R")
                 Button { perform { try engine.setPaused(!engine.snapshot.paused) } } label: {
                     Label(engine.snapshot.paused ? "재개" : "일시정지", systemImage: engine.snapshot.paused ? "play.fill" : "pause.fill")
                 }.help(AppHelp.pause(engine.snapshot.paused))

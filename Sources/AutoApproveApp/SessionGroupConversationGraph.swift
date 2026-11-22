@@ -118,7 +118,14 @@ import AutoApproveCore
         }
         .onDisappear { revealTask?.cancel() }
         .onExitCommand { selected = nil }
-        .onChange(of: content?.group.members.map(\.id)) { _, ids in
+        .onChange(of: content?.group.members.map(\.id), initial: true) { _, ids in
+            if let group = content?.group {
+                let missing = group.members.filter { $0.nickname == nil || $0.role == nil }.map(\.id)
+                if !missing.isEmpty {
+                    do { try engine.requestSessionGroupNicknames(groupID: group.id, memberIDs: missing) }
+                    catch { nicknameNote = error.localizedDescription }
+                }
+            }
             if let selected, ids?.contains(selected) != true { self.selected = nil }
         }
         .sheet(item: $replyTarget) { item in
@@ -874,8 +881,8 @@ private extension AgentKind {
     private func viewport(_ placement: Placement, size: CGSize) -> SessionGroupGraph.Viewport {
         switch mode {
         case let .fitted(minimum, maximum):
-            let multiCircle = (forcedLayout ?? storedLayout) == .circle && nodes.lazy.filter(\.isLeader).prefix(2).count == 2
-            return SessionGroupGraph.fit(placement.content, in: size, minimum: mode == .automatic && multiCircle ? SessionGroupGraph.minimumZoom : minimum, maximum: maximum, focus: placement.leader,
+            let fitCircle = (forcedLayout ?? storedLayout) == .circle
+            return SessionGroupGraph.fit(placement.content, in: size, minimum: mode == .automatic && fitCircle ? SessionGroupGraph.minimumZoom : minimum, maximum: maximum, focus: placement.leader,
                                   topAligned: placement.topAligned)
         case let .manual(view): return view
         }
@@ -1416,7 +1423,7 @@ private extension AgentKind {
             .equatable()
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("\(node.name), \(node.agent.title), \(node.isLeader ? "그룹장" : "구성원")")
-            .accessibilityValue(node.modelLabel + ", " + (scope == .recent ? node.accessibilityRecent : node.accessibilityAll))
+            .accessibilityValue((node.role.map { $0 + ", " } ?? "") + node.modelLabel + ", " + (scope == .recent ? node.accessibilityRecent : node.accessibilityAll))
             .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
             .accessibilityAction { selection = node.id }
             .accessibilityAction(named: Text("터미널 열기")) { openNode(node.id) }
@@ -1475,7 +1482,7 @@ private extension AgentKind {
             .simultaneousGesture(TapGesture(count: 2).onEnded { openNode(node.id) })
             .help("\(node.name) · \(node.agent.title) · \(node.status.title)"
                   + (node.provisional ? "\n임시 이름입니다. 닉네임이 정해지면 바뀝니다." : "")
-                  + "\n" + node.modelLabel + "\n주고받은 메시지 \(node.messages(scope))건(지금 보기 기준)"
+                  + (node.role.map { "\n" + $0 } ?? "") + "\n" + node.modelLabel + "\n주고받은 메시지 \(node.messages(scope))건(지금 보기 기준)"
                   + "\n클릭하면 세션 상태와 대화를 봅니다. 더블클릭하면 연결된 터미널을 엽니다. 끌거나 방향키를 누르면 노드를 옮깁니다.")
             .position(x: shown.x, y: shown.y + GraphNodeView.centerOffset * scale)
     }
@@ -1664,7 +1671,7 @@ private struct GraphNodeView: View, Equatable {
     }
 
     var body: some View {
-        VStack(spacing: 6 * scale) {
+        VStack(spacing: node.role == nil ? 6 * scale : 0) {
             GraphNodeSymbol(agent: node.agent, status: node.status, role: node.isLeader ? .leader : .member, diameter: diameter * scale)
                 .overlay {
                     if hovering && !selected { Circle().stroke(node.agent.graphColor, lineWidth: 1).padding(-8 * scale) }
@@ -1676,6 +1683,7 @@ private struct GraphNodeView: View, Equatable {
                     if focused { Circle().stroke(Color(nsColor: .keyboardFocusIndicatorColor), lineWidth: 3).padding((selected ? -13 : -9) * scale) }
                 }
                 .contentShape(Circle())
+                .padding(.bottom, node.role == nil ? 0 : 2 * scale)
             Text(node.name)
                 .font(.system(size: Self.nameSize * scale, weight: selected ? .semibold : .regular))
                 .foregroundStyle(node.provisional ? .secondary : .primary)
@@ -1686,6 +1694,13 @@ private struct GraphNodeView: View, Equatable {
                 .overlay(Capsule().strokeBorder(hovering ? node.agent.graphColor : Color(nsColor: .separatorColor), lineWidth: hovering ? 1 : 0.5))
                 .frame(maxWidth: Self.width * scale)
                 .contentShape(Capsule())
+            if let role = node.role, !role.isEmpty {
+                Text(role)
+                    .font(.system(size: 11 * scale))
+                    .lineLimit(1)
+                    .help(role)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            }
             Text(node.modelLabel)
                 .font(.system(size: 10 * scale))
                 .foregroundStyle(.secondary)

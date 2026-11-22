@@ -78,6 +78,10 @@ public enum SessionGroupGraph {
         for member in group.members { uses[clean(member.title), default: 0] += 1 }
         var result: [UUID: MemberName] = [:]
         for (index, member) in group.members.enumerated() {
+            if let nickname = member.nickname.map(clean), !nickname.isEmpty {
+                result[member.id] = MemberName(text: nickname, provisional: false)
+                continue
+            }
             if let nickname = liveNicknames[member.id] {
                 let value = clean(nickname)
                 if !value.isEmpty { result[member.id] = MemberName(text: value, provisional: false); continue }

@@ -463,7 +463,7 @@ public final class SessionGroupMailbox {
         )
         """
 
-    private static let notificationOrder = "CASE WHEN m.source_key LIKE 'userButton:questionPriority:%' THEN -1 WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 0 ELSE 1 END,m.sequence"
+    private static let notificationOrder = "CASE WHEN m.source_key LIKE 'userButton:questionPriority:%' THEN -2 WHEN m.source_key LIKE 'userButton:rename:%' OR (m.kind='notice' AND m.body LIKE '[AutoApprove 닉네임 요청]%') THEN -1 WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 0 ELSE 1 END,m.sequence"
 
     public struct InboxOperation: Equatable, Sendable {
         public let unacknowledgedCount: Int

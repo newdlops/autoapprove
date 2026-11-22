@@ -598,10 +598,11 @@ public actor CodexQuestionCollector {
     }, boundLocation: @escaping @Sendable (AgentSession) async throws -> CodexThreadLocation = {
         try await CodexReplyTransport.historyLocation($0,paths:[])
     }) { self.fileReader = fileReader; self.boundLocation=boundLocation }
-    public func collect(_ sessions: [AgentSession]) async -> [CodexQuestionUpdate] {
+    public func collect(_ sessions: [AgentSession], partial: Bool = false) async -> [CodexQuestionUpdate] {
         let targets = sessions.filter { $0.agent == .codex && $0.phase != .ended }
         let liveIDs = Set(targets.map(\.id))
-        readers = readers.filter { liveIDs.contains($0.key) }
+        if !partial { readers = readers.filter { liveIDs.contains($0.key) } }
+        if partial && targets.isEmpty { return [] }
         guard !targets.isEmpty else { historyConnections.closeAll(); metadata.retain(paths: []); hasCollectedMetadata = false; return [] }
         // A one-shot collection should release its large header buffers. Start
         // retaining byte-verified projections only when the collector is reused.
@@ -612,7 +613,7 @@ public actor CodexQuestionCollector {
         let deadline = ProcessInfo.processInfo.systemUptime + 4
         var locations = [String:CodexThreadLocation](), failures = [String:String]()
         var liveMetadataPaths = Set<String>()
-        defer { metadata.retain(paths: liveMetadataPaths) }
+        defer { if !partial { metadata.retain(paths: liveMetadataPaths) } }
         for session in targets {
             do {
                 let files = try fileReader(session,max(0,deadline-ProcessInfo.processInfo.systemUptime))
@@ -631,9 +632,11 @@ public actor CodexQuestionCollector {
             } catch { failures[session.id] = error.localizedDescription }
         }
         let activeDatabases = Set(locations.values.map(\.database))
-        for reader in readers.values { reader.releaseConnection(unlessRetained: activeDatabases) }
-        historyConnections.retain(paths: activeDatabases)
-        let releaseOversubscribedConnections = activeDatabases.count > 4
+        if !partial {
+            for reader in readers.values { reader.releaseConnection(unlessRetained: activeDatabases) }
+            historyConnections.retain(paths: activeDatabases)
+        }
+        let releaseOversubscribedConnections = !partial && activeDatabases.count > 4
         defer {
             if releaseOversubscribedConnections {
                 // Per-session prepared statements pin SQLite handles. When

@@ -147,6 +147,10 @@ extension ApprovalTests {
                        member("중복 이름", "/fixture/a"), member("중복 이름", "/fixture/b"), member("", "")]
         let group = SessionGroup(name: "fixture", members: members)
         let names = SessionGroupGraph.names(group: group, liveNicknames: [members[0].id: "주문 검토", members[1].id: ""])
+        var named = group
+        named.members[0].nickname = "그룹 검토자"
+        let overridden = SessionGroupGraph.names(group: named, liveNicknames: [members[0].id: "이전 탭 이름"])
+        try expectEqual(overridden[members[0].id], .init(text: "그룹 검토자", provisional: false))
         try expectEqual(names[members[0].id], .init(text: "주문 검토", provisional: false), "A connected nickname wins")
         try expectEqual(names[members[1].id], .init(text: "shop · 2", provisional: true), "A connected member without a nickname is provisional")
         try expectEqual(names[members[2].id], .init(text: "shop · 3", provisional: true), "An unconfirmed terminal title is not a name")

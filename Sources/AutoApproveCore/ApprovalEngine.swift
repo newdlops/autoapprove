@@ -2883,9 +2883,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let observed = try await readSessionGroupSessions(reconcile: false, useStatusCache: false)
         let store = SessionGroupStore(directory: paths.directory)
         let groups = try store.load()
-        guard !groupClearActive(expected.id), let index = groups.firstIndex(where: { $0.id == expected.id }),
-              groups[index].sameMembership(as: expected) else {
+        guard !groupClearActive(expected.id), let index = groups.firstIndex(where: { $0.id == expected.id }) else {
             throw AppError.message("그룹 구성이 바뀌었습니다. 현재 그룹에서 다시 갱신해주세요.")
+        }
+        if !groups[index].sameMembership(as: expected) {
+            let reconciled = SessionGroupMatching.followingTerminals(expected, live: observed, agents: [.codex, .claude, .agy])
+            guard groups[index].sameMembership(as: reconciled) else {
+                throw AppError.message("그룹 구성이 바뀌었습니다. 현재 그룹에서 다시 갱신해주세요.")
+            }
+            return groups[index]
         }
         let updated = SessionGroupMatching.followingTerminals(groups[index], live: observed, agents: [.codex, .claude, .agy])
         if updated != groups[index] {
@@ -3227,16 +3233,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return value
     }
 
-    /// Asks for nicknames and roles: the leader names every listed member, or in a group without a
-    /// leader each listed member names itself. Returns the number of requests queued; each costs one short
-    /// turn that only calls set_group_member_title. `byUser` is a press of a request button in the graph:
-    /// the user can ask again at any time, for one member or the whole group, even when names exist.
-    /// Adding members (`byUser` false) asks once per member and skips members asked before.
     @discardableResult
     public func requestSessionGroupNicknames(groupID: UUID, memberIDs: [UUID], byUser: Bool = false) throws -> Int {
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }) else { return 0 }
         func key(_ member: UUID) -> String { "groupNicknameRequested:\(groupID.uuidString):\(member.uuidString)" }
-        let targets = group.members.filter { member in memberIDs.contains(member.id) && (byUser || store.value(key(member.id)) == nil) }
+        let targets = group.members.filter { member in
+            guard memberIDs.contains(member.id) else { return false }
+            if byUser { return true }
+            guard member.role == nil || member.nickname == nil else { return false }
+            guard let previous = store.value(key(member.id)).flatMap(Double.init) else { return true }
+            return Date().timeIntervalSince1970 - previous >= Double(groupMessageTTLMinutes * 60)
+        }
         guard !targets.isEmpty else { return 0 }
         let box = try groupMailbox()
         var requests: [(recipient: UUID, text: String, sourceKey: String?)] = []
@@ -3245,8 +3252,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             + "도구는 AutoApprove MCP의 set_group_member_title(groupID, memberID, title, role)이고 Claude Code에서는 mcp__autoapprove__set_group_member_title이야. 안 보이면 ToolSearch로 불러와. "
             + "이름과 역할 설정 말고 다른 작업은 하지 마."
         if byUser {
-            // The user pressed a button for this, so it is typed as the user's own short request; the text says
-            // which button sent it. Members, IDs and current names come from get_group_status, keeping it short.
             let button = targets.count == 1 ? "'이 구성원 이름 다시 정하기'" : "'전체 다시 정하기'"
             let scope = targets.count == 1
                 ? "구성원 '\(targets[0].title)'(memberID \(targets[0].id.uuidString)) 한 명의"
@@ -3261,7 +3266,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
         } else {
-            // Sent by AutoApprove when members are added; it stays a notice, and the recipient may decline it.
             func line(_ member: SessionGroupMember) -> String {
                 "memberID \(member.id.uuidString), \(member.agent.title), 작업 폴더 \(member.cwd), 지금 이름 \(member.title.isEmpty ? "(없음)" : member.title), 지금 역할 \(member.role ?? "(없음)")"
             }
@@ -3287,8 +3291,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return requests.count
     }
 
-    /// Stores the role a leader set with a nickname. Retries on a concurrent edit of the group store.
-    private func setGroupMemberRole(groupID: UUID, memberID: UUID, role: String) throws {
+    private func setGroupMemberIdentity(groupID: UUID, memberID: UUID, nickname: String, role: String?) throws {
         let store = SessionGroupStore(directory: paths.directory)
         for _ in 0..<3 {
             let latest = try store.load()
@@ -3296,8 +3299,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   let mi = latest[gi].members.firstIndex(where: { $0.id == memberID }) else {
                 throw AppError.message("역할을 저장할 구성원을 찾지 못했습니다.")
             }
-            guard latest[gi].members[mi].role != role else { return }
-            var next = latest; next[gi].members[mi].role = role
+            var next = latest
+            next[gi].members[mi].nickname = nickname
+            if let role { next[gi].members[mi].role = role }
+            guard latest != next else { return }
             do { try store.save(next, expected: latest); publish(); return } catch { continue }
         }
         throw AppError.message("그룹 정보가 계속 바뀌어 역할을 저장하지 못했습니다.")
@@ -4876,9 +4881,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard group.leaderMemberID == nil || group.isLeader(callerMember.id) else { throw RemoteHTTPError(403, "그룹의 탭 표시 변경은 그룹장만 요청할 수 있습니다.") }
             guard !groupClearActive(groupID) else { throw RemoteHTTPError(409, "그룹 초기화가 끝난 뒤 탭 표시를 변경해주세요.") }
             guard let member = group.members.first(where: { $0.id == memberID }) else { throw RemoteHTTPError(404, "이 그룹에서 지정한 구성원을 찾지 못했습니다.") }
-            guard let live = SessionGroupMatching.match(member, in: observed), let session = sessions[live.id], session.phase != .ended else { throw RemoteHTTPError(409, "대화 ID와 원래 터미널 연결을 확인한 뒤 다시 시도해주세요.") }
-            guard let host = ScreenHost(kind: session.terminal), let write = screenAdapters[host]?.setTabLabel else { throw RemoteHTTPError(501, "탭 이름·색상 표식 변경은 Terminal과 iTerm2에서 지원합니다.") }
-            var customization = session.customization ?? .init()
+            let live = SessionGroupMatching.match(member, in: observed)
+            let targetSession = live.flatMap { sessions[$0.id] }
+            var customization = targetSession?.customization ?? .init()
             let title: String
             var role: String?
             if tool == "set_group_member_title" {
@@ -4891,10 +4896,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             } else {
                 guard let color = object["color"] as? String, color == "default" || SessionColor(rawValue: color) != nil else { throw RemoteHTTPError(400, "탭 색상을 지정해주세요. red·orange·yellow·green·blue·purple·gray·default를 지원합니다.") }
-                title = customization.title.isEmpty ? TerminalTabLabel.baseTitle(session.terminalTitle ?? member.title) : customization.title
+                title = customization.title.isEmpty ? TerminalTabLabel.baseTitle(targetSession?.terminalTitle ?? member.title) : customization.title
                 customization.color = color == "default" ? nil : SessionColor(rawValue: color)
             }
             let label = try TerminalTabLabel(title: title, color: customization.color?.rawValue).validated()
+            if tool == "set_group_member_title" {
+                try setGroupMemberIdentity(groupID: groupID, memberID: memberID, nickname: label.title, role: role)
+            }
+            guard let session = targetSession, let live, session.phase != .ended,
+                  let host = ScreenHost(kind: session.terminal), let write = screenAdapters[host]?.setTabLabel else {
+                if tool == "set_group_member_title" {
+                    return ["groupID": groupID.uuidString, "memberID": memberID.uuidString, "title": label.title,
+                            "role": role as Any? ?? NSNull(), "groupApplied": true, "nativeApplied": false,
+                            "message": "그룹 노드에 저장했습니다. 연결된 탭 표시를 변경할 수 없습니다."]
+                }
+                throw RemoteHTTPError(409, "탭 색상을 적용할 연결된 터미널을 확인해주세요.")
+            }
             guard tabLabelChanges.insert(session.id).inserted else { throw RemoteHTTPError(409, "이 세션의 탭 표시를 변경 중입니다. 잠시 뒤 다시 시도해주세요.") }
             defer { tabLabelChanges.remove(session.id) }
             let validate = nativeIdentity(session)
@@ -4909,10 +4926,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             customization.title = label.title
             do { try setCustomization(session.id, value: customization) }
             catch { throw RemoteHTTPError(500, "원래 탭 이름은 변경했지만 표시 설정을 저장하지 못했습니다. " + error.localizedDescription, diagnostics: ["nativeApplied": "true"]) }
-            if let role {
-                do { try setGroupMemberRole(groupID: groupID, memberID: memberID, role: role) }
-                catch { throw RemoteHTTPError(500, "탭 이름은 변경했지만 역할을 저장하지 못했습니다. " + error.localizedDescription, diagnostics: ["nativeApplied": "true"]) }
-            }
             return ["groupID": groupID.uuidString, "memberID": memberID.uuidString, "conversationID": live.conversationID as Any? ?? NSNull(),
                     "applied": true, "verified": true, "title": label.title, "role": role as Any? ?? NSNull(), "tabTitle": actual,
                     "color": label.color as Any? ?? NSNull(), "colorMode": "title_marker", "transport": "local_terminal", "networkRequired": false]
@@ -5018,7 +5031,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let members: [JSONObject] = group.members.map { member in
                     let live = SessionGroupMatching.match(member, in: observed)
                     let unresolved = live == nil ? SessionGroupMatching.connection(member, in: observed) : nil
-                    return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "role": member.role as Any? ?? NSNull(),
+                    return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.nickname ?? member.title, "role": member.role as Any? ?? NSNull(),
                             "cwd": member.cwd, "conversationID": member.conversationID,
                             "providerHome": member.providerHome as Any? ?? NSNull(), "connected": live != nil,
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
@@ -5072,7 +5085,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let members: [JSONObject] = group.treeOrder.map { entry in
                     let member = entry.member, live = SessionGroupMatching.match(member, in: observed)
                     let phase = live.flatMap { row in sessions[row.id].map { groupDisplayPhase($0, observation: row) } }
-                    return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "role": member.role as Any? ?? NSNull(), "cwd": member.cwd,
+                    return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.nickname ?? member.title, "role": member.role as Any? ?? NSNull(), "cwd": member.cwd,
                             "identityWarning": warnings[member.id] as Any? ?? NSNull(), "tty": live?.session.tty as Any? ?? NSNull(),
                             "claudeStatus": live.flatMap { memberStatuses[$0.id] } as Any? ?? NSNull(),
                             "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
@@ -6127,6 +6140,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
         publish()
     }
 
+    public func refresh(sessionIDs: Set<String>) async {
+        let selected = sessionIDs.compactMap { sessions[$0] }.filter { $0.phase != .ended }
+        guard !selected.isEmpty else { return }
+        async let questions = refreshCodexHistory(sessionIDs: sessionIDs)
+        for host in ScreenHost.allCases {
+            let targets = selected.filter { $0.terminal == host.kind }
+            if !targets.isEmpty {
+                await refreshScreenHost(host, reportConnecting: false, targets: targets, hostTargets: pollingTargets(host), selectedOnly: true)
+            }
+        }
+        _ = await questions
+        publish()
+    }
+
     private func refreshDiscovery() async {
         guard !discovering else { return }
         discovering = true
@@ -6186,12 +6213,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if !publishedDiscovery { publish() }
     }
 
-    private func refreshCodexHistory() async -> (targetCount: Int, responsive: Bool)? {
+    private func refreshCodexHistory(sessionIDs: Set<String>? = nil) async -> (targetCount: Int, responsive: Bool)? {
         let epoch = observationEpoch
         let automationEpochs = automationRuntime.epochs
         let automationDefaultEpoch = automationRuntime.defaultEpoch
-        let codexTargets = sessions.values.filter { $0.agent == .codex && $0.phase != .ended }
-        let updates = await codexQuestions.collect(codexTargets)
+        let codexTargets = sessions.values.filter { $0.agent == .codex && $0.phase != .ended && (sessionIDs?.contains($0.id) ?? true) }
+        if sessionIDs != nil && codexTargets.isEmpty { return (0, false) }
+        let updates = await codexQuestions.collect(codexTargets, partial: sessionIDs != nil)
         guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return nil }
         let bindings=Dictionary(uniqueKeysWithValues:codexTargets.map {($0.id,$0.codexApprovalBinding?.threadID)})
         updateCodexQuestions(updates.filter {
@@ -7255,7 +7283,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// sessions, so the health line still counts tabs read on an earlier pass.
     @discardableResult
     private func refreshScreenHost(_ host: ScreenHost, reportConnecting: Bool, targets suppliedTargets: [AgentSession]?,
-                                   hostTargets: [AgentSession]? = nil) async -> Bool? {
+                                   hostTargets: [AgentSession]? = nil, selectedOnly: Bool = false) async -> Bool? {
         guard !remoteInputStopped, let connection = screenConnections[host], connection.enabled, !connection.polling, !connection.permissionBlocked,
               Date() >= connection.retryAfter, let adapter = screenAdapters[host] else { return nil }
         screenConnections[host]?.polling = true
@@ -7469,12 +7497,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return unchanged
         } catch {
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return nil }
-            // Denied Automation stays blocked until the user reconnects; other failures retry.
             let blocked = error is TerminalAdapterError
             screenConnections[host]?.permissionBlocked = blocked
             screenConnections[host]?.retryAfter = Date().addingTimeInterval(5)
             updateHealth(host) { $0.connected = false; $0.status = error.localizedDescription + (blocked ? "" : " · 자동 재연결 대기") }
-            for id in Array(sessions.keys) where sessions[id]?.channel == host.channel && sessions[id]?.phase != .ended {
+            for id in (selectedOnly ? targets.map(\.id) : Array(sessions.keys)) where sessions[id]?.channel == host.channel && sessions[id]?.phase != .ended {
                 sessions[id]?.channel = .none; sessions[id]?.setPhase(.unknown, detail: "\(title) 연결이 끊겨 현재 상태를 확인할 수 없습니다."); clearScreen(id, keepRemote: !blocked)
             }
             publish()

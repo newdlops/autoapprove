@@ -450,7 +450,8 @@ extension ApprovalTests {
         do { _ = try await call("set_group_member_title", ["title":"outside"], member:2); throw AppError.message("Outside member renamed") } catch let error as RemoteHTTPError { try expectEqual(error.status,404) }
         try expectEqual(fixture.labelCount(),4)
         try expectNil(engine.snapshot.sessions.first { $0.id == sessions[0].id }?.customization)
-        try expectEqual(try SessionGroupStore(directory: directory).load()[0],group)
+        var named = group; named.members[1].nickname = "새 이름 'quoted' 🤖"
+        try expectEqual(try SessionGroupStore(directory: directory).load()[0], named)
         // The same verified Claude member gains the exact role the Codex member has.
         let peers = group.addingLeader(members[1].id)
         try SessionGroupStore(directory: directory).save([peers])
