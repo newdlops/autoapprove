@@ -250,8 +250,8 @@ public final class SessionGroupMailbox {
                 WHERE group_id=? AND kind='notice' AND acknowledged IS NULL
                   AND (last_result IS NULL OR last_result IN ('not_started','redeliver','sender_absent'))
                   AND ((source_key LIKE 'followup:%' AND sender_id NOT IN (SELECT value FROM json_each(?)))
-                    OR (source_key LIKE 'stalled:%' AND EXISTS (
-                        SELECT 1 FROM messages original WHERE original.id=substr(messages.source_key,9)
+                    OR ((source_key LIKE 'stalled:%' OR source_key LIKE 'uncertain:%') AND EXISTS (
+                        SELECT 1 FROM messages original WHERE original.id=substr(messages.source_key,instr(messages.source_key,':')+1)
                           AND original.group_id=messages.group_id AND (original.acknowledged IS NOT NULL
                             OR original.last_result IN ('expired','answered','superseded')))))
                 """, [group.uuidString, ids])
@@ -309,15 +309,16 @@ public final class SessionGroupMailbox {
         return !parked
     }
 
-    /// Agent-sent messages that have not started typing since `date` and whose sender was not told yet.
-    /// Reports and choice questions are sent on a worker's behalf after its turn, so they are left out.
-    func stalledForSenders(createdBefore date: Date) throws -> [SessionGroupMessage] {
+    package func stalledForSenders(createdBefore date: Date, uncertainBefore: Date) throws -> [SessionGroupMessage] {
         try rows("""
-            WHERE acknowledged IS NULL AND kind IN ('question','reply','message') AND sender_id<>recipient_id AND created<=?
-              AND (last_result IS NULL OR last_result IN ('not_started','undelivered'))
-              AND NOT EXISTS(SELECT 1 FROM messages n WHERE n.source_key='stalled:' || messages.id)
+            WHERE acknowledged IS NULL AND kind IN ('question','reply','message') AND sender_id<>recipient_id
+              AND (((last_result IS NULL OR last_result IN ('not_started','undelivered')) AND created<=?)
+                OR (last_result='direct_unknown' AND coalesce((SELECT submitted FROM group_submissions
+                    WHERE message_id=messages.id),created)<=CAST(? AS REAL)))
+              AND NOT EXISTS(SELECT 1 FROM messages n WHERE n.source_key=
+                  (CASE WHEN messages.last_result='direct_unknown' THEN 'uncertain:' ELSE 'stalled:' END) || messages.id)
             ORDER BY sequence LIMIT 50
-            """, [String(date.timeIntervalSince1970)])
+            """, [String(date.timeIntervalSince1970), String(uncertainBefore.timeIntervalSince1970)])
     }
 
     /// Messages still queued or awaiting a receipt whose recipient is not a member of the group any more

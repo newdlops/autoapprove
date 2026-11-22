@@ -3579,11 +3579,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    /// Tells the sender once when its message has waited too long without being typed. The notice is
-    /// itself a `.notice`, which is never checked here, so senders that are also blocked cannot loop.
     private func notifyStalledSenders() {
         guard let box = try? groupMailbox(),
-              let stalled = try? box.stalledForSenders(createdBefore: Date().addingTimeInterval(-groupStallNoticeAfter)),
+              let stalled = try? box.stalledForSenders(createdBefore: Date().addingTimeInterval(-groupStallNoticeAfter), uncertainBefore: Date().addingTimeInterval(-60)),
               !stalled.isEmpty else { return }
         let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
         for message in stalled { noticeStalledSender(message, groups: groups) }
@@ -3633,11 +3631,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func noticeStalledSender(_ message: SessionGroupMessage, groups: [SessionGroup]) {
+        let uncertain = message.lastResult == "direct_unknown"
+        let key = (uncertain ? "uncertain:" : "stalled:") + message.id.uuidString
         guard [.question, .reply, .message].contains(message.kind), message.senderID != message.recipientID,
               let group = groups.first(where: { $0.id == message.groupID }),
               group.members.contains(where: { $0.id == message.senderID }),
-              let box = try? groupMailbox(), (try? box.message(sourceKey: "stalled:" + message.id.uuidString)) == nil else { return }
+              let box = try? groupMailbox(), (try? box.message(sourceKey: key)) == nil else { return }
         let recipient = group.members.first { $0.id == message.recipientID }?.title ?? "받는 구성원"
+        if uncertain {
+            let reason = message.lastError ?? "입력 결과를 확인할 수 없습니다."
+            let text = "[AutoApprove 수신 확인 지연] " + recipient + "에게 보낸 메시지 " + message.id.uuidString +
+                "의 입력 결과를 확인하고 있습니다. " + reason +
+                " 같은 질문을 다시 보내지 마세요. 받는 구성원은 get_group_messages에서 원문을 읽고 수신 확인 또는 회신할 수 있습니다."
+            _ = try? box.enqueue(groupID: group.id, senderID: message.senderID, recipientID: message.senderID,
+                                 kind: .notice, text: text, sourceKey: key)
+            return
+        }
         let minutes = max(1, Int(Date().timeIntervalSince(message.createdAt) / 60))
         let reason = message.lastResult == "undelivered"
             ? "입력한 메시지가 여러 번 대화에 들어가지 않아 자동 입력을 멈췄습니다"
@@ -3645,7 +3654,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let text = "[AutoApprove 전달 지연] 보낸 메시지(messageID \(message.id.uuidString), \(message.kind.rawValue))가 '\(recipient)'에게 \(minutes)분째 입력되지 않았습니다. 사유: \(reason) "
             + "메시지는 수신함에 보관되어 있고, 받는 쪽 입력창이 비면 자동으로 전달됩니다. 같은 내용을 다시 보내지 마세요. 진행에 꼭 필요하면 사용자에게 알리세요."
         _ = try? box.enqueue(groupID: group.id, senderID: message.senderID, recipientID: message.senderID, kind: .notice, text: text,
-                             sourceKey: "stalled:" + message.id.uuidString)
+                             sourceKey: key)
     }
 
     /// Why a group message is held instead of typed, so the sender and the graph can tell a busy

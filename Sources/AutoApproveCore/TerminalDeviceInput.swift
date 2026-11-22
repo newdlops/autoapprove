@@ -2,10 +2,7 @@ import Foundation
 import Darwin
 import TerminalInputSupport
 
-/// Terminal input is delivered by the user app under its Accessibility permission.
 public enum TerminalDeviceInput {
-    /// Group traffic is written to the exact tab in one Apple event. No activation,
-    /// clipboard, key events, or foreground-keyboard fallback is allowed here.
     public static func deliverBackground(target: ScreenTarget, screen: String, agent: AgentKind, input: RemoteTerminalInput,
         captureIdentity: @escaping @Sendable (Int32) throws -> TTYInputIdentity = { try TTYInputIdentity.capture(pid: $0) },
         run: (@Sendable (String) throws -> String)? = nil) throws -> TerminalDelivery {
@@ -21,8 +18,6 @@ public enum TerminalDeviceInput {
               current.uid == getuid(), current.effectiveUID == geteuid(), current.processGroup == current.foregroundGroup else {
             return .agentMissing
         }
-        // doScript adds the submission newline. Bracketed paste keeps a long
-        // message together and prevents its internal newlines from submitting early.
         let data = try AutomationScript.literal(["tty": target.tty, "screen": screen,
             "text": claudeClear ? "/clear" : "\u{1b}[200~" + input.text + "\u{1b}[201~", "agent": agent.rawValue] as JSONObject)
         let script = """
@@ -36,8 +31,6 @@ public enum TerminalDeviceInput {
             if (skipClosed(() => String(tab.tty())) === target.tty) matches.push(tab);
           }
           if (!matches.length) return 'missingTarget';
-          // Native tab groups can expose the same TTY through multiple window
-          // aliases. Verify every alias, then write once to that exact TTY.
           for (const tab of matches) {
             if (normalize(tab.contents()) !== normalize(target.screen)) return 'screenChanged';
             if (!tab.processes().some(name => String(name).toLowerCase().includes(target.agent))) return 'agentMissing';
@@ -49,7 +42,7 @@ public enum TerminalDeviceInput {
           return 'sent';
         })();
         """
-        let result = try run?(script) ?? AutomationScript.run(script, app: "Terminal", denied: .permissionDenied)
+        let result = try run?(script) ?? AutomationScript.run(script, app: "Terminal", denied: .permissionDenied, timeout: 25)
         guard let delivered = TerminalDelivery(rawValue: result) else {
             throw RemoteHTTPError(409, "백그라운드 전달 결과를 확인하지 못했습니다. 중복 전송하지 말고 대상 입력을 확인해주세요.", diagnostics: ["delivery": "unknown"])
         }
