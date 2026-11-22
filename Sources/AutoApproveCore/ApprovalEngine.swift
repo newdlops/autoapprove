@@ -2420,6 +2420,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let observedAt: TimeInterval
     }
     private struct AgyState {
+        let revision = UUID()
         let conversationId: String
         let isIdle: Bool
         let modelName: String?
@@ -2598,7 +2599,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (id, home, name)
     }
 
-    /// Only an explicit refresh may query the original tab when passive evidence is missing.
     @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil, selectedReplacement: String? = nil, expectedConversationID: String? = nil) async throws -> SessionGroupIdentityRefresh {
         let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
         if let expectedGroup, saved.first(where: { $0.id == groupID })?.sameMembership(as: expectedGroup) != true {
@@ -2609,8 +2609,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw AppError.message("갱신할 그룹 구성원을 찾지 못했습니다.")
         }
         guard !groupClearActive(groupID) else { throw AppError.message("이 그룹의 초기화가 끝난 뒤 ID를 갱신해주세요.") }
-        // The original binding normally makes a targeted read sufficient. A
-        // resumed conversation can use an exact UUID match elsewhere.
         let isCodex = member.agent == .codex
         var connection: SessionGroupLiveSession?
         if let runtime = member.runtimeID {
@@ -2643,11 +2641,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             verifiedName = named.name
             verifiedInTab = true
         } else {
-            if original.agent == .agy { throw AppError.message("연결 설정에서 agy 훅을 설치하고 해당 대화의 다음 이벤트를 기다려주세요.") }
+            if original.agent == .agy { throw AppError.message("agy에서 대화를 시작하거나 재개한 뒤 ID를 다시 갱신해주세요.") }
             if !isCodex && (original.phase != .idle || original.pendingInTerminal || automaticInputBusy(runtime) || userInputHasPriority(runtime)) {
                 throw AppError.message("원래 터미널이 대기 중일 때 갱신할 수 있습니다. 작업·질문·승인 상태를 확인해주세요.")
             }
-            // With a shared server the TUI owns neither the rollout nor the MCP helper.
             id = try await statusConversationID(original, backgroundOnly: isCodex, markRepeatedCard: isCodex)
             verifiedInTab = true
         }
@@ -2696,8 +2693,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
               !groupClearActive(groupID) else {
             throw AppError.message("조회 중 그룹 연결이 바뀌었습니다. 다시 조회해주세요.")
         }
-        // Automatic reconciliation may have saved exactly this member while
-        // the explicit refresh verified the process. Other edits still conflict.
         if expectedGroup != nil {
             var originalGroup = latest[gi]
             originalGroup.members[mi] = member
@@ -2871,6 +2866,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let reader: @Sendable () throws -> [ProcessRecord] = { if let pid { return try readOne(pid) }; return try readAll() }
         let registry = claudeRegistryReader, codexReader = codexGroupReader, codexEnvironment = codexGroupEnvironment
         let records = try await Task.detached(priority: .utility) { try reader() }.value
+        let agyRevisions = agyEvents.mapValues(\.revision)
         var result: [SessionGroupLiveSession] = []
         for original in originals {
             try Task.checkCancellation()
@@ -2890,7 +2886,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             } else if original.agent == .agy {
                 home = AgyHookInstaller.file.deletingLastPathComponent().path
-                conversation = agyEvents[original.id]?.conversationId
+                conversation = await Task.detached(priority: .utility) {
+                    ProcessOpenFiles.agyConversation(pid: record.pid, started: record.started)
+                }.value ?? agyEvents[original.id]?.conversationId
             } else {
                 if let environment {
                     let path = environment["CLAUDE_CONFIG_DIR"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude").path
@@ -2905,7 +2903,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         claudeStatus = matching[0].status
                     }
                 } else {
-                    // Injected registry readers are also useful for isolated tests; do not infer a home.
                     let rows = await Task.detached(priority: .utility) { registry([record]) }.value
                     let ids = Set(rows.filter { $0.processID == original.id }.compactMap(\.conversationID))
                     if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
@@ -2924,8 +2921,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             observation.claudeRegisteredStatus = claudeStatus
             result.append(observation)
         }
-        // Discovery can lag while a process exits or a PID is reused. Re-read
-        // the process list after the async work, and never publish a stale match.
         let latest = try await Task.detached(priority: .utility) { try reader() }.value
         let byPID = Dictionary(latest.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
         let observed = result.compactMap { observation -> SessionGroupLiveSession? in
@@ -2937,7 +2932,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   latest.contains(where: { $0.key == observation.id && $0.agent == current.agent && "/dev/" + $0.tty == current.tty }) else { return nil }
             var result = observation
             result.session = current
-            if current.agent == .agy { result.conversationID = agyEvents[current.id]?.conversationId }
+            if current.agent == .agy, agyRevisions[current.id] != agyEvents[current.id]?.revision {
+                result.conversationID = agyEvents[current.id]?.conversationId
+            }
             if let process = byPID[current.pid] { result.tabShell = SessionGroupTabShell.observe(current, process: process, records: byPID) }
             let mcp = current.agent == .codex ? groupMCPIdentity(for: current, home: result.providerHome) : nil
             if let mcp, let id = mcp.conversationID {
@@ -2968,8 +2965,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard reconcile else { return observed }
         let groupStore = SessionGroupStore(directory: paths.directory), saved = try groupStore.load()
         var refreshed = CodexGroupIdentity.refreshed(saved, live: observed)
-        // A managed clear owns its write and checkpoint. Manual Claude clears
-        // can reconcile directly from the registry of the original live process.
         let manual = refreshed.filter { !groupClearActive($0.id) }
         let claude = Dictionary(uniqueKeysWithValues: SessionGroupMatching.refreshedClaude(manual, live: observed).map { ($0.id, $0) })
         refreshed = refreshed.map { claude[$0.id] ?? $0 }
@@ -2977,7 +2972,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for attachment in profileGroupAttachments where attachment.expires > Date() {
             guard let gi=refreshed.firstIndex(where:{$0.id==attachment.groupID}),
                   let mi=refreshed[gi].members.firstIndex(where:{$0.id==attachment.memberID}) else{continue}
-            // A user's intervening identity edit invalidates this receipt.
             let member=refreshed[gi].members[mi]
             guard member.agent.rawValue==attachment.entry.agent,member.cwd==attachment.entry.cwd,
                   member.conversationID==attachment.entry.conversationID else{continue}
@@ -3624,7 +3618,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func groupReceiptEvidence(_ message: SessionGroupMessage, live: SessionGroupLiveSession, session: AgentSession) async -> GroupReceiptEvidence {
-        // A busy, asking or occupied recipient may still be holding the typed prompt.
+        if session.agent == .agy {
+            guard let conversation = live.conversationID,
+                  let turn = await Task.detached(priority: .utility, operation: {
+                      AgyTranscript.finalTurn(conversation: conversation)
+                  }).value, SessionGroupMessage.terminalMessageID(turn.prompt) == message.id,
+                  let box = try? groupMailbox() else { return .unknown }
+            do {
+                if try box.confirmedPrompt(message.id, conversation: live.id, prompt: turn.prompt) {
+                    try box.recordSubmission(message.id, conversation: conversation, prompt: turn.prompt)
+                }
+                guard try box.confirmedPrompt(message.id, conversation: conversation, prompt: turn.prompt) else { return .unknown }
+                receiveGroupTurn(conversation: conversation, turn: conversation + ":" + String(turn.step), prompt: turn.prompt, response: turn.answer)
+                return try box.message(message.id)?.acknowledgedAt != nil ? .received : .unknown
+            } catch { return .unknown }
+        }
         guard ![.working, .approval, .input, .ended].contains(session.phase), !session.pendingInTerminal,
               !automaticInputBusy(session.id), !userInputHasPriority(session.id),
               let frame = try? await remoteTerminal(sessionID: session.id, realtime: true, textOnly: true),
@@ -3634,8 +3642,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if current.acknowledgedAt != nil { return .received }
         switch session.agent {
         case .claude:
-            // The transcript is the durable record. A prompt carrying this ID means it arrived,
-            // even when the hook missed it or the terminal reflowed its text.
             let reader = groupTranscriptReader
             if let turn = await Task.detached(priority: .utility, operation: { reader.recoverableGroupTurn(live) }).value,
                SessionGroupMessage.terminalMessageID(turn.prompt) == message.id {
@@ -3646,14 +3652,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 commitGroupReceipt(message)
                 return .received
             }
-            // With hooks, UserPromptSubmit commits every submitted prompt at once; without
-            // them, the transcript above is the only trace. Either way nothing arrived.
             return .lost
         case .codex:
-            // Proof needs an observation taken after the typing; an older one cannot show the prompt.
             guard let entry = codexTurns[session.id], let submitted = try? box.submittedAt(message.id),
                   entry.1 > submitted.addingTimeInterval(groupMailboxPollInterval) else { return .unknown }
-            // Its completion commits it through the turn observer.
             if entry.0.userPrompt.flatMap(SessionGroupMessage.terminalMessageID) == message.id { return .unknown }
             return .lost
         default: return .unknown
@@ -3666,14 +3668,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if [.report, .choiceQuestion].contains(message.kind) { try? applyGroupMessageAcknowledgements([message.id]) }
     }
 
+    private static func canAddressGroupMember(_ member: SessionGroupMember, live: SessionGroupLiveSession?) -> Bool {
+        guard let live else { return false }
+        if let id = UUID(uuidString: member.conversationID) { return live.conversationID.flatMap(UUID.init(uuidString:)) == id }
+        return member.agent == .agy && member.conversationID.isEmpty && live.conversationID == nil &&
+            live.session.agent == .agy && member.runtimeID == live.id && member.cwd == live.session.cwd
+    }
+
     private func sendGroupMailboxNotice(_ message: SessionGroupMessage, observed: [SessionGroupLiveSession],
                                         manualQuestion: Bool = false) async throws {
         guard !groupClearActive(message.groupID) else { throw RemoteHTTPError(409, "그룹 초기화 중이어서 메시지를 수신함에 보관합니다.", diagnostics: ["delivery": "not_started"]) }
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == message.groupID }),
               group.members.contains(where: { $0.id == message.senderID }),
               let recipient = group.members.first(where: { $0.id == message.recipientID }),
-              UUID(uuidString: recipient.conversationID) != nil,
-              let live = SessionGroupMatching.match(recipient, in: observed), live.conversationID.flatMap(UUID.init(uuidString:)) != nil,
+              let live = SessionGroupMatching.match(recipient, in: observed),
+              Self.canAddressGroupMember(recipient, live: live),
               let current = sessions[live.id] else {
             throw RemoteHTTPError(409, "원래 그룹 구성원과 현재 터미널을 확인하지 못해 메시지를 보관하고 있습니다.", diagnostics: ["delivery": "not_started"])
         }
@@ -3687,9 +3696,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         try ready()
-        // Every kind is typed with its body; the observed prompt is the delivery receipt.
         let prompt = message.terminalPrompt(senderTitle: group.members.first { $0.id == message.senderID }?.title ?? "")
-        try await sendGroupLine(current, text: prompt, preflight: {
+        try await sendGroupLine(current, text: prompt, agyTarget: live, preflight: {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
             let empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
                 : current.agent == .agy ? AgyComposerReadiness.isEmpty(frame.screen) : ClaudeComposerReadiness.isEmpty(frame.screen)
@@ -3708,13 +3716,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 throw RemoteHTTPError(409, "메시지가 이미 처리되었습니다.", diagnostics: ["delivery": "not_started"])
             }
             if message.deliversBody {
-                guard let conversation = live.conversationID else {
-                    throw RemoteHTTPError(409, "현재 대화 ID를 확인해주세요.", diagnostics: ["delivery": "not_started"])
-                }
+                let conversation = live.conversationID ?? live.id
                 try box.recordSubmission(message.id, conversation: conversation, prompt: prompt)
             }
-            // Retain the user's Claude hook delegation only for an authenticated task report/question.
-            // A peer's free-form message must never acquire task/approval authority through this hint.
             if [.report, .choiceQuestion].contains(message.kind), message.sourceKey != nil,
                group.canDirect(message.recipientID, worker: message.senderID) {
                 self.groupMailboxDelegations = self.groupMailboxDelegations.filter { Date().timeIntervalSince($0.value.at) < 600 }
@@ -4375,18 +4379,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }.value
     }
 
-    /// Types one line of group traffic (a task, a report or a request) into a session and submits it.
-    /// For Claude in a host that can type without focus, the line also reaches a background tab, and the
-    /// change of Claude's status away from "idle" proves that it was submitted.
-    private func sendGroupLine(_ session: AgentSession, text: String, preflight: (() async throws -> Void)? = nil) async throws {
+    private func sendGroupLine(_ session: AgentSession, text: String, agyTarget: SessionGroupLiveSession? = nil, preflight: (() async throws -> Void)? = nil) async throws {
         if session.agent == .agy {
-            let conversation = agyEvents[session.id]?.conversationId
+            let conversation = agyTarget == nil ? session.providerID : agyTarget?.conversationID
             _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true) { frame in
-                try await preflight?()
-                guard let state = self.agyEvents[session.id], state.conversationId == conversation, state.isIdle,
+                let locks = try? await Task.detached(priority: .utility) {
+                    try ProcessOpenFiles.agyConversations(pid: session.pid, started: session.started)
+                }.value
+                let event = self.agyEvents[session.id]
+                let expected = Set([conversation].compactMap { $0 })
+                let verified = locks == expected || (locks == nil && conversation != nil && event?.conversationId == conversation)
+                guard verified, conversation != nil || agyTarget?.id == session.id,
+                      event.map({ $0.isIdle && $0.conversationId == conversation }) ?? true,
                       AgyComposerReadiness.isEmpty(frame.screen) else {
                     throw RemoteHTTPError(409, "agy의 현재 대화와 빈 입력창을 확인해주세요.", diagnostics: ["delivery":"not_started"])
                 }
+                try await preflight?()
             }
             return
         }
@@ -4416,7 +4424,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return false
             }
             if await submitted(within: 1.5) { return }
-            // A long line arrives as a paste, and Claude does not take the newline at its end as Enter.
             _ = try? await Task.detached(operation: { try type(target, "") }).value
             if await submitted(within: 6) { return }
             throw RemoteHTTPError(409, "터미널에 입력했지만 제출을 확인하지 못했습니다. 대상 터미널의 입력창을 확인해주세요.", diagnostics: ["delivery": "unknown"])
@@ -4777,7 +4784,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),
                             "modelSettingsRecordedAt": live.flatMap { modelSettings[$0.id]?.recordedAt }.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
                             "isCaller": member.id == callerMember.id, "sameAgent": member.agent == caller.session.agent,
-                            "canAskQuestion": member.id != callerMember.id && live?.conversationID.flatMap(UUID.init(uuidString:)) != nil && UUID(uuidString: callerMember.conversationID) != nil && groupMemberIsCaller(callerMember, caller: caller, observed: observed),
+                            "canAskQuestion": member.id != callerMember.id && Self.canAddressGroupMember(member, live: live) && UUID(uuidString: callerMember.conversationID) != nil && groupMemberIsCaller(callerMember, caller: caller, observed: observed),
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
                             "isLeader": group.isLeader(member.id),
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull()]
@@ -4814,7 +4821,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "connected": live != nil, "phase": phase?.rawValue as Any? ?? NSNull(),
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
-                            "canAskQuestion": member.id != callerMember.id && live?.conversationID.flatMap(UUID.init(uuidString:)) != nil && UUID(uuidString: callerMember.conversationID) != nil,
+                            "canAskQuestion": member.id != callerMember.id && Self.canAddressGroupMember(member, live: live) && UUID(uuidString: callerMember.conversationID) != nil,
                             "canAssign": group.canDirect(callerMember.id, worker: member.id),
                             "task": groupTaskJSON(state.current(groupID: group.id, workerMemberID: member.id))]
                 }
@@ -5843,6 +5850,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let discovered = try await Task.detached(priority: .utility) { try reader() }.value
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
             let found = ProcessDiscovery.sessions(discovered)
+            let agyRevisions = agyEvents.mapValues(\.revision)
+            let agyIDs = await Task.detached(priority: .utility) {
+                var ids: [String: String] = [:]
+                for target in found where target.agent == .agy {
+                    ids[target.id] = ProcessOpenFiles.agyConversation(pid: target.pid, started: target.started)
+                }
+                return ids
+            }.value
             let identities = found.map(\.id)
             let dueIDs = Set(ProcessDiscovery.workingDirectoryRefreshIDs(identities,
                 lastRead: workingDirectoryReadAt, now: ProcessInfo.processInfo.systemUptime))
@@ -5863,16 +5878,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
             for session in directoryTargets { workingDirectoryReadAt[session.id] = readAt }
             workingDirectoriesBySession.merge(directories) { _, latest in latest }
             if snapshot.health.discoveryError != nil { snapshot.health.discoveryError = nil }
-            updateDiscovery(found, records: discovered, directories: workingDirectoriesBySession)
+            for target in found where target.agent == .agy && agyRevisions[target.id] == agyEvents[target.id]?.revision {
+                if let id = agyIDs[target.id], let event = agyEvents[target.id], event.conversationId != id {
+                    agyEvents.removeValue(forKey: target.id)
+                    sessions[target.id]?.setPhase(.unknown, detail: "agy 대화 상태를 확인하고 있습니다.")
+                    sessions[target.id]?.channel = ApprovalChannel.none
+                }
+            }
+            updateDiscovery(found, records: discovered, directories: workingDirectoriesBySession, agyIDs: agyIDs)
             publishedDiscovery = true
         } catch {
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
             if snapshot.health.discoveryError != error.localizedDescription { snapshot.health.discoveryError = error.localizedDescription }
         }
         refreshGitBranches()
-        // updateDiscovery publishes the complete successful snapshot itself.
-        // Re-running publish here would repeat question reconciliation, inbox
-        // projection, session sorting and remote-row construction every poll.
         if !publishedDiscovery { publish() }
     }
 
@@ -6588,19 +6607,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    public func updateDiscovery(_ found: [AgentSession], records: [ProcessRecord], directories: [String: String] = [:], claudeRegistrations: [ClaudeSessionRegistration]? = nil) {
+    public func updateDiscovery(_ found: [AgentSession], records: [ProcessRecord], directories: [String: String] = [:], claudeRegistrations: [ClaudeSessionRegistration]? = nil, agyIDs: [String: String] = [:]) {
         let privateTTYs=agentAccounts.privateTTYs
         let found=found.filter{!privateTTYs.contains($0.tty)}
         pruneExpiredRemoteFrames()
         let previousPolling = pollingIdentities()
         let previousCodex = Set(sessions.values.lazy.filter { $0.agent == .codex && $0.phase != .ended }.map(\.id))
         self.records = records
-        // Ordinary terminals do not belong in the inventory or its status counts.
         let managed = found.filter { value in
             guard value.agent != .shell else { return false }
-            // A discovery read started before close may finish after it. Keep
-            // the exact binding while the final screen is retained so that
-            // stale records cannot revive that terminated CLI.
             if let id = ptySessionBindings[value.id], let terminal = try? managedPTY.terminal(id), !terminal.isRunning { return false }
             return true
         }.map { value -> AgentSession in
@@ -6629,8 +6644,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             claudeHookObservedAt = claudeHookObservedAt.filter { live.contains($0.key) }
             retainedDiscoverySessionIDs = live
         }
-        // One fresh ancestry index per discovery snapshot, built only when an
-        // automatic session actually has an original process to remember.
         var recoveryProcesses: [Int32:ProcessRecord]?
         for var session in managed {
             if var existing = sessions[session.id] {
@@ -6645,8 +6658,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             if session.phase == .ended { session.setPhase(.unknown, detail: "새 상태를 확인하고 있습니다."); session.channel = .none; session.automatic = false }
             if sessions[session.id] == nil {
-                // Discovery can supply a fresh queue before the history reader.
-                // Keep the cached queue index complete for that ingress too.
                 if session.queuedQuestions?.isEmpty == false { invalidateDuplicateQuestionIDs() }
                 restorePreferences(&session)
                 if let owned = managedPTY.owned(tty: session.tty), ptyAutomatic[owned.descriptor.ptyID] == true {
@@ -6655,7 +6666,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 session.detail = Self.connectionGuide(session)
             }
-            if session.agent == .agy, let event = agyEvents[session.id] { applyAgyState(event, to: &session) }
+            if session.agent == .agy {
+                if let event = agyEvents[session.id] { applyAgyState(event, to: &session) }
+                else { session.providerID = agyIDs[session.id] }
+            }
             sessions[session.id] = session
             rememberExitContext(session,records:records,byPID:&recoveryProcesses)
         }
@@ -6701,7 +6715,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for id in Array(exitRecoveries.keys) where sessions[id]?.phase == .ended {
             advanceExitRecovery(id, records: records, byPID: &recoveryProcesses)
         }
-        // Conversation identities can change without a new process, so also recheck every minute.
         let groupCandidates = Set(sessions.values.lazy.filter { $0.phase != .ended }.map(\.id))
         if groupCandidates != groupBadgeSessionIDs || Date().timeIntervalSince(groupBadgeRefreshedAt) >= 60 {
             groupBadgeSessionIDs = groupCandidates

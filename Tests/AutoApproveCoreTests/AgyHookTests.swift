@@ -3,6 +3,14 @@ import AutoApproveCore
 
 extension ApprovalTests {
     func testAgyHookStatusAndToolClassification() throws {
+        let presence = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gemini/antigravity-cli/presence").path
+        let first = UUID().uuidString, next = UUID().uuidString
+        let active = presence + "/" + first + ".lock"
+        let switched = presence + "/" + next + ".lock"
+        try expectEqual(ProcessOpenFiles.agyConversation(paths: [active, active]), first.lowercased())
+        try expectEqual(ProcessOpenFiles.agyConversation(paths: [switched]), next.lowercased())
+        try expectNil(ProcessOpenFiles.agyConversation(paths: [active, switched]))
+        try expectNil(ProcessOpenFiles.agyConversation(paths: [presence, "/tmp/" + first + ".lock", presence + "/invalid.lock"]))
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let config = directory.appendingPathComponent("hooks.json")

@@ -9,14 +9,12 @@ enum AgyTranscript {
         let date: Date
     }
 
-    // Read only the bounded tail of the official transcript for this conversation.
-    // A partial turn cannot prove delivery. A later user prompt supersedes earlier answers.
-    static func finalTurn(path: String, conversation: String) -> Turn? {
+    static func finalTurn(path: String? = nil, conversation: String) -> Turn? {
         guard UUID(uuidString: conversation) != nil else { return nil }
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gemini/antigravity-cli/brain")
         let directory = root.appendingPathComponent(conversation).appendingPathComponent(".system_generated/logs").standardizedFileURL
         let file = directory.appendingPathComponent("transcript.jsonl")
-        guard file.path == URL(fileURLWithPath: path).standardizedFileURL.path,
+        guard path.map({ file.path == URL(fileURLWithPath: $0).standardizedFileURL.path }) ?? true,
               directory.resolvingSymlinksInPath().path == directory.path else { return nil }
 
         func read(_ url: URL) -> Turn? {

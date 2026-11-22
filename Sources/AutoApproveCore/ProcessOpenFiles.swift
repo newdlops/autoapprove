@@ -23,7 +23,31 @@ public enum ProcessOpenFiles {
         try readPaths(pid: pid, expectedStart: expectedStart, limit: limit, timeout: timeout, selection: .codexMetadata)
     }
 
-    private enum Selection { case all, codexRollouts, codexMetadata }
+    static func agyConversation(pid: Int32, started: String) -> String? {
+        guard let ids = try? agyConversations(pid: pid, started: started), ids.count == 1 else { return nil }
+        return ids.first
+    }
+
+    static func agyConversations(pid: Int32, started: String) throws -> Set<String> {
+        let paths = try readPaths(pid: pid, expectedStart: started, limit: 4096, timeout: 1, selection: .agyPresence)
+        return agyConversations(paths: paths)
+    }
+
+    package static func agyConversation(paths: [String]) -> String? {
+        let ids = agyConversations(paths: paths)
+        return ids.count == 1 ? ids.first : nil
+    }
+
+    private static func agyConversations(paths: [String]) -> Set<String> {
+        let directory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gemini/antigravity-cli/presence")
+        return Set(paths.compactMap { path -> String? in
+            let file = URL(fileURLWithPath: path)
+            guard file.pathExtension == "lock", file.deletingLastPathComponent().path == directory.path else { return nil }
+            return UUID(uuidString: file.deletingPathExtension().lastPathComponent)?.uuidString.lowercased()
+        })
+    }
+
+    private enum Selection { case all, codexRollouts, codexMetadata, agyPresence }
 
     private static func readPaths(pid: Int32, expectedStart: String?, limit: Int, timeout: TimeInterval,
                                   selection: Selection) throws -> [String] {
@@ -88,6 +112,7 @@ public enum ProcessOpenFiles {
         let name = path[path.index(after: slash)..<path.endIndex]
         switch selection {
         case .all: return true
+        case .agyPresence: return name.count == 41 && name.suffix(5).elementsEqual(".lock".utf8)
         case .codexRollouts:
             return name.starts(with: "rollout-".utf8) && name.suffix(6).elementsEqual(".jsonl".utf8)
         case .codexMetadata:
