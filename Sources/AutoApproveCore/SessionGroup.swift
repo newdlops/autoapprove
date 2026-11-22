@@ -297,6 +297,7 @@ public struct SessionGroupLiveSession: Identifiable, Equatable {
     var tabShell: SessionGroupTabShell?
     var codexIdentityFromMCP = false
     var claudeRegisteredStatus: String?
+    var claudeRegisteredActivity: ClaudeSessionActivity?
     public var id: String { session.id }
     public init(session: AgentSession, conversationID: String?, providerHome: String?, messagingName: String? = nil) {
         self.session = session; self.conversationID = conversationID; self.providerHome = providerHome; self.messagingName = messagingName

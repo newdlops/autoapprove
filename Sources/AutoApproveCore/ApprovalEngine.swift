@@ -191,6 +191,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var recoveredClaudeStates = Set<String>()
     private var claudeHookObservedAt: [String: Date] = [:]
     /// Status Claude registered for each interactive process ("idle", "busy", "waiting", "shell").
+    private var claudeInteractiveActivity: [String: ClaudeSessionActivity] = [:]
     private var claudeRegistryStatus: [String: String] = [:]
     private struct LiveClaudeHook {
         var request: ClaudeHookRequest
@@ -2887,6 +2888,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }.value
             terminalEnvironments[original.id] = environment
             var home: String?, conversation: String?, messagingName: String?, claudeStatus: String?
+            var claudeActivity: ClaudeSessionActivity?
             if original.agent == .codex {
                 home = CodexGroupIdentity.home(environment: environment)
                 let location = try? await Task.detached(priority: .utility) {
@@ -2913,6 +2915,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     if conversation != nil, matching.count == 1 {
                         messagingName = matching[0].peerName
                         claudeStatus = matching[0].status
+                        claudeActivity = matching[0].activity
                     }
                 } else {
                     let rows = await Task.detached(priority: .utility) { registry([record]) }.value
@@ -2922,6 +2925,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     if conversation != nil, matching.count == 1 {
                         messagingName = matching[0].peerName
                         claudeStatus = matching[0].status
+                        claudeActivity = matching[0].activity
                     }
                 }
             }
@@ -2931,6 +2935,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.phase != .ended else { continue }
             var observation = SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName)
             observation.claudeRegisteredStatus = claudeStatus
+            observation.claudeRegisteredActivity = claudeActivity
             result.append(observation)
         }
         let latest = try await Task.detached(priority: .utility) { try reader() }.value
@@ -3892,18 +3897,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return session
             }
             let observedTerminal = live?.session ?? terminal
-            var displayPhase = observedTerminal?.phase
-            if let observedTerminal, observedTerminal.agent == .codex, let activity = observedTerminal.codexActivity,
-               Date().timeIntervalSince(activity.observedAt) < 12 {
-                displayPhase = activity.phase
-            }
+            let displayPhase = observedTerminal.map { groupDisplayPhase($0, observation: live) }
             let inbox = inboxes[member.id]
             let input = groupOperationInput(live, stopped: stopped, clearing: clearing)
             let count = inbox?.unacknowledgedCount ?? 0
             let blocked: Bool
             if case .deferred = input { blocked = true } else { blocked = false }
             return (member.id, SessionGroupMemberOperation(
-                phase: live?.session.phase, input: input, unacknowledgedCount: count,
+                phase: live == nil ? nil : displayPhase, input: input, unacknowledgedCount: count,
                 lastAcknowledgedAt: inbox?.lastAcknowledgedAt, firstPendingAt: inbox?.firstPendingAt,
                 lastDeliveryFailure: inbox?.lastDeliveryFailure,
                 isDeliveryBlocked: count > 0 && (inbox?.hasParkedMessage == true ||
@@ -4977,7 +4978,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else { return nil }
                 let members: [JSONObject] = group.treeOrder.map { entry in
                     let member = entry.member, live = SessionGroupMatching.match(member, in: observed)
-                    let phase = live.flatMap { sessions[$0.id]?.phase }
+                    let phase = live.flatMap { row in sessions[row.id].map { groupDisplayPhase($0, observation: row) } }
                     return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.title, "role": member.role as Any? ?? NSNull(), "cwd": member.cwd,
                             "claudeStatus": live.flatMap { memberStatuses[$0.id] } as Any? ?? NSNull(),
                             "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
@@ -5577,30 +5578,30 @@ private struct ScreenAnalysisStorageKey: Hashable {
         } catch { parentSaveFailed = true }
     }
 
-    private func projectCodexActivity(_ value: AgentSession) -> AgentSession {
-        var session = value
-        if session.phase != .ended, session.codexApprovalBinding != nil {
-            if let activity = session.codexActivity, Date().timeIntervalSince(activity.observedAt) < 12 {
-                session.ownPhase = activity.parent.phase
-                session.phase = activity.phase
-                session.activityDetail = activity.summary
-                session.backgroundMonitoring = activity.children.contains { $0.phase == .working }
-                session.idleSince = nil
-            } else {
-                session.phase = .unknown
-                session.codexActivity = nil
-                session.activityDetail = "Codex의 실시간 상태를 확인하고 있습니다."
-                session.idleSince = nil
-            }
+    private func groupDisplayPhase(_ session: AgentSession, observation: SessionGroupLiveSession?) -> SessionPhase {
+        if session.agent == .codex {
+            return session.projectedCodexActivity().phase
         }
-        return session
+        return projectClaudeActivity(session, observation: observation).phase
+    }
+
+    private func projectClaudeActivity(_ session: AgentSession, observation: SessionGroupLiveSession? = nil) -> AgentSession {
+        guard session.agent == .claude else { return session }
+        let evidence = [observation?.claudeRegisteredActivity, claudeInteractiveActivity[session.id]]
+            .compactMap { $0 }.filter { $0.providerID.caseInsensitiveCompare(observation?.conversationID ?? session.providerID ?? "") == .orderedSame }
+            .max { $0.changedAt < $1.changedAt }
+        return session.projectedClaudeActivity(evidence, lastHook: claudeHookObservedAt[session.id])
+    }
+
+    private func projectCodexActivity(_ value: AgentSession) -> AgentSession {
+        value.projectedCodexActivity()
     }
 
     private func presentedSessions() -> [AgentSession] {
         // Most installs have no verified Claude parent/child relationships.
         // In that common case the ownership graph cannot alter any row, so skip
         // building active-ID, owner, and child indexes for every publication.
-        if claudeParents.isEmpty { return Array(sessions.values) }
+        if claudeParents.isEmpty { return sessions.values.map { projectClaudeActivity($0) } }
         // Persisted links can outlive their child process. When no linked child
         // is active, the graph is irrelevant; preserve only the old projection's
         // behavior of disabling automatic mode on ended child rows.
@@ -5609,7 +5610,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return session.phase != .ended
         }) {
             return sessions.values.map { value in
-                guard value.phase == .ended, claudeParents[value.id] != nil else { return value }
+                guard value.phase == .ended, claudeParents[value.id] != nil else { return projectClaudeActivity(value) }
                 var endedChild = value
                 endedChild.automatic = false
                 return endedChild
@@ -5641,7 +5642,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         raw.reserveCapacity(sessions.count)
         var childrenByOwner: [String: [AgentSession]] = [:]
         for value in sessions.values {
-            var session = value
+            var session = projectClaudeActivity(value)
             if claudeParents[value.id] != nil {
                 session.automatic = !parentSaveFailed && owners[value.id].flatMap { sessions[$0]?.automatic } == true
             }
@@ -5683,13 +5684,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func reconcileClaudeActivities(_ registrations: [ClaudeSessionRegistration]) {
-        // Interactive sessions keep the screen as their source of truth; the registry only
-        // fills in when the screen cannot be read (see `presentPhase`).
         var interactive: [String: String] = [:]
+        var activities: [String: ClaudeSessionActivity] = [:]
         for entry in registrations where entry.kind != "bg" {
-            if let status = entry.status { interactive[entry.processID] = status }
+            interactive[entry.processID] = entry.status
+            activities[entry.processID] = entry.activity
         }
         claudeRegistryStatus = interactive
+        claudeInteractiveActivity = activities
         var observed = Set<String>()
         for entry in registrations where entry.kind == "bg" {
             let id = entry.processID

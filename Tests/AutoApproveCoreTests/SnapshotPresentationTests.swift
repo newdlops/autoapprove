@@ -3,6 +3,30 @@ import Combine
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testGroupCurrentPhaseAfterReport() throws {
+        let now = Date(), earlier = now.addingTimeInterval(-60)
+        var worker = AgentSession(id: "worker", agent: .claude, pid: 2, started: "fixture", tty: "/dev/fixture", cwd: "/fixture", terminal: .terminal)
+        worker.phase = .working
+        worker.lastActivity = earlier
+        let idle = ClaudeSessionActivity(providerID: "thread", status: "idle", changedAt: now)
+        try expectEqual(worker.projectedClaudeActivity(idle, lastHook: earlier, now: now).phase, .idle)
+        try expectEqual(worker.projectedClaudeActivity(idle, lastHook: now, now: now).phase, .working)
+        worker.phase = .idle
+        var busy = idle
+        busy.status = "busy"
+        try expectEqual(worker.projectedClaudeActivity(busy, lastHook: earlier, now: now).phase, .working)
+        worker.phase = .input
+        try expectEqual(worker.projectedClaudeActivity(idle, lastHook: earlier, now: now).phase, .input)
+        worker.agent = .codex
+        worker.phase = .working
+        worker.codexActivity = try JSONDecoder().decode(CodexActivitySnapshot.self, from: Data(#"{"observedAt":1,"parent":{"id":"thread","title":"Parent","phase":"idle"},"children":[]}"#.utf8))
+        worker.codexActivity?.observedAt = now
+        try expectEqual(worker.projectedCodexActivity(now: now).phase, .idle)
+        worker.codexActivity?.parent.phase = .working
+        try expectEqual(worker.projectedCodexActivity(now: now).phase, .working)
+        try expectEqual(worker.projectedCodexActivity(now: now.addingTimeInterval(12)).phase, .unknown)
+    }
+
     func testPresentationHeartbeatPreservesStateAndNotificationTransitions() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-presentation-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
