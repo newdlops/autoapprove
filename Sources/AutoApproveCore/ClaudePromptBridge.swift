@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 enum ClaudePromptBridge {
     static let key = "AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE"
@@ -42,15 +43,21 @@ enum ClaudePromptBridge {
         }
     }
 
-    static func state(path: String, paths: AppPaths, conversation: String?) async -> String? {
+    static func state(path: String, paths: AppPaths, conversation: String?, expectedDraft: String? = nil) async -> String? {
         guard let conversation = conversation.flatMap(UUID.init(uuidString:)),
               let directory = directory(path: path, paths: paths) else { return nil }
         let fm = FileManager.default
         let nonce = UUID()
         let request = directory.appendingPathComponent("request")
         let response = directory.appendingPathComponent(nonce.uuidString)
+        let challenge = directory.appendingPathComponent("match-" + nonce.uuidString)
         do {
             try fm.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            defer { if expectedDraft != nil { try? fm.removeItem(at: challenge) } }
+            if let expectedDraft {
+                let digest = SHA256.hash(data: Data(expectedDraft.precomposedStringWithCanonicalMapping.utf8))
+                try Data(digest.map { String(format: "%02x", $0) }.joined().utf8).write(to: challenge, options: .atomic)
+            }
             try Data(nonce.uuidString.utf8).write(to: request, options: .atomic)
             defer {
                 if (try? String(contentsOf: request, encoding: .utf8)) == nonce.uuidString { try? fm.removeItem(at: request) }

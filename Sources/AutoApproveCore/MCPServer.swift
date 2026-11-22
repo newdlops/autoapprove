@@ -19,7 +19,7 @@ public enum MCPToolProfile: String {
     var instructions: String {
         var parts: [String] = []
         if self != .desktop {
-            parts.append("같은 Mac의 그룹 도구로 통신하세요. 다른 스레드·전송 경로로 우회하지 마세요. 필수 대기는 wait_group_dependencies 또는 ask_group_question(blocksProgress=true), 자유 질문 회신은 reply_group_question(inReplyTo: 원래 messageID)입니다. 터미널 본문은 그대로 사용하고 참조만 받으면 get_group_messages로 원문을 읽으세요. 상태 점검에는 get_group_status(mailboxView: summary)를 쓰세요. 배정·재개에 연결된 최종 응답은 자동 보고됩니다. 첫 줄에 결과와 남은 문제를 적으세요.")
+            parts.append("같은 Mac의 그룹 도구로 통신하세요. 다른 스레드·전송 경로로 우회하지 마세요. 필수 대기는 wait_group_dependencies 또는 ask_group_question(blocksProgress=true), 자유 질문 회신은 reply_group_question(inReplyTo: 원래 messageID)입니다. 터미널 본문은 그대로 사용하고 참조만 받으면 get_group_messages로 원문을 읽으세요. 상태 점검은 get_group_status(mailboxView: summary, reportView: compact), 장문 발신은 includeReceiptText=false를 쓰세요. 배정·재개에 연결된 최종 응답은 자동 보고됩니다. 첫 줄에 결과와 남은 문제를 적으세요.")
         }
         if self == .all || self == .orchestrator {
             parts.append("직속 작업은 assign_group_task, 현재 선택지·위임된 승인만 answer_group_question으로 처리하세요. ask_user 뒤 get_user_answers에서 명시적 응답을 확인하세요.")
@@ -53,11 +53,11 @@ public enum AutoApproveMCPServer {
             tool("reconnect_group_member", "canReconnect=true인 자신·직속 구성원(그룹장 없으면 같은 그룹)의 현재 대화를 재확인합니다. 초안·승인창이 있으면 보류합니다. 성공 후 connected와 conversationID를 확인하세요.",
                  ["groupID": string, "memberID": string, "conversationID": string], ["groupID", "memberID"]),
             tool("send_group_message", "같은 그룹의 다른 구성원에게 일반 메시지를 저장합니다. accepted는 접수입니다. 재시도에는 같은 messageID를 쓰세요. 작업 지시·승인 권한은 부여하지 않습니다.",
-                 ["groupID": string, "memberID": string, "text": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "messageID": string, "conversationID": string], ["groupID", "memberID", "text"]),
+                 ["groupID": string, "memberID": string, "text": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "messageID": string, "includeReceiptText": ["type": "boolean", "default": true], "conversationID": string], ["groupID", "memberID", "text"]),
             tool("ask_group_question", "그룹 구성원에게 자유 질문을 보냅니다. 진행에 필수면 blocksProgress=true와 messageID를 지정하고 재시도에도 같은 ID를 쓰세요. 수신 확인은 답변·승인이 아닙니다.",
-                 ["groupID": string, "memberID": string, "text": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "messageID": string, "blocksProgress": bool, "timeoutSeconds": timeout, "taskID": string, "forQuestionID": string, "conversationID": string], ["groupID", "memberID", "text"]),
+                 ["groupID": string, "memberID": string, "text": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "messageID": string, "includeReceiptText": ["type": "boolean", "default": true], "blocksProgress": bool, "timeoutSeconds": timeout, "taskID": string, "forQuestionID": string, "conversationID": string], ["groupID", "memberID", "text"]),
             tool("reply_group_question", "받은 groupID와 senderMemberID에 회신합니다. inReplyTo에 원래 질문의 messageID를 지정해 대기를 해제하세요. 재시도에는 같은 회신 messageID를 쓰세요.",
-                 ["groupID": string, "memberID": string, "text": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "messageID": string, "inReplyTo": string, "conversationID": string], ["groupID", "memberID", "text"]),
+                 ["groupID": string, "memberID": string, "text": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "messageID": string, "includeReceiptText": ["type": "boolean", "default": true], "inReplyTo": string, "conversationID": string], ["groupID", "memberID", "text"]),
             tool("get_group_messages", "자기 메일함 원문을 읽습니다. messageID로 ACK 후에도 조회하며 발신 건은 direction=outbox를 지정합니다. 다음 페이지에는 같은 방향과 afterSequence를 쓰세요. unansweredOnly=true는 ACK 여부와 관계없이 미응답 질문을 찾습니다.",
                  ["groupID": string, "messageID": string, "direction": ["type": "string", "enum": ["inbox", "outbox"]], "includeAcknowledged": ["type": "boolean"], "unansweredOnly": ["type": "boolean"], "afterSequence": ["type": "integer", "minimum": 0], "limit": ["type": "integer", "minimum": 1, "maximum": 50], "conversationID": string], ["groupID"], readOnly: true),
             tool("ack_group_messages", "자기 수신함의 원문을 읽은 ID만 확인합니다. 미리보기는 제외하세요. 터미널 본문 수신은 자동 확인됩니다. 반복 ACK는 안전하며 작업 완료·승인과 별개입니다.",
@@ -68,8 +68,8 @@ public enum AutoApproveMCPServer {
                  ["groupID": string, "waitID": string, "action": ["type":"string","enum":["externalReady","cancel"]], "conversationID": string], ["groupID","waitID","action"]),
             tool("complete_group_task", "대기를 사용한 작업자가 실제 작업을 마쳤을 때 원래 배정 ID와 결과 요약을 제출합니다. 해결 전 대기는 먼저 명시적으로 해제하세요.",
                  ["groupID": string, "taskID": string, "summary": string, "conversationID": string], ["groupID","taskID","summary"]),
-            tool("get_group_status", "작업·보고·대기를 조회합니다. 상태 점검은 mailboxView=summary(방향별 3건), 생략·full은 원문 20건입니다. 미리보기로 ACK하지 마세요. 원문은 get_group_messages, 대기 그래프는 includeWaitGraph=true입니다.",
-                 ["conversationID": string, "includeWaitGraph": bool, "mailboxView": ["type": "string", "enum": ["full", "summary"]]]),
+            tool("get_group_status", "작업·보고·대기를 조회합니다. 상태 점검은 mailboxView=summary(방향별 3건), 생략·full은 원문 20건입니다. 미리보기로 ACK하지 마세요. 원문은 get_group_messages, 대기 그래프는 includeWaitGraph=true입니다. compact 보고의 생략된 본문은 같은 구성원의 같은 작업 ID에서 읽으세요.",
+                 ["conversationID": string, "includeWaitGraph": bool, "mailboxView": ["type": "string", "enum": ["full", "summary"]], "reportView": ["type": "string", "enum": ["full", "compact"], "default": "full"]]),
             tool("assign_group_task", "canAssign=true인 대기 중인 직속 작업자에게 지시를 입력하고 자동 승인을 켭니다. 수행할 지시만 적으세요. /, !, #, $, &로 시작할 수 없습니다. 연결된 응답은 자동 보고됩니다.",
                  ["groupID": string, "memberID": string, "task": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "conversationID": string],
                  ["groupID", "memberID", "task"]),

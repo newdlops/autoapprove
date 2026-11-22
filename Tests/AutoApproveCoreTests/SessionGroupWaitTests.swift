@@ -144,8 +144,32 @@ extension ApprovalTests {
         let root = UUID().uuidString, question = UUID().uuidString
         _ = try await call("wait_group_dependencies", 0, ["waitID": root, "taskIDs": [a]])
         let ask: JSONObject = ["messageID": question, "blocksProgress": true, "memberID": members[0].id.uuidString, "text": "decision?"]
+        for value: Any in [1 as Any, "false", NSNull()] {
+            for tool in ["send_group_message", "ask_group_question", "reply_group_question"] {
+                let invalid = ask.merging(["includeReceiptText": value]) { _, new in new }
+                do { _ = try await call(tool, 1, invalid); throw AppError.message("Invalid receipt flag accepted") }
+                catch let error as RemoteHTTPError { try expectEqual(error.status, 400) }
+            }
+        }
+        try expectNil(try box.message(UUID(uuidString: question)!))
+        try engine.setPaused(true)
         let receipt = try await call("ask_group_question", 1, ask)
         try expectEqual((receipt["wait"] as? JSONObject)?["state"] as? String, "waiting")
+        func verifyReceipt(_ tool: String, caller: Int, args: JSONObject) async throws {
+            let full = try await call(tool, caller, args)
+            let explicit = try await call(tool, caller, args.merging(["includeReceiptText": true]) { _, new in new })
+            var compact = try await call(tool, caller, args.merging(["includeReceiptText": false]) { _, new in new })
+            var receipt = compact["receipt"] as! JSONObject
+            try expectNil(receipt["text"])
+            let id = UUID(uuidString: compact["messageID"] as! String)!
+            receipt["text"] = try box.message(id)?.text
+            compact["receipt"] = receipt
+            func data(_ result: JSONObject) throws -> Data { try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) }
+            try expectEqual(try data(compact), try data(full))
+            try expectEqual(try data(explicit), try data(full))
+        }
+        try await verifyReceipt("ask_group_question", caller: 1, args: ask)
+        try await verifyReceipt("send_group_message", caller: 1, args: ["memberID":members[0].id.uuidString, "messageID":UUID().uuidString, "text":"fixture"])
         _ = try await call("ack_group_messages", 0, ["messageIDs":[question]])
         do { _ = try await call("complete_group_task", 1, ["taskID": a, "summary":"premature"]); throw AppError.message("ACK completed wait") }
         catch is RemoteHTTPError {}
@@ -154,6 +178,8 @@ extension ApprovalTests {
         let reply: JSONObject = ["memberID":members[1].id.uuidString, "text":"answer", "inReplyTo":question]
         do { _ = try await call("reply_group_question", 2, reply); throw AppError.message("Wrong author answered") }
         catch is RemoteHTTPError {}
+        try await verifyReceipt("reply_group_question", caller: 0, args: reply)
+        try engine.setPaused(false)
         let linked = try await call("reply_group_question", 0, reply)
         try expectEqual(try await call("reply_group_question", 0, reply)["messageID"] as? String, linked["messageID"] as? String)
         try expectEqual((try await call("ask_group_question", 1, ask)["wait"] as? JSONObject)?["state"] as? String, "ready")

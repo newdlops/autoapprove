@@ -1222,6 +1222,7 @@ extension ApprovalTests {
         // A recipient that never takes the typed prompt is not typed at forever: after the
         // attempt limit the message is parked, kept in the inbox and shown as blocked.
         // Each ignored typing waits ~10 s for Claude to accept it, so the fixture uses a limit of two.
+        engine.groupMailboxReminderInterval = 120
         engine.groupMailboxReceiptGrace = 0.3; engine.groupMailboxPollInterval = 0.2; engine.groupMailboxDirectAttemptLimit = 2
         showReady(1); terminal.ignoresInput = true
         let beforeParking = count()

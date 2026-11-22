@@ -37,8 +37,18 @@ export function register(on) {
         const revision = generation
         const session = await $.session.id()
         const buffer = await $.prompt.read()
-        const state = revision !== generation || typeof buffer?.text !== 'string' ? 'unknown'
+        let state = revision !== generation || typeof buffer?.text !== 'string' ? 'unknown'
           : buffer.text.length ? 'draft' : suggestion ? 'suggestion' : 'empty'
+        if (state === 'draft') {
+          const challenge = directory + '/match-' + nonce
+          if (await $.fs.exists(challenge)) {
+            const expected = await $.fs.read(challenge)
+            const bytes = new TextEncoder().encode(buffer.text.normalize('NFC'))
+            const digest = await crypto.subtle.digest('SHA-256', bytes)
+            const hex = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+            state = revision !== generation ? 'unknown' : hex === expected ? 'matchingDraft' : 'differentDraft'
+          }
+        }
         await $.fs.write(directory + '/' + nonce, JSON.stringify({nonce, session, state}))
         handled = nonce
       })

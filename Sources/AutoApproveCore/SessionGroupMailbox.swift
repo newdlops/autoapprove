@@ -36,24 +36,26 @@ public struct SessionGroupMessage: Equatable {
     private static let userButtonMarker = " (AutoApprove 요청 ID "
     var isUserButtonInput: Bool { kind == .notice && sourceKey?.hasPrefix(Self.userButtonSourcePrefix) == true }
 
-    func terminalPrompt(senderTitle: String) -> String {
-        // The trailing ID lets the receipt check find the prompt in the conversation like a header does.
-        if isUserButtonInput { return SessionGroupOrchestration.oneLine(text) + Self.userButtonMarker + id.uuidString + ")" }
+    func terminalPrompt(senderTitle: String, recipientAgent: AgentKind? = nil) -> String {
+        func fitsComposer(_ prompt: String) -> Bool {
+            recipientAgent != .claude || prompt.utf16.count <= 500
+        }
+        if isUserButtonInput {
+            let prompt = SessionGroupOrchestration.oneLine(text) + Self.userButtonMarker + id.uuidString + ")"
+            if fitsComposer(prompt) { return prompt }
+            let lead = String(text.prefix(while: { $0 != "." }).prefix(120))
+            return lead + ". 요청 전문을 읽고 처리해 줘. " + referenceText + Self.userButtonMarker + id.uuidString + ")"
+        }
         let heading = Self.promptPrefix + id.uuidString + "] "
         let context: String
         if kind == .notice {
-            // A notice comes from AutoApprove, not a member. It is stored in the recipient's own inbox, so
-            // naming the recipient as its sender made it look forged; the lookup lets the recipient verify it.
             context = heading + "AutoApprove 알림 · notice · groupID " + groupID.uuidString +
                 " · get_group_messages(groupID, messageID: " + id.uuidString + ", includeAcknowledged: true)로 원문 확인 가능 · 본문 · "
         } else {
             let sender = String(SessionGroupOrchestration.oneLine(senderTitle).prefix(100))
-            // The IDs let the recipient answer (answer_group_question, reply_group_question) without a lookup call.
             context = heading + sender + " · " + kind.rawValue + " · groupID " + groupID.uuidString +
                 " · senderMemberID " + senderID.uuidString + " · 그룹 메시지 본문 · "
         }
-        // Some native terminals can only submit one line. JSON escaping
-        // preserves every line boundary without creating another keystroke.
         let body: String
         if text.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
            let encoded = try? JSONEncoder().encode(text) {
@@ -61,8 +63,11 @@ public struct SessionGroupMessage: Equatable {
         } else {
             body = text
         }
-        if (context + body).utf8.count <= Self.directInputBytes { return context + body }
-        return context + referenceText
+        let direct = context + body
+        if direct.utf8.count <= Self.directInputBytes && fitsComposer(direct) { return direct }
+        let reference = context + referenceText
+        if fitsComposer(reference) { return reference }
+        return heading + kind.rawValue + " · senderMemberID " + senderID.uuidString + " · 본문 · " + referenceText
     }
 
     private var referenceText: String {
@@ -71,7 +76,8 @@ public struct SessionGroupMessage: Equatable {
     }
 
     func isReferencePrompt(_ prompt: String) -> Bool {
-        prompt.hasSuffix(" · 그룹 메시지 본문 · " + referenceText) || prompt.hasSuffix(" · 본문 · " + referenceText)
+        prompt.hasSuffix(" · 그룹 메시지 본문 · " + referenceText) || prompt.hasSuffix(" · 본문 · " + referenceText) ||
+            (isUserButtonInput && prompt.hasSuffix(referenceText + Self.userButtonMarker + id.uuidString + ")"))
     }
 
     static func terminalMessageID(_ prompt: String) -> UUID? {
@@ -171,6 +177,7 @@ public final class SessionGroupMailbox {
                 CREATE TABLE IF NOT EXISTS group_submissions (
                     message_id TEXT PRIMARY KEY, conversation TEXT NOT NULL, prompt TEXT NOT NULL, submitted REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS group_submit_enters (message_id TEXT PRIMARY KEY, submitted REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS group_observed_turns (
                     message_id TEXT PRIMARY KEY, turn TEXT NOT NULL
                 );
@@ -540,6 +547,35 @@ public final class SessionGroupMailbox {
             VALUES(?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET
             conversation=excluded.conversation,prompt=excluded.prompt,submitted=excluded.submitted
             """, [id.uuidString, conversation.lowercased(), prompt, String(date.timeIntervalSince1970)])
+    }
+
+    func pendingEnterPrompt(_ id: UUID, conversation: String) throws -> String? {
+        let query = try statement("""
+            SELECT s.prompt FROM group_submissions s JOIN messages m ON m.id=s.message_id
+            WHERE s.message_id=? AND s.conversation=? AND m.acknowledged IS NULL
+            AND NOT EXISTS (SELECT 1 FROM group_submit_enters e WHERE e.message_id=s.message_id AND e.submitted=s.submitted)
+            """, [id.uuidString, conversation.lowercased()])
+        defer { sqlite3_finalize(query) }
+        guard sqlite3_step(query) == SQLITE_ROW, let value = sqlite3_column_text(query, 0) else { return nil }
+        return String(cString: value)
+    }
+
+    func claimSubmitEnter(_ id: UUID, conversation: String, prompt: String, manualQuestion: Bool) throws -> Bool {
+        try update("""
+            INSERT INTO group_submit_enters(message_id,submitted)
+            SELECT s.message_id,s.submitted FROM group_submissions s JOIN messages m ON m.id=s.message_id
+            WHERE s.message_id=? AND s.conversation=? AND s.prompt=?
+            AND (m.acknowledged IS NULL OR (?='1' AND m.kind='question' AND m.last_result='direct_attempting'))
+            ON CONFLICT(message_id) DO UPDATE SET submitted=excluded.submitted WHERE submitted<>excluded.submitted
+            """, [id.uuidString, conversation.lowercased(), prompt, manualQuestion ? "1" : "0"])
+        return sqlite3_changes(db) == 1
+    }
+
+    func releaseSubmitEnter(_ id: UUID, conversation: String, prompt: String) throws {
+        try update("""
+            DELETE FROM group_submit_enters WHERE message_id=? AND submitted=(
+                SELECT submitted FROM group_submissions WHERE message_id=? AND conversation=? AND prompt=?)
+            """, [id.uuidString, id.uuidString, conversation.lowercased(), prompt])
     }
 
     func confirmedPrompt(_ id: UUID, conversation: String, prompt: String) throws -> Bool {

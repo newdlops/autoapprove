@@ -9,7 +9,14 @@ public enum ClaudeComposerReadiness {
         guard footer.count <= 8, !footer.contains(where: { $0.hasPrefix("───") }) else { return false }
         let first = String(rows[i].dropFirst()).trimmingCharacters(in: .whitespaces)
         let parts = [first] + Array(rows[(i + 1)..<end])
-        return parts.joined() == text || parts.joined(separator: " ") == text
+        var remaining = text[...]
+        for (index, part) in parts.enumerated() {
+            guard !part.isEmpty else { return false }
+            if index > 0, remaining.first == " " { remaining = remaining.dropFirst() }
+            guard remaining.hasPrefix(part) else { return false }
+            remaining = remaining.dropFirst(part.count)
+        }
+        return remaining.isEmpty
     }
 
     package static func framedCandidate(_ screen: String) -> String? {

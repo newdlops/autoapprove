@@ -287,3 +287,21 @@ public enum GroupWorkerApproval: String {
         }
     }
 }
+
+extension SessionGroupAssignment {
+    package func statusReport(currentTasks: [String: JSONObject]) -> JSONObject {
+        let worker = workerMemberID.uuidString
+        var report: JSONObject = ["taskID": id.uuidString, "workerMemberID": worker]
+        if let current = currentTasks[worker], current["id"] as? String == id.uuidString,
+           let instruction = current["task"] as? String, instruction.utf8.elementsEqual(task.utf8) {
+            switch (current["summary"], summary) {
+            case (is NSNull, nil): return report
+            case (let text as String, let summary?) where text.utf8.elementsEqual(summary.utf8): return report
+            default: break
+            }
+        }
+        report["task"] = task
+        report["summary"] = summary as Any? ?? NSNull()
+        return report
+    }
+}

@@ -3435,6 +3435,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func enqueueGroupMessage(_ object: JSONObject, groupID: UUID, memberID: UUID, text: String, kind: SessionGroupMessage.Kind) async throws -> JSONObject {
+        let includeReceiptText = try object["includeReceiptText"] == nil || GroupWaitRequest.flag(object, "includeReceiptText")
         let line = SessionGroupOrchestration.oneLine(text)
         guard !line.isEmpty, text.count <= SessionGroupOrchestration.maximumTaskLength, !text.contains("\0"),
               kind != .message || SessionGroupOrchestration.commandPrefix(line) == nil else {
@@ -3450,7 +3451,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
               let recipient = group.members.first(where: { $0.id == memberID }), recipient.id != sender.id else {
             throw RemoteHTTPError(403, "확인된 현재 세션에서 같은 그룹의 다른 구성원에게만 보낼 수 있습니다.")
         }
-        // Accept while the recipient is busy/disconnected. COMMIT precedes this success response.
         let box = try groupMailbox()
         let blocking = try GroupWaitRequest.flag(object, "blocksProgress")
         let reply = try GroupWaitRequest.uuid(object, "inReplyTo")
@@ -3477,7 +3477,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             message = try box.enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: body)
         }
         scheduleGroupMailboxDelivery()
-        var output: JSONObject = ["accepted": true, "messageID": message.id.uuidString, "receipt": message.json,
+        var receipt = message.json
+        if !includeReceiptText { receipt.removeValue(forKey: "text") }
+        var output: JSONObject = ["accepted": true, "messageID": message.id.uuidString, "receipt": receipt,
                 "delivered": message.acknowledgedAt != nil, "transport": "local_mailbox", "networkRequired": false,
                 "message": "로컬 수신함에 저장했습니다."]
         if let wait { output["wait"] = wait.json }
@@ -3789,6 +3791,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if (try? box.message(message.id))?.acknowledgedAt != nil { return .received }
             }
         }
+        if session.agent == .claude, let conversation = live.conversationID,
+           ![.working, .approval, .ended].contains(session.phase), !session.pendingInTerminal,
+           !snapshot.paused, !remoteInputStopped, !automaticInputBusy(session.id),
+           let host = ScreenHost(kind: session.terminal), screenConnections[host]?.enabled == true,
+           let adapter = screenAdapters[host], adapter.checkedTypeLine != nil,
+           let text = try? groupMailbox().pendingEnterPrompt(message.id, conversation: conversation),
+           SessionGroupMessage.terminalMessageID(text) == message.id, sendingMessages.insert(session.id).inserted {
+            defer { sendingMessages.remove(session.id) }
+            let reader = singleProcessReader
+            if let records = try? await Task.detached(operation: { try reader(session.pid) }).value,
+               records.contains(where: { $0.key == session.id && $0.agent == .claude && "/dev/" + $0.tty == session.tty && $0.isForeground }) {
+                let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: [session.pid], sourcePID: session.pid, sourceStarted: session.started)
+                if await submitRemainingClaudeDraft(text, session: session, live: live, target: target, adapter: adapter, messageID: message.id) != nil { return .unknown }
+            }
+        }
         guard ![.working, .approval, .input, .ended].contains(session.phase), !session.pendingInTerminal,
               !automaticInputBusy(session.id), !userInputHasPriority(session.id),
               let frame = try? await remoteTerminal(sessionID: session.id, realtime: true, textOnly: true),
@@ -3868,8 +3885,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard !message.deliversBody || now.phase != .working else { throw hold("수신 탭의 작업이 끝나기를 기다립니다.") }
         }
         try await ready()
-        let prompt = message.terminalPrompt(senderTitle: group.members.first { $0.id == message.senderID }?.title ?? "")
-        try await sendGroupLine(current, text: prompt, agyTarget: live, preflight: {
+        let prompt = message.terminalPrompt(senderTitle: group.members.first { $0.id == message.senderID }?.title ?? "", recipientAgent: current.agent)
+        try await sendGroupLine(current, text: prompt, groupTarget: live, manualQuestion: manualQuestion, preflight: {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
             var empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
                 : current.agent == .agy ? AgyComposerReadiness.isEmpty(frame.screen) : ClaudeComposerReadiness.isEmpty(frame.screen)
@@ -4593,9 +4610,41 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func sendGroupLine(_ session: AgentSession, text: String, agyTarget: SessionGroupLiveSession? = nil, preflight: (() async throws -> String?)? = nil) async throws {
+    private func submitRemainingClaudeDraft(_ text: String, session: AgentSession, live: SessionGroupLiveSession?,
+                                           target: ScreenTarget, adapter: ScreenHostAdapter, messageID: UUID?, manualQuestion: Bool = false) async -> TerminalDelivery? {
+        guard !text.isEmpty, !Task.isCancelled, !snapshot.paused, !remoteInputStopped,
+              let type = adapter.typeLine, let frame = try? await Task.detached(operation: {
+                  try adapter.readForValidation([target])
+              }).value.screens.first(where: { $0.tty == target.tty }),
+              !RemoteMessageReadiness.hasMenu(frame.contents, agent: .claude) else { return nil }
+        var matches = ClaudeComposerReadiness.containsOnly(text, screen: frame.contents)
+        if let channel = live?.claudePromptChannel, adapter.checkedTypeLine != nil {
+            let result = await ClaudePromptBridge.state(path: channel, paths: paths, conversation: live?.conversationID, expectedDraft: text)
+            matches = result == "matchingDraft" || (result == "draft" && matches)
+        }
+        guard matches, let status = await claudeStatuses([session])[session.id], ClaudeSessionRegistration.acceptsPrompt(status),
+              !(await userInputHasPriority(session.id, backgroundOnly: true)),
+              !Task.isCancelled, !snapshot.paused, !remoteInputStopped,
+              let current = sessions[session.id], current.phase != .ended, current.phase != .approval, !current.pendingInTerminal,
+              !automaticInputBusy(session.id), current.tty == session.tty else { return nil }
+        if let messageID, let conversation = live?.conversationID {
+            guard (try? groupMailbox().claimSubmitEnter(messageID, conversation: conversation, prompt: text, manualQuestion: manualQuestion)) == true else { return nil }
+        }
+        do {
+            let result = try await Task.detached {
+                if let checked = adapter.checkedTypeLine { return try checked(target, "", frame.contents) }
+                return try type(target, "")
+            }.value
+            if result == .screenChanged, let messageID, let conversation = live?.conversationID {
+                try groupMailbox().releaseSubmitEnter(messageID, conversation: conversation, prompt: text)
+            }
+            return result
+        } catch { return .agentMissing }
+    }
+
+    private func sendGroupLine(_ session: AgentSession, text: String, groupTarget: SessionGroupLiveSession? = nil, manualQuestion: Bool = false, preflight: (() async throws -> String?)? = nil) async throws {
         if session.agent == .agy {
-            let conversation = agyTarget == nil ? session.providerID : agyTarget?.conversationID
+            let conversation = groupTarget == nil ? session.providerID : groupTarget?.conversationID
             _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true) { frame in
                 let locks = try? await Task.detached(priority: .utility) {
                     try ProcessOpenFiles.agyConversations(pid: session.pid, started: session.started)
@@ -4603,7 +4652,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let event = self.agyEvents[session.id]
                 let expected = Set([conversation].compactMap { $0 })
                 let verified = locks == expected || (locks == nil && conversation != nil && event?.conversationId == conversation)
-                guard verified, conversation != nil || agyTarget?.id == session.id,
+                guard verified, conversation != nil || groupTarget?.id == session.id,
                       event.map({ $0.isIdle && $0.conversationId == conversation }) ?? true,
                       AgyComposerReadiness.isEmpty(frame.screen) else {
                     throw RemoteHTTPError(409, "agy의 현재 대화와 빈 입력창을 확인해주세요.", diagnostics: ["delivery":"not_started"])
@@ -4642,18 +4691,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return false
             }
             if await submitted(within: 1.5) { return }
-            if let adapter = screenAdapters[host],
-               let pending = try? await Task.detached(operation: { try adapter.readForValidation([target]) }).value.screens.first(where: { $0.tty == target.tty }),
-               sessions[session.id]?.pendingInTerminal == false, !remoteInputStopped, !snapshot.paused,
-               !RemoteMessageReadiness.hasMenu(pending.contents, agent: .claude),
-               ClaudeComposerReadiness.containsOnly(text, screen: pending.contents),
-               !(await userInputHasPriority(session.id, backgroundOnly: true)) {
-                _ = try? await Task.detached(operation: { () throws -> TerminalDelivery in
-                    if let checked { return try checked(target, "", pending.contents) }
-                    return try type(target, "")
-                }).value
+            if let adapter = screenAdapters[host] {
+                let deadline = Date().addingTimeInterval(3)
+                repeat {
+                    guard !Task.isCancelled, sessions[session.id]?.pendingInTerminal == false, !remoteInputStopped, !snapshot.paused else { break }
+                    let result = await submitRemainingClaudeDraft(text, session: session, live: groupTarget, target: target,
+                        adapter: adapter, messageID: SessionGroupMessage.terminalMessageID(text), manualQuestion: manualQuestion)
+                    if let result, result != .screenChanged { break }
+                    if await submitted(within: 0.3) { return }
+                } while Date() < deadline
             }
-            if await submitted(within: 6) { return }
+            if await submitted(within: 4) { return }
             throw RemoteHTTPError(409, "터미널에 입력했지만 제출을 확인하지 못했습니다. 대상 터미널의 입력창을 확인해주세요.", diagnostics: ["delivery": "unknown"])
         }
         _ = try await sendOriginalTerminalMessage(session, object: ["text": text, "revision": "session-group"], textOnly: true, backgroundOnly: true, preflight: { _ in
@@ -5071,6 +5119,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let view = mailboxView as? String, ["full", "summary"].contains(view) else {
                 throw RemoteHTTPError(400, "mailboxView는 full 또는 summary여야 합니다.")
             }
+            guard let reportView = (object["reportView"] ?? "full") as? String, ["full", "compact"].contains(reportView) else {
+                throw RemoteHTTPError(400, "reportView는 full 또는 compact여야 합니다.")
+            }
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
             let groups = try SessionGroupStore(directory: paths.directory).load()
@@ -5101,8 +5152,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "canAssign": group.canDirect(callerMember.id, worker: member.id),
                             "task": groupTaskJSON(state.current(groupID: group.id, workerMemberID: member.id))]
                 }
-                // Reading is not an ACK. A lost tool response must leave the report pending.
                 let reports = state.undelivered.filter { $0.groupID == group.id && $0.parentMemberID == callerMember.id }
+                var tasksByWorker: [String: JSONObject] = [:]
+                if reportView == "compact" && !reports.isEmpty {
+                    for member in members {
+                        if let worker = member["id"] as? String, let task = member["task"] as? JSONObject {
+                            tasksByWorker[worker] = task
+                        }
+                    }
+                }
                 let waits = try groupMailbox().visibleWaits(group.id)
                 var result: JSONObject = ["id": group.id.uuidString, "name": group.name, "members": members,
                         "leaderMemberIDs": group.leaderMemberIDs.map(\.uuidString),
@@ -5110,10 +5168,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         "callerMemberID": callerMember.id.uuidString,
                         "waits": waits.map(\.json),
                         "mailbox": groupMailboxSummary(groupID: group.id, memberID: callerMember.id, summary: view == "summary"),
-                        "reports": reports.map { report -> JSONObject in
-                            ["taskID": report.id.uuidString, "workerMemberID": report.workerMemberID.uuidString, "task": report.task,
-                             "summary": report.summary as Any? ?? NSNull()]
-                        }]
+                        "reports": reports.map { $0.statusReport(currentTasks: tasksByWorker) }]
                 if includeGraph { result["waitGraph"] = SessionGroupMailbox.diagram(waits) }
                 return result
             }
@@ -5159,7 +5214,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let approval = enableGroupWorkerApproval(worker.id)
             do {
                 let prompt = SessionGroupOrchestration.taskMessage(assignment)
-                try await sendGroupLine(current, text: prompt) {
+                try await sendGroupLine(current, text: prompt, groupTarget: worker) {
                     var expected: String?
                     if current.agent == .claude, let channel = worker.claudePromptChannel {
                         let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)

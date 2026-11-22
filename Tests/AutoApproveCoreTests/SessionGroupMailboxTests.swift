@@ -25,6 +25,18 @@ extension ApprovalTests {
         let old = try box.enqueue(groupID: group, senderID: sender, recipientID: recipient, kind: .question, text: "old", at: cutoff)
         let read = try box.enqueue(groupID: group, senderID: sender, recipientID: recipient, kind: .message, text: "read", at: cutoff)
         let fresh = try box.enqueue(groupID: group, senderID: sender, recipientID: recipient, kind: .message, text: "fresh", at: cutoff.addingTimeInterval(1))
+        #if DEBUG
+        let conversation = UUID().uuidString
+        try box.recordSubmission(fresh.id, conversation: conversation, prompt: "original", at: now)
+        try expectEqual(try box.pendingEnterPrompt(fresh.id, conversation: conversation), "original")
+        try expectEqual(try box.claimSubmitEnter(fresh.id, conversation: conversation, prompt: "edited", manualQuestion: false), false)
+        try expectEqual(try box.claimSubmitEnter(fresh.id, conversation: conversation, prompt: "original", manualQuestion: false), true)
+        let reopenedBox = try SessionGroupMailbox(directory: directory)
+        try expectNil(try reopenedBox.pendingEnterPrompt(fresh.id, conversation: conversation))
+        try expectEqual(try reopenedBox.claimSubmitEnter(fresh.id, conversation: conversation, prompt: "original", manualQuestion: false), false)
+        try box.releaseSubmitEnter(fresh.id, conversation: conversation, prompt: "original")
+        try expectEqual(try reopenedBox.pendingEnterPrompt(fresh.id, conversation: conversation), "original")
+        #endif
         try box.acknowledge([read.id], groupID: group, recipientID: recipient, at: now)
         try expectEqual(try box.nextExpiration(ttl: 7200), now)
         try box.expireUnconfirmed(createdThrough: cutoff)
@@ -153,6 +165,9 @@ extension ApprovalTests {
             let message = try store(body)
             let direct = message.terminalPrompt(senderTitle: "fixture")
             let candidate = firstLineReference(message, direct: direct)
+            let claude = message.terminalPrompt(senderTitle: String(repeating: "👩🏽‍💻", count: 100), recipientAgent: .claude)
+            try expect(claude.utf16.count <= 500 && message.isReferencePrompt(claude))
+            try expectEqual(SessionGroupMessage.terminalMessageID(claude), message.id)
             try expectEqual(message.isReferencePrompt(direct), length > 4096)
             if length <= 4096 { try expectEqual(direct.utf8.count, length) }
             try expect(candidate.utf8.count <= 4096 && message.isReferencePrompt(candidate))
@@ -213,6 +228,37 @@ extension ApprovalTests {
             var args: JSONObject = ["owner": UUID().uuidString, "tool": tool, "sessionID": sessions[caller].id, "groupID": group.id.uuidString]
             args.merge(extra) { _, new in new }; return try await engine.mcpAction(args)
         }
+        for invalid: Any in ["extra" as Any, 1, NSNull()] {
+            do { _ = try await call("get_group_status", extra: ["reportView": invalid]); throw AppError.message("Invalid reportView accepted") }
+            catch let error as RemoteHTTPError { try expectEqual(error.status, 400) }
+        }
+        for mailbox in ["full", "summary"] {
+            func report(_ view: String?) async throws -> JSONObject {
+                var args: JSONObject = ["mailboxView": mailbox]
+                if let view { args["reportView"] = view }
+                let status = try await call("get_group_status", extra: args)
+                let groups = status["groups"] as! [JSONObject]
+                return (groups[0]["reports"] as! [JSONObject])[0]
+            }
+            let full = try await report(nil), explicit = try await report("full"), compact = try await report("compact")
+            try expectEqual(Set(full.keys), Set(explicit.keys))
+            try expectEqual(Set(compact.keys), Set(["taskID", "workerMemberID"]))
+            try expectEqual(compact["taskID"] as? String, full["taskID"] as? String)
+            try expectEqual(full["summary"] as? String, "작업 완료")
+        }
+        var sample = assignment
+        sample.summary = nil
+        let worker = sample.workerMemberID.uuidString
+        let current: JSONObject = ["id": sample.id.uuidString, "task": sample.task, "summary": NSNull()]
+        try expectNil(sample.statusReport(currentTasks: [worker: current])["task"])
+        for changed: JSONObject in [["id":UUID().uuidString], ["summary":""], ["task":"different"]] {
+            let item = sample.statusReport(currentTasks: [worker: current.merging(changed) { _, new in new }])
+            try expectEqual(item["task"] as? String, sample.task)
+            try expect(item["summary"] is NSNull)
+        }
+        try expect(sample.statusReport(currentTasks: [UUID().uuidString: current])["summary"] is NSNull)
+        sample.summary = "가"
+        try expectEqual(sample.statusReport(currentTasks: [worker: current.merging(["summary":"가".decomposedStringWithCanonicalMapping]) { _, new in new }])["summary"] as? String, "가")
         _ = try await call("get_group_status"); _ = try await call("get_group_messages")
         try expectEqual(try engine.sessionGroupAssignments().first?.status, .completed, "Reading is not a receipt")
         do { _ = try await call("ack_group_messages", caller: 1, extra: ["messageIDs": [message.id.uuidString]]); throw AppError.message("Worker acknowledged its own report") }
