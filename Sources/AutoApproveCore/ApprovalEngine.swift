@@ -2410,6 +2410,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var contradictedRollout: UUID? = nil
         var terminalName: String? = nil
     }
+    private var mailboxIdentityRetryAfter: [String: Date] = [:]
     private var groupStatusIdentities: [String: GroupStatusIdentity] = [:]
     private struct GroupMCPIdentity {
         let runtimeID: String
@@ -3766,6 +3767,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         guard let live = SessionGroupMatching.match(recipient, in: observed), Self.canAddressGroupMember(recipient, live: live),
               let current = sessions[live.id] else {
+            if recipient.agent == .codex, let original = SessionGroupMatching.connection(recipient, in: observed),
+               original.id == recipient.runtimeID, original.conversationID == nil,
+               sessions[original.id]?.phase == .idle, !manualQuestion,
+               !group.members.contains(where: { $0.id != recipient.id && $0.runtimeID == original.id }),
+               mailboxIdentityRetryAfter[original.id, default: .distantPast] <= Date() {
+                mailboxIdentityRetryAfter = mailboxIdentityRetryAfter.filter { $0.value > Date() }
+                mailboxIdentityRetryAfter[original.id] = Date().addingTimeInterval(120)
+                do {
+                    _ = try await refreshSessionGroupMemberID(groupID: group.id, memberID: recipient.id, expectedGroup: group, expectedRuntimeID: original.id)
+                } catch {
+                    throw RemoteHTTPError(409, "수신 탭의 세션 ID 갱신을 보류했습니다. " + error.localizedDescription, diagnostics: ["delivery": "not_started"])
+                }
+                throw RemoteHTTPError(409, "수신 탭의 세션 ID를 확인했습니다. 전달을 다시 시도합니다.", diagnostics: ["delivery": "not_started"])
+            }
             throw RemoteHTTPError(409, "수신 구성원의 대화 ID와 현재 터미널 연결을 확인하지 못했습니다.", diagnostics: ["delivery": "not_started"])
         }
         if let key = message.sourceKey, key.hasPrefix(SessionGroupMailbox.priorityPrefix),
