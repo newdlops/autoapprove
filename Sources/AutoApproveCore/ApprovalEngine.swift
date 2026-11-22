@@ -5897,9 +5897,26 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return result
     }
 
+    private var claudePromptChannels: [String: String] = [:]
+    private var claudePromptAutomatic: [String: Bool] = [:]
+
+    private func syncClaudePromptSuggestions() {
+        for (id, channel) in claudePromptChannels {
+            let enabled = sessions[id].map { $0.phase != .ended && effectiveAutomatic(id, fallback: $0) } ?? false
+            guard claudePromptAutomatic[id] != enabled else { continue }
+            do {
+                try ClaudePromptBridge.setAutomatic(enabled, path: channel, paths: paths)
+                claudePromptAutomatic[id] = enabled
+            } catch {
+                snapshot.health.auditError = error.localizedDescription
+            }
+        }
+    }
+
     private func publish() {
         if screenPublicationDepth > 0 { screenPublicationPending = true; return }
         projectClaudeApprovals()
+        syncClaudePromptSuggestions()
         projectCapacityResumes()
         let duplicatesBySession = duplicateQuestionIDsBySession()
         var confirmations = QuestionConfirmationCache()
@@ -6905,6 +6922,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for session in managed {
             live.insert(session.id)
             if session.agent == .codex { liveCodex.insert(session.id) }
+        }
+        claudePromptChannels = claudePromptChannels.filter { live.contains($0.key) }
+        claudePromptAutomatic = claudePromptAutomatic.filter { live.contains($0.key) }
+        for record in records where live.contains(record.key) && record.agent == .claude && claudePromptChannels[record.key] == nil {
+            let environment = ProcessDiscovery.environmentCache.environment(record, reader: ProcessEnvironment.read)
+            claudePromptChannels[record.key] = environment[ClaudePromptBridge.key]
         }
         let liveTmuxHandles = Set(managed.compactMap(\.tmuxHandle))
         if retainedTmuxHandles != liveTmuxHandles {

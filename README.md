@@ -1,6 +1,6 @@
 # AutoApprove
 
-**Claude 입력창 연동 · 0.2.379 빌드 406** [변경 사항](docs/releases/v0.2.379.md)
+**Claude 자동승인과 입력 추천 · 0.2.380 빌드 407** [변경 사항](docs/releases/v0.2.380.md)
 
 **현재 탭의 대화 ID로 프로필 저장 · 0.2.377 빌드 404** [변경 사항](docs/releases/v0.2.377.md)
 

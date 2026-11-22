@@ -16,6 +16,8 @@ export function register(on) {
   on('prompt.suggest', async ($, event, next) => {
     const revision = ++generation
     suggestion = false
+    const directory = await $.env.get('AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE')
+    if (directory && await $.fs.exists(directory + '/automatic')) return { isShown: false }
     const result = await next(event)
     if (revision === generation) suggestion = result?.isShown === true
     return result
