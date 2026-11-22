@@ -15,20 +15,18 @@ public struct AgyHookRequest: Decodable {
         public let id: String?
         public let name: String
         public let commandLine: String?
+        public let targetPath: String?
 
         private enum CodingKeys: String, CodingKey { case id, name, args }
-        private enum ArgumentKey: String, CodingKey { case commandLine = "CommandLine" }
+        private enum ArgumentKey: String, CodingKey { case commandLine = "CommandLine", file = "AbsolutePath", directory = "DirectoryPath" }
 
         public init(from decoder: Decoder) throws {
             let fields = try decoder.container(keyedBy: CodingKeys.self)
             id = try fields.decodeIfPresent(String.self, forKey: .id)
             name = try fields.decode(String.self, forKey: .name)
-            if name == "run_command", fields.contains(.args) {
-                let args = try fields.nestedContainer(keyedBy: ArgumentKey.self, forKey: .args)
-                commandLine = try args.decodeIfPresent(String.self, forKey: .commandLine)
-            } else {
-                commandLine = nil
-            }
+            let args = try fields.contains(.args) ? fields.nestedContainer(keyedBy: ArgumentKey.self, forKey: .args) : nil
+            commandLine = name == "run_command" ? try args?.decodeIfPresent(String.self, forKey: .commandLine) : nil
+            targetPath = try args?.decodeIfPresent(String.self, forKey: name == "list_dir" ? .directory : .file)
         }
     }
 
@@ -39,6 +37,20 @@ public struct AgyHookRequest: Decodable {
     public let modelName: String?
     public let fullyIdle: Bool?
     public let terminationReason: String?
+
+    package func permission(automatic: Bool, cwd: String?) -> JSONObject {
+        if let command = toolCall?.commandLine, let risk = SystemCommandRisk.detect(command) {
+            return ["decision": "deny", "reason": risk.detail]
+        }
+        guard hookEventName == .preToolUse, automatic, let toolCall else { return ["decision": "ask"] }
+        if toolCall.name == "run_command", toolCall.commandLine == "/bin/pwd" { return ["decision": "auto_approve"] }
+        guard ["view_file", "read_file", "list_dir"].contains(toolCall.name),
+              let path = toolCall.targetPath, path.hasPrefix("/"), let cwd, cwd.hasPrefix("/") else { return ["decision": "ask"] }
+        let root = URL(fileURLWithPath: cwd).resolvingSymlinksInPath().standardizedFileURL.path
+        let target = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        guard root != "/", target == root || target.hasPrefix(root + "/") else { return ["decision": "ask"] }
+        return ["decision": "auto_approve"]
+    }
 
     public var isIdle: Bool {
         switch hookEventName {

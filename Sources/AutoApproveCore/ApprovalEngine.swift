@@ -2599,7 +2599,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (id, home, name)
     }
 
-    @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil, selectedReplacement: String? = nil, expectedConversationID: String? = nil) async throws -> SessionGroupIdentityRefresh {
+    @discardableResult public func refreshSessionGroupMemberID(groupID: UUID, memberID: UUID, expectedGroup: SessionGroup? = nil, selectedReplacement: String? = nil, expectedConversationID: String? = nil, expectedRuntimeID: String? = nil) async throws -> SessionGroupIdentityRefresh {
         let store = SessionGroupStore(directory: paths.directory), saved = try store.load()
         if let expectedGroup, saved.first(where: { $0.id == groupID })?.sameMembership(as: expectedGroup) != true {
             throw RemoteHTTPError(409, "그룹 구성이 바뀌어 갱신하지 않았습니다. get_session_groups로 다시 확인해주세요.")
@@ -2629,6 +2629,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw AppError.message("원래 터미널 연결을 확인해주세요. 다시 실행한 세션은 실행 중인 세션에 연결한 뒤 갱신할 수 있습니다.")
         }
         let runtime = original.id
+        guard expectedRuntimeID == nil || expectedRuntimeID == runtime else { throw AppError.message("호출한 그룹장 탭이 바뀌었습니다.") }
         let id: String
         var verifiedInTab = false
         var namedHome: String?
@@ -2668,16 +2669,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 throw AppError.message("조회 중 대상 탭의 대화가 바뀌었습니다. 세션 ID를 다시 갱신해주세요.")
             }
         }
+        if let expectedConversationID, UUID(uuidString: expectedConversationID) != uuid {
+            throw AppError.message("선택한 뒤 대상 대화가 바뀌었습니다. 다시 선택해주세요.")
+        }
         if replacing {
-            if let expectedConversationID, UUID(uuidString: expectedConversationID) != uuid {
-                throw AppError.message("선택한 뒤 대상 대화가 바뀌었습니다. 다시 선택해주세요.")
-            }
             let all = try await readSessionGroupSessions(reconcile: false, useStatusCache: false)
-            guard selectedReplacement != nil || !group.members.contains(where: { $0.id != memberID && $0.runtimeID != runtime && $0.tabShell == member.tabShell }),
+            guard selectedReplacement != nil || !group.members.contains(where: { $0.id != memberID && $0.runtimeID != runtime && $0.tabShell?.identifies(connection.tabShell) == true }),
                   let checked = SessionGroupMatching.replacement(member, in: all, selected: selectedReplacement),
                   checked.id == runtime, checked.tabShell == connection.tabShell, checked.providerHome == home,
                   checked.conversationID.map({UUID(uuidString: $0) == uuid}) ?? true,
-                  !all.contains(where: { $0.id != runtime && $0.session.agent == .codex && $0.providerHome == home && $0.conversationID.flatMap(UUID.init(uuidString:)) == uuid }) else {
+                  !all.contains(where: { $0.id != runtime && $0.session.agent == member.agent && $0.providerHome == home && $0.conversationID.flatMap(UUID.init(uuidString:)) == uuid }) else {
                 throw AppError.message("교체할 터미널 또는 대화 ID가 바뀌었습니다.")
             }
         }
@@ -2867,13 +2868,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let registry = claudeRegistryReader, codexReader = codexGroupReader, codexEnvironment = codexGroupEnvironment
         let records = try await Task.detached(priority: .utility) { try reader() }.value
         let agyRevisions = agyEvents.mapValues(\.revision)
+        var terminalEnvironments: [String: [String: String]] = [:]
         var result: [SessionGroupLiveSession] = []
         for original in originals {
             try Task.checkCancellation()
             guard let record = records.first(where: { $0.key == original.id && $0.agent == original.agent && "/dev/" + $0.tty == original.tty }) else { continue }
             let environment = await Task.detached(priority: .utility) {
-                original.agent == .codex ? codexEnvironment(record) : (original.agent == .claude ? ProcessEnvironment.read(record) : nil)
+                original.agent == .codex ? codexEnvironment(record) : ProcessEnvironment.read(record)
             }.value
+            terminalEnvironments[original.id] = environment
             var home: String?, conversation: String?, messagingName: String?, claudeStatus: String?
             if original.agent == .codex {
                 home = CodexGroupIdentity.home(environment: environment)
@@ -2935,7 +2938,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if current.agent == .agy, agyRevisions[current.id] != agyEvents[current.id]?.revision {
                 result.conversationID = agyEvents[current.id]?.conversationId
             }
-            if let process = byPID[current.pid] { result.tabShell = SessionGroupTabShell.observe(current, process: process, records: byPID) }
+            if let process = byPID[current.pid] { result.tabShell = SessionGroupTabShell.observe(current, process: process, records: byPID, environment: terminalEnvironments[current.id]) }
             let mcp = current.agent == .codex ? groupMCPIdentity(for: current, home: result.providerHome) : nil
             if let mcp, let id = mcp.conversationID {
                 groupStatusIdentities.removeValue(forKey: current.id)
@@ -2968,6 +2971,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let manual = refreshed.filter { !groupClearActive($0.id) }
         let claude = Dictionary(uniqueKeysWithValues: SessionGroupMatching.refreshedClaude(manual, live: observed).map { ($0.id, $0) })
         refreshed = refreshed.map { claude[$0.id] ?? $0 }
+        for gi in refreshed.indices where !groupClearActive(refreshed[gi].id) {
+            for mi in refreshed[gi].members.indices {
+                let member = refreshed[gi].members[mi]
+                guard refreshed[gi].isLeader(member.id), let live = SessionGroupMatching.match(member, in: observed),
+                      live.id == member.runtimeID, let tab = live.tabShell else { continue }
+                refreshed[gi].members[mi].tabShell = tab
+            }
+        }
         var remaining:[TerminalProfileGroupAttachment]=[]
         for attachment in profileGroupAttachments where attachment.expires > Date() {
             guard let gi=refreshed.firstIndex(where:{$0.id==attachment.groupID}),
@@ -3040,16 +3051,24 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return SessionGroupMatching.match(member, in: observed)?.id == caller.id
     }
 
-    /// Reading membership and repairing an ID may use the exact saved process.
-    /// This does not authorize messages, tasks or consuming reports until the conversation is verified.
-    private func groupRecoveryCaller(_ member: SessionGroupMember, caller: SessionGroupLiveSession, observed: [SessionGroupLiveSession]) -> Bool {
-        groupMemberIsCaller(member, caller: caller, observed: observed) ||
-            (caller.conversationID == nil && member.runtimeID == caller.id &&
-             SessionGroupMatching.connection(member, in: observed)?.id == caller.id)
+    private func recoveryMember(in group: SessionGroup, caller: SessionGroupLiveSession, observed: [SessionGroupLiveSession]) -> SessionGroupMember? {
+        let verified = group.members.filter { groupMemberIsCaller($0, caller: caller, observed: observed) }
+        if !verified.isEmpty { return verified.count == 1 ? verified.first : nil }
+        guard caller.session.pid > 0 else { return nil }
+        let candidates = group.members.filter { member in
+            if member.runtimeID == caller.id, SessionGroupMatching.connection(member, in: observed)?.id == caller.id {
+                return caller.conversationID == nil || group.isLeader(member.id)
+            }
+            return group.isLeader(member.id) && SessionGroupMatching.replacement(member, in: observed, selected: nil)?.id == caller.id
+        }
+        return candidates.count == 1 ? candidates.first : nil
     }
 
     private func canReconnectGroupMember(_ member: SessionGroupMember, group: SessionGroup, caller: SessionGroupLiveSession,
                                          callerMember: SessionGroupMember, observed: [SessionGroupLiveSession]) -> Bool {
+        if !groupMemberIsCaller(callerMember, caller: caller, observed: observed) {
+            return member.id == callerMember.id && recoveryMember(in: group, caller: caller, observed: observed)?.id == member.id
+        }
         guard SessionGroupMatching.connection(member, in: observed) != nil ||
                 (groupMemberIsCaller(callerMember, caller: caller, observed: observed) &&
                  SessionGroupMatching.replacement(member, in: observed, selected: nil) != nil) else { return false }
@@ -3061,15 +3080,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let observed = try await sessionGroupSessions()
         let (caller, _) = try sessionGroupCaller(object, observed: observed, recovery: true)
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
-              let callerMember = group.members.first(where: { groupRecoveryCaller($0, caller: caller, observed: observed) }),
+              let callerMember = recoveryMember(in: group, caller: caller, observed: observed),
               let member = group.members.first(where: { $0.id == memberID }) else {
             throw RemoteHTTPError(403, "현재 세션의 그룹과 구성원을 확인해주세요. get_session_groups로 다시 조회할 수 있습니다.")
         }
         guard canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed) else {
             throw RemoteHTTPError(409, "재연결할 수 있는 원래 터미널을 확인하지 못했거나 재연결 권한이 없습니다. canReconnect가 true인 구성원만 재연결할 수 있습니다. 종료된 터미널은 자동으로 다시 실행하지 않습니다.")
         }
-        let refreshed = try await refreshSessionGroupMemberID(groupID: groupID, memberID: memberID, expectedGroup: group)
-        // A group-list observation already in flight can predate the new status card.
+        let repairedSelf = member.id == callerMember.id && !groupMemberIsCaller(member, caller: caller, observed: observed)
+        let refreshed = try await refreshSessionGroupMemberID(groupID: groupID, memberID: memberID, expectedGroup: group,
+                                                              expectedConversationID: repairedSelf ? caller.conversationID : nil, expectedRuntimeID: repairedSelf ? caller.id : nil)
         let fresh = try await readSessionGroupSessions(reconcile: false)
         guard let updated = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID })?.members.first(where: { $0.id == memberID }),
               let live = SessionGroupMatching.match(updated, in: fresh), live.id == updated.runtimeID,
@@ -4766,10 +4786,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try sessionGroupCaller(object, observed: observed, recovery: true)
             let groups = try SessionGroupStore(directory: paths.directory).load()
-            let matching = groups.filter { group in group.members.contains { groupRecoveryCaller($0, caller: caller, observed: observed) } }
-            let modelSettings = await groupModelSettings(matching, observed: observed)
-            let output: [JSONObject] = matching.map { group in
-                let callerMember = group.members.first { groupRecoveryCaller($0, caller: caller, observed: observed) }!
+            let matching = groups.compactMap { group in recoveryMember(in: group, caller: caller, observed: observed).map { (group, $0) } }
+            let modelSettings = await groupModelSettings(matching.map { $0.0 }, observed: observed)
+            let output: [JSONObject] = matching.map { group, callerMember in
                 let members: [JSONObject] = group.members.map { member in
                     let live = SessionGroupMatching.match(member, in: observed)
                     let unresolved = live == nil ? SessionGroupMatching.connection(member, in: observed) : nil
@@ -8009,11 +8028,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     publish()
                 }
                 if event.hookEventName == .preToolUse {
-                    if let command = event.toolCall?.commandLine, let risk = SystemCommandRisk.detect(command) {
-                        result = ["decision":"deny","reason":risk.detail]
-                    } else if sessions[agent.key]?.automatic == true, !snapshot.paused, event.toolCall?.name == "read_file" {
-                        result = ["decision":"allow"]
-                    } else { result = ["decision":"ask"] }
+                    let session = sessions[agent.key]
+                    result = event.permission(automatic: session?.automatic == true && !snapshot.paused && !remoteInputStopped,
+                                              cwd: session?.cwd)
                 }
             case "desktopGuard":
                 if let enabled = params["enabled"] as? Bool { try setBackgroundComputerUseGuard(enabled) }

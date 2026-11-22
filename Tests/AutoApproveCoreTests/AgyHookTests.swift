@@ -48,6 +48,16 @@ extension ApprovalTests {
         let stopped = try decode("Stop", ["fullyIdle": true, "terminationReason": "NO_TOOL_CALL"])
         try expect(stopped.isIdle)
         try expectEqual(stopped.terminationReason, "NO_TOOL_CALL")
+        func decision(_ tool: String, _ args: JSONObject, enabled: Bool = true) throws -> String? {
+            let event = try decode("PreToolUse", ["toolCall": ["name": tool, "args": args]])
+            return event.permission(automatic: enabled, cwd: directory.path)["decision"] as? String
+        }
+        try expectEqual(try decision("view_file", ["AbsolutePath": config.path]), "auto_approve")
+        try expectEqual(try decision("list_dir", ["DirectoryPath": directory.path]), "auto_approve")
+        try expectEqual(try decision("view_file", ["AbsolutePath": config.path], enabled: false), "ask")
+        try expectEqual(try decision("view_file", ["AbsolutePath": "/outside"]), "ask")
+        try expectEqual(try decision("run_command", ["CommandLine": "/bin/pwd"]), "auto_approve")
+        try expectEqual(try decision("run_command", ["CommandLine": "/bin/pwd && whoami"]), "ask")
         for tool in ["run_command", "call_mcp_tool", "read_file"] {
             let request = try decode("PreToolUse", ["toolCall": ["name": tool, "args": ["CommandLine": "pwd"]]])
             try expectEqual(request.toolCall?.commandLine, tool == "run_command" ? "pwd" : nil)

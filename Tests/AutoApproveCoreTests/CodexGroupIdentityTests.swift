@@ -371,6 +371,55 @@ extension ApprovalTests {
         }
     }
 
+    @MainActor func testRestoredLeaderRecoversFromCallingTab() async throws {
+        let directory = URL(fileURLWithPath: "/private/tmp").appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let oldRecords = ProcessDiscovery.parse("""
+        900 1 fixture40 900 901 Wed Oct 28 10:00:00 2026 /bin/zsh
+        901 900 fixture40 901 901 Wed Oct 28 10:01:00 2026 /fixture/codex
+        """)
+        let newRecords = ProcessDiscovery.parse("""
+        910 1 fixture41 910 911 Wed Oct 28 12:00:00 2026 /bin/zsh
+        911 910 fixture41 911 911 Wed Oct 28 12:01:00 2026 /fixture/codex
+        """)
+        let tab = UUID().uuidString, oldID = UUID().uuidString.lowercased(), newID = UUID().uuidString.lowercased()
+        let store = SessionGroupStore(directory: directory)
+        func open(_ rows: [ProcessRecord], _ id: String, _ tabID: String) throws -> ApprovalEngine {
+            let engine = try ApprovalEngine(paths: .init(directory: directory), processReader: { rows },
+                codexGroupReader: { _ in .init(threadID: id, database: "/fixture/home/state.sqlite") },
+                codexGroupEnvironment: { _ in ["CODEX_HOME": "/fixture/home", "TERM_SESSION_ID": tabID] })
+            let p = rows[1]
+            engine.updateDiscovery([AgentSession(id: p.key, agent: .codex, pid: p.pid, started: p.started,
+                tty: "/dev/" + p.tty, cwd: "/project", terminal: .terminal)], records: rows)
+            return engine
+        }
+        let old = try open(oldRecords, oldID, tab)
+        let member = try await old.sessionGroupSessions()[0].member
+        let group = SessionGroup(name: "saved", members: [member], leaderMemberID: member.id)
+        try store.save([group])
+        old.stop()
+        func call(_ tool: String, _ engine: ApprovalEngine) async throws -> JSONObject {
+            try await engine.mcpAction(["tool": tool, "owner": UUID().uuidString, "sessionID": newRecords[1].key,
+                "conversationID": newID, "groupID": group.id.uuidString, "memberID": member.id.uuidString])
+        }
+        let unrelated = try open(newRecords, newID, UUID().uuidString)
+        let invisible = try await call("get_session_groups", unrelated)
+        try expectEqual((invisible["groups"] as? [JSONObject])?.count, 0)
+        unrelated.stop()
+        let restored = try open(newRecords, newID, tab)
+        defer { restored.stop() }
+        let listed = try await call("get_session_groups", restored)
+        let row = ((listed["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject])?.first
+        try expectEqual(row?["isCaller"] as? Bool, true)
+        try expectEqual(row?["canReconnect"] as? Bool, true)
+        try expectEqual(try store.load()[0].members[0].conversationID, oldID)
+        let repaired = try await call("reconnect_group_member", restored)
+        try expectEqual(repaired["conversationID"] as? String, newID)
+        try expectEqual(try store.load()[0].leaderMemberID, member.id)
+        let status = try await call("get_group_status", restored)
+        try expectEqual((status["groups"] as? [JSONObject])?.count, 1)
+    }
+
     @MainActor func testCodexReplacementPreservesGroupRoleAndValidatesTabLifetime() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

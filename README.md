@@ -1,5 +1,7 @@
 # AutoApprove
 
+**그룹장 탭 복구와 agy 자동 승인 · 0.2.360 빌드 387** [변경 사항](docs/releases/v0.2.360.md)
+
 **Antigravity 대화 ID 갱신 · 0.2.359 빌드 386** 실행 중인 agy 대화를 잠금 파일로 식별합니다. [변경 사항](docs/releases/v0.2.359.md)
 
 **Antigravity 세션 연결 · 0.2.358 빌드 385** 실행 중인 agy 터미널을 감지하고 공식 훅에서 대화 ID와 작업 상태를 받습니다. [설치 방법](docs/releases/v0.2.358.md)

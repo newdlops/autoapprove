@@ -633,7 +633,7 @@ private extension AgentKind {
         switch self {
         case .codex: .blue
         case .claude: .purple
-        case .agy: .teal
+        case .agy: .green
         case .shell: .gray
         }
     }

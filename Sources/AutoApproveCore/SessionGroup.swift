@@ -265,18 +265,26 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
-/// The lifetime of a native tab's shell survives restarting Codex but ends when the tab closes.
 public struct SessionGroupTabShell: Codable, Equatable, Sendable {
     let host: TerminalKind
     let tty: String
     let shellRuntime: String
 
-    static func observe(_ session: AgentSession, process: ProcessRecord, records: [Int32: ProcessRecord]) -> Self? {
-        guard session.agent == .codex, [.terminal, .iterm].contains(session.terminal),
+    var terminalSessionID: UUID? = nil
+
+    func identifies(_ other: Self?) -> Bool {
+        guard let other, host == other.host else { return false }
+        if let terminalSessionID, let observed = other.terminalSessionID { return terminalSessionID == observed }
+        return tty == other.tty && shellRuntime == other.shellRuntime
+    }
+
+    static func observe(_ session: AgentSession, process: ProcessRecord, records: [Int32: ProcessRecord], environment: [String: String]? = nil) -> Self? {
+        guard session.agent != .shell, [.terminal, .iterm].contains(session.terminal),
               process.key == session.id, "/dev/" + process.tty == session.tty,
               let parent = records[process.parent], parent.tty == process.tty,
               SessionExitRecovery.isShell(parent) else { return nil }
-        return Self(host: session.terminal, tty: session.tty, shellRuntime: parent.key)
+        let raw = session.terminal == .iterm ? environment?["ITERM_SESSION_ID"]?.components(separatedBy: ":").last : environment?["TERM_SESSION_ID"]
+        return Self(host: session.terminal, tty: session.tty, shellRuntime: parent.key, terminalSessionID: raw.flatMap(UUID.init(uuidString:)))
     }
 }
 
@@ -322,13 +330,13 @@ public struct SessionGroupMemberOperation: Equatable {
 
 public enum SessionGroupMatching {
     static func replacement(_ member: SessionGroupMember, in live: [SessionGroupLiveSession], selected: String?) -> SessionGroupLiveSession? {
-        guard member.agent == .codex, let home = member.providerHome, UUID(uuidString: member.conversationID) != nil,
-              !live.contains(where: { $0.id == member.runtimeID || ($0.session.agent == .codex && $0.providerHome == home &&
+        guard member.agent != .shell, let home = member.providerHome, UUID(uuidString: member.conversationID) != nil,
+              !live.contains(where: { $0.id == member.runtimeID || ($0.session.agent == member.agent && $0.providerHome == home &&
                   $0.conversationID.flatMap(UUID.init(uuidString:)) == UUID(uuidString: member.conversationID)) }) else { return nil }
         let matches = live.filter { row in
-            row.session.agent == .codex && row.session.phase != .ended && row.session.cwd == member.cwd &&
+            row.session.agent == member.agent && row.session.phase != .ended && row.session.cwd == member.cwd &&
                 row.providerHome == home && [.terminal, .iterm].contains(row.session.terminal) &&
-                (selected.map { row.id == $0 } ?? (member.tabShell != nil && member.tabShell == row.tabShell))
+                (selected.map { row.id == $0 } ?? (member.tabShell?.identifies(row.tabShell) == true))
         }
         return matches.count == 1 ? matches[0] : nil
     }

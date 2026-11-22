@@ -148,8 +148,9 @@ import AutoApproveCore
                 var observation = payload.filter { fields.contains($0.key) }
                 if let tool = payload["toolCall"] as? JSONObject, let name = tool["name"] as? String {
                     var call: JSONObject = ["name":name]
-                    if name == "run_command", let args = tool["args"] as? JSONObject, let line = args["CommandLine"] as? String {
-                        call["args"] = ["CommandLine":line]
+                    if let args = tool["args"] as? JSONObject {
+                        let keys = ["run_command": "CommandLine", "list_dir": "DirectoryPath", "view_file": "AbsolutePath", "read_file": "AbsolutePath"]
+                        if let key = keys[name], let value = args[key] as? String { call["args"] = [key: value] }
                     }
                     observation["toolCall"] = call
                 }
