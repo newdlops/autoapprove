@@ -232,23 +232,26 @@ extension ApprovalTests {
         try engine.setPaused(true)
         let backlog = try box.enqueue(groupID: group.id, senderID: members[1].id, recipientID: members[0].id, kind: .message, text: "earlier message")
         try expectEqual(try engine.requestSessionGroupNicknames(groupID: group.id, memberIDs: [members[1].id], byUser: true), 1)
-        let earlier = try unwrapGroup(try box.heads().first)
-        try expectEqual(try engine.requestSessionGroupNicknames(groupID: group.id, memberIDs: members.map(\.id), byUser: true), 1)
-        let request = try unwrapGroup(try box.heads().first)
+        let earlier = try unwrapGroup(try box.heads().first { $0.recipientID == members[1].id })
+        try expectEqual(try engine.requestSessionGroupNicknames(groupID: group.id, memberIDs: nil, byUser: true), members.count)
+        let requests = try box.heads()
+        try expectEqual(Set(requests.map(\.recipientID)), Set(members.map(\.id)))
+        let request = try unwrapGroup(requests.first { $0.recipientID == members[0].id })
         try expect(request.id != earlier.id && request.sequence > backlog.sequence)
         try expectEqual(try box.message(earlier.id)?.lastResult, "superseded")
-        try expectEqual(try box.conversations(groupID: group.id).messages.first?.id, request.id)
+        try expectEqual(Set(try box.conversations(groupID: group.id).messages.prefix(members.count).map(\.id)), Set(requests.map(\.id)))
         try box.acknowledge([backlog.id], groupID: group.id, recipientID: members[0].id)
         try engine.setPaused(false)
-        try expect(try await waitForGroup(5) { (try? box.message(request.id)?.lastResult) == "direct_submitted" })
-        let typed = try unwrapGroup(terminal.typed.last)
-        try expect(typed.hasPrefix("AutoApprove 대화 그래프에서 '전체 다시 정하기' 버튼을 눌러 보내는 내 요청이야."), "Typed as the user's request: \(typed)")
-        try expect(!typed.contains("[AutoApprove 그룹 전달") && !typed.contains("senderMemberID"), "No relay header")
-        try expect(typed.hasSuffix("(AutoApprove 요청 ID " + request.id.uuidString + ")"))
-        _ = engine.handleHook(["hook_event_name": "UserPromptSubmit", "session_id": ids[records[0].pid]!, "requestID": UUID().uuidString,
-                               "agentPID": records[0].pid, "agentStarted": records[0].started, "prompt": typed])
-        try expectEqual(try box.message(request.id)?.lastResult, "observed", "The observed prompt is the receipt, so it is never typed again")
-        try expectEqual(terminal.typed.count, 1)
+        for (i, member) in members.enumerated() {
+            let own = try unwrapGroup(requests.first { $0.recipientID == member.id })
+            try expect(try await waitForGroup(8) { (try? box.message(own.id)?.lastResult) == "direct_submitted" })
+            let typed = try unwrapGroup(terminal.typed.first { $0.hasSuffix("(AutoApprove 요청 ID " + own.id.uuidString + ")") })
+            try expect(typed.hasPrefix("AutoApprove 대화 그래프에서 '전체 다시 정하기' 버튼을 눌러 보내는 내 요청이야.") && typed.contains(member.id.uuidString))
+            _ = engine.handleHook(["hook_event_name": "UserPromptSubmit", "session_id": ids[records[i].pid]!, "requestID": UUID().uuidString,
+                                   "agentPID": records[i].pid, "agentStarted": records[i].started, "prompt": typed])
+            try expectEqual(try box.message(own.id)?.lastResult, "observed")
+        }
+        try expectEqual(terminal.typed.count, members.count)
         let question = try box.enqueue(groupID: group.id, senderID: members[0].id, recipientID: members[1].id,
                                        kind: .question, text: "first pending question")
         let later = try box.enqueue(groupID: group.id, senderID: members[0].id, recipientID: members[1].id,
@@ -264,6 +267,8 @@ extension ApprovalTests {
         let list = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "get_group_messages", "sessionID": sessions[1].id,
             "groupID": group.id.uuidString, "unansweredOnly": true])
         try expectEqual((list["messages"] as? [JSONObject])?.compactMap { $0["messageID"] as? String }, [question.id.uuidString, later.id.uuidString])
+        _ = engine.handleHook(["hook_event_name": "Stop", "session_id": ids[records[1].pid]!, "requestID": UUID().uuidString,
+                               "agentPID": records[1].pid, "agentStarted": records[1].started])
         terminal.setStatus(records[1].pid, "idle")
         writer.show("done\n" + rule + "\n❯ \n" + rule + "\nfixture status", on: sessions[1].tty)
         engine.updateDiscovery(sessions, records: records); await engine.refreshScreens()
@@ -1162,7 +1167,7 @@ extension ApprovalTests {
                                         kind: .message, text: "queued behind question")
         let beforeInspection = count()
         let operation = try unwrapGroup(engine.sessionGroupOperations(group)[members[1].id])
-        try expectNotNil(operation.phase, "The conversation is confirmed even though input is blocked")
+        try expectEqual(operation.phase, .working, "Background shell work is visible on the node")
         try expectEqual(operation.input, .deferred("Claude Code에서 셸 명령 실행 중"))
         try expectEqual(operation.unacknowledgedCount, 2)
         try expect(operation.isDeliveryBlocked)

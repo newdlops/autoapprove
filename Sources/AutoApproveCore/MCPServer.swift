@@ -80,7 +80,7 @@ public enum AutoApproveMCPServer {
                  ["groupID": string, "requestID": string, "conversationID": string], ["groupID", "requestID"], destructive:true),
             tool("clear_group_member", "지정한 구성원만 /clear하고 ID를 갱신합니다. 그룹장이 있으면 그룹장만 가능합니다. 같은 대상의 재시도는 같은 requestID, 다른 요청은 새 ID를 쓰세요. 자신이면 현재 응답을 끝내고 get_group_clear_status로 완료를 확인하세요.",
                  ["groupID": string, "memberID": string, "requestID": string, "conversationID": string], ["groupID", "memberID", "requestID"], destructive:true),
-            tool("set_group_member_title", "원래 Terminal·iTerm2 탭과 구성원 이름(1~80자)을 바꿉니다. role(1~120자)은 선택입니다. 그룹장이 있으면 그룹장만 가능합니다.",
+            tool("set_group_member_title", "원래 Terminal·iTerm2 탭과 구성원 이름(1~80자)을 바꿉니다. role(1~120자)은 선택입니다. 구성원은 자신을 변경할 수 있고, 그룹장은 다른 구성원도 변경할 수 있습니다.",
                  ["groupID": string, "memberID": string, "title": string, "role": string, "conversationID": string], ["groupID", "memberID", "title"]),
             tool("set_group_member_tab_color", "원래 탭 제목에 색상 표식을 적용합니다. default는 표식을 제거합니다. 그룹장이 있으면 그룹장만 가능합니다.",
                  ["groupID": string, "memberID": string, "color": ["type":"string","enum":SessionColor.allCases.map(\.rawValue) + ["default"]], "conversationID": string], ["groupID", "memberID", "color"]),

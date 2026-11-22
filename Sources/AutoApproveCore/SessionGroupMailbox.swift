@@ -377,16 +377,17 @@ public final class SessionGroupMailbox {
         try update("UPDATE messages SET next_attempt=? WHERE id=? AND " + Self.awaitingReceipt, [String(date.timeIntervalSince1970), id.uuidString])
     }
 
-    func enqueueNicknameRequest(group: UUID, recipient: UUID, scope: String, text: String) throws {
+    func enqueueNicknameRequest(group: UUID, recipient: UUID, scope: String, text: String, replacesAll: Bool) throws {
         let prefix = "userButton:rename:"
         let queued = "group_id=? AND recipient_id=? AND kind='notice' AND acknowledged IS NULL AND (last_result IS NULL OR last_result IN ('not_started','redeliver')) AND source_key LIKE ?"
         let base = [group.uuidString, recipient.uuidString]
-        let pendingAll = try scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE " + queued + ")", base + [prefix + "all:%"]) != 0
-        let merged = pendingAll ? "all" : scope
-        let pattern = prefix + (merged == "all" ? "%" : merged + ":%")
+        let pattern = prefix + (replacesAll ? "%" : scope + ":%")
         try update("UPDATE messages SET last_result='superseded',last_error=NULL WHERE " + queued, base + [pattern])
+        if replacesAll {
+            try update("UPDATE messages SET last_result='superseded',last_error=NULL WHERE group_id=? AND recipient_id=? AND kind='notice' AND acknowledged IS NULL AND (last_result IS NULL OR last_result IN ('not_started','redeliver')) AND source_key IS NULL AND body LIKE '[AutoApprove 닉네임 요청]%'", base)
+        }
         _ = try insertMessage(id: nil, groupID: group, senderID: recipient, recipientID: recipient,
-            kind: .notice, text: pendingAll && scope != "all" ? text + " 이 구성원부터 적용한 뒤, 앞서 요청한 나머지 구성원의 닉네임과 역할도 정해 줘." : text, sourceKey: prefix + merged + ":" + UUID().uuidString)
+            kind: .notice, text: text, sourceKey: prefix + scope + ":" + UUID().uuidString)
     }
 
     public func enqueue(id: UUID? = nil, groupID: UUID, senderID: UUID, recipientID: UUID, kind: SessionGroupMessage.Kind,

@@ -267,7 +267,7 @@ import AutoApproveCore
         }
     }
 
-    private func requestNicknames(_ members: [UUID]) {
+    private func requestNicknames(_ members: [UUID]?) {
         guard !requestingNicknames else { return }
         requestingNicknames = true
         nicknameNote = nil
@@ -276,14 +276,9 @@ import AutoApproveCore
             do {
                 let sent = try engine.requestSessionGroupNicknames(groupID: groupID, memberIDs: members, byUser: true)
                 nicknameNote = sent == 0 ? "요청할 구성원이 없습니다"
-                    : (engine.snapshot.paused ? "최신 요청으로 등록했습니다. 일시정지를 해제하면 우선 전달합니다." : "최신 요청으로 등록했습니다. 수신 세션이 입력 가능해지면 우선 전달합니다.")
+                    : (engine.snapshot.paused ? "\(sent)명의 메시지 큐 맨 앞에 등록했습니다. 일시정지를 해제하면 우선 전달합니다." : "\(sent)명의 메시지 큐 맨 앞에 등록했습니다. 수신 세션이 입력 가능해지면 우선 전달합니다.")
             } catch { alert = GraphAlert(title: "이름 다시 정하기를 요청하지 못했습니다", message: error.localizedDescription) }
         }
-    }
-
-    /// Who receives a rename request, for the button help: the leader names everyone, or members name themselves.
-    private func renameRecipient(_ content: ConversationGraphModel.Content) -> String {
-        content.nodes.contains(where: \.isLeader) ? "그룹장에게" : "각 구성원에게"
     }
 
     private func nicknameNoteView() -> some View {
@@ -315,12 +310,12 @@ import AutoApproveCore
                 .padding(.horizontal, 16).padding(.top, 12)
             if !content.nodes.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Button("전체 다시 정하기") { requestNicknames(content.nodes.map(\.id)) }
+                    Button("전체 다시 정하기") { requestNicknames(nil) }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(requestingNicknames)
                         .help(requestingNicknames ? "요청을 저장하고 있습니다."
-                              : "구성원 \(content.nodes.count)명의 이름과 역할을 지금 하는 일에 맞게 다시 정해 달라고 \(renameRecipient(content)) 요청합니다. 언제든 다시 요청할 수 있습니다.")
+                              : "구성원 \(content.nodes.count)명 각각의 큐에 자기 이름과 역할을 정하는 요청을 맨 앞에 등록합니다.")
                     nicknameNoteView()
                 }
                 .padding(.horizontal, 16)
@@ -411,7 +406,7 @@ import AutoApproveCore
                         .disabled(requestingNicknames)
                         .padding(.top, 6)
                         .help(requestingNicknames ? "요청을 저장하고 있습니다."
-                              : "이 구성원의 이름과 역할을 지금 하는 일에 맞게 다시 정해 달라고 \(renameRecipient(content)) 요청합니다. 언제든 다시 요청할 수 있습니다.")
+                              : "이 구성원의 큐에 자기 이름과 역할을 정하는 요청을 맨 앞에 등록합니다.")
                     nicknameNoteView()
                 }
                 .padding(.leading, inset).padding(.trailing, 16).padding(.top, 8).padding(.bottom, 12)

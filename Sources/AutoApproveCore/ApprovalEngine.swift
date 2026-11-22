@@ -3234,11 +3234,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     @discardableResult
-    public func requestSessionGroupNicknames(groupID: UUID, memberIDs: [UUID], byUser: Bool = false) throws -> Int {
+    public func requestSessionGroupNicknames(groupID: UUID, memberIDs: [UUID]?, byUser: Bool = false) throws -> Int {
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }) else { return 0 }
         func key(_ member: UUID) -> String { "groupNicknameRequested:\(groupID.uuidString):\(member.uuidString)" }
         let targets = group.members.filter { member in
-            guard memberIDs.contains(member.id) else { return false }
+            guard memberIDs?.contains(member.id) != false else { return false }
             if byUser { return true }
             guard member.role == nil || member.nickname == nil else { return false }
             guard let previous = store.value(key(member.id)).flatMap(Double.init) else { return true }
@@ -3248,22 +3248,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let box = try groupMailbox()
         var requests: [(recipient: UUID, text: String, scope: String?)] = []
         let leader = group.leaderMemberID.flatMap { id in group.members.contains(where: { $0.id == id }) ? id : nil }
+        let everyone = byUser && (memberIDs == nil || targets.count > 1 && targets.count == group.members.count)
         if byUser {
-            let all = targets.count == group.members.count
-            func prompt(_ ids: [UUID], everyone: Bool) -> String {
-                let button = everyone && ids.count != 1 ? "'전체 다시 정하기'" : "'이 구성원 이름 다시 정하기'"
-                let scope = everyone ? "모든 구성원" : ids.map(\.uuidString).joined(separator: ", ")
-                return "AutoApprove 대화 그래프에서 " + button + " 버튼을 눌러 보내는 내 요청이야. groupID " + group.id.uuidString +
-                    "에서 " + scope + "의 닉네임과 역할을 먼저 정해 줘. get_group_status로 memberID와 작업을 확인하고 set_group_member_title(groupID, memberID, title, role)로 각각 저장해. title은 겹치지 않는 3~20자 이름, role은 맡은 일 한 줄이야."
-            }
-            if let leader {
-                let ids = targets.map(\.id)
-                requests.append((leader, prompt(ids, everyone: all), all ? "all" : ids.map(\.uuidString).sorted().joined(separator: ",")))
-            } else {
-                for member in targets {
-                    let text = prompt([member.id], everyone: false)
-                    requests.append((member.id, text, member.id.uuidString))
-                }
+            let button = everyone ? "'전체 다시 정하기'" : "'이 구성원 이름 다시 정하기'"
+            for member in targets {
+                let text = "AutoApprove 대화 그래프에서 " + button + " 버튼을 눌러 보내는 내 요청이야. groupID " + group.id.uuidString +
+                    "에서 본인(memberID " + member.id.uuidString + ")의 닉네임과 역할을 먼저 정해 줘. get_group_status로 현재 역할과 작업을 확인하고 set_group_member_title(groupID, memberID, title, role)로 저장해. title은 겹치지 않는 3~20자 이름, role은 맡은 일 한 줄이야."
+                requests.append((member.id, text, member.id.uuidString))
             }
         } else {
             func line(_ member: SessionGroupMember) -> String {
@@ -3283,7 +3274,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try box.transaction {
             for request in requests {
                 if let scope = request.scope {
-                    try box.enqueueNicknameRequest(group: group.id, recipient: request.recipient, scope: scope, text: request.text)
+                    try box.enqueueNicknameRequest(group: group.id, recipient: request.recipient, scope: scope, text: request.text, replacesAll: everyone)
                 } else {
                     _ = try box.insertMessage(id: nil, groupID: group.id, senderID: request.recipient, recipientID: request.recipient,
                                               kind: .notice, text: request.text, sourceKey: nil)
@@ -5037,7 +5028,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let (caller, _) = try sessionGroupCaller(object, observed: observed)
             guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
                   let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else { throw RemoteHTTPError(403, "현재 세션이 속한 그룹만 변경할 수 있습니다.") }
-            guard group.leaderMemberID == nil || group.isLeader(callerMember.id) else { throw RemoteHTTPError(403, "그룹의 탭 표시 변경은 그룹장만 요청할 수 있습니다.") }
+            guard group.leaderMemberID == nil || group.isLeader(callerMember.id) || (tool == "set_group_member_title" && callerMember.id == memberID) else { throw RemoteHTTPError(403, "다른 구성원의 이름이나 탭 색상 변경은 그룹장만 요청할 수 있습니다.") }
             guard !groupClearActive(groupID) else { throw RemoteHTTPError(409, "그룹 초기화가 끝난 뒤 탭 표시를 변경해주세요.") }
             guard let member = group.members.first(where: { $0.id == memberID }) else { throw RemoteHTTPError(404, "이 그룹에서 지정한 구성원을 찾지 못했습니다.") }
             let live = SessionGroupMatching.match(member, in: observed)
@@ -5863,10 +5854,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func groupDisplayPhase(_ session: AgentSession, observation: SessionGroupLiveSession?) -> SessionPhase {
-        if session.agent == .codex {
-            return session.projectedCodexActivity().phase
+        let projected = session.agent == .codex ? session.projectedCodexActivity() : projectClaudeActivity(session, observation: observation)
+        if [.idle, .unknown].contains(projected.phase),
+           projected.backgroundMonitoring == true || session.backgroundMonitoring == true || observation?.claudeRegisteredStatus == "shell" {
+            return .working
         }
-        return projectClaudeActivity(session, observation: observation).phase
+        return projected.phase
     }
 
     private func projectClaudeActivity(_ session: AgentSession, observation: SessionGroupLiveSession? = nil) -> AgentSession {

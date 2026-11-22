@@ -452,7 +452,9 @@ extension ApprovalTests {
         try expectNil(engine.snapshot.sessions.first { $0.id == sessions[0].id }?.customization)
         var named = group; named.members[1].nickname = "새 이름 'quoted' 🤖"
         try expectEqual(try SessionGroupStore(directory: directory).load()[0], named)
-        // The same verified Claude member gains the exact role the Codex member has.
+        let own = try await call("set_group_member_title", ["title":"본인 역할", "role":"배포 확인"], caller: 1, member: 1)
+        try expectEqual(own["title"] as? String, "본인 역할")
+        try expectEqual(try SessionGroupStore(directory: directory).load()[0].members[1].role, "배포 확인")
         let peers = group.addingLeader(members[1].id)
         try SessionGroupStore(directory: directory).save([peers])
         _ = try await call("set_group_member_title", ["title":"co-leader"], caller: 1, member: 0)
