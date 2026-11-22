@@ -296,6 +296,7 @@ public struct SessionGroupLiveSession: Identifiable, Equatable {
     public var messagingName: String?
     var tabShell: SessionGroupTabShell?
     var codexIdentityFromMCP = false
+    var claudePromptChannel: String?
     var claudeRegisteredStatus: String?
     var claudeRegisteredActivity: ClaudeSessionActivity?
     public var id: String { session.id }

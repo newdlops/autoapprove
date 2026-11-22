@@ -31,6 +31,10 @@ if (configuration === 'release') {
 await copyFile('dist/autoapprove-bridge.vsix', path.join(resources, 'autoapprove-bridge.vsix'));
 await copyFile('dist/AppIcon.icns', path.join(resources, 'AppIcon.icns'));
 await cp(path.join(build,'AutoApprove_AutoApproveCore.bundle'), path.join(resources, 'AutoApprove_AutoApproveCore.bundle'), { recursive: true });
+const promptPlugin = path.join(resources, 'AutoApprove_AutoApproveCore.bundle/ClaudePromptBridge');
+await rm(promptPlugin + '.zip', {force: true});
+execFileSync('/usr/bin/zip', ['-q', '-X', promptPlugin + '.zip', '.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.js'], {cwd: promptPlugin});
+await rm(promptPlugin, {recursive: true});
 const codexRuntime=process.argv.find(value=>value.startsWith('--codex-runtime='))?.slice('--codex-runtime='.length)
   || process.env.AUTOAPPROVE_CODEX_RUNTIME
   || await (await import('./fetch-official-codex.mjs')).ensureOfficialCodexRuntime();

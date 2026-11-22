@@ -1,6 +1,6 @@
 # AutoApprove
 
-**Claude 추천 입력과 그룹 메시지 전달 · 0.2.378 빌드 405** [변경 사항](docs/releases/v0.2.378.md)
+**Claude 입력창 연동 · 0.2.379 빌드 406** [변경 사항](docs/releases/v0.2.379.md)
 
 **현재 탭의 대화 ID로 프로필 저장 · 0.2.377 빌드 404** [변경 사항](docs/releases/v0.2.377.md)
 

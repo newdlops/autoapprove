@@ -17,7 +17,7 @@ let package = Package(
         .target(name: "CLocalDashboard"),
         .target(name: "CNativePeer", linkerSettings: [.linkedLibrary("bsm")]),
         .target(name: "TerminalInputSupport", dependencies: ["CTTYInput"]),
-        .target(name: "AutoApproveCore", dependencies: ["CSQLite", "CPTY", "CLocalDashboard", "CNativePeer", "TerminalInputSupport"], resources: [.copy("Resources/RemoteWeb"), .copy("Resources/CloudflareRelay"), .copy("Resources/CodexOfficialRelease.json")]),
+        .target(name: "AutoApproveCore", dependencies: ["CSQLite", "CPTY", "CLocalDashboard", "CNativePeer", "TerminalInputSupport"], resources: [.copy("Resources/ClaudePromptBridge"), .copy("Resources/RemoteWeb"), .copy("Resources/CloudflareRelay"), .copy("Resources/CodexOfficialRelease.json")]),
         .executableTarget(name: "AutoApproveApp", dependencies: ["AutoApproveCore"]),
         .executableTarget(name: "AutoApproveCLI", dependencies: ["AutoApproveCore"]),
         .executableTarget(name: "AutoApproveChecks", dependencies: ["AutoApproveCore"], path: "Tests/AutoApproveCoreTests", swiftSettings: [.unsafeFlags(["-parse-as-library"]), .unsafeFlags(["-Onone"], .when(configuration: .release))])

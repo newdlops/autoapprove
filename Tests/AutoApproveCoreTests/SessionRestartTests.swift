@@ -179,7 +179,10 @@ extension ApprovalTests {
         try expect(launched, "The resume command must be typed into the original shell: \(engine.snapshot.sessionRestart?.items.first?.message ?? "")")
         try expectEqual(terminal.terminated, 1, "The CLI is ended with one signal")
         try expect(terminal.typed.isEmpty, "Ending the CLI types nothing into the terminal")
-        try expectEqual(terminal.launched, [["/fixture/claude", "--model", "opus", "--resume", conversation].map(HookInstaller.quote).joined(separator: " ")])
+        try expectEqual(terminal.launched.count, 1)
+        let command = terminal.launched[0]
+        try expect(command.hasPrefix("env 'AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE="))
+        try expect(command.contains(["/fixture/claude", "--model", "opus", "--resume", conversation, "--plugin-dir"].map(HookInstaller.quote).joined(separator: " ")))
         // The app's discovery loop reports the new CLI.
         terminal.status = "idle"
         var next = ProcessDiscovery.sessions(reopened).first { $0.agent == .claude }!

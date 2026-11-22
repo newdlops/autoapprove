@@ -2973,6 +2973,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
                   current.phase != .ended else { continue }
             var observation = SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName)
+            observation.claudePromptChannel = environment?[ClaudePromptBridge.key]
             observation.claudeRegisteredStatus = claudeStatus
             observation.claudeRegisteredActivity = claudeActivity
             result.append(observation)
@@ -3867,7 +3868,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
             var empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
                 : current.agent == .agy ? AgyComposerReadiness.isEmpty(frame.screen) : ClaudeComposerReadiness.isEmpty(frame.screen)
-            if !empty, current.agent == .claude, current.terminal == .terminal, live.claudeRegisteredStatus == "idle",
+            if current.agent == .claude, let channel = live.claudePromptChannel {
+                empty = try await self.managedClaudeComposerReady(channel: channel, conversation: live.conversationID, screen: frame.screen)
+            } else if !empty, current.agent == .claude, current.terminal == .terminal, live.claudeRegisteredStatus == "idle",
                frame.inputReason == nil, self.screenAdapters[.terminal]?.checkedTypeLine != nil {
                 empty = await ClaudeTerminalSuggestion.matches(screen: frame.screen, tty: current.tty)
             }
@@ -4083,7 +4086,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         do { _ = try SessionRestartCommand.plan(agent: original.agent, executable: executable, argv: Array(argv.dropFirst()), conversationID: UUID().uuidString) }
         catch { return fail(error.localizedDescription) }
-        let environment = await Task.detached(operation: { ProcessEnvironment.read(process) ?? [:] }).value
+        var environment = await Task.detached(operation: { ProcessEnvironment.read(process) ?? [:] }).value
 
         guard !Task.isCancelled, !remoteInputStopped else { return }
         guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
@@ -4111,10 +4114,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try Task.checkCancellation()
         } catch is CancellationError {return}
         catch {return fail(error.localizedDescription)}
-        let plan: SessionRestartCommand.Plan
+        var plan: SessionRestartCommand.Plan
         do { plan = try SessionRestartCommand.plan(agent: original.agent, executable: codexContext?.executable ?? executable, argv: Array(argv.dropFirst()), conversationID: conversation) }
         catch { return fail(error.localizedDescription) }
-        // Let an input transaction already in flight finish before ending this CLI.
+        if original.agent == .claude {
+            if !plan.arguments.contains(ClaudePromptBridge.plugin.path) { plan.arguments += ["--plugin-dir", ClaudePromptBridge.plugin.path] }
+            environment[ClaudePromptBridge.key] = ClaudePromptBridge.channel(paths).path
+        }
         let settleUntil = Date().addingTimeInterval(5)
         while sendingMessages.contains(id) || automaticInputBusy(id) {
             guard !Task.isCancelled, !remoteInputStopped else { return }
@@ -4568,6 +4574,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             return result
         }.value
+    }
+
+    private func managedClaudeComposerReady(channel: String, conversation: String?, screen: String) async throws -> Bool {
+        let state = await ClaudePromptBridge.state(path: channel, paths: paths, conversation: conversation)
+        switch state {
+        case "draft":
+            throw RemoteHTTPError(409, "Claude 입력창에 작성 중인 글이 있어 전달을 기다립니다.", diagnostics: ["delivery": "not_started"])
+        case "empty": return ClaudeComposerReadiness.isEmpty(screen)
+        case "suggestion": return ClaudeComposerReadiness.isEmpty(screen) || ClaudeComposerReadiness.framedCandidate(screen) != nil
+        default:
+            throw RemoteHTTPError(409, "Claude 입력창 상태 회신을 기다리고 있습니다.", diagnostics: ["delivery": "not_started"])
+        }
     }
 
     private func sendGroupLine(_ session: AgentSession, text: String, agyTarget: SessionGroupLiveSession? = nil, preflight: (() async throws -> String?)? = nil) async throws {
@@ -5129,11 +5147,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
             do {
                 let prompt = SessionGroupOrchestration.taskMessage(assignment)
                 try await sendGroupLine(current, text: prompt) {
+                    var expected: String?
+                    if current.agent == .claude, let channel = worker.claudePromptChannel {
+                        let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
+                        guard frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: .claude),
+                              try await self.managedClaudeComposerReady(channel: channel, conversation: worker.conversationID, screen: frame.screen) else {
+                            throw RemoteHTTPError(409, "Claude 입력창을 확인할 때까지 작업 전달을 기다립니다.", diagnostics: ["delivery": "not_started"])
+                        }
+                        expected = frame.screen
+                    }
                     try self.verifyGroupDirection(groupID, caller: callerMember, target: target)
                     if let conversation = assignment.workerConversationID {
                         try self.groupMailbox().recordSubmission(assignment.id, conversation: conversation, prompt: prompt)
                     }
-                    return nil
+                    return expected
                 }
                 if var latest = try? groupOrchestration() { latest.markDelivered(assignment.id); try? saveGroupOrchestration(latest) }
             } catch {

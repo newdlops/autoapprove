@@ -141,7 +141,7 @@ extension ApprovalTests {
         try expectEqual(normalized.conversationID,"");try expect(!normalized.resumesConversation)
         try expectEqual(try normalized.resumeCommand(),"cd -- '/tmp/fresh-workspace' && 'env' '-u' 'AUTOAPPROVE_NATIVE_RUNTIME_ROOT' '-u' 'AUTOAPPROVE_SELECTED_TRANSITION_SOCKET' 'codex'")
         var claude=normalized;claude.id=UUID();claude.agent="claude";claude.providerHome="/tmp/provider with space"
-        try expectEqual(try claude.resumeCommand(),"cd -- '/tmp/fresh-workspace' && 'env' 'CLAUDE_CONFIG_DIR=/tmp/provider with space' 'claude'",
+        try expect(try claude.resumeCommand().contains("'CLAUDE_CONFIG_DIR=/tmp/provider with space' 'AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE=") && claude.resumeCommand().contains("'claude' '--plugin-dir'"),
                         "Claude restoration must retain the interactive shell so the session can restart in its own tab")
         var another=normalized;another.id=UUID()
         try expect(normalized.key != another.key,"Separate tabs in one folder have distinct launch receipts")
@@ -158,7 +158,12 @@ extension ApprovalTests {
             let result=context.evaluateScript(try TerminalProfileLauncher.script(entry))?.toString()
             try expectNil(context.exception);try expectEqual(result,#"{"tty":"/dev/ttys099"}"#)
             try expectEqual(context.evaluateScript("commands.length")?.toInt32(),1)
-            try expectEqual(context.evaluateScript("commands[0]")?.toString(),try entry.resumeCommand())
+            let command = context.evaluateScript("commands[0]")!.toString()!
+            let expected = try entry.resumeCommand()
+            let channel = #"(?<=claude-prompt-bridge/)[0-9A-F-]{36}(?=')"#
+            try expectEqual(command.replacingOccurrences(of: channel, with: "channel", options: .regularExpression),
+                            expected.replacingOccurrences(of: channel, with: "channel", options: .regularExpression))
+            if entry.agent == "claude" { try expect(command != expected) }
         }}
         var specific=normalized;specific.conversationID=" 00000000-0000-4000-8000-000000000001 "
         try expectEqual(try specific.validated().conversationID,"00000000-0000-4000-8000-000000000001")

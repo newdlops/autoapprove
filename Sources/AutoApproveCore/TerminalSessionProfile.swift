@@ -84,14 +84,14 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         if entry.agent == "codex" {arguments += ["-u","AUTOAPPROVE_NATIVE_RUNTIME_ROOT","-u","AUTOAPPROVE_SELECTED_TRANSITION_SOCKET"]}
         if entry.agent != "agy", let home=entry.providerHome {arguments.append((agent == "codex" ? "CODEX_HOME":"CLAUDE_CONFIG_DIR")+"="+home)}
         if let searchPath=compatibleCLI?.environment["PATH"] {arguments.append("PATH="+searchPath)}
+        if entry.agent == "claude" { arguments.append(ClaudePromptBridge.key + "=" + ClaudePromptBridge.channel(AppPaths()).path) }
         arguments.append(compatibleCLI?.executable ?? bundledRuntime?.executable ?? agent)
         if bundledRuntime != nil || compatibleCLI != nil {
             arguments += standalone ? ["-c","features.daemon_auto_start=false"]:["--remote","unix://"]
         }
         if entry.resumesConversation {arguments += [agent == "codex" ? "resume":agent == "agy" ? "--conversation":"--resume",entry.conversationID]}
+        if entry.agent == "claude" { arguments += ["--plugin-dir", ClaudePromptBridge.plugin.path] }
         arguments += try entry.executionSettings?.arguments(agent: entry.agent) ?? []
-        // Keep the tab's interactive shell for both agents. A CLI that replaces its shell leaves a tab that cannot
-        // run anything after the CLI exits, so the session could never be restarted in the same tab.
         return "cd -- "+HookInstaller.quote(entry.cwd)+" && "+arguments.map(HookInstaller.quote).joined(separator:" ")
     }
 }
