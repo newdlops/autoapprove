@@ -96,16 +96,51 @@ struct TerminalProfileGroupAttachment {
 }
 
 public enum TerminalProfileGroupRestore {
-    /// Preserve unrelated groups and later edits to an existing group's structure.
+    package static func resolveMemberIDs(_ snapshots: [TerminalProfileGroup], in groups: [SessionGroup]) throws -> [TerminalProfileGroup] {
+        try snapshots.map { snapshot in
+            guard let current = groups.first(where: { $0.id == snapshot.group.id }) else { return snapshot }
+            var ids: [UUID: UUID] = [:]
+            let original = snapshot.group
+            for saved in original.members where !current.members.contains(where: { $0.id == saved.id }) {
+                guard let conversation = UUID(uuidString: saved.conversationID) else { continue }
+                let matches = current.members.filter {
+                    $0.agent == saved.agent && UUID(uuidString: $0.conversationID) == conversation &&
+                        TerminalProfileGroup.normalizedHome($0.providerHome, agent: saved.agent.rawValue) ==
+                        TerminalProfileGroup.normalizedHome(saved.providerHome, agent: saved.agent.rawValue)
+                }
+                guard matches.count <= 1 else { throw AppError.message("같은 대화에 여러 그룹 구성원이 연결되어 있습니다.") }
+                if let match = matches.first { ids[saved.id] = match.id }
+            }
+            guard !ids.isEmpty else { return snapshot }
+            let members = original.members.map { saved in
+                var member = saved
+                member.id = ids[saved.id] ?? saved.id
+                member.parentMemberID = saved.parentMemberID.map { ids[$0] ?? $0 }
+                return member
+            }
+            guard Set(members.map(\.id)).count == members.count else { throw AppError.message("프로필의 여러 구성원이 같은 대화에 연결됩니다.") }
+            var group = SessionGroup(id: original.id, name: original.name, members: members)
+            for leader in original.leaderMemberIDs { group = group.addingLeader(ids[leader] ?? leader) }
+            return TerminalProfileGroup(group: group, links: snapshot.links.map {
+                .init(entryID: $0.entryID, memberID: ids[$0.memberID] ?? $0.memberID)
+            })
+        }
+    }
+
     public static func merge(_ snapshots:[TerminalProfileGroup],into current:[SessionGroup],restored:Set<UUID>) throws -> [SessionGroup] {
         var result=current
         for snapshot in snapshots where snapshot.links.contains(where:{restored.contains($0.entryID)}) {
             guard let gi=result.firstIndex(where:{$0.id==snapshot.group.id}) else {
-                result.append(snapshot.group);continue
+                var group = snapshot.group
+                let linked = Set(snapshot.links.filter { restored.contains($0.entryID) }.map(\.memberID))
+                for i in group.members.indices where linked.contains(group.members[i].id) && group.members[i].providerHome == nil {
+                    group.members[i].providerHome = TerminalProfileGroup.normalizedHome(nil, agent: group.members[i].agent.rawValue)
+                }
+                result.append(group)
+                continue
             }
             let existingMemberIDs = Set(result[gi].members.map(\.id))
             for saved in snapshot.group.members where !result[gi].members.contains(where:{$0.id==saved.id}) {
-                // A separately edited group can already contain this conversation under another member ID.
                 guard !result[gi].members.contains(where:{$0.agent==saved.agent && !$0.conversationID.isEmpty && $0.conversationID==saved.conversationID && $0.providerHome==saved.providerHome}) else{continue}
                 var member=saved
                 if result[gi].leaderMemberID==nil || !result[gi].members.contains(where:{$0.id==member.parentMemberID}) {member.parentMemberID=nil}
@@ -125,8 +160,8 @@ public enum TerminalProfileGroupRestore {
                 guard let saved=snapshot.group.members.first(where:{$0.id==link.memberID}),
                       let index=result[gi].members.firstIndex(where:{$0.id==link.memberID}) else{continue}
                 var member=result[gi].members[index]
-                if member.agent != saved.agent || member.cwd != saved.cwd || member.conversationID != saved.conversationID || member.providerHome != saved.providerHome {member.runtimeID=nil;member.tabShell=nil}
-                member.agent=saved.agent;member.cwd=saved.cwd;member.conversationID=saved.conversationID;member.providerHome=saved.providerHome
+                if member.agent != saved.agent || member.cwd != saved.cwd || member.conversationID != saved.conversationID || TerminalProfileGroup.normalizedHome(member.providerHome,agent:member.agent.rawValue) != TerminalProfileGroup.normalizedHome(saved.providerHome,agent:saved.agent.rawValue) {member.runtimeID=nil;member.tabShell=nil}
+                member.agent=saved.agent;member.cwd=saved.cwd;member.conversationID=saved.conversationID;member.providerHome=saved.providerHome ?? TerminalProfileGroup.normalizedHome(nil,agent:saved.agent.rawValue)
                 result[gi].members[index]=member
             }
         }

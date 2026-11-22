@@ -329,32 +329,34 @@ public struct SessionGroupMemberOperation: Equatable {
 }
 
 public enum SessionGroupMatching {
-    static func replacement(_ member: SessionGroupMember, in live: [SessionGroupLiveSession], selected: String?) -> SessionGroupLiveSession? {
-        guard member.agent != .shell, let home = member.providerHome, UUID(uuidString: member.conversationID) != nil,
+    public static func replacement(_ member: SessionGroupMember, in live: [SessionGroupLiveSession], selected: String?) -> SessionGroupLiveSession? {
+        let home = member.providerHome ?? (member.agent == .claude ? TerminalProfileGroup.normalizedHome(nil, agent: "claude") : nil)
+        guard member.agent != .shell, let home, let previous = UUID(uuidString: member.conversationID),
               !live.contains(where: { $0.id == member.runtimeID || ($0.session.agent == member.agent && $0.providerHome == home &&
-                  $0.conversationID.flatMap(UUID.init(uuidString:)) == UUID(uuidString: member.conversationID)) }) else { return nil }
+                  $0.conversationID.flatMap(UUID.init(uuidString:)) == previous) }) else { return nil }
         let matches = live.filter { row in
-            row.session.agent == member.agent && row.session.phase != .ended && row.session.cwd == member.cwd &&
-                row.providerHome == home && [.terminal, .iterm].contains(row.session.terminal) &&
+            guard row.session.agent == member.agent, row.session.phase != .ended, row.session.cwd == member.cwd,
+                  row.providerHome == home else { return false }
+            if member.agent == .claude, let selected {
+                return row.id == selected && row.conversationID.flatMap(UUID.init(uuidString:)) != nil
+            }
+            return [.terminal, .iterm].contains(row.session.terminal) &&
                 (selected.map { row.id == $0 } ?? (member.tabShell?.identifies(row.tabShell) == true))
         }
         return matches.count == 1 ? matches[0] : nil
     }
 
-    /// Claude /clear changes the registered conversation inside the same process.
-    /// Transfer the original member record only when the old identity has no other live owner.
     package static func refreshedClaude(_ groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [SessionGroup] {
         groups.map { group in
             var updated = group
             for (index, member) in group.members.enumerated() where member.agent == .claude || member.agent == .agy {
-                // A resume can preserve the conversation while replacing the process.
-                // Bind that exact conversation before tracking a later /clear in its new process.
                 if let resumed = match(member, in: live), resumed.id != member.runtimeID,
-                   member.providerHome != nil, UUID(uuidString: member.conversationID) != nil,
+                   (member.providerHome != nil || (member.agent == .claude && resumed.providerHome != nil)), UUID(uuidString: member.conversationID) != nil,
                    !live.contains(where: { $0.id == member.runtimeID && $0.session.phase != .ended }),
                    !group.members.contains(where: { $0.id != member.id && $0.agent == member.agent &&
                        ($0.runtimeID == resumed.id || (UUID(uuidString: $0.conversationID) == UUID(uuidString: member.conversationID) &&
                            ($0.providerHome == nil || $0.providerHome == resumed.providerHome))) }) {
+                    updated.members[index].providerHome = resumed.providerHome ?? member.providerHome
                     updated.members[index].cwd = resumed.session.cwd
                     updated.members[index].runtimeID = resumed.id
                     updated.members[index].tabShell = resumed.tabShell
@@ -395,19 +397,20 @@ public enum SessionGroupMatching {
         return match(member, in: live)
     }
 
-    /// A conversation can be attached only when one exact live observation matches.
     public static func match(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
         let matches = live.filter { observation in
             guard observation.session.agent == member.agent, observation.session.phase != .ended else { return false }
             if member.agent == .codex || member.agent == .agy, let id = UUID(uuidString: member.conversationID) {
-                // cwd, PID and TTY may change while resuming the same saved
-                // conversation. They locate an input endpoint, not membership.
                 return id == observation.conversationID.flatMap(UUID.init(uuidString:)) &&
                     (member.providerHome == nil || member.providerHome == observation.providerHome)
             }
             if member.conversationID.isEmpty {
                 return member.runtimeID == observation.id && member.cwd == observation.session.cwd
             }
+            if member.agent == .claude, let id = UUID(uuidString: member.conversationID), let observedHome = observation.providerHome,
+               id == observation.conversationID.flatMap(UUID.init(uuidString:)),
+               TerminalProfileGroup.normalizedHome(member.providerHome, agent: "claude") ==
+                   TerminalProfileGroup.normalizedHome(observedHome, agent: "claude") { return true }
             if member.providerHome == nil {
                 return member.runtimeID == observation.id && member.cwd == observation.session.cwd &&
                     UUID(uuidString: member.conversationID) == observation.conversationID.flatMap(UUID.init(uuidString:))

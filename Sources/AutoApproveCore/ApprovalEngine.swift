@@ -2490,9 +2490,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func restoreTerminalProfileGroups(_ profile:TerminalSessionProfile,results:[TerminalProfileRestoreResult],
                                             previous:[TerminalProfileCandidate]) async throws {
         let profile=try profile.validated(),store=SessionGroupStore(directory:paths.directory),saved=try store.load()
-        // Old files have no group snapshot. Recover only exact known conversations
-        // from the still-persisted groups; never use a project/title guess.
-        let snapshots=profile.groups ?? TerminalProfileGroup.capture(saved,candidates:profile.entries.map {.init(id:$0.id.uuidString,entry:$0)})
+        let savedSnapshots=profile.groups ?? TerminalProfileGroup.capture(saved,candidates:profile.entries.map {.init(id:$0.id.uuidString,entry:$0)})
+        let snapshots = try TerminalProfileGroupRestore.resolveMemberIDs(savedSnapshots, in: saved)
         let successful=results.filter {$0.phase == .opened || $0.phase == .alreadyOpen}
         var next=try TerminalProfileGroupRestore.merge(snapshots,into:saved,restored:Set(successful.map(\.id)))
         var pending:[TerminalProfileGroupAttachment]=[]
@@ -4811,6 +4810,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return ["id": group.id.uuidString, "name": group.name, "members": members,
                         "leaderMemberIDs": group.leaderMemberIDs.map(\.uuidString),
                         "leaderMemberID": group.leaderMemberID?.uuidString as Any? ?? NSNull()]
+            }
+            if output.isEmpty, caller.session.agent == .claude {
+                let reason = groups.isEmpty ? "no_local_groups" : caller.conversationID == nil ? "unverified_conversation" : "no_matching_member"
+                let detail: String
+                switch reason {
+                case "no_local_groups": detail = "이 Mac에 저장된 그룹이 없습니다. 원래 Mac에서 그룹을 포함한 세션 프로필을 가져와 복원해주세요."
+                case "unverified_conversation": detail = "현재 Claude 프로세스의 대화 UUID를 등록 파일에서 확인할 수 없습니다."
+                default: detail = "현재 Claude 대화와 일치하는 그룹 구성원이 없습니다. 새 대화 UUID로 시작했다면 AutoApprove의 세션 그룹 창에서 기존 구성원의 ‘새 대화로 교체…’를 열고 현재 Claude 탭을 선택해주세요."
+                }
+                return ["groups": output, "agent": "claude", "attribution": attribution, "transport": "local_terminal",
+                        "networkRequired": false, "reason": reason, "message": detail]
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
                     "transport": "local_terminal", "networkRequired": false,

@@ -208,10 +208,14 @@ import AutoApproveCore
                             Button("현재 대화 연결") { Task { await bind(member, to: match, in: group) } }.disabled(loading)
                                 .help("같은 실행 세션의 확인된 대화 ID를 그룹에 저장합니다.")
                         }
-                        if member.agent == .codex, connection == nil, member.providerHome != nil {
+                        if (member.agent == .claude || (member.agent == .codex && member.providerHome != nil)), connection == nil {
                             Menu("새 대화로 교체…") {
-                                let choices = live.filter { $0.session.agent == .codex && $0.session.cwd == member.cwd && $0.providerHome == member.providerHome && [.terminal, .iterm].contains($0.session.terminal) }
-                                if choices.isEmpty { Text("같은 홈과 프로젝트에 실행 중인 Codex가 없습니다") }
+                                let choices = live.filter { candidate in
+                                    SessionGroupMatching.replacement(member, in: live, selected: candidate.id) != nil &&
+                                        (member.agent != .claude || !group.members.contains { $0.id != member.id &&
+                                            SessionGroupMatching.match($0, in: live)?.id == candidate.id })
+                                }
+                                if choices.isEmpty { Text("같은 설정 홈과 프로젝트에 연결할 수 있는 \(member.agent.title) 대화가 없습니다") }
                                 ForEach(choices) { target in
                                     Button("\(target.session.displayedTerminalTitle) · \(target.session.tty)") {
                                         Task { await replace(member, with: target, in: group) }

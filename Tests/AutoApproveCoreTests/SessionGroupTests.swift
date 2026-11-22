@@ -333,6 +333,28 @@ extension ApprovalTests {
         try expectNil(SessionGroupMatching.connection(member, in: [changed]))
         changed = live; changed.session.id = "process:43:start"
         try expectNil(SessionGroupMatching.match(member, in: [live, changed]))
+        var claude = live
+        claude.session.agent = .claude
+        claude.providerHome = NSHomeDirectory() + "/.claude"
+        var saved = claude.member
+        saved.providerHome = nil
+        claude.session.id = "resumed"
+        claude.session.cwd = "/different/project"
+        try expectEqual(SessionGroupMatching.match(saved, in: [claude])?.id, claude.id)
+        let group = SessionGroup(name: "Resumed", members: [saved], leaderMemberID: saved.id)
+        let repaired = SessionGroupMatching.refreshedClaude([group], live: [claude])[0]
+        try expectEqual(repaired.members[0].runtimeID, claude.id)
+        try expectEqual(repaired.members[0].providerHome, claude.providerHome)
+        try expectNil(SessionGroupMatching.match(saved, in: [claude, claude]))
+        var restarted = claude
+        restarted.conversationID = UUID().uuidString
+        restarted.session.cwd = saved.cwd
+        try expectNil(SessionGroupMatching.match(saved, in: [restarted]))
+        try expectNil(SessionGroupMatching.replacement(saved, in: [restarted], selected: nil))
+        try expectEqual(SessionGroupMatching.replacement(saved, in: [restarted], selected: restarted.id)?.id, restarted.id)
+        try expectNil(SessionGroupMatching.replacement(saved, in: [restarted, claude], selected: restarted.id))
+        claude.providerHome = "/different/claude-config"
+        try expectNil(SessionGroupMatching.match(saved, in: [claude]))
         var unresolved = member; unresolved.conversationID = ""
         try expectEqual(SessionGroupMatching.match(unresolved, in: [live])?.id, session.id)
         changed.session.id = "process:43:start"
