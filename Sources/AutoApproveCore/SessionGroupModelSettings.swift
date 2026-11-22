@@ -2,7 +2,6 @@ import Foundation
 import Darwin
 import CSQLite
 
-/// Last settings recorded by this exact conversation, not a guessed global default.
 public struct SessionGroupModelSettings: Equatable, Sendable {
     public var model: String?
     public var reasoningEffort: String?
@@ -20,8 +19,6 @@ public struct SessionGroupModelSettings: Equatable, Sendable {
     }
 }
 
-/// Explicit status reads retain metadata only. Active group tasks may also read
-/// a bounded final response to recover a missing Stop hook, without typing input.
 public final class SessionGroupModelSettingsReader: @unchecked Sendable {
     private struct Identity: Equatable {
         var device: dev_t, inode: ino_t, size: off_t
@@ -37,14 +34,15 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
             device = s.st_dev; inode = s.st_ino; size = s.st_size; modified = s.st_mtimespec; changed = s.st_ctimespec
         }
     }
+    package typealias GroupTurn = (prompt: String, date: Date, response: WorkCompletion)
     private struct Cached {
+        var groupTurns: [UUID: GroupTurn]
         var path: String, identity: Identity, value: SessionGroupModelSettings?
         var finalTurn: FinalTurn?, completionLoaded: Bool
     }
     private struct FinalTurn {
         var completion: WorkCompletion
         var prompt: String?
-        var promptOccurrences: Int = 0
         var promptAt: Date?
     }
     private let lock = NSLock()
@@ -72,14 +70,42 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         return completion
     }
 
-    func recoverableGroupTurn(_ live: SessionGroupLiveSession) -> (prompt: String, date: Date, response: WorkCompletion)? {
+    package func groupTurns(_ live: SessionGroupLiveSession) -> [UUID: GroupTurn] {
         guard let id = live.conversationID.flatMap(UUID.init(uuidString:))?.uuidString.lowercased(),
-              let home = live.providerHome, home.hasPrefix("/"),
-              let turn = claude(live, home: home, id: id, includeCompletion: true)?.finalTurn,
-              let prompt = turn.prompt, SessionGroupMessage.terminalMessageID(prompt) != nil,
-              turn.promptOccurrences == 1, let date = turn.promptAt,
-              date <= turn.completion.date, turn.completion.date <= Date().addingTimeInterval(5) else { return nil }
-        return (prompt, date, turn.completion)
+              let home = live.providerHome, home.hasPrefix("/") else { return [:] }
+        return claude(live, home: home, id: id, includeCompletion: true)?.groupTurns ?? [:]
+    }
+
+    private static func groupTurns(_ bytes: Data, id: String) -> [UUID: GroupTurn] {
+        var turns: [UUID: GroupTurn] = [:]
+        var seen = Set<UUID>()
+        var active: (id: UUID, prompt: String, date: Date)?
+        for line in bytes.split(separator: 10) {
+            guard let row = try? JSONSerialization.jsonObject(with: Data(line)) as? JSONObject else { active = nil; continue }
+            guard row["isSidechain"] as? Bool != true,
+                  (row["sessionId"] as? String)?.lowercased() == id else { continue }
+            if row["type"] as? String == "user" {
+                let content = (row["message"] as? JSONObject)?["content"]
+                let parts = content as? [JSONObject]
+                if let parts, !parts.isEmpty, parts.allSatisfy({ $0["type"] as? String == "tool_result" }) { continue }
+                active = nil
+                let text = content as? String ?? parts?.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n")
+                guard let text, let key = SessionGroupMessage.terminalMessageID(text) else { continue }
+                turns.removeValue(forKey: key)
+                guard seen.insert(key).inserted, let submitted = (row["timestamp"] as? String).flatMap(date) else { continue }
+                active = (key, text, submitted)
+            } else if row["type"] as? String == "assistant", let active {
+                turns.removeValue(forKey: active.id)
+                guard let message = row["message"] as? JSONObject, message["stop_reason"] as? String == "end_turn",
+                      let item = row["uuid"] as? String, UUID(uuidString: item) != nil,
+                      let ended = (row["timestamp"] as? String).flatMap(date), ended >= active.date,
+                      ended <= Date().addingTimeInterval(5), let parts = message["content"] as? [JSONObject] else { continue }
+                let text = parts.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n")
+                let result = WorkCompletion(id: "claude-log:" + id + ":" + item, date: ended, summary: text)
+                if result.originalResponse != nil { turns[active.id] = (active.prompt, active.date, result) }
+            }
+        }
+        return turns
     }
 
     private func claude(_ live: SessionGroupLiveSession, home: String, id: String, includeCompletion: Bool) -> Cached? {
@@ -95,8 +121,6 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         if Identity(direct) != nil { path = direct }
         else if let previous = cache[key], Identity(previous.path) != nil { path = previous.path }
         else {
-            // A resumed conversation can retain its original project directory.
-            // Match the UUID filename only; never choose the newest project/log.
             guard let children = try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil), children.count <= 2048 else { return nil }
             let matches = children.map { $0.appendingPathComponent(id + ".jsonl").path }.filter { Identity($0) != nil }
             guard matches.count == 1 else { return nil }
@@ -104,7 +128,6 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         }
         guard let before = Identity(path), let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return nil }
         defer { try? handle.close() }
-        // Bound I/O even for very large conversations and discard partial lines.
         let start = max(0, before.size - 1_048_576)
         guard (try? handle.seek(toOffset: UInt64(start))) != nil,
               var bytes = try? handle.read(upToCount: Int(before.size - start)), let end = bytes.lastIndex(of: 10) else { return nil }
@@ -118,7 +141,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         let completion = includeCompletion ? Self.claudeCompletion(bytes, id: id) : nil
         guard Identity(path) == before else { return nil }
         if cache.count >= 256, cache[key] == nil { cache.removeAll(keepingCapacity: true) }
-        let result = Cached(path: path, identity: before, value: value, finalTurn: completion, completionLoaded: includeCompletion)
+        let result = Cached(groupTurns: includeCompletion ? Self.groupTurns(bytes, id: id) : [:], path: path, identity: before, value: value, finalTurn: completion, completionLoaded: includeCompletion)
         cache[key] = result
         return result
     }
@@ -139,27 +162,18 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
 
     private static func claudeCompletion(_ bytes: Data, id: String) -> FinalTurn? {
         var final: WorkCompletion?
-        var latest: FinalTurn?
         for line in bytes.split(separator: 10).reversed() {
             guard let row = try? JSONSerialization.jsonObject(with: Data(line)) as? JSONObject,
                   row["isSidechain"] as? Bool != true,
                   (row["sessionId"] as? String).flatMap(UUID.init(uuidString:)) == UUID(uuidString: id),
                   let type = row["type"] as? String else { continue }
-            // A newer request or tool-use block means the conversation is not finished.
             if type == "user" {
                 guard let message = row["message"] as? JSONObject else { return nil }
                 let parts = message["content"] as? [JSONObject]
-                // Tool results are not a new human request.
                 if let parts, !parts.isEmpty, parts.allSatisfy({ $0["type"] as? String == "tool_result" }) { continue }
                 guard let final else { return nil }
                 let text = message["content"] as? String ?? parts?.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n")
-                if let found = latest {
-                    if found.prompt == text { latest?.promptOccurrences += 1 }
-                    continue
-                }
-                latest = FinalTurn(completion: final, prompt: text, promptOccurrences: 1, promptAt: (row["timestamp"] as? String).flatMap(date))
-                if text.flatMap(SessionGroupMessage.terminalMessageID) == nil { return latest }
-                continue
+                return FinalTurn(completion: final, prompt: text, promptAt: (row["timestamp"] as? String).flatMap(date))
             }
             guard type == "assistant" else { continue }
             if final != nil { continue }
@@ -171,7 +185,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             final = WorkCompletion(id: "claude-log:\(id):\(item)", date: ended, summary: text)
         }
-        return latest ?? final.map { FinalTurn(completion: $0) }
+        return final.map { FinalTurn(completion: $0) }
     }
 
     private func codex(home: String, id: String) -> SessionGroupModelSettings? {

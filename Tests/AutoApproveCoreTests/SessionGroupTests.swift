@@ -176,13 +176,22 @@ extension ApprovalTests {
         let retryIn = try unwrapGroup(try box.message(id)?.nextAttemptAt).timeIntervalSinceNow
         try expect(retryIn > 200, "A busy recipient is not retried on the short timer (next try in \(Int(retryIn))s)")
         try expect(terminal.typed.isEmpty)
-        // No hook: Claude's registry turns idle and the next discovery and screen pass notice it.
         terminal.setStatus(records[1].pid, "idle")
         engine.updateDiscovery(sessions, records: records); await engine.refreshScreens()
         try expect(try await waitForGroup(5) { (try? box.message(id)?.lastResult) == "direct_submitted" },
                    "Turning idle types the held message without waiting for the timer")
         try expectEqual(terminal.typed.count, 1)
         try expect(terminal.typed[0].contains("fixture held for busy"))
+        try box.acknowledge([id], groupID: group.id, recipientID: members[1].id)
+        let question = try box.enqueue(groupID: group.id, senderID: members[0].id, recipientID: members[1].id,
+                                       kind: .question, text: "earlier question")
+        _ = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "ack_group_messages", "sessionID": sessions[1].id,
+            "groupID": group.id.uuidString, "messageIDs": [question.id.uuidString]])
+        engine.groupMailboxReminderInterval = 0.1
+        terminal.setStatus(records[1].pid, "idle")
+        engine.updateDiscovery(sessions, records: records); await engine.refreshScreens()
+        try expect(try await waitForGroup(12) { terminal.typed.contains { $0.contains(question.id.uuidString) && $0.contains("inReplyTo") } })
+
     }
 
     /// A rename request from the graph button is typed as the user's own short request, with no relay

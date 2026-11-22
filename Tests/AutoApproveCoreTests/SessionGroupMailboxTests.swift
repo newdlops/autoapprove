@@ -182,6 +182,20 @@ extension ApprovalTests {
         try expectEqual(replies.count, 1)
         try expectEqual(replies.first?.text, body)
         try expectEqual(replies.first?.sourceKey, "answer:" + second.id.uuidString)
+        try expect(try box.remindIfDue(question, before: Date()))
+        let reopened = try SessionGroupMailbox(directory: directory)
+        try expect(!(try reopened.remindIfDue(question, before: Date())))
+        try expect(!(try reopened.remindIfDue(second, before: Date())))
+        let followup = try reopened.message(sourceKey: "followup:" + question.id.uuidString)
+        guard let followup else { throw AppError.message("Missing question follow-up") }
+        let retryPrompt = "[AutoApprove 그룹 전달 " + followup.id.uuidString + "] follow up"
+        try addSubmission(id: followup.id, prompt: retryPrompt)
+        hook("UserPromptSubmit", conversation: conversation, field: "prompt", value: retryPrompt)
+        hook("Stop", conversation: conversation, field: "last_assistant_message", value: "Recovered answer")
+        let resolved = try reopened.conversations(groupID: group).conversations
+        try expectEqual(resolved.first { $0.id == question.id }?.answer?.text, "Recovered answer")
+        try expectEqual(resolved.filter { $0.answer == nil }.count, 0)
+        try expectEqual(try reopened.inboxOperations(groupID: group)[recipient]?.unacknowledgedCount, 0)
     }
 
     func testGroupMailboxRefusesCorruptStorage() throws {

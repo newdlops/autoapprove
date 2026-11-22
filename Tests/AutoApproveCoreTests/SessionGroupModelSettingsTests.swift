@@ -59,19 +59,20 @@ extension ApprovalTests {
         var bound = try encoded(prompt); bound.append(try encoded(row)); try bound.write(to: log, options: .atomic)
         try expectEqual(reader.completion(live, after: ended.addingTimeInterval(-1), task: "Owned original task")?.summary, "Fixture final result")
         try expectNil(reader.completion(live, after: ended.addingTimeInterval(-1), task: "An unrelated assignment"))
-#if DEBUG
-        let groupPrompt = "[AutoApprove 그룹 전달 " + UUID().uuidString + "] exact"
+        let key = UUID()
+        let groupPrompt = "[AutoApprove 그룹 전달 " + key.uuidString + "] exact"
         var submitted = prompt
         submitted["message"] = ["role": "user", "content": groupPrompt]
         var recovered = try encoded(submitted)
         recovered.append(try encoded(row))
         try recovered.write(to: log, options: .atomic)
-        try expectEqual(reader.recoverableGroupTurn(live)?.response.originalResponse, "Fixture final result")
+        recovered.append(try encoded(prompt))
+        try recovered.write(to: log, options: .atomic)
+        try expectEqual(reader.groupTurns(live)[key]?.response.summary, "Fixture final result")
         var replayed = try encoded(submitted)
         replayed.append(recovered)
         try replayed.write(to: log, options: .atomic)
-        try expectNil(reader.recoverableGroupTurn(live))
-#endif
+        try expectNil(reader.groupTurns(live)[key])
         try save(row)
         try expectNil(reader.completion(live, after: ended.addingTimeInterval(-1), task: "Owned original task"))
         var foreign = row; foreign["sessionId"] = UUID().uuidString

@@ -269,6 +269,8 @@ extension SessionGroupMailbox {
         if let old = try message(sourceKey: key), old.text != text || (id != nil && old.id != id) {
             throw RemoteHTTPError(409, "이미 답변된 질문입니다. 새 대화는 별도 메시지로 보내세요.")
         }
+        try update("UPDATE messages SET last_result='answered',last_error=NULL WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'expired' AND last_result IS NOT 'superseded'", [question.uuidString])
+        try update("UPDATE messages SET last_result='superseded',last_error=NULL WHERE source_key=? AND acknowledged IS NULL", ["followup:" + question.uuidString])
         let answer = try insertMessage(id: id, groupID: group, senderID: sender, recipientID: recipient, kind: .reply, text: text, sourceKey: key)
         try suppressLateAnswerDelivery(question, answer: answer)
         return answer

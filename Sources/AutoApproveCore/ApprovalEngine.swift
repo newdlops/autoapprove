@@ -3105,7 +3105,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let delay: TimeInterval
         do {
             let box = try groupMailbox()
-            if try box.pendingCount > 0 || !box.recoverableClaudeQuestions().isEmpty { scheduleGroupMailboxDelivery() }
+            if try box.pendingCount > 0 || !box.outstandingQuestions().isEmpty { scheduleGroupMailboxDelivery() }
             guard try box.hasUnresolvedWaits() else { return }
             let state = try groupOrchestration()
             try box.transaction { try box.reconcileWaits(assignments: state.assignments) }
@@ -3322,10 +3322,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func recordSessionGroupAnswer(_ box: SessionGroupMailbox, questionID: UUID, messageID: UUID?,
-                                          groupID: UUID, senderID: UUID, recipientID: UUID, body: String) throws -> SessionGroupMessage {
+                                          groupID: UUID, senderID: UUID, recipientID: UUID, body: String, fromRecipient: Bool = false) throws -> SessionGroupMessage {
         let state = try groupOrchestration()
         let answer = try box.transaction {
             let message = try box.answer(questionID, id: messageID, group: groupID, sender: senderID, recipient: recipientID, text: body)
+            if fromRecipient, let original = try box.message(questionID) { try box.confirmDelivery(original) }
             try box.reconcileWaits(assignments: state.assignments, group: groupID)
             return message
         }
@@ -3371,7 +3372,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             refreshGroupWaits()
         } else if let reply {
             message = try recordSessionGroupAnswer(box, questionID: reply, messageID: requestedID, groupID: groupID,
-                                                   senderID: sender.id, recipientID: recipient.id, body: body)
+                                                   senderID: sender.id, recipientID: recipient.id, body: body, fromRecipient: true)
         } else {
             message = try box.enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: body)
         }
@@ -3420,14 +3421,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         self.refreshGroupWaits()
                         self.publish()
                     }
-                    let questions = try box.recoverableClaudeQuestions()
+                    let questions = try box.outstandingQuestions()
                     let hasDelivery = try box.hasNotificationWork || box.hasPendingReceipts || !questions.isEmpty
                     guard hasDelivery || expiration != nil else { self.groupMailboxTask = nil; return }
                     if !hasDelivery, let expiration { delay = max(0.1, expiration.timeIntervalSinceNow) }
-                    if !self.snapshot.paused, Date().timeIntervalSince(self.groupRecoveryAt) >= 5, !questions.isEmpty,
-                       self.sessions.values.contains(where: { $0.agent == .claude && $0.phase != .ended }) {
+                    if !self.snapshot.paused, Date().timeIntervalSince(self.groupRecoveryAt) >= 5, !questions.isEmpty {
                         self.groupRecoveryAt = Date()
-                        await self.recoverClaudeGroupQuestions(questions)
+                        await self.recoverGroupQuestions(questions)
                     }
                     if hasDelivery { try await self.deliverGroupMailboxNotifications() }
                     if let expiration { delay = min(delay, max(0.1, expiration.timeIntervalSinceNow)) }
@@ -3437,25 +3437,38 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func recoverClaudeGroupQuestions(_ questions: [SessionGroupMessage]) async {
+    private func recoverGroupQuestions(_ questions: [SessionGroupMessage]) async {
         guard !remoteInputStopped, let groups = try? SessionGroupStore(directory: paths.directory).load(),
-              let live = try? await sessionGroupSessions(), !Task.isCancelled else { return }
+              let live = try? await sessionGroupSessions(), let box = try? groupMailbox() else { return }
         let reader = groupTranscriptReader
-        for candidate in live where candidate.session.agent == .claude {
-            guard let conversation = candidate.conversationID, let session = sessions[candidate.id],
-                  ![.working, .approval, .input, .ended].contains(session.phase),
-                  !session.pendingInTerminal, session.backgroundMonitoring != true,
-                  session.interruption?.needsAttention != true,
-                  let group = groups.first(where: { group in
-                      group.members.contains { SessionGroupMatching.match($0, in: live)?.id == candidate.id }
-                  }), let member = group.members.first(where: { SessionGroupMatching.match($0, in: live)?.id == candidate.id }),
-                  questions.contains(where: { $0.groupID == group.id && $0.recipientID == member.id }),
-                  let observed = await Task.detached(priority: .utility, operation: { reader.recoverableGroupTurn(candidate) }).value,
-                  !Task.isCancelled, !remoteInputStopped, let id = SessionGroupMessage.terminalMessageID(observed.prompt),
-                  questions.contains(where: { $0.id == id && $0.groupID == group.id && $0.recipientID == member.id }),
-                  let turn = try? groupMailbox().recoveryTurn(id, promptAt: observed.date, fallback: observed.response.id) else { continue }
-            receiveGroupTurn(conversation: conversation, turn: turn, prompt: observed.prompt,
-                             response: observed.response.originalResponse)
+        let destinations = Dictionary(grouping: questions, by: \.recipientID)
+        for group in groups {
+            for member in group.members {
+                guard let pending = destinations[member.id]?.filter({ $0.groupID == group.id }), !pending.isEmpty,
+                      let candidate = SessionGroupMatching.match(member, in: live),
+                      let conversation = candidate.conversationID else { continue }
+                if candidate.session.agent == .claude {
+                    let turns = await Task.detached(priority: .utility) { reader.groupTurns(candidate) }.value
+                    guard !Task.isCancelled, !remoteInputStopped, !snapshot.paused else { return }
+                    for question in pending {
+                        let reminder = try? box.message(sourceKey: "followup:" + question.id.uuidString)
+                        for source in [question, reminder].compactMap({ $0 }) {
+                            guard let observed = turns[source.id],
+                                  let turn = try? box.recoveryTurn(source.id, promptAt: observed.date, fallback: observed.response.id) else { continue }
+                            receiveGroupTurn(conversation: conversation, turn: turn, prompt: observed.prompt, response: observed.response.originalResponse)
+                        }
+                    }
+                }
+                guard !Task.isCancelled, !remoteInputStopped, !snapshot.paused,
+                      let session = sessions[candidate.id], !session.pendingInTerminal,
+                      session.phase == .idle || (session.phase == .unknown && candidate.claudeRegisteredStatus == "idle"),
+                      !["busy", "waiting"].contains(candidate.claudeRegisteredStatus ?? ""),
+                      !groupClearActive(group.id), !userInputHasPriority(session.id) else { continue }
+                let cutoff = Date().addingTimeInterval(-groupMailboxReminderInterval)
+                for question in pending where question.acknowledgedAt != nil {
+                    if (try? box.remindIfDue(question, before: cutoff)) == true { break }
+                }
+            }
         }
     }
 
@@ -3615,6 +3628,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
         for message in messages {
             guard !Task.isCancelled, !remoteInputStopped else { return }
+            if activeGroupMailboxMessages.contains(message.id) { continue }
+            if message.lastResult == "direct_attempting" {
+                do {
+                    if try box.submittedAt(message.id) == nil {
+                        try box.noteAttempt(message.id, result: "not_started", retryAt: Date(), increment: -1)
+                        continue
+                    }
+                } catch { continue }
+            }
             let later = Date().addingTimeInterval(groupMailboxReceiptGrace)
             guard let recipient = groups.first(where: { $0.id == message.groupID })?.members.first(where: { $0.id == message.recipientID }),
                   let live = SessionGroupMatching.match(recipient, in: observed), let session = sessions[live.id] else {
@@ -3652,6 +3674,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return try box.message(message.id)?.acknowledgedAt != nil ? .received : .unknown
             } catch { return .unknown }
         }
+        if session.agent == .claude, let conversation = live.conversationID {
+            let reader = groupTranscriptReader
+            if let turn = await Task.detached(priority: .utility, operation: { reader.groupTurns(live)[message.id] }).value,
+               let box = try? groupMailbox(), (try? box.confirmedPrompt(message.id, conversation: conversation, prompt: turn.prompt)) == true,
+               let id = try? box.recoveryTurn(message.id, promptAt: turn.date, fallback: turn.response.id) {
+                receiveGroupTurn(conversation: conversation, turn: id, prompt: turn.prompt, response: turn.response.originalResponse)
+                if (try? box.message(message.id))?.acknowledgedAt != nil { return .received }
+            }
+        }
         guard ![.working, .approval, .input, .ended].contains(session.phase), !session.pendingInTerminal,
               !automaticInputBusy(session.id), !userInputHasPriority(session.id),
               let frame = try? await remoteTerminal(sessionID: session.id, realtime: true, textOnly: true),
@@ -3661,16 +3692,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if current.acknowledgedAt != nil { return .received }
         switch session.agent {
         case .claude:
-            let reader = groupTranscriptReader
-            if let turn = await Task.detached(priority: .utility, operation: { reader.recoverableGroupTurn(live) }).value,
-               SessionGroupMessage.terminalMessageID(turn.prompt) == message.id {
-                if let conversation = live.conversationID,
-                   let id = try? box.recoveryTurn(message.id, promptAt: turn.date, fallback: turn.response.id) {
-                    receiveGroupTurn(conversation: conversation, turn: id, prompt: turn.prompt, response: turn.response.originalResponse)
-                }
-                commitGroupReceipt(message)
-                return .received
-            }
             return .lost
         case .codex:
             guard let entry = codexTurns[session.id], let submitted = try? box.submittedAt(message.id),
@@ -3679,12 +3700,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return .lost
         default: return .unknown
         }
-    }
-
-    private func commitGroupReceipt(_ message: SessionGroupMessage) {
-        guard let box = try? groupMailbox(), (try? box.message(message.id))?.acknowledgedAt == nil else { return }
-        try? box.confirmDelivery(message)
-        if [.report, .choiceQuestion].contains(message.kind) { try? applyGroupMessageAcknowledgements([message.id]) }
     }
 
     private static func canAddressGroupMember(_ member: SessionGroupMember, live: SessionGroupLiveSession?) -> Bool {
@@ -4150,6 +4165,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let question: SessionGroupMessage
                 if request.kind == .question, try box.canAutomaticallyAnswer(id) {
                     question = request
+                } else if request.kind == .notice, let key = request.sourceKey, key.hasPrefix("followup:"),
+                          let originalID = UUID(uuidString: String(key.dropFirst(9))),
+                          let original = try box.unansweredQuestion(originalID, in: request.groupID),
+                          original.recipientID == request.recipientID, original.senderID == request.senderID,
+                          try box.canAutomaticallyAnswer(originalID) {
+                    question = original
                 } else if let upstream = resumed?.decision,
                           let original = try box.message(upstream), original.kind == .question,
                           original.groupID == request.groupID, original.recipientID == request.recipientID {

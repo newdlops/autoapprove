@@ -95,6 +95,7 @@ public struct SessionGroupMessage: Equatable {
                 "notificationAttempts": attempts, "lastNotificationResult": lastResult as Any? ?? NSNull(),
                 "lastError": lastError as Any? ?? NSNull()]
         if lastResult == "superseded", acknowledgedAt == nil { value["state"] = "superseded" }
+        if lastResult == "answered" { value["state"] = "answered" }
         if isExpired { value["state"] = "expired" }
         if let key = sourceKey, key.hasPrefix("answer:") { value["inReplyTo"] = String(key.dropFirst(7)) }
         if kind == .question { value["replyWith"] = ["inReplyTo": id.uuidString] }
@@ -172,6 +173,12 @@ public final class SessionGroupMailbox {
                 CREATE INDEX IF NOT EXISTS wait_group ON group_waits(group_id,state);
                 CREATE INDEX IF NOT EXISTS wait_task ON group_waits(owner_task);
                 """)
+            try execute("""
+                UPDATE messages AS q SET last_result='answered',last_error=NULL
+                WHERE kind='question' AND \(Self.pendingFilter)
+                  AND EXISTS(SELECT 1 FROM messages a WHERE a.source_key='answer:' || q.id
+                    AND a.kind='reply' AND a.group_id=q.group_id AND a.sender_id=q.recipient_id AND a.recipient_id=q.sender_id);
+                """)
             for suffix in ["-wal", "-shm"] { _ = chmod(path + suffix, 0o600) }
             guard try scalar("PRAGMA synchronous") == 2, try scalar("PRAGMA fullfsync") == 1 else {
                 throw AppError.message("그룹 수신함의 디스크 저장 설정을 확인하지 못했습니다.")
@@ -229,7 +236,7 @@ public final class SessionGroupMailbox {
     }
     public func message(_ id: UUID) throws -> SessionGroupMessage? { try rows("WHERE id=?", [id.uuidString]).first }
     public func message(sourceKey: String) throws -> SessionGroupMessage? { try rows("WHERE source_key=?", [sourceKey]).first }
-    private static let pendingFilter = "acknowledged IS NULL AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'"
+    private static let pendingFilter = "acknowledged IS NULL AND last_result IS NOT 'answered' AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'"
 
     public var pendingCount: Int { get throws { try scalar("SELECT count(*) FROM messages WHERE " + Self.pendingFilter) } }
 
@@ -252,7 +259,7 @@ public final class SessionGroupMailbox {
     // stays "submitted"; it is typed again only after the engine finds proof that the
     // earlier typing never reached the model. Repeated loss moves it to "undelivered".
 
-    private static let awaitingReceipt = "acknowledged IS NULL AND last_result IN ('direct_submitted','direct_unknown')"
+    private static let awaitingReceipt = "acknowledged IS NULL AND last_result IN ('direct_attempting','direct_submitted','direct_unknown')"
 
     var hasPendingReceipts: Bool { get throws { try scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE " + Self.awaitingReceipt + ")") != 0 } }
 
@@ -263,7 +270,7 @@ public final class SessionGroupMailbox {
     /// Proof of loss: queue the same message (same ID) for one more typing, or park it.
     func requeueLostSubmission(_ id: UUID, attemptLimit: Int, at date: Date = Date()) throws -> Bool {
         guard let message = try message(id), message.acknowledgedAt == nil,
-              ["direct_submitted", "direct_unknown"].contains(message.lastResult ?? "") else { return false }
+              ["direct_attempting", "direct_submitted", "direct_unknown"].contains(message.lastResult ?? "") else { return false }
         let parked = message.attempts >= attemptLimit
         try update("UPDATE messages SET last_result=?,next_attempt=?,last_error=? WHERE id=? AND acknowledged IS NULL",
                    [parked ? "undelivered" : "redeliver", String(date.timeIntervalSince1970),
@@ -288,7 +295,7 @@ public final class SessionGroupMailbox {
     func queuedForMissingRecipients(members: [UUID: Set<UUID>]) throws -> [SessionGroupMessage] {
         try rows("""
             WHERE acknowledged IS NULL
-              AND (last_result IS NULL OR last_result NOT IN ('superseded','batched','undelivered','expired'))
+              AND (last_result IS NULL OR last_result NOT IN ('answered','superseded','batched','undelivered','expired'))
             ORDER BY sequence
             """).filter { members[$0.groupID]?.contains($0.recipientID) != true }
     }
@@ -395,7 +402,7 @@ public final class SessionGroupMailbox {
     private static let notificationFilter = """
         m.acknowledged IS NULL
         AND (m.last_result IS NULL OR m.last_result NOT IN
-            ('superseded','expired','direct_attempting','direct_submitted','direct_unknown','late','batched','undelivered'))
+            ('answered','superseded','expired','direct_attempting','direct_submitted','direct_unknown','late','batched','undelivered'))
         AND NOT EXISTS (
             SELECT 1 FROM group_waits w
             WHERE w.group_id=m.group_id AND w.state IN ('waiting','ready','expired')
@@ -429,7 +436,7 @@ public final class SessionGroupMailbox {
                        min(CASE WHEN acknowledged IS NULL THEN created END) AS first_pending,
                        max(CASE WHEN acknowledged IS NULL AND last_result='undelivered' THEN last_error END) AS parked
                 FROM messages
-                WHERE group_id=? AND kind NOT IN ('waitNotice','notice') AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'
+                WHERE group_id=? AND kind NOT IN ('waitNotice','notice') AND last_result IS NOT 'answered' AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'
                 GROUP BY recipient_id
             ), heads AS (
                 SELECT m.recipient_id, m.last_result, m.last_error,
@@ -505,12 +512,32 @@ public final class SessionGroupMailbox {
                    [id.uuidString, String(date.timeIntervalSince1970)])
     }
 
-    func recoverableClaudeQuestions() throws -> [SessionGroupMessage] {
+    func outstandingQuestions() throws -> [SessionGroupMessage] {
         try rows("""
-            WHERE kind='question' AND last_result IS NOT 'expired' AND EXISTS(SELECT 1 FROM group_submissions s WHERE s.message_id=messages.id)
+            WHERE kind='question' AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'
               AND NOT EXISTS(SELECT 1 FROM messages answer WHERE answer.source_key='answer:' || messages.id)
-            ORDER BY sequence DESC LIMIT 64
+            ORDER BY sequence
             """)
+    }
+
+    package func remindIfDue(_ question: SessionGroupMessage, before cutoff: Date) throws -> Bool {
+        try transaction {
+            guard let current = try unansweredQuestion(question.id, in: question.groupID),
+                  let received = current.acknowledgedAt, received <= cutoff,
+                  try canAutomaticallyAnswer(question.id),
+                  try !expiredConversationQuestions(question.groupID).contains(question.id),
+                  try message(sourceKey: "followup:" + question.id.uuidString) == nil,
+                  try scalar("""
+                    SELECT EXISTS(SELECT 1 FROM messages WHERE group_id=? AND recipient_id=?
+                        AND source_key LIKE 'followup:%' AND (created>? OR (\(Self.pendingFilter))))
+                    """, [question.groupID.uuidString, question.recipientID.uuidString, String(cutoff.timeIntervalSince1970)]) == 0 else { return false }
+            _ = try insertMessage(id: nil, groupID: question.groupID, senderID: question.senderID,
+                recipientID: question.recipientID, kind: .notice,
+                text: "이전에 수신한 질문에 답변이 필요합니다. get_group_messages에서 원래 질문 " + question.id.uuidString +
+                    "의 본문을 확인하고 해당 ID를 inReplyTo로 지정해 답해주세요.",
+                sourceKey: "followup:" + question.id.uuidString)
+            return true
+        }
     }
 
     func recoveryTurn(_ id: UUID, promptAt: Date, fallback: String) throws -> String? {
@@ -560,7 +587,7 @@ public final class SessionGroupMailbox {
 
     /// `attempts` counts typings. A try that stopped before typing passes -1 to undo its count.
     public func noteAttempt(_ id: UUID, result: String, error: String? = nil, retryAt: Date, increment: Int) throws {
-        try update("UPDATE messages SET attempts=max(0,attempts+?),next_attempt=?,last_result=?,last_error=? WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'batched' AND last_result IS NOT 'expired'",
+        try update("UPDATE messages SET attempts=max(0,attempts+?),next_attempt=?,last_result=?,last_error=? WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'answered' AND last_result IS NOT 'superseded' AND last_result IS NOT 'batched' AND last_result IS NOT 'expired'",
                    [String(increment), String(retryAt.timeIntervalSince1970), result, String((error ?? "").prefix(500)), id.uuidString])
     }
 
