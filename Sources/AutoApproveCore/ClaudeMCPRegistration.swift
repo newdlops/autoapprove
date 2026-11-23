@@ -5,6 +5,7 @@ package enum ClaudeMCPRegistration {
                                relay: String? = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("autoapprove").path) throws {
         guard cwd.hasPrefix("/") else { throw AppError.message("Claude 프로젝트의 작업 폴더를 확인하지 못했습니다.") }
         var childEnvironment = ProcessInfo.processInfo.environment
+        if let path = environment["PATH"] { childEnvironment["PATH"] = path }
         childEnvironment["CLAUDE_CONFIG_DIR"] = environment["CLAUDE_CONFIG_DIR"]
         func run(_ args: [String]) throws -> CommandResult {
             try CommandRunner.run(executable, ["mcp"] + args, timeout: 10, environment: childEnvironment,

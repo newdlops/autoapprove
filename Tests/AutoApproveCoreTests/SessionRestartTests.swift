@@ -89,6 +89,36 @@ extension ApprovalTests {
 
     func testSessionRestartCommandKeepsKnownOptionsOnly() throws {
         let id = UUID().uuidString
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        for agent in [AgentKind.codex, .claude, .agy] {
+            let link = root.appendingPathComponent(agent.rawValue)
+            for version in ["old", "new"] {
+                let binary = root.appendingPathComponent(agent.rawValue + "-" + version)
+                try Data(("#!/bin/sh\nprintf '%s\\n' " + version + " \"$@\"\n").utf8).write(to: binary)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+                if version == "new" { try FileManager.default.removeItem(at: link) }
+                try FileManager.default.createSymbolicLink(at: link, withDestinationURL: binary)
+                let selected = SessionRestartCommand.installedLauncher(agent: agent, path: ".:" + root.path,
+                    runningExecutable: root.appendingPathComponent(agent.rawValue + "-old").path, userHome: nil)
+                try expectEqual(selected, link.path)
+                let plan = try SessionRestartCommand.plan(agent: agent, executable: selected ?? "", argv: [], conversationID: id)
+                let result = try CommandRunner.run(plan.arguments[0], Array(plan.arguments.dropFirst()))
+                try expectEqual(result.output.split(separator: "\n").map(String.init), [version] + Array(plan.arguments.dropFirst()))
+                try expectEqual(plan.arguments.last, id.lowercased())
+            }
+        }
+        let package = root.appendingPathComponent("packages/app-server-daemon")
+        let current = package.appendingPathComponent("current/bin")
+        try FileManager.default.createDirectory(at: current, withIntermediateDirectories: true)
+        let binary = current.appendingPathComponent("codex")
+        try FileManager.default.createSymbolicLink(atPath: binary.path, withDestinationPath: "/bin/echo")
+        let stale = package.appendingPathComponent("releases/old/bin/codex")
+        for path in [nil, stale.deletingLastPathComponent().path] {
+            try expectEqual(SessionRestartCommand.installedLauncher(agent: .codex, path: path,
+                runningExecutable: stale.path, userHome: nil), binary.path)
+        }
         let claude = try SessionRestartCommand.plan(agent: .claude, executable: "/opt/claude",
             argv: ["--model", "opus", "--add-dir", "/a", "/b", "--dangerously-skip-permissions", "-c", "--resume", "old", "고쳐줘"], conversationID: id)
         try expectEqual(claude.arguments, ["/opt/claude", "--model", "opus", "--add-dir", "/a", "/b", "--dangerously-skip-permissions", "--resume", id.lowercased()])

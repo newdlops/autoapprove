@@ -9,6 +9,36 @@ public enum SessionRestartCommand {
     public static let resumePrompt = "세션을 다시 시작했습니다. 다시 시작하기 전에 진행하던 작업이 있으면 이어서 진행하세요. " +
         "제 답이나 승인을 기다리던 일은 이 입력을 승인으로 보지 말고 다시 물어보세요. 이어갈 작업이 없으면 다른 작업을 하지 말고 '이어갈 작업 없음'이라고만 답하세요."
 
+    public static func installedLauncher(agent: AgentKind, path: String?, runningExecutable: String, userHome: String?) -> String? {
+        guard agent != .shell else { return nil }
+        func currentCodex(_ candidate: String) -> String? {
+            guard agent == .codex, candidate.hasPrefix("/") else { return nil }
+            let file = URL(fileURLWithPath: candidate)
+            let bin = file.deletingLastPathComponent()
+            let releases = bin.deletingLastPathComponent().deletingLastPathComponent()
+            let package = releases.deletingLastPathComponent()
+            guard file.lastPathComponent == "codex", bin.lastPathComponent == "bin",
+                  releases.lastPathComponent == "releases", ["standalone", "app-server-daemon"].contains(package.lastPathComponent),
+                  package.deletingLastPathComponent().lastPathComponent == "packages" else { return nil }
+            return package.appendingPathComponent("current/bin/codex").path
+        }
+        var candidates = (path ?? "").split(separator: ":").filter { $0.hasPrefix("/") }.map {
+            URL(fileURLWithPath: String($0)).appendingPathComponent(agent.rawValue).path
+        }
+        if let userHome, userHome.hasPrefix("/") {
+            candidates.append(URL(fileURLWithPath: userHome).appendingPathComponent(".local/bin/" + agent.rawValue).path)
+        }
+        if let current = currentCodex(runningExecutable) { candidates.append(current) }
+        for candidate in candidates {
+            let file = URL(fileURLWithPath: currentCodex(candidate) ?? candidate)
+            guard !file.path.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                  (try? file.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true,
+                  FileManager.default.isExecutableFile(atPath: file.path) else { continue }
+            return file.path
+        }
+        return nil
+    }
+
     public struct Plan: Equatable {
         public var arguments: [String]
         /// Original arguments that are not passed again, such as an initial prompt.

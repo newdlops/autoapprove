@@ -4153,14 +4153,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let shell = chain[index]
         let argumentsReader = processArgumentsReader, pathReader = processPathReader
-        let resolved: String? = process.executable.hasPrefix("/") ? process.executable : await Task.detached(operation: { pathReader(process) }).value
-        guard let executable = resolved else { return fail("CLI 실행 파일 경로를 확인하지 못했습니다.") }
+        var environment = await Task.detached {
+            ProcessEnvironment.read(process, names: ProcessEnvironment.names.union(["PATH", "HOME"])) ?? [:]
+        }.value
+        let installed = SessionRestartCommand.installedLauncher(agent: original.agent, path: environment["PATH"],
+            runningExecutable: process.executable, userHome: environment["HOME"])
+        let executable: String
+        if let installed { executable = installed }
+        else if process.executable.hasPrefix("/") { executable = process.executable }
+        else if let path = await Task.detached(operation: { pathReader(process) }).value { executable = path }
+        else { return fail("CLI 실행 파일 경로를 확인하지 못했습니다.") }
         guard let argv = await Task.detached(operation: { argumentsReader(process) }).value, !argv.isEmpty else {
             return fail("CLI의 실행 옵션을 읽지 못했습니다.")
         }
         do { _ = try SessionRestartCommand.plan(agent: original.agent, executable: executable, argv: Array(argv.dropFirst()), conversationID: UUID().uuidString) }
         catch { return fail(error.localizedDescription) }
-        var environment = await Task.detached(operation: { ProcessEnvironment.read(process) ?? [:] }).value
 
         guard !Task.isCancelled, !remoteInputStopped else { return }
         guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
@@ -4183,8 +4190,23 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let conversation else { return fail("대화 ID를 확인하지 못해 같은 대화로 다시 열 수 없습니다.") }
         let codexContext:CodexCLIContext?
         do {
-            codexContext=original.agent == .codex
-                ? try await Task.detached(priority:.utility) {try CodexOfficialExecutable.forSession(process)}.value:nil
+            if original.agent == .codex, let installed {
+                let source = environment
+                codexContext = try await Task.detached(priority: .utility) {
+                    let userHome = source["HOME"] ?? NSHomeDirectory()
+                    let hint = try CodexAccountTransitionTarget.canonicalHome(source["CODEX_HOME"] ?? userHome + "/.codex")
+                    let home = CodexServerLocation.connectedHome(pid: process.pid, hints: [hint]) ?? hint
+                    var launch = ProcessInfo.processInfo.environment
+                    launch["PATH"] = source["PATH"]
+                    guard let cli = try CodexCLIContext.resolve(home: home, userHome: userHome, executable: installed, environment: launch) else {
+                        throw AppError.message("현재 설치된 Codex 실행 파일을 열 수 없습니다.")
+                    }
+                    return try CodexOfficialExecutable.context(cli)
+                }.value
+            } else {
+                codexContext = original.agent == .codex
+                    ? try await Task.detached(priority: .utility) { try CodexOfficialExecutable.forSession(process) }.value : nil
+            }
             try Task.checkCancellation()
         } catch is CancellationError {return}
         catch {return fail(error.localizedDescription)}
