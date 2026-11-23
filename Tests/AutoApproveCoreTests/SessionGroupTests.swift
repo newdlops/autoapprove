@@ -443,11 +443,13 @@ extension ApprovalTests {
         100521 1 fixture1 100521 100521 Wed Oct 28 12:00:00 2026 /fixture/claude
         100522 1 fixture2 100522 100522 Wed Oct 28 12:00:00 2026 /fixture/claude
         100523 1 fixture3 100523 100523 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100524 1 fixture4 100524 100524 Wed Oct 28 12:00:00 2026 /fixture/claude
+        100525 1 fixture5 100525 100525 Wed Oct 28 12:00:00 2026 /fixture/claude
         """)
-        let sessions = records.map { AgentSession(id: $0.key, agent: $0.agent!, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/tmp/group-fixture", terminal: .terminal) }
+        let sessions = records.map { AgentSession(id: $0.key, agent: $0.agent!, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/tmp/group-fixture", terminal: $0.pid == 100524 ? .claudeBackground : .terminal) }
         let claudeID = UUID().uuidString
         let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { records in
-            records.filter { $0.pid == 100522 }.map { .init(processID: $0.key, kind: "interactive", activity: .init(providerID: claudeID, status: "idle", changedAt: Date()), peerName: "fixture-claude-peer") }
+            records.filter { [100522, 100524, 100525].contains($0.pid) }.map { .init(processID: $0.key, kind: $0.pid == 100525 ? "bg" : "interactive", activity: .init(providerID: claudeID, status: "idle", changedAt: Date()), peerName: "fixture-claude-peer") }
         }
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records })
         defer { engine.stop() }
@@ -460,6 +462,13 @@ extension ApprovalTests {
         let store = SessionGroupStore(directory: directory)
         try store.save([SessionGroup(name: "함께", members: [caller.member, second.member, third.member]),
                         SessionGroup(name: "다른 그룹", members: [second.member])])
+        for child in sessions.suffix(2) {
+            do {
+                _ = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "get_session_groups",
+                    "sessionID": child.id, "conversationID": claudeID, "agentKind": "claude"])
+                throw AppError.message("Background Claude claimed its parent's group")
+            } catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+        }
         let result = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "get_session_groups", "sessionID": caller.id])
         let groups = try unwrapGroup(result["groups"] as? [JSONObject])
         try expectEqual(groups.count, 1)
@@ -474,6 +483,13 @@ extension ApprovalTests {
             _ = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "get_session_groups", "sessionID": "invalid"])
             throw AppError.message("Unknown caller must be rejected")
         } catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+        let saved = try store.load()
+        let children = Array(sessions.suffix(2))
+        engine.updateDiscovery(children, records: Array(records.suffix(2)))
+        let remaining = try await engine.sessionGroupSessions()
+        try expect(remaining.isEmpty)
+        try expectNil(SessionGroupMatching.connection(second.member, in: remaining))
+        try expectEqual(try store.load(), saved)
     }
 
     @MainActor func testSessionGroupObservationsUseExactBindingWithoutThreadList() async throws {

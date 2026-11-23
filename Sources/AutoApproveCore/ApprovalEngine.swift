@@ -187,6 +187,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var workingDirectoriesBySession: [String: String] = [:]
     private var workingDirectoryReadAt: [String: TimeInterval] = [:]
     private let remoteProcessVerifier: @Sendable (AgentSession) throws -> Bool
+    private var registeredBackgroundClaude = Set<String>()
     private var claudeParents: [String: String] = [:]
     private var recoveredClaudeStates = Set<String>()
     private var claudeHookObservedAt: [String: Date] = [:]
@@ -2913,9 +2914,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return observed
     }
 
+    private func isBackgroundGroupSession(_ session: AgentSession) -> Bool {
+        session.terminal == .claudeBackground || claudeParents[session.id] != nil || registeredBackgroundClaude.contains(session.id)
+    }
+
     private func readSessionGroupSessions(runtimeID: String? = nil, reconcile: Bool = true, useStatusCache: Bool = true) async throws -> [SessionGroupLiveSession] {
         let candidates = runtimeID.map { sessions[$0].map { [$0] } ?? [] } ?? Array(sessions.values)
-        let originals = candidates.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 }
+        let originals = candidates.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 && !isBackgroundGroupSession($0) }
         guard !originals.isEmpty || runtimeID == nil else { return [] }
         guard originals.count <= 512 else { throw AppError.message("세션이 너무 많아 그룹 구성을 확인하지 못했습니다.") }
         let readAll = processReader, readOne = singleProcessReader, pid = runtimeID == nil ? nil : originals.first?.pid
@@ -2949,29 +2954,24 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     ProcessOpenFiles.agyConversation(pid: record.pid, started: record.started)
                 }.value ?? agyEvents[original.id]?.conversationId
             } else {
+                let rows: [ClaudeSessionRegistration]
                 if let environment {
                     let path = environment["CLAUDE_CONFIG_DIR"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude").path
                     home = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
                     let directory = URL(fileURLWithPath: path)
-                    let rows = await Task.detached(priority: .utility) { ClaudeSessionRegistry.read(records: [record], directory: directory) }.value
-                    let ids = Set(rows.filter { $0.processID == original.id }.compactMap(\.conversationID))
-                    if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
-                    let matching = rows.filter { $0.processID == original.id && $0.conversationID == conversation }
-                    if conversation != nil, matching.count == 1 {
-                        messagingName = matching[0].peerName
-                        claudeStatus = matching[0].status
-                        claudeActivity = matching[0].activity
-                    }
+                    rows = await Task.detached(priority: .utility) { ClaudeSessionRegistry.read(records: [record], directory: directory) }.value
                 } else {
-                    let rows = await Task.detached(priority: .utility) { registry([record]) }.value
-                    let ids = Set(rows.filter { $0.processID == original.id }.compactMap(\.conversationID))
-                    if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
-                    let matching = rows.filter { $0.processID == original.id && $0.conversationID == conversation }
-                    if conversation != nil, matching.count == 1 {
-                        messagingName = matching[0].peerName
-                        claudeStatus = matching[0].status
-                        claudeActivity = matching[0].activity
-                    }
+                    rows = await Task.detached(priority: .utility) { registry([record]) }.value
+                }
+                let registrations = rows.filter { $0.processID == original.id }
+                guard !registrations.contains(where: { $0.kind == "bg" }) else { continue }
+                let ids = Set(registrations.compactMap(\.conversationID))
+                if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
+                let matching = registrations.filter { $0.conversationID == conversation }
+                if conversation != nil, matching.count == 1 {
+                    messagingName = matching[0].peerName
+                    claudeStatus = matching[0].status
+                    claudeActivity = matching[0].activity
                 }
             }
             guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
@@ -2988,7 +2988,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let latest = try await Task.detached(priority: .utility) { try reader() }.value
         let byPID = Dictionary(latest.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
         let observed = result.compactMap { observation -> SessionGroupLiveSession? in
-            guard let current = sessions[observation.id], current.phase != .ended,
+            guard let current = sessions[observation.id], current.phase != .ended, !isBackgroundGroupSession(current),
                   current.pid == observation.session.pid, current.started == observation.session.started,
                   current.tty == observation.session.tty, current.cwd == observation.session.cwd,
                   current.agent == observation.session.agent,
@@ -3061,6 +3061,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Per-call conversation evidence takes precedence over the MCP host process.
     /// A daemon can serve multiple conversations and need not have a visible TUI.
     private func sessionGroupCaller(_ object: JSONObject, observed: [SessionGroupLiveSession], recovery: Bool = false) throws -> (session: SessionGroupLiveSession, attribution: String) {
+        if let id = object["sessionID"] as? String, let session = sessions[id], session.agent == .claude,
+           isBackgroundGroupSession(session) || !observed.contains(where: { $0.id == id }) {
+            throw RemoteHTTPError(409, "그룹을 호출한 Claude의 독립 터미널을 확인하지 못했습니다.")
+        }
         let claimed = object["conversationID"] as? String
         guard claimed == nil || UUID(uuidString: claimed!) != nil else { throw RemoteHTTPError(400, "현재 대화의 UUID를 확인해주세요.") }
         if object["agentKind"] as? String == AgentKind.codex.rawValue,
@@ -3958,7 +3962,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let clearing = groupClearActive(group.id)
         let evidence = groupConnectionObservation.map { Date().timeIntervalSince($0.at) < 120 ? $0.sessions : [] } ?? []
         let current = evidence.compactMap { observed -> SessionGroupLiveSession? in
-            guard let live = sessions[observed.id], live.phase != .ended, live.tty == observed.session.tty,
+            guard let live = sessions[observed.id], live.phase != .ended, !isBackgroundGroupSession(live), live.tty == observed.session.tty,
                   live.cwd == observed.session.cwd, live.codexApprovalBinding?.threadID == observed.session.codexApprovalBinding?.threadID,
                   !observed.codexIdentityFromMCP || groupMCPIdentity(for: live, home: observed.providerHome)?.conversationID ==
                     observed.conversationID.flatMap(UUID.init(uuidString:)) else { return nil }
@@ -5875,6 +5879,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func reconcileClaudeParents(registrations: [ClaudeSessionRegistration]) {
+        registeredBackgroundClaude = Set(registrations.lazy.filter { $0.kind == "bg" }.map(\.processID))
         let found = ClaudeSessionRegistry.parents(sessions: Array(sessions.values), records: records, registrations: registrations)
         let next = claudeParents.merging(found) { _, new in new }
         guard next != claudeParents || parentSaveFailed else { return }

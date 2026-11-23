@@ -1,5 +1,7 @@
 # AutoApprove
 
+**백그라운드 가상 터미널의 그룹 ID 충돌 방지 · 0.2.391 빌드 418** [변경 사항](docs/releases/v0.2.391.md)
+
 **세션 재시작 시 CLI 업데이트 반영 · 0.2.390 빌드 417** [변경 사항](docs/releases/v0.2.390.md)
 
 **Claude 입력창의 CR 줄 끝 제출 복구 · 0.2.389 빌드 416** [변경 사항](docs/releases/v0.2.389.md)
