@@ -3497,6 +3497,41 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (group, member)
     }
 
+    private func groupEvidenceTarget(_ object: JSONObject, groupID: UUID, memberID: UUID) async throws -> (SessionGroup, SessionGroupMember, SessionGroupLiveSession?) {
+        let observed = try await readSessionGroupSessions(reconcile: false)
+        let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
+        guard attribution != "provided_conversation_id",
+              let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
+              group.members.contains(where: { group.isLeader($0.id) && groupMemberIsCaller($0, caller: caller, observed: observed) }),
+              let target = group.members.first(where: { $0.id == memberID }) else {
+            throw RemoteHTTPError(403, "현재 그룹의 그룹장 세션에서 같은 그룹의 구성원을 지정해주세요.")
+        }
+        return (group, target, SessionGroupMatching.match(target, in: observed))
+    }
+
+    private func groupTerminalEvidence(_ object: JSONObject) async throws -> JSONObject {
+        guard let groupID = try GroupWaitRequest.uuid(object, "groupID"), let memberID = try GroupWaitRequest.uuid(object, "memberID") else {
+            throw RemoteHTTPError(400, "그룹 ID와 구성원 ID를 지정해주세요.")
+        }
+        let (_, member, before) = try await groupEvidenceTarget(object, groupID: groupID, memberID: memberID)
+        guard let before, UUID(uuidString: member.conversationID) != nil, remoteCanRead(before.session) else {
+            throw RemoteHTTPError(409, "구성원의 대화 ID와 원본 터미널 화면 연결을 확인해주세요.")
+        }
+        let frame = try await remoteTerminal(sessionID: before.id, realtime: true, textOnly: true)
+        if let reason = frame.outputReason { throw RemoteHTTPError(409, reason) }
+        let (_, latest, after) = try await groupEvidenceTarget(object, groupID: groupID, memberID: memberID)
+        guard let after, after.id == before.id, after.session.tty == before.session.tty,
+              after.conversationID == before.conversationID, latest.conversationID == member.conversationID,
+              after.providerHome == before.providerHome else {
+            throw RemoteHTTPError(409, "조회 중 구성원의 연결이 바뀌었습니다. 다시 조회해주세요.")
+        }
+        let tail = frame.screen.utf8.suffix(12000).drop(while: { $0 & 0xc0 == 0x80 })
+        return ["groupID": groupID.uuidString, "memberID": memberID.uuidString, "conversationID": latest.conversationID,
+                "title": latest.nickname ?? latest.title, "phase": groupDisplayPhase(after.session, observation: after).rawValue,
+                "observedAt": ISO8601DateFormatter().string(from: frame.observedAt), "screen": String(decoding: tail, as: UTF8.self),
+                "truncated": tail.count < frame.screen.utf8.count]
+    }
+
     private func groupMailboxSummary(groupID: UUID, memberID: UUID, summary: Bool) -> JSONObject {
         do {
             let limit = summary ? 3 : 20
@@ -5174,10 +5209,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 kind: tool == "ask_group_question" ? .question : tool == "reply_group_question" ? .reply : .message)
         case "wait_group_dependencies", "update_group_wait", "complete_group_task":
             return try await groupWaitAction(tool, object: object)
+        case "get_group_member_terminal":
+            return try await groupTerminalEvidence(object)
         case "get_group_messages", "ack_group_messages":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)) else { throw RemoteHTTPError(400, "그룹 ID를 지정해주세요.") }
-            let (group, caller) = try await groupMailboxCaller(object, groupID: groupID)
             if tool == "ack_group_messages" {
+                let (_, caller) = try await groupMailboxCaller(object, groupID: groupID)
                 guard let strings = object["messageIDs"] as? [String] else { throw RemoteHTTPError(400, "수신 확인할 messageIDs를 지정해주세요.") }
                 let ids = strings.compactMap(UUID.init(uuidString:))
                 guard ids.count == strings.count else { throw RemoteHTTPError(400, "메시지 ID는 UUID여야 합니다.") }
@@ -5185,6 +5222,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 try applyGroupMessageAcknowledgements(ids)
                 scheduleGroupMailboxDelivery()
                 return ["acknowledged": true, "messageIDs": strings, "message": "수신 확인을 저장했습니다."]
+            }
+            let group: SessionGroup, mailbox: SessionGroupMember
+            if let memberID = try GroupWaitRequest.uuid(object, "mailboxMemberID") {
+                (group, mailbox, _) = try await groupEvidenceTarget(object, groupID: groupID, memberID: memberID)
+            } else {
+                (group, mailbox) = try await groupMailboxCaller(object, groupID: groupID)
             }
             func integer(_ name: String, fallback: Int64) throws -> Int64 {
                 guard let raw = object[name] else { return fallback }
@@ -5200,15 +5243,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   object["includeAcknowledged"] == nil || (object["includeAcknowledged"] as? NSNumber).map({ CFGetTypeID($0) == CFBooleanGetTypeID() }) == true else { throw RemoteHTTPError(400, "조회 방향·페이지 범위를 확인해주세요.") }
             if let id = try GroupWaitRequest.uuid(object, "messageID") {
                 guard let message = try groupMailbox().message(id), message.groupID == groupID,
-                      (direction == "outbox" ? message.senderID : message.recipientID) == caller.id else { throw RemoteHTTPError(404, "자기 수신함·발신함에 해당 메시지가 없습니다.") }
-                return ["messages": [message.json], "hasMore": false, "direction": direction, "groupID": groupID.uuidString]
+                      (direction == "outbox" ? message.senderID : message.recipientID) == mailbox.id else { throw RemoteHTTPError(404, "지정한 수신함·발신함에 해당 메시지가 없습니다.") }
+                return ["memberID": mailbox.id.uuidString, "messages": [message.json], "hasMore": false, "direction": direction, "groupID": groupID.uuidString]
             }
             let unanswered = try GroupWaitRequest.flag(object, "unansweredOnly")
             guard !unanswered || direction == "inbox" else { throw RemoteHTTPError(400, "미응답 질문은 수신함에서 조회해주세요.") }
-            let messages = try unanswered ? groupMailbox().pendingReplies(group: groupID, member: caller.id, senders: group.members.map(\.id), after: after, limit: limit + 1) : groupMailbox().list(groupID: groupID, memberID: caller.id, outbox: direction == "outbox",
+            let messages = try unanswered ? groupMailbox().pendingReplies(group: groupID, member: mailbox.id, senders: group.members.map(\.id), after: after, limit: limit + 1) : groupMailbox().list(groupID: groupID, memberID: mailbox.id, outbox: direction == "outbox",
                 includeAcknowledged: object["includeAcknowledged"] as? Bool == true, after: after, limit: limit + 1)
             let page = Array(messages.prefix(limit))
-            return ["groupID": groupID.uuidString, "memberID": caller.id.uuidString, "messages": page.map(\.json),
+            return ["groupID": groupID.uuidString, "memberID": mailbox.id.uuidString, "messages": page.map(\.json),
                     "hasMore": messages.count > limit, "nextAfterSequence": page.last?.sequence as Any? ?? NSNull(),
                     "networkRequired": false, "transport": "local_mailbox",
                     "message": "메시지를 조회했습니다."]

@@ -112,6 +112,34 @@ extension ApprovalTests {
         let waiting = try await send("busy then idle")
         try expect(try await waitForGroup(5) { (try? box.message(waiting)?.lastResult) == "not_started" })
         try expect(terminal.typed.isEmpty); try expectEqual(try box.pendingCount, 1)
+        let request: JSONObject = ["owner": UUID().uuidString, "sessionID": sessions[0].id,
+            "groupID": group.id.uuidString, "memberID": members[1].id.uuidString]
+        func inspect(_ tool: String, _ overrides: JSONObject = [:]) async throws -> JSONObject {
+            var params = request.merging(overrides) { _, new in new }
+            params["tool"] = tool
+            if tool == "get_group_messages" { params["mailboxMemberID"] = params.removeValue(forKey: "memberID") }
+            return try await engine.mcpAction(params)
+        }
+        let inbox = try await inspect("get_group_messages", ["messageID": waiting.uuidString])
+        try expectEqual((inbox["messages"] as? [JSONObject])?.count, 1)
+        try expectNil(try box.message(waiting)?.acknowledgedAt)
+        for screen in ["first live output", "updated live output"] {
+            writer.show(screen, on: sessions[1].tty)
+            let frame = try await inspect("get_group_member_terminal")
+            try expectEqual(frame["screen"] as? String, screen)
+            try expectNotNil(frame["observedAt"] as? String)
+        }
+        for tool in ["get_group_messages", "get_group_member_terminal"] {
+            for overrides: JSONObject in [["sessionID": sessions[1].id, "memberID": members[0].id.uuidString],
+                                           ["memberID": UUID().uuidString], ["groupID": UUID().uuidString]] {
+                do {
+                    _ = try await inspect(tool, overrides)
+                    throw AppError.message("Group evidence escaped its leader or member scope")
+                } catch let error as RemoteHTTPError { try expectEqual(error.status, 403) }
+            }
+        }
+        writer.show(custom, on: sessions[1].tty)
+        try expect(terminal.typed.isEmpty)
         terminal.setStatus(records[1].pid, "idle")
         try box.noteAttempt(waiting, result: "not_started", retryAt: Date().addingTimeInterval(45))
         _ = engine.handleHook(["hook_event_name": "Notification", "notification_type": "idle_prompt",
@@ -137,6 +165,15 @@ extension ApprovalTests {
         try expect(try engine.sessionGroupAssignments().isEmpty)
         try expect(engine.snapshot.sessions.allSatisfy { !$0.automatic })
         try expect(engine.networkIsolated); try expectEqual(try box.pendingCount, 0)
+        engine.updateDiscovery([sessions[0]], records: [records[0]])
+        let archived = try await inspect("get_group_messages", ["includeAcknowledged": true])
+        try expectEqual((archived["messages"] as? [JSONObject])?.count, 5)
+        let outbox = try await inspect("get_group_messages", ["direction": "outbox", "includeAcknowledged": true])
+        try expectEqual((outbox["messages"] as? [JSONObject])?.count, 0)
+        do {
+            _ = try await inspect("get_group_member_terminal")
+            throw AppError.message("Offline member returned a live terminal")
+        } catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
     }
 
     /// A message held for a busy recipient waits for the recipient to turn idle instead of a short
