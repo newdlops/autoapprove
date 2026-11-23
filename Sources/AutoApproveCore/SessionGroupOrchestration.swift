@@ -33,6 +33,9 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
     /// True from the moment the task is recorded until it has been typed into the worker's terminal.
     /// A record that still says so when the app starts never reached the worker and is dropped.
     public var pendingDelivery: Bool?
+    public var workScope: String?
+    public var interruptCheckpoint: String?
+
 
     public init(id: UUID = UUID(), groupID: UUID, workerMemberID: UUID, parentMemberID: UUID,
                 workerSessionID: String, parentSessionID: String, task: String, sentAt: Date = Date()) {
@@ -108,6 +111,15 @@ public struct SessionGroupOrchestration: Codable, Equatable {
         }
     }
 
+    mutating func recordUncertainAssignment(_ id: UUID) {
+        guard let index = assignments.firstIndex(where: { $0.id == id }) else { return }
+        assignments[index].deliveryError = "unknown"
+    }
+
+    mutating func checkpointInterrupt(_ id: UUID, text: String?) {
+        if let index = assignments.firstIndex(where: { $0.id == id }) { assignments[index].interruptCheckpoint = text }
+    }
+
     public mutating func markDelivered(_ id: UUID) {
         for index in assignments.indices where assignments[index].id == id { assignments[index].pendingDelivery = nil }
     }
@@ -117,7 +129,7 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     @discardableResult
     public mutating func removeUndelivered() -> Int {
         let before = assignments.count
-        assignments.removeAll { $0.status == .working && $0.pendingDelivery == true }
+        assignments.removeAll { $0.status == .working && $0.pendingDelivery == true && $0.deliveryError != "unknown" }
         return before - assignments.count
     }
 

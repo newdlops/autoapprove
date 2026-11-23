@@ -122,6 +122,10 @@ public struct SessionGroupMessage: Equatable {
                 "notificationAttempts": attempts, "lastNotificationResult": lastResult as Any? ?? NSNull(),
                 "lastError": lastError as Any? ?? NSNull()]
         if lastResult == "superseded", acknowledgedAt == nil { value["state"] = "superseded" }
+        if lastResult == "superseded", lastError == "cancelledBySender" { value["state"] = "cancelled" }
+        if lastResult == "superseded", let reason = lastError, reason.hasPrefix("supersededBy=") {
+            value["supersededBy"] = String(reason.dropFirst("supersededBy=".count))
+        }
         if lastResult == "answered" { value["state"] = "answered" }
         if isExpired { value["state"] = "expired" }
         if let key = sourceKey, key.hasPrefix("answer:") { value["inReplyTo"] = String(key.dropFirst(7)) }
@@ -427,6 +431,21 @@ public final class SessionGroupMailbox {
         guard let result = try message(key) else { throw AppError.message("저장된 그룹 메시지를 확인하지 못했습니다.") }
         return result
     }
+    func retireQueued(_ ids: [UUID], group: UUID, sender: UUID, recipient: UUID, replacement: UUID?) throws {
+        let reason = replacement.map { "supersededBy=" + $0.uuidString } ?? "cancelledBySender"
+        for id in ids {
+            guard let row = try message(id), row.groupID == group, row.senderID == sender, row.recipientID == recipient,
+                  row.kind == .message, row.acknowledgedAt == nil, id != replacement else {
+                throw RemoteHTTPError(409, "같은 수신자에게 보낸 대기 중 일반 메시지만 취소하거나 대체할 수 있습니다.")
+            }
+            if row.lastResult == "superseded", row.lastError == reason { continue }
+            guard [nil, "not_started"].contains(row.lastResult), try submittedAt(id) == nil else {
+                throw RemoteHTTPError(409, "메시지 " + id.uuidString + "의 전달이 이미 시작됐거나 종료되었습니다.")
+            }
+            try update("UPDATE messages SET last_result='superseded',last_error=? WHERE id=?", [reason, id.uuidString])
+        }
+    }
+
     public func list(groupID: UUID, memberID: UUID, outbox: Bool = false, includeAcknowledged: Bool = false,
                      after: Int64 = 0, limit: Int = 50) throws -> [SessionGroupMessage] {
         try rows("WHERE group_id=? AND " + (outbox ? "sender_id" : "recipient_id") + "=? AND sequence>?" +
@@ -497,6 +516,7 @@ public final class SessionGroupMailbox {
         public let lastDeliveryFailure: String?
         /// A message parked after repeated lost typings; it has left the delivery queue.
         public var hasParkedMessage = false
+        public var queuedCount = 0
     }
 
     /// Measure the whole inbox without materializing conversation bodies. The
@@ -505,6 +525,7 @@ public final class SessionGroupMailbox {
         let query = try statement("""
             WITH inbox AS (
                 SELECT recipient_id, sum(acknowledged IS NULL) AS pending, max(acknowledged) AS last_ack,
+                       sum(acknowledged IS NULL AND (last_result IS NULL OR last_result IN ('not_started','redeliver','undelivered'))) AS queued,
                        min(CASE WHEN acknowledged IS NULL THEN created END) AS first_pending,
                        max(CASE WHEN acknowledged IS NULL AND last_result='undelivered' THEN last_error END) AS parked
                 FROM messages
@@ -515,7 +536,7 @@ public final class SessionGroupMailbox {
                        row_number() OVER (PARTITION BY m.recipient_id ORDER BY \(Self.notificationOrder)) AS position
                 FROM messages m WHERE m.group_id=? AND \(Self.notificationFilter)
             )
-            SELECT inbox.recipient_id, pending, last_ack, first_pending, heads.position, heads.last_result, heads.last_error, inbox.parked
+            SELECT inbox.recipient_id, pending, last_ack, first_pending, heads.position, heads.last_result, heads.last_error, inbox.parked, inbox.queued
             FROM inbox LEFT JOIN heads ON heads.recipient_id=inbox.recipient_id AND heads.position=1
             """, [groupID.uuidString, groupID.uuidString])
         defer { sqlite3_finalize(query) }
@@ -537,7 +558,7 @@ public final class SessionGroupMailbox {
                                         lastAcknowledgedAt: date(2), firstPendingAt: date(3),
                                         hasNotificationHead: sqlite3_column_int(query, 4) == 1,
                                         headDidNotStart: blocked, lastDeliveryFailure: blocked ? (string(5) == "not_started" ? string(6) : parked) : nil,
-                                        hasParkedMessage: parked != nil)
+                                        hasParkedMessage: parked != nil, queuedCount: Int(sqlite3_column_int64(query, 8)))
         }
     }
 

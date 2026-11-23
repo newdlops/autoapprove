@@ -19,7 +19,7 @@ public enum MCPToolProfile: String {
     var instructions: String {
         var parts: [String] = []
         if self != .desktop {
-            parts.append("같은 Mac의 그룹 도구로 통신하세요. 다른 스레드·전송 경로로 우회하지 마세요. 필수 대기는 wait_group_dependencies 또는 ask_group_question(blocksProgress=true), 자유 질문 회신은 reply_group_question(inReplyTo: 원래 messageID)입니다. 터미널 본문은 그대로 사용하고 참조만 받으면 get_group_messages로 원문을 읽으세요. 상태 점검은 get_group_status(mailboxView: summary, reportView: compact), 장문 발신은 includeReceiptText=false를 쓰세요. 배정·재개에 연결된 최종 응답은 자동 보고됩니다. 첫 줄에 결과와 남은 문제를 적으세요.")
+            parts.append("같은 Mac의 그룹 도구로 통신하세요. 다른 스레드·전송 경로로 우회하지 마세요. 필수 대기는 wait_group_dependencies 또는 ask_group_question(blocksProgress=true), 자유 질문 회신은 reply_group_question(inReplyTo: 원래 messageID)입니다. 터미널 본문은 그대로 사용하고 참조만 받으면 get_group_messages로 원문을 읽으세요. 상태 점검은 get_group_status(view: overview), 장문 발신은 includeReceiptText=false를 쓰세요. 배정·재개에 연결된 최종 응답은 자동 보고됩니다. 첫 줄에 결과와 남은 문제를 적으세요.")
         }
         if self == .all || self == .orchestrator {
             parts.append("직속 작업은 assign_group_task, 현재 선택지·위임된 승인만 answer_group_question으로 처리하세요. ask_user 뒤 get_user_answers에서 명시적 응답을 확인하세요.")
@@ -52,8 +52,8 @@ public enum AutoApproveMCPServer {
             tool("get_session_groups", "현재 그룹·역할·연결·모델 기록을 조회합니다. 공유 서버는 conversationID를 지정하세요. 연결이 끊기고 canReconnect=true이면 reconnect_group_member로 복구하세요.", ["conversationID": string], readOnly: true),
             tool("reconnect_group_member", "canReconnect=true인 자신·직속 구성원(그룹장 없으면 같은 그룹)의 현재 대화를 재확인합니다. 초안·승인창이 있으면 보류합니다. 성공 후 connected와 conversationID를 확인하세요.",
                  ["groupID": string, "memberID": string, "conversationID": string], ["groupID", "memberID"]),
-            tool("send_group_message", "같은 그룹의 다른 구성원에게 일반 메시지를 저장합니다. accepted는 접수입니다. 재시도에는 같은 messageID를 쓰세요. 작업 지시·승인 권한은 부여하지 않습니다.",
-                 ["groupID": string, "memberID": string, "text": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "messageID": string, "includeReceiptText": ["type": "boolean", "default": true], "conversationID": string], ["groupID", "memberID", "text"]),
+            tool("send_group_message", "같은 그룹의 다른 구성원에게 일반 메시지를 저장합니다. accepted는 접수입니다. 새 messageID와 supersedes=[이전 ID]는 대기 중인 자기 일반 메시지들을 원자적으로 대체합니다. 재시도에는 같은 ID를 쓰세요. 작업 지시·승인 권한은 부여하지 않습니다.",
+                 ["groupID": string, "memberID": string, "text": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "messageID": string, "supersedes": ids, "includeReceiptText": ["type": "boolean", "default": true], "conversationID": string], ["groupID", "memberID", "text"]),
             tool("ask_group_question", "그룹 구성원에게 자유 질문을 보냅니다. 진행에 필수면 blocksProgress=true와 messageID를 지정하고 재시도에도 같은 ID를 쓰세요. 수신 확인은 답변·승인이 아닙니다.",
                  ["groupID": string, "memberID": string, "text": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "messageID": string, "includeReceiptText": ["type": "boolean", "default": true], "blocksProgress": bool, "timeoutSeconds": timeout, "taskID": string, "forQuestionID": string, "conversationID": string], ["groupID", "memberID", "text"]),
             tool("reply_group_question", "받은 groupID와 senderMemberID에 회신합니다. inReplyTo에 원래 질문의 messageID를 지정해 대기를 해제하세요. 재시도에는 같은 회신 messageID를 쓰세요.",
@@ -70,11 +70,18 @@ public enum AutoApproveMCPServer {
                  ["groupID": string, "waitID": string, "action": ["type":"string","enum":["externalReady","cancel"]], "conversationID": string], ["groupID","waitID","action"]),
             tool("complete_group_task", "대기를 사용한 작업자가 실제 작업을 마쳤을 때 원래 배정 ID와 결과 요약을 제출합니다. 해결 전 대기는 먼저 명시적으로 해제하세요.",
                  ["groupID": string, "taskID": string, "summary": string, "conversationID": string], ["groupID","taskID","summary"]),
-            tool("get_group_status", "작업·보고·대기를 조회합니다. 상태 점검은 mailboxView=summary(방향별 3건), 생략·full은 원문 20건입니다. 미리보기로 ACK하지 마세요. 원문은 get_group_messages, 대기 그래프는 includeWaitGraph=true입니다. compact 보고의 생략된 본문은 같은 구성원의 같은 작업 ID에서 읽으세요.",
-                 ["conversationID": string, "includeWaitGraph": bool, "mailboxView": ["type": "string", "enum": ["full", "summary"]], "reportView": ["type": "string", "enum": ["full", "compact"], "default": "full"]]),
+            tool("get_group_status", "view=overview는 구성원별 한 행(입력창·작업·대기 수·컨텍스트)만 반환합니다. 상세 작업·보고·대기도 조회할 수 있습니다. 상태 점검은 mailboxView=summary(방향별 3건), 생략·full은 원문 20건입니다. 미리보기로 ACK하지 마세요. 원문은 get_group_messages, 대기 그래프는 includeWaitGraph=true입니다. compact 보고의 생략된 본문은 같은 구성원의 같은 작업 ID에서 읽으세요.",
+                 ["view": ["type": "string", "enum": ["overview", "full"]], "conversationID": string, "includeWaitGraph": bool, "mailboxView": ["type": "string", "enum": ["full", "summary"]], "reportView": ["type": "string", "enum": ["full", "compact"], "default": "full"]]),
             tool("assign_group_task", "canAssign=true인 대기 중인 직속 작업자에게 지시를 입력하고 자동 승인을 켭니다. 수행할 지시만 적으세요. /, !, #, $, &로 시작할 수 없습니다. 연결된 응답은 자동 보고됩니다.",
-                 ["groupID": string, "memberID": string, "task": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "conversationID": string],
+                 ["groupID": string, "memberID": string, "workScope": string, "requestID": string, "allowScopeConflict": bool, "task": ["type": "string", "minLength": 1, "maxLength": SessionGroupOrchestration.maximumTaskLength], "conversationID": string],
                  ["groupID", "memberID", "task"]),
+            tool("assign_group_tasks", "구성원별 배정 결과와 오류를 돌려줍니다. 공통 task 또는 항목별 task를 사용하세요. 항목별 requestID를 재사용하고 전달 불명은 먼저 화면을 확인하세요.",
+                 ["groupID": string, "conversationID": string, "task": string, "assignments": ["type": "array", "minItems": 1, "maxItems": 16,
+                  "items": ["type": "object", "properties": ["memberID": string, "task": string, "workScope": string, "allowScopeConflict": bool, "requestID": string], "required": ["memberID"], "additionalProperties": false]]], ["groupID", "assignments"]),
+            tool("interrupt_group_task", "그룹장이 현재 작업 ID와 실행 중 화면을 확인하고 마지막 화면을 저장한 뒤 Esc를 한 번 전달합니다. escapeSent는 입력 전달 결과입니다.",
+                 ["groupID": string, "memberID": string, "taskID": string, "conversationID": string], ["groupID","memberID","taskID"], destructive: true),
+            tool("cancel_group_messages", "같은 구성원에게 보낸 대기 중 일반 메시지를 취소합니다. 이미 전송 중인 항목이 있으면 전체 요청을 보류합니다.",
+                 ["groupID": string, "memberID": string, "messageIDs": ids, "conversationID": string], ["groupID","memberID","messageIDs"], destructive: true),
             tool("answer_group_question", "직속 작업자의 현재 요청·선택지를 확인한 뒤 choice를 지정합니다. 권한 선택은 사용자 승인으로 처리되므로 위임된 작업 범위 안에서만 승인하세요. 전체 일시정지·금지된 시스템 변경·요청 변경 시 승인할 수 없습니다.",
                  ["groupID": string, "memberID": string, "choice": ["type": "integer", "minimum": 1, "maximum": 9], "conversationID": string],
                  ["groupID", "memberID", "choice"]),
@@ -191,7 +198,7 @@ public enum AutoApproveMCPServer {
             let handle = {
             if let value = response(message, profile: profile, call: { tool, arguments in
                 var params = arguments; params["tool"] = tool; params["owner"] = owner
-                let groupTool = ["wait_group_dependencies", "update_group_wait", "complete_group_task", "get_session_groups", "get_group_status", "assign_group_task", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "get_group_member_terminal", "ack_group_messages", "clear_session_group", "clear_group_member", "set_group_member_title", "set_group_member_tab_color", "get_group_clear_status"].contains(tool)
+                let groupTool = ["wait_group_dependencies", "update_group_wait", "complete_group_task", "get_session_groups", "get_group_status", "assign_group_task", "assign_group_tasks", "interrupt_group_task", "cancel_group_messages", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "get_group_member_terminal", "ack_group_messages", "clear_session_group", "clear_group_member", "set_group_member_title", "set_group_member_tab_color", "get_group_clear_status"].contains(tool)
                 // Only this process may attribute the caller; never trust a supplied session or agent kind.
                 params.removeValue(forKey: "codexCallerRuntimeID")
                 if groupTool {
@@ -237,7 +244,7 @@ public enum AutoApproveMCPServer {
                         if groupTool { params["agentKind"] = agent.agent?.rawValue }
                     }
                 }
-                return try MCPBridgeClient.request(path: paths.socket, message: ["method": "mcp", "params": params], timeout: groupTool ? 60 : 20)
+                return try MCPBridgeClient.request(path: paths.socket, message: ["method": "mcp", "params": params], timeout: tool == "assign_group_tasks" ? 300 : groupTool ? 60 : 20)
             }) { reply(value) }
             }
             if message["method"] as? String == "tools/call", message["id"] != nil {

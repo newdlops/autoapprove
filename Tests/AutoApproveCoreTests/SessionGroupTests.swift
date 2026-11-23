@@ -120,6 +120,29 @@ extension ApprovalTests {
             if tool == "get_group_messages" { params["mailboxMemberID"] = params.removeValue(forKey: "memberID") }
             return try await engine.mcpAction(params)
         }
+        let overview = try await inspect("get_group_status", ["view": "overview"])
+        let compact = try unwrapGroup((overview["groups"] as? [JSONObject])?.first)
+        let workerRow = try unwrapGroup((compact["members"] as? [JSONObject])?.first { $0["id"] as? String == members[1].id.uuidString })
+        try expectNil(compact["reports"]); try expectNil(compact["mailbox"]); try expectNil(workerRow["task"])
+        try expectEqual(workerRow["contextUsedPercent"] as? Int, 32)
+        try expectEqual(workerRow["fiveHourUsedPercent"] as? Int, 12)
+        try expectEqual(workerRow["queued"] as? Int, 1)
+        let first = UUID(), second = UUID(), newest = UUID()
+        for id in [first, second] {
+            _ = try box.enqueue(id: id, groupID: group.id, senderID: members[0].id, recipientID: members[1].id, kind: .message, text: "old")
+        }
+        let replacing: JSONObject = ["text": "latest", "messageID": newest.uuidString, "supersedes": [first.uuidString, second.uuidString]]
+        _ = try await inspect("send_group_message", replacing)
+        _ = try await inspect("send_group_message", replacing)
+        try expectEqual(try box.message(first)?.json["supersededBy"] as? String, newest.uuidString)
+        try expectEqual(try box.message(second)?.lastResult, "superseded")
+        do {
+            _ = try await inspect("cancel_group_messages", ["messageIDs": [newest.uuidString, waiting.uuidString]])
+            throw AppError.message("Partial queue cancellation committed")
+        } catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+        try expect(try box.message(newest)?.lastResult != "superseded")
+        _ = try await inspect("cancel_group_messages", ["messageIDs": [newest.uuidString]])
+        try expectEqual(try box.message(newest)?.json["state"] as? String, "cancelled")
         let inbox = try await inspect("get_group_messages", ["messageID": waiting.uuidString])
         try expectEqual((inbox["messages"] as? [JSONObject])?.count, 1)
         try expectNil(try box.message(waiting)?.acknowledgedAt)
@@ -167,7 +190,7 @@ extension ApprovalTests {
         try expect(engine.networkIsolated); try expectEqual(try box.pendingCount, 0)
         engine.updateDiscovery([sessions[0]], records: [records[0]])
         let archived = try await inspect("get_group_messages", ["includeAcknowledged": true])
-        try expectEqual((archived["messages"] as? [JSONObject])?.count, 5)
+        try expectEqual((archived["messages"] as? [JSONObject])?.count, 8)
         let outbox = try await inspect("get_group_messages", ["direction": "outbox", "includeAcknowledged": true])
         try expectEqual((outbox["messages"] as? [JSONObject])?.count, 0)
         do {
@@ -710,16 +733,81 @@ extension ApprovalTests {
         try expectEqual(crowded.assignments.count, SessionGroupOrchestration.limit + 5, "Pending tasks are never dropped for space")
     }
 
+    @MainActor func testLargeGroupOverviewPayload() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let paths = AppPaths(directory: dir); try paths.prepare()
+        let records = ProcessDiscovery.parse((0..<11).map { n in
+            let pid = 104600 + n
+            return "\(pid) 1 fixture\(n) \(pid) \(pid) Wed Oct 28 12:00:00 2026 /fixture/claude"
+        }.joined(separator: "\n"))
+        let sessions = records.map { AgentSession(id: $0.key, agent: .claude, pid: $0.pid, started: $0.started,
+            tty: "/dev/" + $0.tty, cwd: "/fixture", terminal: .iterm) }
+        let ids = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, UUID().uuidString) })
+        let members = sessions.map { session -> SessionGroupMember in
+            var member = SessionGroupMember(agent: .claude, title: session.id, cwd: session.cwd, conversationID: ids[session.id]!)
+            member.runtimeID = session.id
+            return member
+        }
+        let group = SessionGroup(name: "overview", members: members, leaderMemberID: members[0].id)
+        try SessionGroupStore(directory: dir).save([group])
+        let body = String(repeating: "Review the proposed change. ", count: 125)
+        var state = SessionGroupOrchestration()
+        for i in 1..<members.count {
+            let assignment = SessionGroupAssignment(groupID: group.id, workerMemberID: members[i].id, parentMemberID: members[0].id,
+                workerSessionID: sessions[i].id, parentSessionID: sessions[0].id, task: body)
+            state.begin(assignment); state.markDelivered(assignment.id)
+        }
+        try AuditStore(path: paths.database).set(SessionGroupOrchestration.storeKey, String(decoding: JSONEncoder().encode(state), as: UTF8.self))
+        let engine = try ApprovalEngine(paths: paths, claudeRegistryReader: { rows in rows.map {
+            .init(processID: $0.key, kind: "interactive", sessionID: ids[$0.key], status: "idle")
+        } }, processReader: { records }, isolateByDefault: true)
+        defer { engine.stop() }
+        engine.updateDiscovery(sessions, records: records)
+        let args: JSONObject = ["owner": UUID().uuidString, "sessionID": sessions[0].id, "tool": "get_group_status"]
+        let full = try await engine.mcpAction(args)
+        let overview = try await engine.mcpAction(args.merging(["view": "overview"]) { _, new in new })
+        let rows = try unwrapGroup((overview["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject])
+        try expectEqual(rows.count, 11)
+        let shortBytes = try JSONSerialization.data(withJSONObject: overview).count
+        let fullBytes = try JSONSerialization.data(withJSONObject: full).count
+        try expect(shortBytes * 5 < fullBytes)
+        print("11-member status fixture: overview=\(shortBytes) bytes, full=\(fullBytes) bytes")
+    }
+
+    @MainActor func testOverdueGroupAssignmentNotifiesOnce() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let paths = AppPaths(directory: dir); try paths.prepare()
+        let members = ["leader", "worker"].map { SessionGroupMember(agent: .claude, title: $0, cwd: "/fixture", conversationID: UUID().uuidString) }
+        let group = SessionGroup(name: "missing reports", members: members, leaderMemberID: members[0].id)
+        try SessionGroupStore(directory: dir).save([group])
+        let old = SessionGroupAssignment(groupID: group.id, workerMemberID: members[1].id, parentMemberID: members[0].id,
+            workerSessionID: "worker", parentSessionID: "leader", task: "review", sentAt: Date().addingTimeInterval(-1810))
+        var state = SessionGroupOrchestration(assignments: [old]); state.markDelivered(old.id)
+        try AuditStore(path: paths.database).set(SessionGroupOrchestration.storeKey, String(decoding: JSONEncoder().encode(state), as: UTF8.self))
+        let box = try SessionGroupMailbox(directory: dir)
+        for _ in 0..<2 {
+            let engine = try ApprovalEngine(paths: paths, processReader: { [] }, isolateByDefault: true)
+            try engine.start(poll: false)
+            try expect(try await waitForGroup(5) { (try? box.message(sourceKey: "missingReport:" + old.id.uuidString)) != nil })
+            engine.stop()
+        }
+        let notices = try box.list(groupID: group.id, memberID: members[0].id, includeAcknowledged: true)
+        try expectEqual(notices.count, 1); try expectEqual(notices.first?.kind, .notice)
+    }
+
     @MainActor func testGroupTaskTurnsOnWorkerAutomaticApproval() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("group-assign-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let records = ProcessDiscovery.parse("""
         100551 1 fixture6 100551 100551 Wed Oct 28 12:00:00 2026 /fixture/claude
         100552 1 fixture7 100552 100552 Wed Oct 28 12:00:00 2026 /fixture/claude
+        100553 1 fixture0 100553 100553 Wed Oct 28 12:00:00 2026 /fixture/claude
         """)
         var sessions = records.map { AgentSession(id: $0.key, agent: $0.agent!, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/tmp/group-fixture", terminal: .iterm) }
         for index in sessions.indices { sessions[index].phase = .idle }
-        let ids = [records[0].pid: UUID().uuidString, records[1].pid: UUID().uuidString]
+        let ids = [records[0].pid: UUID().uuidString, records[1].pid: UUID().uuidString, records[2].pid: UUID().uuidString]
         let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { records in
             records.compactMap { record in ids[record.pid].map { .init(processID: record.key, kind: "interactive", activity: .init(providerID: $0, status: "idle", changedAt: Date())) } }
         }
@@ -733,7 +821,8 @@ extension ApprovalTests {
         let leader = try unwrapGroup(observed.first { $0.id == records[0].key })
         let worker = try unwrapGroup(observed.first { $0.id == records[1].key })
         let leaderMember = leader.member, workerMember = worker.member
-        let group = SessionGroup(name: "자동 승인", members: [leaderMember, workerMember], leaderMemberID: leaderMember.id)
+        let other = try unwrapGroup(observed.first { $0.id == records[2].key }).member
+        let group = SessionGroup(name: "자동 승인", members: [leaderMember, workerMember, other], leaderMemberID: leaderMember.id)
         try SessionGroupStore(directory: directory).save([group])
         func automatic() -> Bool? { engine.snapshot.sessions.first { $0.id == worker.id }?.automatic }
         try expectEqual(automatic(), false)
@@ -761,9 +850,41 @@ extension ApprovalTests {
         engine.refreshSessionGroupBadges()
         func badge(_ id: String) -> SessionGroupBadge? { engine.snapshot.sessions.first { $0.id == id }?.sessionGroup }
         try expect(try await waitForGroup(5) { badge(leader.id) != nil && badge(worker.id) != nil }, "Session list rows must show group roles")
-        try expectEqual(badge(leader.id)?.role, .leader); try expectEqual(badge(leader.id)?.childCount, 1)
+        try expectEqual(badge(leader.id)?.role, .leader); try expectEqual(badge(leader.id)?.childCount, 2)
         try expectEqual(badge(worker.id)?.role, .member); try expectEqual(badge(worker.id)?.task, .working)
         try expectEqual(badge(worker.id)?.parentTitle, leaderMember.title)
+
+        let batchID = UUID().uuidString
+        let batch: JSONObject = ["owner": UUID().uuidString, "tool": "assign_group_tasks", "sessionID": leader.id,
+            "groupID": group.id.uuidString, "task": "다시 리뷰하세요", "assignments": [
+                ["memberID": workerMember.id.uuidString, "workScope": "PR#339", "requestID": batchID],
+                ["memberID": other.id.uuidString, "task": "Review independently", "workScope": "PR#339"]]]
+        let results = try unwrapGroup(try await engine.mcpAction(batch)["results"] as? [JSONObject])
+        try expectEqual(results.first?["taskID"] as? String, batchID)
+        try expect((results.last?["error"] as? String)?.contains(workerMember.id.uuidString) == true)
+        do { _ = try await assign("#356 수정"); throw AppError.message("Command prefix was accepted") }
+        catch let error as RemoteHTTPError { try expect(error.localizedDescription.contains("#356 수정")) }
+        let repeated = try unwrapGroup(try await engine.mcpAction(batch)["results"] as? [JSONObject])
+        try expectEqual(repeated.first?["alreadyRecorded"] as? Bool, true)
+        let interrupt: JSONObject = ["owner": UUID().uuidString, "tool": "interrupt_group_task", "sessionID": leader.id,
+            "groupID": group.id.uuidString, "memberID": workerMember.id.uuidString, "taskID": batchID]
+        writer.show("Compiling packages…\n❯ \nEsc to interrupt", on: worker.session.tty)
+        let before = writer.writes.count
+        for invalid: JSONObject in [["taskID": UUID().uuidString], ["sessionID": worker.id]] {
+            do {
+                _ = try await engine.mcpAction(interrupt.merging(invalid) { _, new in new })
+                throw AppError.message("An unrelated task or caller sent an interrupt")
+            } catch is RemoteHTTPError { }
+        }
+        try expectEqual(writer.writes.count, before)
+        let stopped = try await engine.mcpAction(interrupt)
+        try expectEqual(stopped["escapeSent"] as? Bool, true)
+        try expect((stopped["checkpoint"] as? String)?.contains("Compiling") == true)
+        try expectEqual(writer.writes.last, "\u{1b}")
+        let retry = try await engine.mcpAction(interrupt)
+        try expectEqual(retry["alreadyRequested"] as? Bool, true)
+        try expectEqual(writer.writes.count, before + 1)
+        writer.show("검사 원본\n› ", on: worker.session.tty)
 
         try engine.setPaused(true); defer { try? engine.setPaused(false) }
         let paused = try await assign("일시정지 중 작업")
