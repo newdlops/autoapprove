@@ -1056,6 +1056,20 @@ extension ApprovalTests {
         try expectEqual(multiple["stage"] as? String,"selectBackgroundJob")
         writer.show("Waiting for git fetch\n✻ Worked for 4m · 1 shell still running\n────────\n❯ \n────────\n? for shortcuts",on:worker.session.tty)
         let priorWrites = writer.writes.count
+        let managed = "────────\n❯ \n────────\n1 shell · ← 2 agents · ↓ to manage"
+        writer.show(managed,on:worker.session.tty)
+        _ = try await action("get_group_member_terminal")
+        for mode in ["overview","full"] {
+            let status = try await action("get_group_status",["view":mode])
+            let row = try unwrapGroup((status["groups"] as? [JSONObject])?.first.flatMap { ($0["members"] as? [JSONObject])?.first { $0["id"] as? String == workerMember.id.uuidString } })
+            try expectEqual(row["phase"] as? String,"waitingOnBackground")
+            try expectEqual(row["backgroundRunning"] as? Int,1)
+            try expectEqual(row["taskStatus"] as? String,"waitingOnBackground")
+            try expectEqual(row["assignmentStatus"] as? String,"working")
+        }
+        try expectEqual(ActivityDetector.backgroundCount(managed,agent:.claude),1)
+        try expectEqual(ActivityDetector.backgroundCount(managed.replacingOccurrences(of:"1 shell",with:"3 shells"),agent:.claude),3)
+        try expectEqual(ActivityDetector.detect(managed.replacingOccurrences(of:"❯ ",with:"❯ draft"),agent:.claude).phase,.input)
         let recoveryResult = try await action("interrupt_group_task",recovery)
         try expectEqual(recoveryResult["stage"] as? String,"workerStopRequested")
         try expectEqual(recoveryResult["escapeSent"] as? Bool,false)

@@ -463,6 +463,14 @@ public final class SessionGroupMailbox {
             """, [])
     }
 
+    func enrichPendingTaskNotice(_ id: UUID, detail: String) throws {
+        try update("""
+            UPDATE messages SET body=body || ? WHERE id=? AND kind='notice' AND acknowledged IS NULL
+            AND last_result IS NOT 'superseded' AND (last_result IS NULL OR last_result='not_started')
+            AND instr(body,'백그라운드 셸')=0 AND NOT EXISTS(SELECT 1 FROM group_submissions WHERE message_id=messages.id)
+            """,[detail,id.uuidString])
+    }
+
     func retireTaskNotice(_ id: UUID) throws {
         try update("UPDATE messages SET acknowledged=coalesce(acknowledged,?),last_result='superseded' WHERE source_key=? AND acknowledged IS NULL",
             [String(Date().timeIntervalSince1970),"missingReport:" + id.uuidString])

@@ -3491,10 +3491,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             message = try box.enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: body)
         }
         scheduleGroupMailboxDelivery()
-        var receipt = message.json
+        let messageAtReturn = try box.message(message.id) ?? message
+        var receipt = messageAtReturn.json
         if !includeReceiptText { receipt.removeValue(forKey: "text") }
         var output: JSONObject = ["accepted": true, "messageID": message.id.uuidString, "receipt": receipt,
-                "delivered": message.acknowledgedAt != nil, "transport": "local_mailbox", "networkRequired": false,
+                "deliveryObservedAt": ISO8601DateFormatter().string(from:Date()), "deliveryStage": messageAtReturn.acknowledgedAt == nil ? "accepted" : "acknowledged",
+                "delivered": messageAtReturn.acknowledgedAt != nil, "transport": "local_mailbox", "networkRequired": false,
                 "message": "로컬 수신함에 저장했습니다."]
         if let wait { output["wait"] = wait.json }
         return output
@@ -3560,7 +3562,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         guard jobReads.insert(key).inserted else { throw RemoteHTTPError(409,"백그라운드 작업을 조회 중입니다.") }
         defer { jobReads.remove(key) }
-        let provider = jobProvider(live)
+        let assignment = try groupOrchestration().current(groupID:group.id,workerMemberID:member.id)
+        let since = assignment.flatMap { $0.workerSessionID == live.id && $0.workerConversationID?.lowercased() == conversation.lowercased() ? $0.sentAt : nil }
+        let provider = live.session.agent == .claude ? ClaudeBackgroundJobs.provider(after:since) : jobProvider(live)
         let snapshot: GroupJobInventory
         do { snapshot = try await Task.detached(priority:.utility) { try provider.inventory(live,group.id,member.id) }.value }
         catch { jobSnapshots.removeValue(forKey:key); throw error }
@@ -3716,7 +3720,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let footer = frame.flatMap { $0.outputReason == nil ? ActivityDetector.backgroundCount($0.screen,agent:live.session.agent) : nil }
                     let identified = inventory?.count ?? 0
                     row["identifiedRunning"] = identified
-                    row["backgroundRunning"] = footer.map { max($0,identified) } as Any? ?? NSNull()
+                    row["backgroundRunning"] = footer.map { max($0,identified) } as Any? ?? (identified > 0 ? identified as Any : NSNull())
                     row["source"] = identified > 0 ? "verifiedProcesses" : footer == nil ? "unknown" : "countOnly"
                 }
                  row["canStop"] = visible.contains(where: { $0.status == "running" })
@@ -3753,10 +3757,24 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return ["groupID":gid.uuidString,"members":members]
     }
 
+    private func backgroundDetails(group: UUID, member: UUID, live: SessionGroupLiveSession, screen: String?) throws -> (count: Int?, jobs: [GroupBackgroundJob], waiting: Bool) {
+        let snapshot = jobSnapshots[jobKey(group,member,live)]
+        let fresh = snapshot.flatMap { Date().timeIntervalSince($0.at) < 60 ? $0 : nil }
+        var jobs: [GroupBackgroundJob] = []
+        if let fresh, let conversation = live.conversationID, !fresh.ids.isEmpty {
+            jobs = try groupMailbox().backgroundJobs(group:group,member:member,session:live.id,conversation:conversation).filter { fresh.ids.contains($0.id) }
+        }
+        let visible = screen.flatMap { ActivityDetector.backgroundCount($0,agent:live.session.agent) }
+        let count = fresh?.complete == true ? fresh?.count : visible.map { max($0,jobs.count) } ?? (jobs.isEmpty ? nil : jobs.count)
+        let waiting = live.session.agent == .claude && !live.session.pendingInTerminal && live.session.phase != .approval &&
+            (count ?? 0) > 0 && screen.map { ActivityDetector.detect($0,agent:.claude).phase == .idle && Self.emptyGroupComposer($0,agent:.claude) } == true
+        return (count,jobs,waiting)
+    }
+
     private func groupOverview(_ group: SessionGroup, observed: [SessionGroupLiveSession], models: [String: SessionGroupModelSettings], state: SessionGroupOrchestration) throws -> JSONObject {
         let inbox = try groupMailbox().inboxOperations(groupID: group.id)
         let formatter = ISO8601DateFormatter()
-        let rows: [JSONObject] = group.treeOrder.map { entry in
+        let rows: [JSONObject] = try group.treeOrder.map { entry in
             let member = entry.member
             let live = SessionGroupMatching.match(member, in: observed)
             let task = state.current(groupID: group.id, workerMemberID: member.id)
@@ -3787,13 +3805,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
             row["backgroundRunning"] = NSNull()
             row["canAcceptTask"] = NSNull()
             if let live {
-                if let entry = jobSnapshots[jobKey(group.id,member.id,live)], !entry.complete, Date().timeIntervalSince(entry.at) < 60 {
-                    row["backgroundIdentified"] = entry.count
-                }
-                if let entry = jobSnapshots[jobKey(group.id,member.id,live)], entry.complete, Date().timeIntervalSince(entry.at) < 60 {
-                    row["backgroundRunning"] = entry.count
-                } else if let frame, let count = ActivityDetector.backgroundCount(frame.raw,agent:live.session.agent) {
-                    row["backgroundRunning"] = count
+                let details = try backgroundDetails(group:group.id,member:member.id,live:live,screen:frame?.raw)
+                row["backgroundRunning"] = details.count as Any? ?? NSNull()
+                row["backgroundIdentified"] = details.jobs.count
+                if details.waiting {
+                    row["phase"] = "waitingOnBackground"
+                    row["backgroundJobs"] = details.jobs.prefix(3).map { job in
+                        var brief: JSONObject = ["command":job.command,"jobID":job.id]
+                        if let start = job.startedAt { brief["elapsedSeconds"] = max(0,Int(Date().timeIntervalSince(start))) }
+                        return brief
+                    }
                 }
                 if let frame {
                     let agent = live.session.agent
@@ -3812,7 +3833,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 row["assignedBy"] = task.parentMemberID.uuidString
                 row["assignedAt"] = formatter.string(from:task.sentAt)
                 row["closedWithoutReport"] = task.closedWithoutReport == true
-                row["taskID"] = task.id.uuidString; row["taskStatus"] = task.status.rawValue
+                row["taskID"] = task.id.uuidString
+                row["assignmentStatus"] = task.status.rawValue
+                row["taskStatus"] = task.status == .working && row["phase"] as? String == "waitingOnBackground" ? "waitingOnBackground" : task.status.rawValue
                 row["taskTitle"] = String(SessionGroupOrchestration.oneLine(task.task).prefix(72))
                 row["workScope"] = task.workScope
             }
@@ -5308,11 +5331,36 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 for task in state.assignments where task.status == .working && task.isDelivered && Date().timeIntervalSince(task.sentAt) >= 1800 {
                     let key = "missingReport:" + task.id.uuidString
+                    let existing = try? box.message(sourceKey:key)
+                    if let existing, existing.acknowledgedAt != nil || existing.text.contains("백그라운드 셸") ||
+                        ![nil,"not_started"].contains(existing.lastResult) || (try? box.submittedAt(existing.id)) != nil { continue }
                     guard let group = groups.first(where: { $0.id == task.groupID }),
-                          [task.parentMemberID, task.workerMemberID].allSatisfy({ id in group.members.contains { $0.id == id } }),
-                          (try? box.message(sourceKey: key)) == nil else { continue }
+                          [task.parentMemberID, task.workerMemberID].allSatisfy({ id in group.members.contains { $0.id == id } }) else { continue }
+                    var detail = ""
+                    if let member = group.members.first(where:{ $0.id == task.workerMemberID }), member.agent == .claude,
+                       let observed = try? await readSessionGroupSessions(runtimeID:task.workerSessionID,reconcile:false),
+                       let live = SessionGroupMatching.match(member,in:observed), live.id == task.workerSessionID,
+                       live.conversationID == task.workerConversationID {
+                        _ = try? await refreshBackgroundJobs(live,group:group,member:member)
+                        let frame = try? await remoteTerminal(sessionID:live.id,realtime:true,textOnly:true)
+                        if let info = try? backgroundDetails(group:group.id,member:member.id,live:live,screen:frame.flatMap { $0.outputReason == nil ? $0.screen : nil }),
+                           let count = info.count, count > 0 {
+                            detail = " 백그라운드 셸 " + String(count) + "개 실행 중."
+                            for job in info.jobs.prefix(3) {
+                                let minutes = job.startedAt.map { String(max(0,Int(Date().timeIntervalSince($0)/60))) + "분째" } ?? "시작 시각 미확인"
+                                detail += " " + job.command + " (" + minutes + ")."
+                            }
+                            if info.jobs.isEmpty { detail += " 명령과 시작 시각 미확인." }
+                        }
+                    }
+                    guard let latest = try? groupOrchestration().current(groupID:group.id,workerMemberID:task.workerMemberID),
+                          latest.id == task.id, latest.status == .working, latest.parentMemberID == task.parentMemberID else { continue }
+                    if let existing {
+                        if !detail.isEmpty { try? box.enrichPendingTaskNotice(existing.id,detail:detail) }
+                        continue
+                    }
                     if (try? box.enqueue(groupID: task.groupID, senderID: task.parentMemberID, recipientID: task.parentMemberID,
-                        kind: .notice, text: "[AutoApprove 보고 확인] 배정 후 30분 동안 완료 보고가 없습니다. 작업 " + task.id.uuidString + "의 현재 상태를 확인해주세요.", sourceKey: key)) != nil { scheduleGroupMailboxDelivery() }
+                        kind: .notice, text: "[AutoApprove 보고 확인] 배정 후 30분 동안 완료 보고가 없습니다. 작업 " + task.id.uuidString + "의 현재 상태를 확인해주세요." + detail, sourceKey: key)) != nil { scheduleGroupMailboxDelivery() }
                 }
             }
         }
@@ -6064,45 +6112,49 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let state = try groupOrchestration()
             let visibleGroups = groups.filter { $0.members.contains { groupMemberIsCaller($0, caller: caller, observed: observed) } }
             let modelSettings = await groupModelSettings(visibleGroups, observed: observed)
-            if let mode = object["view"] {
-                guard let mode = mode as? String, ["overview", "full"].contains(mode) else { throw RemoteHTTPError(400, "view는 overview 또는 full이어야 합니다.") }
-                if mode == "overview" {
-                    let ids = Set(visibleGroups.flatMap(\.members).compactMap { SessionGroupMatching.match($0, in: observed)?.id })
-                    let missing = ids.filter { id in
-                        guard let current = sessions[id], remoteCanRead(current) else { return false }
-                        let last = max(remoteObservedScreens[id]?.observedAt ?? .distantPast, remoteFrames[id]?.frame.observedAt ?? .distantPast)
-                        return Date().timeIntervalSince(last) >= 10
-                    }
-                    var iterator = missing.makeIterator()
-                    await withTaskGroup(of: Void.self) { reads in
-                        for _ in 0..<min(missing.count, 3) {
-                            if let id = iterator.next() { reads.addTask { _ = try? await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true) } }
-                        }
-                        while await reads.next() != nil {
-                            if let id = iterator.next() { reads.addTask { _ = try? await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true) } }
-                        }
-                    }
-                    let native = visibleGroups.flatMap { group in
-                        group.members.compactMap { member -> (SessionGroup,SessionGroupMember,SessionGroupLiveSession)? in
-                            guard [.codex,.claude].contains(member.agent), let live = SessionGroupMatching.match(member,in:observed),
-                                  Date().timeIntervalSince(jobSnapshots[jobKey(group.id,member.id,live)]?.at ?? .distantPast) > 20 else { return nil }
-                            return (group,member,live)
-                        }
-                    }
-                    var jobs = native.makeIterator()
-                    await withTaskGroup(of:Void.self) { reads in
-                        func schedule() {
-                            guard let (group,member,live) = jobs.next() else { return }
-                            reads.addTask { _ = try? await self.refreshBackgroundJobs(live,group:group,member:member) }
-                        }
-                        for _ in 0..<min(native.count,4) { schedule() }
-                        while await reads.next() != nil { schedule() }
-                    }
-                    let latestGroups = try SessionGroupStore(directory: paths.directory).load()
-                    guard visibleGroups.allSatisfy({ old in latestGroups.contains(where: { $0.id == old.id && $0.sameMembership(as: old) }) }) else {
-                        throw RemoteHTTPError(409, "조회 중 그룹 연결이 바뀌었습니다. 다시 확인해주세요.")
-                    }
-                    return ["groups": try visibleGroups.map { try groupOverview($0, observed: observed, models: modelSettings, state: state) }]
+            guard let mode = (object["view"] ?? "full") as? String, ["overview","full"].contains(mode) else { throw RemoteHTTPError(400,"view는 overview 또는 full이어야 합니다.") }
+            let ids = Set(visibleGroups.flatMap(\.members).compactMap { SessionGroupMatching.match($0, in: observed)?.id })
+            let missing = ids.filter { id in
+                guard let current = sessions[id], remoteCanRead(current) else { return false }
+                let last = max(remoteObservedScreens[id]?.observedAt ?? .distantPast, remoteFrames[id]?.frame.observedAt ?? .distantPast)
+                return Date().timeIntervalSince(last) >= 10
+            }
+            var iterator = missing.makeIterator()
+            await withTaskGroup(of: Void.self) { reads in
+                for _ in 0..<min(missing.count, 3) {
+                    if let id = iterator.next() { reads.addTask { _ = try? await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true) } }
+                }
+                while await reads.next() != nil {
+                    if let id = iterator.next() { reads.addTask { _ = try? await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true) } }
+                }
+            }
+            let native = visibleGroups.flatMap { group in
+                group.members.compactMap { member -> (SessionGroup,SessionGroupMember,SessionGroupLiveSession)? in
+                    guard [.codex,.claude].contains(member.agent), let live = SessionGroupMatching.match(member,in:observed),
+                          Date().timeIntervalSince(jobSnapshots[jobKey(group.id,member.id,live)]?.at ?? .distantPast) > 20 else { return nil }
+                    return (group,member,live)
+                }
+            }
+            var jobs = native.makeIterator()
+            await withTaskGroup(of:Void.self) { reads in
+                func schedule() {
+                    guard let (group,member,live) = jobs.next() else { return }
+                    reads.addTask { _ = try? await self.refreshBackgroundJobs(live,group:group,member:member) }
+                }
+                for _ in 0..<min(native.count,4) { schedule() }
+                while await reads.next() != nil { schedule() }
+            }
+            let latestGroups = try SessionGroupStore(directory: paths.directory).load()
+            guard visibleGroups.allSatisfy({ old in latestGroups.contains(where: { $0.id == old.id && $0.sameMembership(as: old) }) }) else {
+                throw RemoteHTTPError(409, "조회 중 그룹 연결이 바뀌었습니다. 다시 확인해주세요.")
+            }
+            let summaries = try visibleGroups.map { try groupOverview($0,observed:observed,models:modelSettings,state:state) }
+            if mode == "overview" { return ["groups":summaries] }
+            var waitingByGroup: [UUID:[UUID:JSONObject]] = [:]
+            for summary in summaries {
+                guard let gid = (summary["id"] as? String).flatMap(UUID.init(uuidString:)), let rows = summary["members"] as? [JSONObject] else { continue }
+                for row in rows where row["phase"] as? String == "waitingOnBackground" {
+                    if let mid = (row["id"] as? String).flatMap(UUID.init(uuidString:)) { waitingByGroup[gid,default:[:]][mid] = row }
                 }
             }
             let memberStatuses = await claudeStatuses(observed.map(\.session))
@@ -6113,7 +6165,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let members: [JSONObject] = group.treeOrder.map { entry in
                     let member = entry.member, live = SessionGroupMatching.match(member, in: observed)
                     let phase = live.flatMap { row in sessions[row.id].map { groupDisplayPhase($0, observation: row) } }
-                    return ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.nickname ?? member.title, "role": member.role as Any? ?? NSNull(), "cwd": member.cwd,
+                    var result: JSONObject = ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.nickname ?? member.title, "role": member.role as Any? ?? NSNull(), "cwd": member.cwd,
                             "identityWarning": warnings[member.id] as Any? ?? NSNull(), "tty": live?.session.tty as Any? ?? NSNull(),
                             "claudeStatus": live.flatMap { memberStatuses[$0.id] } as Any? ?? NSNull(),
                             "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
@@ -6128,6 +6180,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "canAskQuestion": member.id != callerMember.id && Self.canAddressGroupMember(member, live: live) && UUID(uuidString: callerMember.conversationID) != nil,
                             "canAssign": group.canDirect(callerMember.id, worker: member.id),
                             "task": groupTaskJSON(state.current(groupID: group.id, workerMemberID: member.id))]
+                    if let waiting = waitingByGroup[group.id]?[member.id] {
+                        for key in ["phase","taskStatus","assignmentStatus","backgroundRunning","backgroundJobs"] { result[key] = waiting[key] }
+                    }
+                    return result
                 }
                 let reports = state.undelivered.filter { $0.groupID == group.id && $0.parentMemberID == callerMember.id }
                 var tasksByWorker: [String: JSONObject] = [:]

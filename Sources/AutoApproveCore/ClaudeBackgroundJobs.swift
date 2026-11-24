@@ -2,14 +2,13 @@ import Foundation
 import Darwin
 
 enum ClaudeBackgroundJobs {
-    static let provider = GroupJobProvider(inventory: { live,group,member in
+    static let provider = provider(after:nil)
+
+    static func provider(after assignmentStart: Date?) -> GroupJobProvider {
+        GroupJobProvider(inventory: { live,group,member in
         let thread = try conversation(live)
         let directory = try taskDirectory(live,thread:thread)
         let generation = live.id
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath:directory,isDirectory:&isDirectory), isDirectory.boolValue else {
-            return .init(server:generation,jobs:[],complete:false)
-        }
         guard let owner = try ProcessDiscovery.read(pid:live.session.pid).first(where: { $0.key == live.id && $0.agent == .claude && "/dev/" + $0.tty == live.session.tty }) else { throw GroupJobProvider.stale() }
         var jobs: [GroupBackgroundJob] = []
         let children = try related(owner.pid,children:true)
@@ -21,17 +20,39 @@ enum ClaudeBackgroundJobs {
                   let file = taskFile(root:root,directory:directory,records:try related(root.pid,children:false)) else { continue }
             let nativeID = URL(fileURLWithPath:file).deletingPathExtension().lastPathComponent
             let arguments = ProcessEnvironment.arguments(root) ?? []
-            let command = arguments.last.flatMap { $0.count > 0 && $0 != root.executable ? $0 : nil } ?? executable
+            let command = executable == "git" && Array(arguments.dropFirst()) == ["status"] ? "git status" : arguments.last.flatMap { $0.count > 0 && $0 != root.executable ? $0 : nil } ?? executable
             var job = GroupBackgroundJob(group:group,member:member,session:live.id,conversation:thread,server:generation,
                 process:nativeID,item:root.key,command:String(SessionGroupOrchestration.oneLine(command).prefix(160)),firstSeen:Date())
             job.startedAt = ProcessEnvironment.startDate(root.started)
             job.outputFileIdentity = fileIdentity(file)
             jobs.append(job)
         }
+        var frontier = children
+        var visited = Set<Int32>()
+        let nativeRoots = Set(jobs.map(\.item))
+        for _ in 0..<8 where !frontier.isEmpty {
+            var next: [ProcessRecord] = []
+            for row in frontier where visited.count < 128 && visited.insert(row.pid).inserted && !nativeRoots.contains(row.key) {
+                let executable = (row.executable as NSString).lastPathComponent
+                if ["bash","sh","zsh"].contains(executable) { next += try related(row.pid,children:true); continue }
+                guard executable == "git", let target = statusProcess(row,owner:owner),
+                      (assignmentStart.map { target.started >= $0 } == true ||
+                       ProcessEnvironment.read(row,names:["CLAUDE_CODE_SESSION_ID"])?["CLAUDE_CODE_SESSION_ID"]?.lowercased() == thread) else { continue }
+                let job = GroupBackgroundJob(group:group,member:member,session:live.id,conversation:thread,server:generation,
+                    process:"git-status-" + String(row.pid),item:"status:" + target.token,command:"git status",firstSeen:Date(),startedAt:target.started)
+                jobs.append(job)
+            }
+            frontier = next
+        }
         let counts = Dictionary(grouping:jobs,by:\.process)
         return .init(server:generation,jobs:jobs.filter { counts[$0.process]?.count == 1 },complete:false)
     }, evidence: { live,job in
         let thread = try conversation(live)
+        if job.item.hasPrefix("status:") {
+            guard live.id == job.session, thread == job.conversation else { throw GroupJobProvider.stale() }
+            let state = ClaudeFetchInterrupt.status(String(job.item.dropFirst(7)))
+            return .init(ended:state == "unknown" ? nil : state == "fetchExited")
+        }
         guard live.id == job.session, thread == job.conversation, validID(job.process),
               let pid = pid(job) else { throw GroupJobProvider.stale() }
         let active: Bool
@@ -42,6 +63,18 @@ enum ClaudeBackgroundJobs {
         return .init(output:tail(file,identity:job.outputFileIdentity),ended:!active)
     }, stop: { live,job,authorize in
         let thread = try conversation(live)
+        if job.item.hasPrefix("status:") {
+            guard live.id == job.session, thread == job.conversation,
+                  let pid = Int32(job.process.dropFirst("git-status-".count)) else { throw GroupJobProvider.stale() }
+            try await authorize()
+            return try await Task.detached {
+                guard let owner = try ProcessDiscovery.read(pid:live.session.pid).first(where:{ $0.key == live.id && $0.agent == .claude && "/dev/" + $0.tty == live.session.tty }),
+                      let row = try ProcessDiscovery.read(pid:pid).first, let target = statusProcess(row,owner:owner),
+                      job.item == "status:" + target.token else { throw GroupJobProvider.stale() }
+                guard Darwin.kill(pid,SIGTERM) == 0 else { throw GroupJobProvider.stale() }
+                return true
+            }.value
+        }
         guard live.id == job.session, thread == job.conversation, validID(job.process), let pid = pid(job) else { throw GroupJobProvider.stale() }
         let directory = try taskDirectory(live,thread:thread)
         try await authorize()
@@ -58,7 +91,19 @@ enum ClaudeBackgroundJobs {
             guard Darwin.kill(-pid,SIGTERM) == 0 else { throw POSIXError(POSIXErrorCode(rawValue:errno) ?? .EIO) }
             return true
         }.value
-    })
+        })
+    }
+
+    private static func statusProcess(_ row: ProcessRecord, owner: ProcessRecord) -> ClaudeFetchInterrupt.Target? {
+        guard (row.executable as NSString).lastPathComponent == "git",
+              let target = ClaudeFetchInterrupt.Target(pid:row.pid),
+              let chain = try? ProcessDiscovery.readAncestorChain(of:row.pid,through:owner.pid),
+              chain.first?.key == row.key, chain.last?.key == owner.key,
+              chain.dropFirst().dropLast().allSatisfy({ ["sh","zsh","bash"].contains(($0.executable as NSString).lastPathComponent) }),
+              let args = ProcessEnvironment.arguments(row), Array(args.dropFirst()) == ["status"],
+              ClaudeFetchInterrupt.Target(pid:row.pid) == target else { return nil }
+        return target
+    }
 
     private static func owned(_ root: ProcessRecord, by owner: ProcessRecord) throws -> Bool {
         let chain = try ProcessDiscovery.readAncestorChain(of:root.pid,through:owner.pid)

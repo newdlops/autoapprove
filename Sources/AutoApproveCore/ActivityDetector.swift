@@ -50,7 +50,7 @@ public enum ActivityDetector {
             }
         }
         let compact = agent == .claude ? compactClaudeFooter(tail) : nil
-        let background = compact?.monitoring == true || tail.suffix(5).contains(where: isRemainingShellHint) || matches(bottom, #"(?i)\b[1-9][0-9]* (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b|running in (?:the )?background"#)
+        let background = compact?.monitoring == true || tail.suffix(5).contains(where: isRemainingShellHint) || (agent == .claude && tail.suffix(5).contains(where: isManagedShellFooter)) || matches(bottom, #"(?i)\b[1-9][0-9]* (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b|running in (?:the )?background"#)
         let unresolved = background ? ActivityObservation(phase: .working, detail: "백그라운드 작업이 보이지만 다음 지시를 받을 준비가 됐는지 아직 확인하지 못했습니다.") : unknown
         let glyphs = agent == .claude ? "❯" : "›»"
         guard let index = tail.lastIndex(where: { line in line.first.map { glyphs.contains($0) } == true }) else { return unresolved }
@@ -62,7 +62,7 @@ public enum ActivityDetector {
         } ?? Array(tail.dropFirst(index+1))
         let isHint: (String) -> Bool = { line in
             matches(line, #"\?\s*for shortcuts|shift\+tab to cycle"#)
-                || isRemainingShellHint(line) || (agent == .claude && isCompactClaudeFooter(line))
+                || isRemainingShellHint(line) || (agent == .claude && (isCompactClaudeFooter(line) || isManagedShellFooter(line)))
                 || (agent == .codex && matches(line, #"[0-9]{1,3}% (?:context )?left|^[^·]+ · [~/]"#))
         }
         let isDecoration: (String) -> Bool = { isHint($0) || isBackgroundHint($0) || $0.allSatisfy { "─━╌- ".contains($0) } }
@@ -101,11 +101,15 @@ public enum ActivityDetector {
             if let line = before.first, isRemainingShellHint(line) { lines.append(line) }
         }
         if let compact = compactClaudeFooter(footer) { lines.append(compact.text) }
-        for line in lines where isBackgroundHint(line) || isCompactClaudeFooter(line) {
+        for line in lines where isBackgroundHint(line) || isCompactClaudeFooter(line) || (agent == .claude && isManagedShellFooter(line)) {
             let pattern = #"(?i)\b\d{1,4}(?= (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?|shells?)\b)"#
             if let range = line.range(of:pattern,options:.regularExpression) { return Int(line[range]) }
         }
         return nil
+    }
+
+    private static func isManagedShellFooter(_ line: String) -> Bool {
+        matches(line, #"^(?:⏵⏵ [^·]{1,40} · )?[0-9]{1,4} shells? · (?:← [0-9]{1,4} agents? · )?↓ to manage$"#)
     }
 
     private static func isRemainingShellHint(_ line: String) -> Bool {
