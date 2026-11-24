@@ -44,6 +44,12 @@ public struct SessionGroupMember: Codable, Equatable, Identifiable, Sendable {
     public var role: String? = nil
     public var nickname: String? = nil
 
+    public var diagnosticLabel: String {
+        let name = [nickname, title].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty }
+        let identity = "\(agent.title) · \(id.uuidString.prefix(8))"
+        return name.map { "\($0) (\(identity))" } ?? identity
+    }
+
     public init(id: UUID = UUID(), agent: AgentKind, title: String, cwd: String,
                 conversationID: String, providerHome: String? = nil) {
         self.id = id; self.agent = agent; self.title = title; self.cwd = cwd

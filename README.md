@@ -1,6 +1,6 @@
 # AutoApprove
 
-**Codex 자식 승인창 복구 · 0.2.400 빌드 427** [변경 사항](docs/releases/v0.2.400.md)
+**그룹 구성원 식별과 Codex ID 갱신 · 0.2.401 빌드 428** [변경 사항](docs/releases/v0.2.401.md)
 
 **그룹장의 구성원 보관함·터미널 조회 · 0.2.392 빌드 419** [변경 사항](docs/releases/v0.2.392.md)
 

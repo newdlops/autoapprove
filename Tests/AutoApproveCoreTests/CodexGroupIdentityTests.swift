@@ -18,6 +18,7 @@ private final class CodexGroupScreen: @unchecked Sendable {
     let lock = NSLock(), id = UUID().uuidString.lowercased()
     private var value = "Codex\n› Ask Codex to do anything\n  ? for shortcuts"
     private var writes: [String] = []
+    var rejectNextFrame = false
     private var resumeWrites = 0
     private var rollout: String?
     init(_ initial: String? = nil) { if let initial { value = initial } }
@@ -33,7 +34,9 @@ private final class CodexGroupScreen: @unchecked Sendable {
     var resumes: Int { lock.lock(); defer { lock.unlock() }; return resumeWrites }
     func resume() -> ResumeDelivery { lock.lock(); defer { lock.unlock() }; resumeWrites += 1; return .typed }
     func send(_ input: RemoteTerminalInput) -> TerminalDelivery {
-        lock.lock(); defer { lock.unlock() }; writes.append(input.bytes)
+        lock.lock(); defer { lock.unlock() }
+        if rejectNextFrame { rejectNextFrame = false; return .screenChanged }
+        writes.append(input.bytes)
         if input.bytes.contains("/status") {
             let footer = value.contains("Goal stalled") ? " · Goal stalled (/goal resume)" : ""
             value += "\n>_ OpenAI Codex (v0.169.0)\nModel: fixture\nDirectory: /project\nPermissions: Read Only\nAgents.md: none\nSession: \(id)\n› Ask Codex to do anything\n  ? for shortcuts" + footer
@@ -236,6 +239,7 @@ extension ApprovalTests {
             let record = ProcessDiscovery.parse("100597 1 fixture46 100597 100597 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
             let session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/project", terminal: .terminal)
             let screen = CodexGroupScreen(), priority = GroupInputCooldown(continuous: continuous)
+            screen.rejectNextFrame = true
             var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen.screen) }) },
                 approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { _, _, _, input in
                     try expect(priority.idleSeconds >= 1.5, "Never input during keyboard priority")
@@ -685,6 +689,8 @@ extension ApprovalTests {
             let sameTab = SessionGroupLiveSession(session: original, conversationID: freshID.uuidString, providerHome: "/home")
             var member = sameTab.member
             member.conversationID = oldID.uuidString
+            member.nickname = "시험도구 검증"
+            try expect(member.diagnosticLabel.contains("시험도구 검증") && member.diagnosticLabel.contains(member.id.uuidString.prefix(8)))
             var other = sameTab
             other.session.id = "another"
             other.conversationID = oldID.uuidString

@@ -2290,6 +2290,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard !sendingMessages.contains(original.id), !remoteInputStopped else { throw RemoteHTTPError(409, "메시지를 전달하고 있습니다. 잠시 후 다시 확인해주세요.") }
             sendingMessages.insert(original.id); defer { sendingMessages.remove(original.id) }
             for attempt in 0..<3 {
+                if attempt > 0, codexStatusQuery {
+                    try await waitForGroupStatusInput(original, backgroundOnly: backgroundOnly)
+                }
                 let frame = try await remoteTerminal(sessionID: original.id, realtime: true, textOnly: textOnly)
                 guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
                       current.tty == original.tty, current.terminal == original.terminal,
@@ -2536,7 +2539,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if codexAccountInputHeld(id) { return (codexApprovalHoldReason(sessionID: id) ?? Self.codexAccountHoldMessage, false) }
         if changingGoals.contains(id) { return ("이 세션의 Goal 설정을 변경하고 있어 ID 조회를 보류했습니다.", false) }
         if automaticInputBusy(id) { return ("자동 승인 또는 복구 입력을 전달하고 있어 ID 조회를 보류했습니다. 입력 완료 후 다시 갱신해주세요.", true) }
-        if remoteUserInputHasPriority(id) { return ("이 세션에 전달 중인 입력의 보호 시간이 끝나지 않아 ID 조회를 보류했습니다.", true) }
+        if remoteInputSessions.contains(id) { return ("원래 터미널에서 입력을 전달하는 중이라 ID 조회를 기다립니다.", true) }
+        if remoteUserInputHasPriority(id) { return ("최근 터미널 입력의 보호 시간이 끝나기를 기다립니다.", true) }
         if includeNativeInput && nativeUserInputHasPriority(id) { return ("터미널 앱의 키보드·원격 조작 우선권이 유지되어 ID 조회를 보류했습니다. 입력과 보조키를 놓은 뒤 다시 갱신해주세요.", true) }
         return nil
     }
@@ -3786,8 +3790,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 guard let polled, Date().timeIntervalSince(polled.observedAt) < 15 else { return nil }
                 return (polled.raw, polled.observedAt)
             }
-            var row: JSONObject = ["id": member.id.uuidString, "name": member.nickname ?? member.title, "composer": "unknown",
-                "phase": live.map { groupDisplayPhase($0.session, observation: $0).rawValue } ?? "disconnected",
+            let connectionState = live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected"
+            var row: JSONObject = ["id": member.id.uuidString, "name": member.nickname ?? member.title, "composer": "unknown", "connectionState": connectionState,
+                "phase": live.map { groupDisplayPhase($0.session, observation: $0).rawValue } ?? connectionState,
                 "queued": inbox[member.id]?.queuedCount ?? 0, "unacknowledged": inbox[member.id]?.unacknowledgedCount ?? 0]
             if let report = state.assignments.filter({ $0.groupID == group.id && $0.workerMemberID == member.id && $0.completedAt != nil && $0.summary != nil })
                 .max(by:{ $0.completedAt! < $1.completedAt! }), let summary = report.summary, let date = report.completedAt {
@@ -4438,7 +4443,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
               let group = groups.first(where: { $0.id == message.groupID }),
               group.members.contains(where: { $0.id == message.senderID }),
               let box = try? groupMailbox(), (try? box.message(sourceKey: key)) == nil else { return }
-        let recipient = group.members.first { $0.id == message.recipientID }?.title ?? "받는 구성원"
+        let recipient = group.members.first { $0.id == message.recipientID }?.diagnosticLabel ?? message.recipientID.uuidString
         if uncertain {
             let reason = message.lastError ?? "입력 결과를 확인할 수 없습니다."
             let text = "[AutoApprove 수신 확인 지연] " + recipient + "에게 보낸 메시지 " + message.id.uuidString +
@@ -4607,7 +4612,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 throw RemoteHTTPError(409, "수신 탭의 세션 ID를 확인했습니다. 전달을 다시 시도합니다.", diagnostics: ["delivery": "not_started"])
             }
-            throw RemoteHTTPError(409, "수신 구성원의 대화 ID와 현재 터미널 연결을 확인하지 못했습니다.", diagnostics: ["delivery": "not_started"])
+            let reason = SessionGroupMatching.connection(recipient, in: observed) == nil
+                ? "연결된 실행 세션을 식별하지 못했습니다." : "터미널은 확인했지만 저장된 대화 ID를 검증하지 못했습니다."
+            throw RemoteHTTPError(409, recipient.diagnosticLabel + " · " + reason, diagnostics: ["delivery": "not_started"])
         }
         if let key = message.sourceKey, key.hasPrefix(SessionGroupMailbox.priorityPrefix),
            let original = key.dropFirst(SessionGroupMailbox.priorityPrefix.count).split(separator: ":").first,

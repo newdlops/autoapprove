@@ -344,12 +344,12 @@ import AutoApproveCore
         guard !loading else { return }; loading = true; defer { loading = false }
         bulkFailures = []
         do {
-            notice = "터미널에서 세션 ID를 조회하고 있습니다…"
+            notice = "\(member.diagnosticLabel) · 세션 ID 조회 중…"
             let result = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
             groups = try store.load(); live = try await engine.sessionGroupSessions()
             error = nil
             notice = result.changed ? "현재 세션 ID로 갱신했습니다." : "현재 세션 ID가 기존과 일치합니다."
-        } catch { notice = nil; self.error = error.localizedDescription }
+        } catch { notice = nil; self.error = member.diagnosticLabel + " · " + error.localizedDescription }
     }
 
     private func refreshAllIdentities(in original: SessionGroup) async {
@@ -369,14 +369,14 @@ import AutoApproveCore
         for (index, member) in group.members.enumerated() {
             if bulkStopRequested || Task.isCancelled { break }
             if merged.contains(member.id) { attempted += 1; continue }
-            notice = "\(group.name) · \(index + 1)/\(group.members.count) 조회 중 · \(member.title.isEmpty ? member.agent.title : member.title)"
+            notice = "\(group.name) · \(index + 1)/\(group.members.count) 조회 중 · \(member.diagnosticLabel)"
             do {
                 let result = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id, expectedMember: member)
                 if let duplicate = result.mergedMemberID { merged.insert(duplicate) }
                 if result.changed || previous[member.id]?.conversationID != member.conversationID || previous[member.id]?.runtimeID != member.runtimeID { changed += 1 } else { confirmed += 1 }
             } catch {
                 if group.isLeader(member.id) { failedLeader = member.id }
-                bulkFailures.append("\(member.title.isEmpty ? member.agent.title : member.title): \(error.localizedDescription)")
+                bulkFailures.append("\(member.diagnosticLabel) · \(error.localizedDescription)")
             }
             attempted += 1
         }
@@ -393,7 +393,7 @@ import AutoApproveCore
                     recoveredLeader = true
                     bulkFailures.removeAll()
                 }
-            } catch { bulkFailures = ["그룹장 복구: " + error.localizedDescription] }
+            } catch { bulkFailures = [(group.members.first { $0.id == leaderID }?.diagnosticLabel ?? leaderID.uuidString) + " · 그룹장 복구 · " + error.localizedDescription] }
         }
         do { live = try await engine.sessionGroupSessions(); groups = try store.load() }
         catch { self.error = "조회 결과를 다시 표시하지 못했습니다. " + error.localizedDescription }
