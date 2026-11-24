@@ -701,6 +701,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("OS permissions: web revision rejects revoked, ABA and exited policies",tests.testOSPermissionWebRevisionRejectsStalePolicyAndABARestore),
             ("Web interaction: explicit single/multiple/free-text answers and bounds", tests.testWebQuestionAnswersAreExplicitAndBounded),
             ("Web interaction: MCP ownership, expiry and no default answer", tests.testWebQuestionOwnershipExpiryAndNoDefaultAnswer),
+            ("Group Goals: native CLI commands and user Goal evidence", tests.testNativeGroupGoalCommandsAndEvidence),
             ("Web interaction: MCP stdio initialization, tool list and errors", tests.testMCPStdioProtocolAndToolErrors),
             ("Web interaction: explicit screen capture, cache, permission and stop", tests.testTestScreenCaptureIsExplicitAndStops),
             ("Discovery: passive neighbor cache filtering and nearby address order", tests.testDiscoveryNeighborHintsAndNearbyOrder),

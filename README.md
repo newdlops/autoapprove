@@ -1,6 +1,6 @@
 # AutoApprove
 
-**그룹장 MCP의 구성원 Goal 관리 · 0.2.402 빌드 429** [변경 사항](docs/releases/v0.2.402.md)
+**Codex·Claude Code·agy 구성원의 Goal 설정·중지·해제 · 0.2.403 빌드 430** [변경 사항](docs/releases/v0.2.403.md)
 
 **그룹장의 구성원 보관함·터미널 조회 · 0.2.392 빌드 419** [변경 사항](docs/releases/v0.2.392.md)
 

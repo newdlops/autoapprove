@@ -80,6 +80,32 @@ extension ApprovalTests {
         try expect(delayed.active.isEmpty); try expectEqual(await count.count, 1)
     }
 
+    func testNativeGroupGoalCommandsAndEvidence() throws {
+        for agent in [AgentKind.claude,.agy] {
+            for action in ["set","edit","resume"] {
+                try expectEqual(try TerminalGroupGoal.command(agent:agent,action:action,objective:"Verify tests"),"/goal Verify tests")
+            }
+            for action in ["clear","pause"] {
+                let expected = agent == .claude ? "/goal clear" : "Cancel the current goal and stop working toward it."
+                try expectEqual(try TerminalGroupGoal.command(agent:agent,action:action,objective:nil),expected)
+            }
+            try expectThrows(try TerminalGroupGoal.command(agent:agent,action:"set",objective:"ok\n/exit"))
+        }
+        try expectThrows(try TerminalGroupGoal.command(agent:.claude,action:"set",objective:"CLEAR"))
+        let thread = UUID().uuidString.lowercased()
+        func event(_ met: Bool, _ sidechain: Bool = false) throws -> Data {
+            let entry: JSONObject = ["type":"attachment","sessionId":thread,"isSidechain":sidechain,"uuid":UUID().uuidString,
+                "attachment":["type":"goal_status","sentinel":true,"met":met,"condition":"Existing user goal"] as JSONObject]
+            return try JSONSerialization.data(withJSONObject:entry) + Data([10])
+        }
+        let active = try event(false) + event(true,true)
+        try expectEqual(ClaudeGroupGoalEvidence.read(active,id:thread,complete:false)?.objective,"Existing user goal")
+        let cleared = try active + event(true)
+        try expectEqual(ClaudeGroupGoalEvidence.read(cleared,id:thread,complete:false)?.objective,nil)
+        try expect(ClaudeGroupGoalEvidence.read(cleared,id:thread,complete:false)?.revision != nil)
+        try expect(ClaudeGroupGoalEvidence.read(active,id:UUID().uuidString,complete:false) == nil)
+    }
+
     func testMCPStdioProtocolAndToolErrors() throws {
         let initialize = AutoApproveMCPServer.response(["jsonrpc": "2.0", "id": 1, "method": "initialize", "params": ["protocolVersion": "2025-11-25"]]) { _, _ in throw AppError.message("Must not call") }
         try expectEqual((initialize?["result"] as? JSONObject)?["protocolVersion"] as? String, "2025-11-25")

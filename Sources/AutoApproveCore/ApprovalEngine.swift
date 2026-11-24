@@ -3891,6 +3891,161 @@ private struct ScreenAnalysisStorageKey: Hashable {
             diagnostics:["delivery":"not_started","taskID":task.id.uuidString,"assignedBy":task.parentMemberID.uuidString,"assignedAt":date,"taskTitle":title])
     }
 
+    private static func groupGoalAction(_ object: JSONObject) -> String? {
+        guard let action = object["action"] as? String else { return nil }
+        switch action {
+        case "delete": return "clear"
+        case "stop": return "pause"
+        case "create","set","edit","pause","resume","clear": return action
+        default: return nil
+        }
+    }
+
+    private func validateGoalAssignment(_ object: JSONObject, group: UUID, member: UUID, leader: UUID, thread: String) throws {
+        let requested = try GroupWaitRequest.uuid(object,"taskID")
+        let task = try groupOrchestration().current(groupID:group,workerMemberID:member)
+        if let task, task.status == .working, task.parentMemberID != leader { throw Self.taskOwnershipConflict(task) }
+        if let requested {
+            guard let task, task.id == requested, task.status == .working, task.workerConversationID == thread else {
+                throw RemoteHTTPError(409,"지정한 작업과 현재 대화의 배정을 다시 확인해주세요.")
+            }
+        }
+    }
+
+    private func terminalGroupGoal(_ object: JSONObject, modifying: Bool, group: SessionGroup, leader: SessionGroupMember,
+                                   member: SessionGroupMember, live: SessionGroupLiveSession) async throws -> JSONObject {
+        guard let thread = live.conversationID, UUID(uuidString:thread) != nil, currentJobEndpoint(live,group:group,member:member),
+              let session = sessions[live.id] else { throw GroupJobProvider.stale() }
+        let key = "terminalGoalRequest:" + member.agent.rawValue + ":" + (live.providerHome ?? "") + ":" + thread
+        let previous = store.value(key) ?? ""
+        let receipt = previous.isEmpty ? nil : try JSONDecoder().decode(TerminalGroupGoal.self,from:Data(previous.utf8))
+        let reader = groupTranscriptReader
+        func evidence() async -> ClaudeGroupGoalEvidence? {
+            guard member.agent == .claude else { return nil }
+            return await Task.detached(priority:.utility) { reader.claudeGoal(live) }.value
+        }
+        func details(_ native: ClaudeGroupGoalEvidence?, _ request: TerminalGroupGoal?) throws -> JSONObject {
+            var result: JSONObject = ["groupID":group.id.uuidString,"memberID":member.id.uuidString,"threadID":thread,
+                "goalRevision":[session.id,native?.revision ?? "unknown",request?.revision ?? "none"].joined(separator:"/"),
+                "controlAvailable":remoteCanRead(session),"source":native == nil ? "unobserved" : "claudeTranscript",
+                "goalStatus":native.map { $0.objective == nil ? "none" : "active" } ?? "unknown"]
+            result["goal"] = native?.objective.map { ["objective":$0,"status":"active"] } as Any? ?? NSNull()
+            result["lastRequest"] = try request.map { try JSONSerialization.jsonObject(with:JSONEncoder().encode($0)) } ?? NSNull()
+            return result
+        }
+        let observed = await evidence()
+        func validate() throws {
+            try verifyGroupDirection(group.id,caller:leader,target:member)
+            guard currentJobEndpoint(live,group:group,member:member),
+                  !modifying || (!snapshot.paused && !remoteInputStopped && sessions[live.id]?.pendingInTerminal == false && !automaticInputBusy(live.id)) else {
+                throw GroupJobProvider.stale()
+            }
+        }
+        try validate()
+        let state = try details(observed,receipt)
+        guard modifying else { return state }
+        guard let action = Self.groupGoalAction(object), object["threadID"] as? String == thread,
+              object["goalRevision"] as? String == state["goalRevision"] as? String,
+              !snapshot.paused, !remoteInputStopped, !automaticInputBusy(session.id), !sendingMessages.contains(session.id),
+              !groupWorkerActions.contains(session.id), !groupClearActive(group.id),
+              !(await userInputHasPriority(session.id,backgroundOnly:true)), groupWorkerActions.insert(session.id).inserted else {
+            throw RemoteHTTPError(409,"원래 대화와 최신 goalRevision, 진행 중인 입력을 다시 확인해주세요.")
+        }
+        defer { groupWorkerActions.remove(session.id) }
+        if action == "create", observed?.revision == nil || observed?.objective != nil {
+            throw RemoteHTTPError(409,"기존 Goal이 있거나 상태를 확인할 수 없습니다. 교체하려면 set을 사용하세요.")
+        }
+        if action == "edit", let observed, observed.objective == nil { throw RemoteHTTPError(409,"수정할 Goal이 없습니다. set을 사용하세요.") }
+        let supplied = (object["objective"] as? String)?.trimmingCharacters(in:.whitespacesAndNewlines)
+        let objective: String?
+        switch action {
+        case "pause":
+            objective = observed?.objective ?? supplied ?? receipt?.objective
+        case "clear":
+            guard supplied == nil else { throw RemoteHTTPError(400,"해제에는 objective가 필요하지 않습니다.") }
+            objective = nil
+        case "resume":
+            guard observed?.objective == nil else { throw RemoteHTTPError(409,"이미 활성 Goal이 있습니다.") }
+            objective = supplied ?? (receipt?.action == "pause" ? receipt?.objective : nil)
+        default:
+            objective = supplied
+        }
+        if ["create","set","edit","resume"].contains(action) { try validateGoalAssignment(object,group:group.id,member:member.id,leader:leader.id,thread:thread) }
+        let line = try TerminalGroupGoal.command(agent:member.agent,action:action,objective:objective)
+        if action == "pause", let objective { _ = try TerminalGroupGoal.command(agent:member.agent,action:"resume",objective:objective) }
+        func revalidate() async throws {
+            let (_,latest,bound) = try await groupEvidenceTarget(object,groupID:group.id,memberID:member.id)
+            guard latest == member, bound?.id == live.id, bound?.conversationID == thread, bound?.providerHome == live.providerHome,
+                  !snapshot.paused, !remoteInputStopped, !automaticInputBusy(session.id), sessions[session.id]?.pendingInTerminal == false,
+                  (store.value(key) ?? "") == previous, (await evidence())?.revision == observed?.revision else { throw GroupJobProvider.stale() }
+            if member.agent == .agy {
+                let locks = try? await Task.detached(priority:.utility) { try ProcessOpenFiles.agyConversations(pid:session.pid,started:session.started) }.value
+                guard locks == Set([thread]) || (locks == nil && agyEvents[live.id]?.conversationId == thread) else { throw GroupJobProvider.stale() }
+            }
+            try validate()
+        }
+        var frame = try await remoteTerminal(sessionID:session.id,realtime:true,textOnly:true)
+        if ["pause","clear"].contains(action), frame.inputReason == nil, frame.outputReason == nil,
+           !RemoteMessageReadiness.hasMenu(frame.screen,agent:member.agent), frame.keys.contains("escape"),
+           ActivityDetector.detect(frame.screen,agent:member.agent).phase == .working ||
+           (member.agent == .agy && ActivityDetector.nonemptyTail(frame.screen).suffix(6).joined(separator:" ").range(of:#"(?i)esc(?:ape)? to (?:cancel|interrupt|stop)"#,options:.regularExpression) != nil) {
+            try await revalidate()
+            guard !(await nativeUserInputHasPriority(session.id,backgroundOnly:true)) else { throw GroupJobProvider.stale() }
+            var input: JSONObject = ["sessionID":session.id,"revision":frame.revision,"kind":"escape"]
+            if let stream = frame.streamID { input["relay"] = true; input["streamID"] = stream }
+            _ = try await remoteInput(input,automaticAuthorization:validate,authorizationSource:"그룹장 Goal 중지",backgroundOnly:true)
+            for _ in 0..<12 {
+                try await Task.sleep(for:.milliseconds(200))
+                frame = try await remoteTerminal(sessionID:session.id,realtime:true,textOnly:true)
+                if Self.groupComposerIdle(frame,agent:member.agent) { break }
+            }
+        }
+        guard Self.groupComposerIdle(frame,agent:member.agent) else {
+            throw RemoteHTTPError(409,"원본 CLI 입력창이 비거나 진행 중인 턴이 중지될 때 다시 시도해주세요.")
+        }
+        try await revalidate()
+        guard !(await nativeUserInputHasPriority(session.id,backgroundOnly:true)) else { throw GroupJobProvider.stale() }
+        var request = TerminalGroupGoal(action:action,objective:objective,delivery:"unknown")
+        func saveRequest() throws { try store.set(key,String(decoding:try JSONEncoder().encode(request),as:UTF8.self)) }
+        try saveRequest()
+        do {
+            if frame.keys.contains("submit") || frame.keys.contains("message") {
+                var input: JSONObject = ["sessionID":session.id,"revision":frame.revision,"kind":"submit","text":line]
+                if !frame.keys.contains("submit"), let stream = frame.streamID {
+                    input["kind"] = "message"; input["relay"] = true; input["streamID"] = stream
+                }
+                _ = try await remoteInput(input,automaticAuthorization:validate,authorizationSource:"그룹장 Goal 관리",backgroundOnly:true)
+            } else {
+                try await sendGroupLine(session,text:line,groupTarget:live) {
+                    try validate()
+                    let fresh = try await self.remoteTerminal(sessionID:session.id,realtime:true,textOnly:true)
+                    guard Self.groupComposerIdle(fresh,agent:member.agent) else { throw GroupJobProvider.stale() }
+                    return fresh.screen
+                }
+            }
+        } catch {
+            if (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started" { try store.set(key,previous) }
+            throw error
+        }
+        request.delivery = "submitted"
+        try saveRequest()
+        var latest = await evidence()
+        if member.agent == .claude {
+            for _ in 0..<6 {
+                if let latest, latest.revision != observed?.revision,
+                   latest.objective == (["pause","clear"].contains(action) ? nil : objective) {
+                    request.delivery = "confirmed"
+                    try saveRequest()
+                    break
+                }
+                try await Task.sleep(for:.milliseconds(150))
+                latest = await evidence()
+            }
+        }
+        log(AuditEvent(sessionID:session.id,summary:"그룹 Goal " + action,outcome:request.delivery,source:"세션 그룹",tool:"manage_group_member_goal",request:leader.id.uuidString))
+        return try details(latest,request)
+    }
+
     private func groupMemberGoal(_ object: JSONObject, modifying: Bool) async throws -> JSONObject {
         guard let gid = try GroupWaitRequest.uuid(object, "groupID"), let mid = try GroupWaitRequest.uuid(object, "memberID") else {
             throw RemoteHTTPError(400, "그룹과 구성원 ID를 지정해주세요.")
@@ -3900,8 +4055,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw RemoteHTTPError(403, "그룹장이 직속 구성원의 Goal을 관리할 수 있습니다.")
         }
         let (_, member, endpoint) = try await groupEvidenceTarget(object, groupID: gid, memberID: mid)
-        guard member.agent == .codex else { throw RemoteHTTPError(400, "현재 그룹 Goal 제어는 Codex 구성원을 지원합니다.") }
         guard let endpoint, let thread = endpoint.conversationID, let session = sessions[endpoint.id] else { throw GroupJobProvider.stale() }
+        if member.agent == .claude || member.agent == .agy {
+            return try await terminalGroupGoal(object, modifying:modifying, group:group, leader:leader, member:member, live:endpoint)
+        }
+        guard member.agent == .codex else { throw RemoteHTTPError(400, "Goal을 지원하는 CLI 구성원을 선택해주세요.") }
         let target = try await codexGoalTarget(session, threadID: thread)
         guard target.home == endpoint.providerHome else { throw GroupJobProvider.stale() }
         let key = "groupGoal:" + gid.uuidString + ":" + mid.uuidString + ":" + thread
@@ -3920,24 +4078,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
               confirmedEndpoint?.providerHome == target.home else { throw GroupJobProvider.stale() }
         try validateCodexQueueSession(session, threadID: thread)
         guard modifying else { return try details(current) }
-        guard let action = object["action"] as? String, ["create","edit","pause","resume"].contains(action),
+        guard let action = Self.groupGoalAction(object),
               object["threadID"] as? String == thread, object["goalRevision"] as? String == (current?.revision ?? "none"),
               target.queueAvailable else { throw RemoteHTTPError(409, "제어 서버와 현재 threadID·goalRevision·action을 확인해주세요.") }
-        guard action == "create" ? current == nil : current?.instanceID.map({ store.value(key) == $0 }) == true else {
-            throw RemoteHTTPError(409, "새 Goal은 빈 대화에 만들 수 있고, 기존 Goal은 이 그룹이 만든 경우에만 변경할 수 있습니다.")
+        guard current == nil ? ["create","set"].contains(action) : action != "create" && current?.instanceID != nil else {
+            throw RemoteHTTPError(409, "현재 Goal의 존재 여부와 식별자를 다시 확인해주세요.")
         }
         let objective: String?
-        switch action {
-        case "create", "edit":
-            guard let tid = try GroupWaitRequest.uuid(object,"taskID"), let task = try groupOrchestration().current(groupID:gid, workerMemberID:mid),
-                  task.id == tid, task.status == .working, task.parentMemberID == leader.id, task.workerConversationID == thread,
-                  let text = (object["objective"] as? String)?.trimmingCharacters(in:.whitespacesAndNewlines),
+        if ["create","set","edit"].contains(action) {
+            try validateGoalAssignment(object, group:gid, member:mid, leader:leader.id, thread:thread)
+            guard let text = (object["objective"] as? String)?.trimmingCharacters(in:.whitespacesAndNewlines),
                   !text.isEmpty, text.count <= SessionGroupOrchestration.maximumTaskLength, !text.contains("\0"),
-                  SessionGroupOrchestration.commandPrefix(text) == nil else { throw RemoteHTTPError(409,"현재 배정의 taskID와 목표 설명을 확인해주세요.") }
+                  SessionGroupOrchestration.commandPrefix(text) == nil else { throw RemoteHTTPError(400,"목표 설명을 확인해주세요.") }
             objective = text
-        default:
-            guard object["objective"] == nil, action == "pause" ? current?.status == .active : current?.status == .paused else {
-                throw RemoteHTTPError(409, "활성 Goal은 일시정지할 수 있고 일시정지된 Goal은 재개할 수 있습니다.")
+        } else {
+            guard object["objective"] == nil, action == "clear" || (action == "pause" ? current?.status == .active : current?.canResume == true) else {
+                throw RemoteHTTPError(409, "현재 Goal 상태에서 실행할 수 없는 변경입니다.")
             }
             objective = nil
         }
@@ -3953,9 +4109,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
             changingGoalThreads.remove(threadKey)
             groupWorkerActions.remove(session.id)
         }
-        let status: CodexGoal.Status? = action == "edit" ? nil : action == "pause" ? .paused : .active
+        if action == "clear", let current {
+            try setManualGoalHold(session.id,String(decoding:try JSONEncoder().encode(ManualGoalHold(goal:current,action:"cancel")),as:UTF8.self))
+            cancelCapacityResume(session.id)
+            cancelCodexProgressCheck(session.id)
+            _ = try await codexGoals.change(target,session.cwd,current,.cancel)
+            guard try await codexGoals.read(target,session.cwd) == nil else { throw RemoteHTTPError(409,"Goal 해제 결과를 다시 조회해주세요.") }
+            try store.set(key,"")
+            log(AuditEvent(sessionID:session.id,summary:"그룹 Goal 해제",outcome:"Goal 해제 확인",source:"세션 그룹",tool:"manage_group_member_goal",request:leader.id.uuidString))
+            return try details(nil)
+        }
+        let status: CodexGoal.Status? = action == "edit" || (action == "set" && current != nil) ? nil : action == "pause" ? .paused : .active
         let updated = try await CodexGoalTransport.setGroupGoal(target, cwd:session.cwd, expected:current, objective:objective, status:status)
-        if action == "create", let instance = updated.instanceID { try store.set(key, instance) }
+        if current == nil, let instance = updated.instanceID { try store.set(key, instance) }
         if updated.status == .paused {
             try setManualGoalHold(session.id,String(decoding:try JSONEncoder().encode(ManualGoalHold(goal:updated,action:"pause")),as:UTF8.self))
             cancelCapacityResume(session.id)

@@ -36,6 +36,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
     }
     package typealias GroupTurn = (prompt: String, date: Date, response: WorkCompletion)
     private struct Cached {
+        var goal: ClaudeGroupGoalEvidence?
         var groupTurns: [UUID: GroupTurn]
         var path: String, identity: Identity, value: SessionGroupModelSettings?
         var finalTurn: FinalTurn?, completionLoaded: Bool
@@ -94,7 +95,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
                     source: "agy_transcript", recordedAt: (row["created_at"] as? String).flatMap(Self.date))
                 if settings.model != nil { value = settings; break }
             }
-            cache[path] = Cached(groupTurns: [:], path: path, identity: identity, value: value, finalTurn: nil, completionLoaded: false)
+            cache[path] = Cached(goal:nil, groupTurns: [:], path: path, identity: identity, value: value, finalTurn: nil, completionLoaded: false)
             if let value { return value }
         }
         return nil
@@ -117,6 +118,12 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         guard let id = live.conversationID.flatMap(UUID.init(uuidString:))?.uuidString.lowercased(),
               let home = live.providerHome, home.hasPrefix("/") else { return [:] }
         return claude(live, home: home, id: id, includeCompletion: true)?.groupTurns ?? [:]
+    }
+
+    func claudeGoal(_ live: SessionGroupLiveSession) -> ClaudeGroupGoalEvidence? {
+        guard let id = live.conversationID.flatMap(UUID.init(uuidString:))?.uuidString.lowercased(),
+              let home = live.providerHome, home.hasPrefix("/") else { return nil }
+        return claude(live, home:home, id:id, includeCompletion:true)?.goal
     }
 
     private static func groupTurns(_ bytes: Data, id: String) -> [UUID: GroupTurn] {
@@ -184,7 +191,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         let completion = includeCompletion ? Self.claudeCompletion(bytes, id: id) : nil
         guard Identity(path) == before else { return nil }
         if cache.count >= 256, cache[key] == nil { cache.removeAll(keepingCapacity: true) }
-        let result = Cached(groupTurns: includeCompletion ? Self.groupTurns(bytes, id: id) : [:], path: path, identity: before, value: value, finalTurn: completion, completionLoaded: includeCompletion)
+        let result = Cached(goal:includeCompletion ? ClaudeGroupGoalEvidence.read(bytes,id:id,complete:start == 0) : nil, groupTurns: includeCompletion ? Self.groupTurns(bytes, id: id) : [:], path: path, identity: before, value: value, finalTurn: completion, completionLoaded: includeCompletion)
         cache[key] = result
         return result
     }
