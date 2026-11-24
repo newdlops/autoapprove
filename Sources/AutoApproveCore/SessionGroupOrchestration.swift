@@ -37,6 +37,8 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
     var closedWithoutReport: Bool?
     public var replacesTaskID: UUID?
     public var interruptCheckpoint: String?
+    var backgroundInterrupt: String?
+    var backgroundCheckpoint: String?
 
 
     public init(id: UUID = UUID(), groupID: UUID, workerMemberID: UUID, parentMemberID: UUID,
@@ -155,6 +157,12 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     mutating func recordUncertainAssignment(_ id: UUID) {
         guard let index = assignments.firstIndex(where: { $0.id == id }) else { return }
         assignments[index].deliveryError = "unknown"
+    }
+
+    mutating func recordBackgroundInterrupt(_ id: UUID, target: String?, screen: String?) {
+        guard let index = assignments.firstIndex(where: { $0.id == id }) else { return }
+        assignments[index].backgroundInterrupt = target
+        assignments[index].backgroundCheckpoint = screen
     }
 
     mutating func checkpointInterrupt(_ id: UUID, text: String?) {

@@ -3626,7 +3626,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func groupBackgroundAction(_ object: JSONObject, stop: Bool) async throws -> JSONObject {
+    private func groupBackgroundAction(_ object: JSONObject, stop: Bool, authorizeStop: (@MainActor () throws -> Void)? = nil) async throws -> JSONObject {
         guard let gid = try GroupWaitRequest.uuid(object,"groupID") else { throw RemoteHTTPError(400,"그룹 ID가 필요합니다.") }
         let selected = try GroupWaitRequest.uuid(object,"memberID")
         let id = object["jobID"] as? String
@@ -3678,6 +3678,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                       !self.snapshot.paused, !self.remoteInputStopped, !self.groupClearActive(gid), endpoint?.id == live.id,
                                       endpoint?.providerHome == live.providerHome, endpoint?.conversationID == live.conversationID,
                                       try box.backgroundJobs(group:gid,member:member.id,session:live.id,conversation:reserved.conversation,id:id).first?.status == "running" else { throw GroupJobProvider.stale() }
+                                try authorizeStop?()
                                 try box.saveBackgroundJob(reserved)
                                 }
                             }.value
@@ -3770,7 +3771,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
             var row: JSONObject = ["id": member.id.uuidString, "name": member.nickname ?? member.title, "composer": "unknown",
                 "phase": live.map { groupDisplayPhase($0.session, observation: $0).rawValue } ?? "disconnected",
                 "queued": inbox[member.id]?.queuedCount ?? 0, "unacknowledged": inbox[member.id]?.unacknowledgedCount ?? 0]
-            row["lastReport"] = state.assignments.filter { $0.groupID == group.id && $0.workerMemberID == member.id && $0.summary != nil }.max { ($0.completedAt ?? $0.sentAt) < ($1.completedAt ?? $1.sentAt) }.flatMap { $0.summary }.map { String(SessionGroupOrchestration.oneLine($0).prefix(180)) }
+            if let report = state.assignments.filter({ $0.groupID == group.id && $0.workerMemberID == member.id && $0.completedAt != nil && $0.summary != nil })
+                .max(by:{ $0.completedAt! < $1.completedAt! }), let summary = report.summary, let date = report.completedAt {
+                let text = String(SessionGroupOrchestration.oneLine(summary).prefix(180))
+                let sameConversation = live?.conversationID.flatMap(UUID.init(uuidString:)).map { $0 == report.workerConversationID.flatMap(UUID.init(uuidString:)) } == true
+                let current = report.id == task?.id && sameConversation
+                row["lastReportTaskID"] = report.id.uuidString
+                row["lastReportAt"] = formatter.string(from:date)
+                row["lastReportScope"] = current ? "currentTask" : "history"
+                row[current ? "lastReport" : "previousReport"] = text
+            }
             let queued = (state.queue ?? []).filter { $0.assignment.groupID == group.id && $0.assignment.workerMemberID == member.id }
             row["queuedTaskCount"] = queued.count
             row["taskQueue"] = queued.prefix(3).map { ["id":$0.assignment.id.uuidString,"afterTaskID":$0.after.uuidString,"title":String($0.assignment.task.prefix(72)),"state":$0.hold ?? "waiting"] }
@@ -4059,18 +4069,34 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let endpoint, let session = sessions[endpoint.id], !saved.isLeader(member),
               groupWorkerActions.insert(endpoint.id).inserted else { throw RemoteHTTPError(409, "작업자 연결 또는 진행 중인 요청을 확인해주세요.") }
         defer { groupWorkerActions.remove(endpoint.id) }
+        let explicitClaude = object["tool"] as? String == "interrupt_group_task" && session.agent == .claude
         func validate() throws {
             guard !snapshot.paused, !remoteInputStopped, !groupClearActive(group),
                   let current = sessions[endpoint.id], current.phase != .ended, !current.pendingInTerminal,
                   let assignment = try groupOrchestration().current(groupID: group, workerMemberID: member),
-                  assignment.id == taskID, assignment.status == .working, assignment.isDelivered,
+                  assignment.id == taskID, (assignment.status == .working || explicitClaude && [.completed,.reported].contains(assignment.status)), assignment.isDelivered,
                   assignment.workerSessionID == endpoint.id, assignment.workerConversationID == endpoint.conversationID,
                   let latest = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == group }),
                   latest.sameMembership(as: saved), latest.members.contains(target) else { throw RemoteHTTPError(409, "그룹 또는 작업자의 현재 배정이 바뀌었습니다.") }
         }
         try validate()
-        if let previous = try groupOrchestration().current(groupID: group, workerMemberID: member)?.interruptCheckpoint {
-            return ["taskID": taskID.uuidString, "alreadyRequested": true, "checkpoint": previous]
+        guard let assignment = try groupOrchestration().current(groupID:group,workerMemberID:member) else { throw GroupJobProvider.stale() }
+        let stopPrompt = "배정 " + taskID.uuidString + "에서 시작해 대기 중인 백그라운드 Bash 셸을 확인하세요. 이 대화의 해당 배정에 속한 셸 하나가 확인될 때만 그 작업 ID로 TaskStop을 호출하고 결과를 알려주세요. 대상이 불분명하면 중단하지 말고 이유를 알려주세요."
+        if let prior = assignment.backgroundInterrupt, object["tool"] as? String == "interrupt_group_task" {
+            var reply: JSONObject = ["taskID":taskID.uuidString,"alreadyRequested":true,"escapeSent":false,"checkpoint":assignment.backgroundCheckpoint ?? ""]
+            if prior == "claudeTaskStop" {
+                let reader = groupTranscriptReader
+                let result = await Task.detached { reader.completion(endpoint,after:assignment.sentAt,task:stopPrompt) }.value
+                try validate()
+                reply["stage"] = result == nil ? "workerStopRequested" : "workerReplied"
+                reply["workerReply"] = result.map { String($0.summary.prefix(300)) }
+            }
+            else if prior.hasPrefix("fetch:") { reply["stage"] = ClaudeFetchInterrupt.status(prior) }
+            else if let conversation = endpoint.conversationID {
+                reply["jobID"] = prior
+                reply["stage"] = try groupMailbox().backgroundJobs(group:group,member:member,session:endpoint.id,conversation:conversation,id:prior).first?.status ?? "unknown"
+            }
+            return reply
         }
         let frame = try await remoteTerminal(sessionID: endpoint.id, realtime: true, textOnly: true)
         guard !sendingMessages.contains(endpoint.id), !(await nativeUserInputHasPriority(endpoint.id, backgroundOnly: true)) else {
@@ -4080,9 +4106,76 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try validate()
         let agyWorking = session.agent == .agy && sessions[session.id]?.phase == .working &&
             ActivityDetector.nonemptyTail(frame.screen).suffix(6).joined(separator: " ").range(of: #"(?i)esc(?:ape)? to (?:cancel|interrupt|stop)"#, options: .regularExpression) != nil
-        guard confirmed?.id == endpoint.id, confirmed?.conversationID == endpoint.conversationID,
-              frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: session.agent),
-              agyWorking || ActivityDetector.detect(frame.screen, agent: session.agent).phase == .working else {
+        guard confirmed?.id == endpoint.id, confirmed?.conversationID == endpoint.conversationID, frame.outputReason == nil,
+              frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: session.agent) else { throw GroupJobProvider.stale() }
+        if object["tool"] as? String == "interrupt_group_task", session.agent == .claude, Self.groupComposerIdle(frame,agent:.claude),
+           let count = ActivityDetector.backgroundCount(frame.screen,agent:.claude), count > 0 {
+            let jobs = try? await refreshBackgroundJobs(endpoint,group:saved,member:target)
+            let ids = jobSnapshots[jobKey(group,member,endpoint)]?.ids ?? []
+            let active = (jobs ?? []).filter { ids.contains($0.id) }
+            try validate()
+            let checkpoint = String(frame.screen.suffix(1600))
+            let candidates = active.filter { $0.taskID == taskID || ($0.taskID == nil && count == 1 && $0.startedAt.map { $0 >= assignment.sentAt } == true) }
+            let selected = candidates.count == 1 ? candidates.first : nil
+            if selected == nil && count != 1 {
+                return ["stage":"selectBackgroundJob","taskID":taskID.uuidString,"backgroundRunning":count,"jobs":active.map(\.json),"nextTool":"list_group_background_jobs","escapeSent":false]
+            }
+            guard selected != nil || active.isEmpty || active.allSatisfy({ $0.taskID == nil && $0.startedAt == nil }) else {
+                return ["stage":"checkBackgroundOwnership","jobs":active.map(\.json),"taskID":taskID.uuidString,"escapeSent":false]
+            }
+            let fetch: ClaudeFetchInterrupt.Target?
+            if selected == nil, active.isEmpty, count == 1, frame.screen.range(of:#"\bgit\s+fetch\b"#,options:.regularExpression) != nil {
+                fetch = try? await Task.detached { try ClaudeFetchInterrupt.find(session,after:assignment.sentAt) }.value
+            } else { fetch = nil }
+            func reserve(_ target: String) throws {
+                try validate()
+                var state = try groupOrchestration()
+                state.recordBackgroundInterrupt(taskID,target:target,screen:checkpoint)
+                try saveGroupOrchestration(state)
+            }
+            do {
+                if let selected {
+                    var params = object
+                    params["jobID"] = selected.id
+                    let result = try await groupBackgroundAction(params,stop:true) { try reserve(selected.id) }
+                    guard let status = result["status"] as? String, status != "running" else {
+                        throw RemoteHTTPError(409,"셸 종료 요청이 접수되지 않았습니다.",diagnostics:["delivery":"not_started"])
+                    }
+                    return ["taskID":taskID.uuidString,"jobID":selected.id,"stage":status,"escapeSent":false,"checkpoint":checkpoint]
+                }
+                if let fetch {
+                    let (_,_,bound) = try await groupEvidenceTarget(object,groupID:group,memberID:member)
+                    let liveFrame = try await remoteTerminal(sessionID:endpoint.id,realtime:true,textOnly:true)
+                    guard bound?.id == endpoint.id, bound?.conversationID == endpoint.conversationID,
+                          liveFrame.screen == frame.screen, Self.groupComposerIdle(liveFrame,agent:.claude),
+                          !(await nativeUserInputHasPriority(endpoint.id,backgroundOnly:true)) else { throw GroupJobProvider.stale() }
+                    try reserve(fetch.token)
+                    try ClaudeFetchInterrupt.stop(fetch,session:session,after:assignment.sentAt)
+                    return ["taskID":taskID.uuidString,"stage":ClaudeFetchInterrupt.status(fetch.token),"escapeSent":false,"checkpoint":checkpoint]
+                }
+                try await sendGroupLine(session,text:stopPrompt,groupTarget:endpoint) {
+                    let (_,_,latest) = try await self.groupEvidenceTarget(object,groupID:group,memberID:member)
+                    let fresh = try await self.remoteTerminal(sessionID:endpoint.id,realtime:true,textOnly:true)
+                    guard latest?.id == endpoint.id, latest?.conversationID == endpoint.conversationID,
+                          Self.groupComposerIdle(fresh,agent:.claude), ActivityDetector.backgroundCount(fresh.screen,agent:.claude) == 1,
+                          !(await self.nativeUserInputHasPriority(endpoint.id,backgroundOnly:true)) else { throw GroupJobProvider.stale() }
+                    try reserve("claudeTaskStop")
+                    return fresh.screen
+                }
+                return ["taskID":taskID.uuidString,"stage":"workerStopRequested","escapeSent":false,"checkpoint":checkpoint]
+            } catch {
+                if (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started" {
+                    var state = try groupOrchestration()
+                    state.recordBackgroundInterrupt(taskID,target:nil,screen:nil)
+                    try saveGroupOrchestration(state)
+                }
+                throw error
+            }
+        }
+        if let previous = assignment.interruptCheckpoint {
+            return ["taskID": taskID.uuidString, "alreadyRequested": true, "checkpoint": previous]
+        }
+        guard assignment.status == .working, agyWorking || ActivityDetector.detect(frame.screen, agent: session.agent).phase == .working else {
             throw RemoteHTTPError(409, "실행 중인 작업 화면을 확인하지 못했습니다.")
         }
         var state = try groupOrchestration()

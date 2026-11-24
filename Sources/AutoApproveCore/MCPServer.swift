@@ -86,7 +86,7 @@ public enum AutoApproveMCPServer {
             tool("retry_group_submission", "그룹장이 저장된 원래 메시지 또는 배정 ID와 입력창 원문이 일치할 때 Enter를 한 번 보냅니다.", ["groupID":string,"memberID":string,"messageID":string,"conversationID":string], ["groupID","memberID","messageID"],destructive:true),
             tool("replace_group_task", "그룹장이 직속 구성원의 taskID를 새 task로 교체합니다. 재시도는 같은 requestID로 하세요.", ["groupID":string,"memberID":string,"taskID":string,"task":string,"requestID":string,"conversationID":string], ["groupID","memberID","taskID","task","requestID"], destructive:true),
             tool("clear_group_composer", "그룹장이 입력 중인 초안을 확인합니다. 반환된 draftToken을 다시 지정하면 해당 초안만 비웁니다.", ["groupID":string,"memberID":string,"draftToken":string,"conversationID":string], ["groupID","memberID"], destructive:true),
-            tool("interrupt_group_task", "그룹장이 현재 작업 ID와 실행 중 화면을 확인하고 마지막 화면을 저장한 뒤 Esc를 한 번 전달합니다. escapeSent는 입력 전달 결과입니다.",
+            tool("interrupt_group_task", "그룹장이 현재 작업 ID와 실행 중 화면을 확인하고 마지막 화면을 저장한 뒤 Esc를 한 번 전달합니다. Claude 빈 입력창에 셸이 남으면 해당 셸 종료를 시도합니다. workerStopRequested는 Claude에 TaskStop 확인을 요청한 상태이며 종료 확인은 stopped입니다.",
                  ["groupID": string, "memberID": string, "taskID": string, "conversationID": string], ["groupID","memberID","taskID"], destructive: true),
             tool("cancel_group_messages", "같은 구성원에게 보낸 대기 중 일반 메시지를 취소합니다. 이미 전송 중인 항목이 있으면 전체 요청을 보류합니다.",
                  ["groupID": string, "memberID": string, "messageIDs": ids, "conversationID": string], ["groupID","memberID","messageIDs"], destructive: true),

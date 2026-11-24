@@ -96,6 +96,10 @@ public enum ActivityDetector {
               rows.count-marker <= 10 else { return nil }
         let footer = Array(rows.dropFirst(marker+1))
         var lines = footer
+        if agent == .claude {
+            let before = rows[..<marker].reversed().drop(while: { $0.allSatisfy { "─━╌ ".contains($0) } })
+            if let line = before.first, isRemainingShellHint(line) { lines.append(line) }
+        }
         if let compact = compactClaudeFooter(footer) { lines.append(compact.text) }
         for line in lines where isBackgroundHint(line) || isCompactClaudeFooter(line) {
             let pattern = #"(?i)\b\d{1,4}(?= (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?|shells?)\b)"#
@@ -105,7 +109,7 @@ public enum ActivityDetector {
     }
 
     private static func isRemainingShellHint(_ line: String) -> Bool {
-        matches(line, #"(?i)^[•·⏵▶↳\s]*[0-9]{1,4} shells? still running\.?(?:\s*·\s*[^·]{1,64})?$"#)
+        matches(line, #"(?i)^(?:[✻✶✽✢✳] [^·]{1,64} · )?[•●·⏵▶↳\s]*[0-9]{1,4} shells? still running\.?(?:\s*·\s*[^·]{1,64})?$"#)
     }
 
     private static func isBackgroundHint(_ line: String) -> Bool {

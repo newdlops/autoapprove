@@ -836,6 +836,10 @@ extension ApprovalTests {
         try SessionGroupStore(directory: dir).save([group])
         let body = String(repeating: "Review the proposed change. ", count: 125)
         var state = SessionGroupOrchestration()
+        let earlier = SessionGroupAssignment(groupID:group.id,workerMemberID:members[1].id,parentMemberID:members[0].id,workerSessionID:sessions[1].id,parentSessionID:sessions[0].id,task:"이전 작업")
+        state.begin(earlier)
+        state.markDelivered(earlier.id)
+        _ = state.complete(workerSessionID:sessions[1].id,completion:WorkCompletion(id:"old",summary:"리베이스 충돌로 멈춤"))
         for i in 1..<members.count {
             let assignment = SessionGroupAssignment(groupID: group.id, workerMemberID: members[i].id, parentMemberID: members[0].id,
                 workerSessionID: sessions[i].id, parentSessionID: sessions[0].id, task: body)
@@ -852,6 +856,11 @@ extension ApprovalTests {
         let overview = try await engine.mcpAction(args.merging(["view": "overview"]) { _, new in new })
         let rows = try unwrapGroup((overview["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject])
         try expectEqual(rows.count, 11)
+        let history = try unwrapGroup(rows.first { $0["id"] as? String == members[1].id.uuidString })
+        try expectEqual(history["previousReport"] as? String,"리베이스 충돌로 멈춤")
+        try expectNil(history["lastReport"])
+        try expectEqual(history["lastReportTaskID"] as? String,earlier.id.uuidString)
+        try expectEqual(history["lastReportScope"] as? String,"history")
         let shortBytes = try JSONSerialization.data(withJSONObject: overview).count
         let fullBytes = try JSONSerialization.data(withJSONObject: full).count
         try expect(shortBytes * 5 < fullBytes)
@@ -1040,6 +1049,19 @@ extension ApprovalTests {
         try expectEqual(writer.writes.filter { $0.contains("후속 검증") }.count,1)
         let command = try await action("send_group_message",["text":"다음 검증","asTask":true,"messageID":UUID().uuidString])
         try expectNotNil(command["taskID"])
+        let currentID = try unwrapGroup(command["taskID"] as? String)
+        let recovery: JSONObject = ["taskID":currentID]
+        writer.show("────────\n❯ \n────────\n2 shells still running",on:worker.session.tty)
+        let multiple = try await action("interrupt_group_task",recovery)
+        try expectEqual(multiple["stage"] as? String,"selectBackgroundJob")
+        writer.show("Waiting for git fetch\n✻ Worked for 4m · 1 shell still running\n────────\n❯ \n────────\n? for shortcuts",on:worker.session.tty)
+        let priorWrites = writer.writes.count
+        let recoveryResult = try await action("interrupt_group_task",recovery)
+        try expectEqual(recoveryResult["stage"] as? String,"workerStopRequested")
+        try expectEqual(recoveryResult["escapeSent"] as? Bool,false)
+        try expect(writer.writes.last?.contains("TaskStop") == true)
+        try expectEqual(try await action("interrupt_group_task",recovery)["alreadyRequested"] as? Bool,true)
+        try expectEqual(writer.writes.count,priorWrites + 1)
         try expectEqual(ActivityDetector.backgroundCount("❯ \n1 shell still running",agent:.claude),1)
         try expectEqual(ActivityDetector.detect("❯ \n1 shell still running",agent:.claude).phase,.idle)
         try expectEqual(ActivityDetector.detect("❯ draft\n1 shell still running",agent:.claude).phase,.input)
