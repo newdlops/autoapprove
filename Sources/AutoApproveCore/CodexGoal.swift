@@ -97,6 +97,27 @@ public struct CodexGoalTransport:Sendable {
             return goal
         }.value
     })
+    static func setGroupGoal(_ target: CodexReplyTarget, cwd: String, expected: CodexGoal?, objective: String?, status: CodexGoal.Status?) async throws -> CodexGoal {
+        try await Task.detached(priority: .utility) {
+            let connection = try CodexQueueConnection(home: target.home)
+            try validate(connection, target: target, cwd: cwd)
+            let current = try readControl(connection, target: target)
+            guard current?.revision == expected?.revision else { throw RemoteHTTPError(409, "Goal이 변경되었습니다. 다시 조회해주세요.") }
+            var params: JSONObject = ["threadId":target.threadID, "origin":"automatic"]
+            params["objective"] = objective
+            params["status"] = status?.rawValue
+            try Task.checkCancellation()
+            let response = try decode(connection.request("thread/goal/set", params), threadID: target.threadID)
+            guard let response, let result = try readControl(connection, target: target), result.instanceID != nil,
+                  response.createdAt == result.createdAt, response.objective == result.objective,
+                  result.objective == (objective ?? current?.objective),
+                  status == nil || result.status == status,
+                  current == nil || (result.instanceID == current?.instanceID && result.tokenBudget == current?.tokenBudget)
+            else { throw RemoteHTTPError(409, "Goal 변경 결과를 확인하지 못했습니다. 현재 Goal을 다시 조회해주세요.") }
+            return result
+        }.value
+    }
+
     private static func validate(_ connection:CodexQueueConnection,target:CodexReplyTarget,cwd:String) throws {
         guard UUID(uuidString:target.threadID) != nil else {throw RemoteHTTPError(400,"원래 Codex 대화를 지정해주세요.")}
         let value=try connection.request("thread/read",["threadId":target.threadID,"includeTurns":false])

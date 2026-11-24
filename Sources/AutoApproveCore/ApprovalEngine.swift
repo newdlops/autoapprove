@@ -3891,6 +3891,80 @@ private struct ScreenAnalysisStorageKey: Hashable {
             diagnostics:["delivery":"not_started","taskID":task.id.uuidString,"assignedBy":task.parentMemberID.uuidString,"assignedAt":date,"taskTitle":title])
     }
 
+    private func groupMemberGoal(_ object: JSONObject, modifying: Bool) async throws -> JSONObject {
+        guard let gid = try GroupWaitRequest.uuid(object, "groupID"), let mid = try GroupWaitRequest.uuid(object, "memberID") else {
+            throw RemoteHTTPError(400, "그룹과 구성원 ID를 지정해주세요.")
+        }
+        let (group, leader) = try await groupMailboxCaller(object, groupID: gid, verified: true)
+        guard group.isLeader(leader.id), group.canDirect(leader.id, worker: mid) else {
+            throw RemoteHTTPError(403, "그룹장이 직속 구성원의 Goal을 관리할 수 있습니다.")
+        }
+        let (_, member, endpoint) = try await groupEvidenceTarget(object, groupID: gid, memberID: mid)
+        guard member.agent == .codex else { throw RemoteHTTPError(400, "현재 그룹 Goal 제어는 Codex 구성원을 지원합니다.") }
+        guard let endpoint, let thread = endpoint.conversationID, let session = sessions[endpoint.id] else { throw GroupJobProvider.stale() }
+        let target = try await codexGoalTarget(session, threadID: thread)
+        guard target.home == endpoint.providerHome else { throw GroupJobProvider.stale() }
+        let key = "groupGoal:" + gid.uuidString + ":" + mid.uuidString + ":" + thread
+        let current = try await codexGoals.read(target, session.cwd)
+        func details(_ goal: CodexGoal?) throws -> JSONObject {
+            let owned = goal?.instanceID.map { store.value(key) == $0 } ?? false
+            var result: JSONObject = ["groupID":gid.uuidString, "memberID":mid.uuidString, "threadID":thread,
+                "goalRevision":goal?.revision ?? "none", "groupOwned":owned, "controlAvailable":target.queueAvailable]
+            result["goal"] = try goal.map { try JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) } ?? NSNull()
+            return result
+        }
+        let (confirmedGroup, confirmedMember, confirmedEndpoint) = try await groupEvidenceTarget(object, groupID: gid, memberID: mid)
+        guard confirmedGroup.isLeader(leader.id), confirmedGroup.canDirect(leader.id, worker: mid),
+              confirmedGroup.sameMembership(as: group), confirmedMember == member,
+              confirmedEndpoint?.id == endpoint.id, confirmedEndpoint?.conversationID == thread,
+              confirmedEndpoint?.providerHome == target.home else { throw GroupJobProvider.stale() }
+        try validateCodexQueueSession(session, threadID: thread)
+        guard modifying else { return try details(current) }
+        guard let action = object["action"] as? String, ["create","edit","pause","resume"].contains(action),
+              object["threadID"] as? String == thread, object["goalRevision"] as? String == (current?.revision ?? "none"),
+              target.queueAvailable else { throw RemoteHTTPError(409, "제어 서버와 현재 threadID·goalRevision·action을 확인해주세요.") }
+        guard action == "create" ? current == nil : current?.instanceID.map({ store.value(key) == $0 }) == true else {
+            throw RemoteHTTPError(409, "새 Goal은 빈 대화에 만들 수 있고, 기존 Goal은 이 그룹이 만든 경우에만 변경할 수 있습니다.")
+        }
+        let objective: String?
+        switch action {
+        case "create", "edit":
+            guard let tid = try GroupWaitRequest.uuid(object,"taskID"), let task = try groupOrchestration().current(groupID:gid, workerMemberID:mid),
+                  task.id == tid, task.status == .working, task.parentMemberID == leader.id, task.workerConversationID == thread,
+                  let text = (object["objective"] as? String)?.trimmingCharacters(in:.whitespacesAndNewlines),
+                  !text.isEmpty, text.count <= SessionGroupOrchestration.maximumTaskLength, !text.contains("\0"),
+                  SessionGroupOrchestration.commandPrefix(text) == nil else { throw RemoteHTTPError(409,"현재 배정의 taskID와 목표 설명을 확인해주세요.") }
+            objective = text
+        default:
+            guard object["objective"] == nil, action == "pause" ? current?.status == .active : current?.status == .paused else {
+                throw RemoteHTTPError(409, "활성 Goal은 일시정지할 수 있고 일시정지된 Goal은 재개할 수 있습니다.")
+            }
+            objective = nil
+        }
+        let threadKey = target.home + "\0" + thread
+        guard !snapshot.paused, !remoteInputStopped, !userInputHasPriority(session.id), !automaticInputBusy(session.id),
+              !groupWorkerActions.contains(session.id), !changingGoalThreads.contains(threadKey), !changingGoals.contains(session.id),
+              !groupClearActive(gid) else { throw GroupJobProvider.stale() }
+        changingGoals.insert(session.id)
+        changingGoalThreads.insert(threadKey)
+        groupWorkerActions.insert(session.id)
+        defer {
+            changingGoals.remove(session.id)
+            changingGoalThreads.remove(threadKey)
+            groupWorkerActions.remove(session.id)
+        }
+        let status: CodexGoal.Status? = action == "edit" ? nil : action == "pause" ? .paused : .active
+        let updated = try await CodexGoalTransport.setGroupGoal(target, cwd:session.cwd, expected:current, objective:objective, status:status)
+        if action == "create", let instance = updated.instanceID { try store.set(key, instance) }
+        if updated.status == .paused {
+            try setManualGoalHold(session.id,String(decoding:try JSONEncoder().encode(ManualGoalHold(goal:updated,action:"pause")),as:UTF8.self))
+            cancelCapacityResume(session.id)
+            cancelCodexProgressCheck(session.id)
+        } else if updated.status == .active { try setManualGoalHold(session.id,"") }
+        log(AuditEvent(sessionID:session.id,summary:"그룹 Goal " + action,outcome:"Goal 변경 확인",source:"세션 그룹",tool:"manage_group_member_goal",request:leader.id.uuidString))
+        return try details(updated)
+    }
+
     private func manageGroupTask(_ object: JSONObject) async throws -> JSONObject {
         guard let gid = try GroupWaitRequest.uuid(object,"groupID"), let mid = try GroupWaitRequest.uuid(object,"memberID"),
               let id = try GroupWaitRequest.uuid(object,"taskID"), let action = object["action"] as? String,
@@ -6224,6 +6298,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try box.transaction { try box.retireQueued(ids, group: group, sender: caller.id, recipient: member, replacement: nil) }
             scheduleGroupMailboxDelivery()
             return ["cancelled": ids.map(\.uuidString)]
+        case "get_group_member_goal", "manage_group_member_goal":
+            return try await groupMemberGoal(object, modifying: tool == "manage_group_member_goal")
         case "manage_group_task":
             return try await manageGroupTask(object)
         case "retry_group_submission":
