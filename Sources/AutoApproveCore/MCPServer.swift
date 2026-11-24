@@ -78,6 +78,10 @@ public enum AutoApproveMCPServer {
             tool("assign_group_tasks", "구성원별 배정 결과와 오류를 돌려줍니다. 공통 task 또는 항목별 task를 사용하세요. 항목별 requestID를 재사용하고 전달 불명은 먼저 화면을 확인하세요.",
                  ["groupID": string, "conversationID": string, "task": string, "assignments": ["type": "array", "minItems": 1, "maxItems": 16,
                   "items": ["type": "object", "properties": ["memberID": string, "task": string, "workScope": string, "allowScopeConflict": bool, "requestID": string], "required": ["memberID"], "additionalProperties": false]]], ["groupID", "assignments"]),
+            tool("watch_group_events", "그룹장의 변경 이벤트 조회. cursor를 보관해 다음 호출에 사용하세요. 최대 50건, waitSeconds 0~20초.", ["groupID": string, "cursor": ["type":"integer","minimum":0], "waitSeconds":["type":"integer","minimum":0,"maximum":20], "conversationID":string], ["groupID"], readOnly:true),
+            tool("explain_group_delivery", "그룹장이 메시지별 제출·수신 증거와 다음 행동을 조회합니다.", ["groupID":string,"messageID":string,"conversationID":string], ["groupID","messageID"], readOnly:true),
+            tool("replace_group_task", "그룹장이 직속 구성원의 taskID를 새 task로 교체합니다. 재시도는 같은 requestID로 하세요.", ["groupID":string,"memberID":string,"taskID":string,"task":string,"requestID":string,"conversationID":string], ["groupID","memberID","taskID","task","requestID"], destructive:true),
+            tool("clear_group_composer", "그룹장이 입력 중인 초안을 확인합니다. 반환된 draftToken을 다시 지정하면 해당 초안만 비웁니다.", ["groupID":string,"memberID":string,"draftToken":string,"conversationID":string], ["groupID","memberID"], destructive:true),
             tool("interrupt_group_task", "그룹장이 현재 작업 ID와 실행 중 화면을 확인하고 마지막 화면을 저장한 뒤 Esc를 한 번 전달합니다. escapeSent는 입력 전달 결과입니다.",
                  ["groupID": string, "memberID": string, "taskID": string, "conversationID": string], ["groupID","memberID","taskID"], destructive: true),
             tool("cancel_group_messages", "같은 구성원에게 보낸 대기 중 일반 메시지를 취소합니다. 이미 전송 중인 항목이 있으면 전체 요청을 보류합니다.",
@@ -198,7 +202,7 @@ public enum AutoApproveMCPServer {
             let handle = {
             if let value = response(message, profile: profile, call: { tool, arguments in
                 var params = arguments; params["tool"] = tool; params["owner"] = owner
-                let groupTool = ["wait_group_dependencies", "update_group_wait", "complete_group_task", "get_session_groups", "get_group_status", "assign_group_task", "assign_group_tasks", "interrupt_group_task", "cancel_group_messages", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "get_group_member_terminal", "ack_group_messages", "clear_session_group", "clear_group_member", "set_group_member_title", "set_group_member_tab_color", "get_group_clear_status"].contains(tool)
+                let groupTool = ["wait_group_dependencies", "update_group_wait", "complete_group_task", "get_session_groups", "get_group_status", "assign_group_task", "assign_group_tasks", "watch_group_events","explain_group_delivery","replace_group_task","clear_group_composer","interrupt_group_task", "cancel_group_messages", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "get_group_member_terminal", "ack_group_messages", "clear_session_group", "clear_group_member", "set_group_member_title", "set_group_member_tab_color", "get_group_clear_status"].contains(tool)
                 // Only this process may attribute the caller; never trust a supplied session or agent kind.
                 params.removeValue(forKey: "codexCallerRuntimeID")
                 if groupTool {

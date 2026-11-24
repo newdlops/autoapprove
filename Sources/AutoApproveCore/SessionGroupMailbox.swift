@@ -39,7 +39,7 @@ public struct SessionGroupMessage: Equatable {
     }
     var isUserButtonInput: Bool { kind == .notice && sourceKey?.hasPrefix(Self.userButtonSourcePrefix) == true }
 
-    func terminalPrompt(senderTitle: String, recipientAgent: AgentKind? = nil) -> String {
+    package func terminalPrompt(senderTitle: String, recipientAgent: AgentKind? = nil) -> String {
         func fitsComposer(_ prompt: String) -> Bool {
             recipientAgent != .claude || prompt.utf16.count <= 500
         }
@@ -181,6 +181,26 @@ public final class SessionGroupMailbox {
             try execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; CREATE TABLE IF NOT EXISTS messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,group_id TEXT NOT NULL,sender_id TEXT NOT NULL,recipient_id TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,created REAL NOT NULL,acknowledged REAL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,last_result TEXT,last_error TEXT,source_key TEXT UNIQUE); CREATE INDEX IF NOT EXISTS message_inbox ON messages(group_id,recipient_id,acknowledged,sequence); CREATE INDEX IF NOT EXISTS message_outbox ON messages(group_id,sender_id,sequence);")
             try execute("""
                 CREATE INDEX IF NOT EXISTS message_pending_age ON messages(created) WHERE \(Self.pendingFilter);
+                CREATE TABLE IF NOT EXISTS group_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, gid TEXT NOT NULL, member TEXT NOT NULL,
+                    ref TEXT NOT NULL, kind TEXT NOT NULL, at REAL NOT NULL, age INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(gid,ref,kind));
+                CREATE INDEX IF NOT EXISTS group_events_page ON group_events(gid,seq);
+                CREATE TABLE IF NOT EXISTS group_delivery_observations (mid TEXT PRIMARY KEY, at REAL NOT NULL);
+                CREATE TRIGGER IF NOT EXISTS group_delivery_time AFTER UPDATE OF last_result,last_error,acknowledged ON messages
+                WHEN NEW.last_result IS NOT OLD.last_result OR NEW.last_error IS NOT OLD.last_error OR NEW.acknowledged IS NOT OLD.acknowledged
+                BEGIN
+                    INSERT OR REPLACE INTO group_delivery_observations(mid,at) VALUES(NEW.id,strftime('%s','now'));
+                END;
+                CREATE TRIGGER IF NOT EXISTS group_delivery_event AFTER UPDATE OF last_result,acknowledged ON messages
+                WHEN (NEW.acknowledged IS NOT OLD.acknowledged OR NEW.last_result IS NOT OLD.last_result)
+                    AND (NEW.acknowledged IS NOT NULL OR NEW.last_result IN ('direct_submitted','direct_unknown','undelivered','superseded'))
+                BEGIN
+                    INSERT OR IGNORE INTO group_events(gid,member,ref,kind,at,age)
+                    VALUES(NEW.group_id,NEW.recipient_id,NEW.id,
+                        CASE WHEN NEW.acknowledged IS NOT NULL THEN 'acknowledged' ELSE NEW.last_result END,
+                        strftime('%s','now'),max(0,CAST(strftime('%s','now')-NEW.created AS INTEGER)));
+                END;
                 CREATE TABLE IF NOT EXISTS group_submissions (
                     message_id TEXT PRIMARY KEY, conversation TEXT NOT NULL, prompt TEXT NOT NULL, submitted REAL NOT NULL
                 );
@@ -431,6 +451,61 @@ public final class SessionGroupMailbox {
         guard let result = try message(key) else { throw AppError.message("저장된 그룹 메시지를 확인하지 못했습니다.") }
         return result
     }
+    func recordHeldEvents() throws {
+        try update("""
+            INSERT OR IGNORE INTO group_events(gid,member,ref,kind,at,age)
+            SELECT group_id,recipient_id,id,'deliveryHeld',strftime('%s','now'),CAST(strftime('%s','now')-created AS INTEGER)
+            FROM messages WHERE acknowledged IS NULL AND last_result IN ('not_started','undelivered','sender_absent')
+              AND created<=strftime('%s','now')-300
+            """, [])
+    }
+
+    func taskEvent(_ task: SessionGroupAssignment, kind: String) throws {
+        try update("INSERT OR IGNORE INTO group_events(gid,member,ref,kind,at,age) VALUES(?,?,?,?,?,?)",
+            [task.groupID.uuidString, task.workerMemberID.uuidString, task.id.uuidString, kind,
+             String(Date().timeIntervalSince1970), String(max(0, Int(Date().timeIntervalSince(task.sentAt))))])
+    }
+
+    package func events(group: UUID, after cursor: Int) throws -> [JSONObject] {
+        let q = try statement("SELECT seq,member,ref,kind,at,age FROM group_events WHERE gid=? AND seq>? ORDER BY seq LIMIT 51", [group.uuidString, String(cursor)])
+        defer { sqlite3_finalize(q) }
+        var page: [JSONObject] = []
+        while true {
+            switch sqlite3_step(q) {
+            case SQLITE_ROW:
+                page.append(["cursor": Int(sqlite3_column_int64(q, 0)), "memberID": String(cString: sqlite3_column_text(q, 1)),
+                    "referenceID": String(cString: sqlite3_column_text(q, 2)), "event": String(cString: sqlite3_column_text(q, 3)),
+                    "observedAt": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: sqlite3_column_double(q, 4))),
+                    "elapsedSeconds": Int(sqlite3_column_int64(q, 5))])
+            case SQLITE_DONE: return page
+            default: throw AppError.message("그룹 이벤트를 읽지 못했습니다.")
+            }
+        }
+    }
+
+    func deliveryExplanation(_ m: SessionGroupMessage) throws -> JSONObject {
+        let q = try statement("SELECT at FROM group_delivery_observations WHERE mid=?", [m.id.uuidString])
+        defer { sqlite3_finalize(q) }
+        let last = sqlite3_step(q) == SQLITE_ROW ? Date(timeIntervalSince1970: sqlite3_column_double(q, 0)) : m.lastResult == nil ? m.createdAt : nil
+        let stage: String, next: String
+        if m.acknowledgedAt != nil { stage = "acknowledged"; next = "none" }
+        else {
+            switch m.lastResult {
+            case "direct_unknown", "direct_attempting": stage = "submissionUnknown"; next = "inspectTerminal"
+            case "direct_submitted": stage = "enterSent"; next = "awaitReceipt"
+            case "not_started", "undelivered", "sender_absent": stage = "held"; next = "inspectHold"
+            case "batched": stage = "batched"; next = "awaitReceipt"
+            case "superseded", "answered", "expired": stage = m.json["state"] as? String ?? "retired"; next = "none"
+            default: stage = "queued"; next = "awaitDelivery"
+            }
+        }
+        var result: JSONObject = ["messageID": m.id.uuidString, "memberID": m.recipientID.uuidString, "stage": stage,
+            "nextAction": next, "evidence": m.lastResult ?? "mailbox", "attempts": m.attempts,
+            "observedAt": (m.acknowledgedAt ?? last).map(ISO8601DateFormatter().string(from:)) as Any? ?? NSNull()]
+        result["reason"] = m.lastError
+        return result
+    }
+
     func retireQueued(_ ids: [UUID], group: UUID, sender: UUID, recipient: UUID, replacement: UUID?) throws {
         let reason = replacement.map { "supersededBy=" + $0.uuidString } ?? "cancelledBySender"
         for id in ids {
@@ -578,7 +653,7 @@ public final class SessionGroupMailbox {
         get throws { try scalar("SELECT EXISTS(SELECT 1 FROM messages m WHERE " + Self.notificationFilter + ")") != 0 }
     }
 
-    func recordSubmission(_ id: UUID, conversation: String, prompt: String, at date: Date = Date()) throws {
+    package func recordSubmission(_ id: UUID, conversation: String, prompt: String, at date: Date = Date()) throws {
         try update("""
             INSERT INTO group_submissions(message_id,conversation,prompt,submitted)
             VALUES(?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET
@@ -613,6 +688,13 @@ public final class SessionGroupMailbox {
             DELETE FROM group_submit_enters WHERE message_id=? AND submitted=(
                 SELECT submitted FROM group_submissions WHERE message_id=? AND conversation=? AND prompt=?)
             """, [id.uuidString, id.uuidString, conversation.lowercased(), prompt])
+    }
+
+    func submissionPrompt(_ id: UUID, conversation: String) throws -> String? {
+        let q = try statement("SELECT prompt FROM group_submissions WHERE message_id=? AND conversation=?", [id.uuidString,conversation.lowercased()])
+        defer { sqlite3_finalize(q) }
+        guard sqlite3_step(q) == SQLITE_ROW, let value = sqlite3_column_text(q, 0) else { return nil }
+        return String(cString:value)
     }
 
     func confirmedPrompt(_ id: UUID, conversation: String, prompt: String) throws -> Bool {

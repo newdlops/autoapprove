@@ -34,6 +34,7 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
     /// A record that still says so when the app starts never reached the worker and is dropped.
     public var pendingDelivery: Bool?
     public var workScope: String?
+    public var replacesTaskID: UUID?
     public var interruptCheckpoint: String?
 
 
@@ -44,6 +45,9 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
         self.task = task; self.sentAt = sentAt; status = .working; pendingDelivery = true
     }
     public var isDelivered: Bool { pendingDelivery != true }
+    var canReplace: Bool {
+        status == .working || (interruptCheckpoint != nil && (status == .completed || status == .reported))
+    }
 
     public var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
 }
@@ -105,6 +109,12 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     public mutating func cancel(_ id: UUID) {
         assignments.removeAll { $0.id == id }
     }
+    mutating func restoreAfterFailedReplacement(_ old: SessionGroupAssignment) {
+        if let index = assignments.firstIndex(where: { $0.id == old.id && $0.status == .superseded }),
+           current(groupID: old.groupID, workerMemberID: old.workerMemberID)?.status != .working {
+            assignments[index] = old
+        }
+    }
     public mutating func supersede(groupID: UUID, workerMemberID: UUID) {
         for index in assignments.indices where assignments[index].groupID == groupID && assignments[index].workerMemberID == workerMemberID && assignments[index].status == .working {
             assignments[index].status = .superseded
@@ -129,7 +139,7 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     @discardableResult
     public mutating func removeUndelivered() -> Int {
         let before = assignments.count
-        assignments.removeAll { $0.status == .working && $0.pendingDelivery == true && $0.deliveryError != "unknown" }
+        assignments.removeAll { $0.status == .working && $0.pendingDelivery == true && $0.deliveryError != "unknown" && $0.replacesTaskID == nil }
         return before - assignments.count
     }
 

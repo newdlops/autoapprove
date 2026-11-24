@@ -18,7 +18,7 @@ function padded(size, ending = '\n') {
 }
 const result = id => ({jsonrpc:'2.0', id, result:{}});
 const parseError = {jsonrpc:'2.0', id:null, error:{code:-32700, message:'Parse error'}};
-const expectedTools = ['ask_user','get_user_answers','get_session_groups','reconnect_group_member','send_group_message','ask_group_question','reply_group_question','get_group_messages','get_group_member_terminal','ack_group_messages','wait_group_dependencies','update_group_wait','complete_group_task','get_group_status','assign_group_task','assign_group_tasks','interrupt_group_task','cancel_group_messages','answer_group_question','clear_session_group','clear_group_member','set_group_member_title','set_group_member_tab_color','get_group_clear_status','get_diagnostics','list_screens','start_screen_share','stop_screen_share','desktop_list_apps','desktop_open_app','desktop_snapshot','desktop_screenshot','desktop_press','desktop_set_value','desktop_type','desktop_key'];
+const expectedTools = ['ask_user','get_user_answers','get_session_groups','reconnect_group_member','send_group_message','ask_group_question','reply_group_question','get_group_messages','get_group_member_terminal','ack_group_messages','wait_group_dependencies','update_group_wait','complete_group_task','get_group_status','assign_group_task','assign_group_tasks','watch_group_events','explain_group_delivery','replace_group_task','clear_group_composer','interrupt_group_task','cancel_group_messages','answer_group_question','clear_session_group','clear_group_member','set_group_member_title','set_group_member_tab_color','get_group_clear_status','get_diagnostics','list_screens','start_screen_share','stop_screen_share','desktop_list_apps','desktop_open_app','desktop_snapshot','desktop_screenshot','desktop_press','desktop_set_value','desktop_type','desktop_key'];
 const checked = [];
 async function check(name, chunks, verify) {
   const child = spawn(binary, ['mcp', '--home', home], {env:{...process.env, HOME:home, ZDOTDIR:home}, stdio:['pipe','pipe','pipe']});
@@ -72,7 +72,7 @@ try {
     for(let index=0;index<metadataIDs.length;index++){
       assert.deepEqual(values[index].id,metadataIDs[index]);
       assert.deepEqual(values[index].result.tools.map(t=>t.name),expectedTools);
-      for(const tool of values[index].result.tools){assert.equal(tool.annotations.destructiveHint,['clear_session_group','clear_group_member','interrupt_group_task','cancel_group_messages'].includes(tool.name));assert.equal(tool.annotations.openWorldHint,false);}
+      for(const tool of values[index].result.tools){assert.equal(tool.annotations.destructiveHint,['clear_session_group','clear_group_member','replace_group_task','clear_group_composer','interrupt_group_task','cancel_group_messages'].includes(tool.name));assert.equal(tool.annotations.openWorldHint,false);}
     }
     for(const index of [metadataIDs.length,metadataIDs.length+1])assert.equal(values[index].error.code,-32600);
     assert.deepEqual(values.at(-1),result('after-metadata'));

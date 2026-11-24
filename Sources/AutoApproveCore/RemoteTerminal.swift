@@ -276,6 +276,8 @@ public enum TerminalKeyboard {
                 pasteboard = try environment.preparePasteboard(input.text)
                 packets = [(9,.maskCommand,[],true)]
                 if input.kind != .text { packets.append((36,[],[],false)) }
+            } else if input.kind == .eraseLine {
+                packets = [(14,.maskControl,[],false),(32,.maskControl,[],false)]
             } else if input.kind == .choice {
                 if input.text.hasPrefix("digit:") { packets = chunks(String(input.text.dropFirst(6))).map{(0,[],$0,false)} }
                 else { let delta=Int(input.text) ?? 0;packets=Array(repeating:(delta < 0 ? 126:125,[],[],false),count:abs(delta));packets.append((36,[],[],false)) }
@@ -336,7 +338,7 @@ public enum TerminalKeyboard {
 }
 
 public struct RemoteTerminalInput: Codable, Equatable, Sendable {
-    public enum Kind: String, Codable, Sendable { case text, submit, message, characters, enter, escape, interrupt, up, down, left, right, backspace, delete, home, end, tab, choice }
+    public enum Kind: String, Codable, Sendable { case eraseLine, text, submit, message, characters, enter, escape, interrupt, up, down, left, right, backspace, delete, home, end, tab, choice }
     public var kind: Kind
     public var text: String
     public var relay: Bool? = nil
@@ -348,6 +350,7 @@ public struct RemoteTerminalInput: Codable, Equatable, Sendable {
         case .submit: return text + "\r"
         case .message: return "\u{1b}[200~" + text + "\u{1b}[201~\r"
         case .enter: return "\r"
+        case .eraseLine: return "\u{05}\u{15}"
         case .escape: return "\u{1b}"
         case .interrupt: return "\u{03}"
         case .up: return "\u{1b}[A"

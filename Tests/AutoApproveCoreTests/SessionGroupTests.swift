@@ -31,6 +31,7 @@ private final class GroupTerminalWriter: @unchecked Sendable {
     func send(_ target: ScreenTarget, _ input: RemoteTerminalInput) -> TerminalDelivery {
         lock.lock(); defer { lock.unlock() }
         if rejections > 0 { rejections -= 1; return .screenChanged }
+        if input.kind == .eraseLine { screens[target.tty] = "────────\n❯ \n────────\n? for shortcuts" }
         output.append((target.tty, input.bytes)); return .sent
     }
 }
@@ -884,6 +885,56 @@ extension ApprovalTests {
         let retry = try await engine.mcpAction(interrupt)
         try expectEqual(retry["alreadyRequested"] as? Bool, true)
         try expectEqual(writer.writes.count, before + 1)
+        func action(_ tool: String, _ fields: JSONObject = [:]) async throws -> JSONObject {
+            var request = interrupt.merging(fields) { _, new in new }
+            request["tool"] = tool
+            return try await engine.mcpAction(request)
+        }
+        let waitingID = UUID().uuidString
+        let replacement: JSONObject = ["requestID":waitingID, "task":"새 설계를 검토하세요"]
+        let waiting = try await action("replace_group_task", replacement)
+        try expectEqual(waiting["stage"] as? String, "awaitingStop")
+        try expectEqual(writer.writes.count, before + 1)
+        let empty = "────────\n❯ \n────────\n? for shortcuts"
+        writer.show(empty, on:worker.session.tty)
+        let changed = try await action("replace_group_task", replacement)
+        try expectEqual(changed["taskID"] as? String, waitingID)
+        let sent = writer.writes.count
+        let replay = try await action("replace_group_task", replacement)
+        try expectEqual(replay["alreadyRecorded"] as? Bool, true)
+        try expectEqual(writer.writes.count, sent)
+        let box = try SessionGroupMailbox(directory:directory)
+        let message = try box.enqueue(groupID:group.id,senderID:leaderMember.id,recipientID:workerMember.id,kind:.message,text:"상태 확인")
+        let details: JSONObject = ["messageID":message.id.uuidString]
+        try expectEqual(try await action("explain_group_delivery",details)["stage"] as? String,"queued")
+        try box.noteAttempt(message.id,result:"direct_unknown",retryAt:Date.distantFuture)
+        try expectEqual(try await action("explain_group_delivery",details)["stage"] as? String,"submissionUnknown")
+        let prompt = message.terminalPrompt(senderTitle:"leader",recipientAgent:.claude)
+        try box.recordSubmission(message.id,conversation:workerMember.conversationID,prompt:prompt)
+        writer.show("────────\n❯ " + prompt + "\n────────\n? for shortcuts",on:worker.session.tty)
+        try expectEqual(try await action("explain_group_delivery",details)["stage"] as? String,"draftVisible")
+        let preview = try await action("clear_group_composer")
+        let token = try unwrapGroup(preview["draftToken"] as? String)
+        writer.show("────────\n❯ #updated\n────────\n? for shortcuts",on:worker.session.tty)
+        do { _ = try await action("clear_group_composer",["draftToken":token]); throw AppError.message("stale draft erased") }
+        catch is RemoteHTTPError {}
+        let latest = try unwrapGroup(try await action("clear_group_composer")["draftToken"] as? String)
+        let cleared = try await action("clear_group_composer",["draftToken":latest])
+        try expectEqual(cleared["stage"] as? String,"cleared")
+        try expectEqual(writer.writes.last,"\u{05}\u{15}")
+        try box.noteAttempt(message.id,result:"direct_submitted",retryAt:Date.distantFuture)
+        try expectEqual(try await action("explain_group_delivery",details)["stage"] as? String,"enterSent")
+        try box.acknowledge([message.id],groupID:group.id,recipientID:workerMember.id)
+        try expectEqual(try await action("explain_group_delivery",details)["stage"] as? String,"acknowledged")
+        let page = try await action("watch_group_events")
+        let events = try unwrapGroup(page["events"] as? [JSONObject])
+        try expect(events.contains { $0["event"] as? String == "direct_unknown" && $0["referenceID"] as? String == message.id.uuidString })
+        let cursor = try unwrapGroup(page["cursor"] as? Int)
+        try expect(try SessionGroupMailbox(directory:directory).events(group:group.id,after:cursor).isEmpty)
+        for tool in ["watch_group_events","explain_group_delivery","replace_group_task","clear_group_composer"] {
+            do { _ = try await action(tool,details.merging(["sessionID":worker.id]) { _,new in new }); throw AppError.message("unverified caller accepted") }
+            catch is RemoteHTTPError {}
+        }
         writer.show("검사 원본\n› ", on: worker.session.tty)
 
         try engine.setPaused(true); defer { try? engine.setPaused(false) }

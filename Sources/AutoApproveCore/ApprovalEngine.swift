@@ -2113,7 +2113,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         if let reason = remoteInputReason(session) { throw RemoteHTTPError(409, reason) }
-        guard !remoteInputSessions.contains(id), observed.frame.keys.contains(kind.rawValue) else { throw RemoteHTTPError(409, "다른 입력이 진행 중이거나 지원하지 않는 키입니다. 화면을 확인해주세요.") }
+        guard !remoteInputSessions.contains(id), (kind == .eraseLine ? automaticAuthorization != nil && backgroundOnly && observed.frame.keys.contains("backspace") : observed.frame.keys.contains(kind.rawValue)) else { throw RemoteHTTPError(409, "다른 입력이 진행 중이거나 지원하지 않는 키입니다. 화면을 확인해주세요.") }
         if !relay && automaticInputBusy(id) { throw RemoteHTTPError(409, "Mac에서 승인 또는 이어서 진행 입력을 전달하고 있습니다. 잠시 뒤 화면을 확인해주세요.") }
         let input = RemoteTerminalInput(kind: kind, text: object["text"] as? String ?? "", relay: relay); try input.validate()
         // This capability is private; callers cannot enable it through JSON. It
@@ -3578,6 +3578,120 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return ["id": group.id.uuidString, "name": group.name, "members": rows]
     }
 
+    private static func emptyGroupComposer(_ screen: String, agent: AgentKind) -> Bool {
+        switch agent {
+        case .agy: return AgyComposerReadiness.isEmpty(screen)
+        case .claude: return ClaudeComposerReadiness.isEmpty(screen)
+        case .codex: return CodexStatusIdentity.canQuery(screen)
+        default: return false
+        }
+    }
+
+    private static func groupComposerIdle(_ frame: RemoteTerminalFrame, agent: AgentKind) -> Bool {
+        frame.inputReason == nil && frame.outputReason == nil && !RemoteMessageReadiness.hasMenu(frame.screen, agent: agent)
+            && !(agent == .agy && ActivityDetector.nonemptyTail(frame.screen).suffix(6).joined(separator:" ").range(of:#"(?i)esc(?:ape)? to (?:cancel|interrupt|stop)"#,options:.regularExpression) != nil)
+            && ActivityDetector.detect(frame.screen, agent: agent).phase != .working && emptyGroupComposer(frame.screen, agent: agent)
+    }
+
+    private func groupObservation(_ tool: String, _ object: JSONObject) async throws -> JSONObject {
+        guard let groupID = try GroupWaitRequest.uuid(object, "groupID") else { throw RemoteHTTPError(400, "그룹 ID가 필요합니다.") }
+        func leader() async throws -> SessionGroup {
+            let (group, caller) = try await groupMailboxCaller(object, groupID: groupID, verified: true)
+            guard group.isLeader(caller.id) else { throw RemoteHTTPError(403, "그룹장만 조회할 수 있습니다.") }
+            return group
+        }
+        let group = try await leader()
+        let box = try groupMailbox()
+        if tool == "watch_group_events" {
+            func number(_ key: String, max: Int) throws -> Int {
+                guard let raw = object[key] else { return 0 }
+                guard let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), let value = Int(n.stringValue),
+                      (0...max).contains(value) else { throw RemoteHTTPError(400, "조회 범위를 확인해주세요.") }
+                return value
+            }
+            let cursor = try number("cursor", max: Int.max)
+            let deadline = Date().addingTimeInterval(Double(try number("waitSeconds", max: 20)))
+            var rows = try box.events(group: groupID, after: cursor)
+            while rows.isEmpty && Date() < deadline {
+                try await Task.sleep(for: .milliseconds(400))
+                rows = try box.events(group: groupID, after: cursor)
+            }
+            guard try await leader().sameMembership(as: group) else { throw RemoteHTTPError(409, "그룹이 변경됐습니다.") }
+            let names = Dictionary(uniqueKeysWithValues: group.members.map { ($0.id.uuidString,$0.nickname ?? $0.title) })
+            let page = rows.prefix(50).map { row in
+                var result = row
+                if let id = row["memberID"] as? String { result["memberName"] = names[id] }
+                return result
+            }
+            return ["events":page, "cursor":page.last?["cursor"] ?? cursor, "hasMore":rows.count > 50]
+        }
+        guard let id = try GroupWaitRequest.uuid(object, "messageID"), let message = try box.message(id),
+              message.groupID == groupID else { throw RemoteHTTPError(404, "해당 그룹의 메시지를 찾을 수 없습니다.") }
+        var draftAt: Date?
+        if message.acknowledgedAt == nil, ["direct_attempting","direct_submitted","direct_unknown"].contains(message.lastResult),
+           let (_, _, live) = try? await groupEvidenceTarget(object, groupID: groupID, memberID: message.recipientID),
+           let conversation = live?.conversationID, let live,
+           let prompt = try box.submissionPrompt(id, conversation: conversation),
+           let frame = try? await remoteTerminal(sessionID: live.id, realtime: true, textOnly: true),
+           frame.outputReason == nil, Self.matchesGroupDraft(prompt, screen: frame.screen, agent: live.session.agent),
+           let (_, _, confirmed) = try? await groupEvidenceTarget(object, groupID: groupID, memberID: message.recipientID),
+           confirmed?.id == live.id, confirmed?.conversationID == conversation { draftAt = frame.observedAt }
+        guard try await leader().sameMembership(as: group), let latest = try box.message(id) else { throw RemoteHTTPError(409, "조회 중 그룹이 변경됐습니다.") }
+        var result = try box.deliveryExplanation(latest)
+        if let draftAt, latest.acknowledgedAt == nil, latest.lastResult == message.lastResult {
+            result["stage"] = "draftVisible"; result["evidence"] = "exactComposerMatch"
+            result["nextAction"] = "inspectComposer"; result["observedAt"] = ISO8601DateFormatter().string(from: draftAt)
+        }
+        return result
+    }
+
+    private static func matchesGroupDraft(_ text: String, screen: String, agent: AgentKind) -> Bool {
+        guard !RemoteMessageReadiness.hasMenu(screen, agent: agent), ActivityDetector.detect(screen, agent: agent).phase != .working else { return false }
+        if agent == .claude { return ClaudeComposerReadiness.containsOnly(text, screen: screen) }
+        let marker = agent == .agy ? ">" : "›"
+        var lines = PromptDetector.normalizedLines(screen)
+        guard let i = lines.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces).hasPrefix(marker) }),
+              lines[i].trimmingCharacters(in: .whitespaces) == marker + " " + text else { return false }
+        lines[i] = marker
+        return emptyGroupComposer(lines.joined(separator: "\n"), agent: agent)
+    }
+
+    private func clearGroupComposer(_ object: JSONObject) async throws -> JSONObject {
+        guard let group = try GroupWaitRequest.uuid(object, "groupID"), let member = try GroupWaitRequest.uuid(object, "memberID") else { throw RemoteHTTPError(400, "그룹과 대상 구성원을 지정해주세요.") }
+        let (saved, target, live) = try await groupEvidenceTarget(object, groupID: group, memberID: member)
+        guard let live, let conversation = live.conversationID, !saved.isLeader(member), groupWorkerActions.insert(live.id).inserted else { throw RemoteHTTPError(409, "작업자 연결을 확인해주세요.") }
+        defer { groupWorkerActions.remove(live.id) }
+        func validate() throws {
+            guard !snapshot.paused, !groupClearActive(group), !sendingMessages.contains(live.id),
+                  let current = sessions[live.id], !current.pendingInTerminal, ![.working,.approval,.ended].contains(current.phase),
+                  let latest = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == group }),
+                  latest.sameMembership(as: saved), latest.members.contains(target) else { throw RemoteHTTPError(409, "대상 또는 입력 상태가 변경됐습니다.") }
+        }
+        try validate()
+        let frame = try await remoteTerminal(sessionID: live.id, realtime: true, textOnly: true)
+        let agent = live.session.agent
+        guard frame.inputReason == nil, frame.outputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: agent),
+              ActivityDetector.detect(frame.screen, agent: agent).phase != .working else { throw RemoteHTTPError(409, "대기 중인 입력창을 확인해주세요.") }
+        let marker = agent == .codex ? "›" : agent == .agy ? ">" : "❯"
+        let line = PromptDetector.normalizedLines(frame.screen).map { $0.trimmingCharacters(in: .whitespaces) }.last { $0.hasPrefix(marker + " ") }
+        let draft = line.map { String($0.dropFirst(2)) } ?? ""
+        let matches = !draft.isEmpty && Self.matchesGroupDraft(draft, screen: frame.screen, agent: agent)
+        if Self.emptyGroupComposer(frame.screen, agent: agent) { return ["stage":"empty"] }
+        guard matches else { throw RemoteHTTPError(409, "입력 중인 초안을 식별하지 못했습니다.") }
+        if agent == .claude, let candidate = ClaudeComposerReadiness.framedCandidate(frame.screen), candidate == draft {
+            guard let channel = live.claudePromptChannel,
+                  await ClaudePromptBridge.state(path: channel, paths: paths, conversation: conversation, expectedDraft: draft) == "matchingDraft" else { throw RemoteHTTPError(409, "Claude 자동추천과 구분되는 초안을 확인해주세요.") }
+        }
+        guard let token = object["draftToken"] as? String else { return ["stage":"draft","draftToken":frame.revision,"characters":draft.count] }
+        let (_, _, confirmed) = try await groupEvidenceTarget(object, groupID: group, memberID: member)
+        guard token == frame.revision, confirmed?.id == live.id, confirmed?.conversationID == conversation,
+              [.terminal,.iterm,.tmux].contains(live.session.terminal),
+              !(await nativeUserInputHasPriority(live.id, backgroundOnly:true)) else { throw RemoteHTTPError(409, "초안 또는 대상이 변경됐거나 입력이 진행 중입니다.") }
+        _ = try await remoteInput(["kind":"eraseLine","revision":token,"sessionID":live.id], automaticAuthorization: { try validate() }, authorizationSource:"그룹장 입력창 비우기", backgroundOnly:true)
+        let after = try await remoteTerminal(sessionID: live.id, realtime:true, textOnly:true)
+        return ["stage":Self.groupComposerIdle(after, agent: agent) ? "cleared" : "unconfirmed"]
+    }
+
     private func interruptGroupTask(_ object: JSONObject) async throws -> JSONObject {
         guard let group = try GroupWaitRequest.uuid(object, "groupID"), let member = try GroupWaitRequest.uuid(object, "memberID"),
               let taskID = try GroupWaitRequest.uuid(object, "taskID") else { throw RemoteHTTPError(400, "그룹·구성원·현재 작업 ID를 지정해주세요.") }
@@ -3739,6 +3853,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if Date().timeIntervalSince(groupHousekeepingAt) >= groupMailboxHousekeepingInterval {
             groupHousekeepingAt = Date()
             parkMessagesForRemovedMembers()
+            try groupMailbox().recordHeldEvents()
             notifyStalledSenders()
         }
         let overdue = try groupMailbox().overdueReceipts()
@@ -4166,7 +4281,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func saveGroupOrchestration(_ state: SessionGroupOrchestration) throws {
         let data = try JSONEncoder().encode(state)
         try store.set(SessionGroupOrchestration.storeKey, String(decoding: data, as: UTF8.self))
+        let previous = Dictionary((groupOrchestrationCache?.assignments ?? []).map { ($0.id,$0.status) }, uniquingKeysWith: { _,new in new })
         groupOrchestrationCache = state
+        if let box = try? groupMailbox() {
+            for item in state.assignments where previous[item.id] != item.status {
+                try? box.taskEvent(item, kind: "task_" + item.status.rawValue)
+            }
+        }
         refreshGroupWaits()
         if !sessionGroupBadges.isEmpty { publish() }
     }
@@ -4705,6 +4826,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if Date().timeIntervalSince(lastMissingReportCheck) >= 60 {
             lastMissingReportCheck = Date()
             if let groups = try? SessionGroupStore(directory: paths.directory).load(), let box = try? groupMailbox() {
+                for task in state.assignments where task.status == .working && task.isDelivered && Date().timeIntervalSince(task.sentAt) >= 60 {
+                    if let session = sessions[task.workerSessionID], session.phase == .idle, !session.pendingInTerminal,
+                       let raw = remoteObservedScreens[session.id], Date().timeIntervalSince(raw.observedAt) < 15,
+                       raw.observedAt > task.sentAt, Self.emptyGroupComposer(raw.raw, agent: session.agent) {
+                        try? box.taskEvent(task, kind: "idleWithoutReport")
+                    }
+                }
                 for task in state.assignments where task.status == .working && task.isDelivered && Date().timeIntervalSince(task.sentAt) >= 1800 {
                     let key = "missingReport:" + task.id.uuidString
                     guard let group = groups.first(where: { $0.id == task.groupID }),
@@ -5558,7 +5686,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
             return ["results": results]
-        case "assign_group_task":
+        case "watch_group_events", "explain_group_delivery":
+            return try await groupObservation(tool, object)
+        case "clear_group_composer":
+            return try await clearGroupComposer(object)
+        case "replace_group_task", "assign_group_task":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)),
                   let raw = object["task"] as? String else { throw RemoteHTTPError(400, "그룹 ID, 구성원 ID와 작업 내용을 지정해주세요.") }
@@ -5572,23 +5704,53 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             let (group, caller, callerMember, target, worker, current) = try await groupDirectWorker(object, groupID: groupID, memberID: memberID)
             let requestID = try GroupWaitRequest.uuid(object, "requestID")
+            let replacing = tool == "replace_group_task"
+            if replacing {
+                _ = try await groupEvidenceTarget(object, groupID: groupID, memberID: memberID)
+                guard requestID != nil, try GroupWaitRequest.uuid(object, "taskID") != nil else { throw RemoteHTTPError(400, "taskID와 requestID가 필요합니다.") }
+            }
             if let requestID, let prior = try groupOrchestration().assignments.first(where: { $0.id == requestID }) {
                 guard prior.groupID == groupID, prior.workerMemberID == memberID, prior.parentMemberID == callerMember.id,
-                      prior.task == task, prior.workScope == (object["workScope"] as? String)?.trimmingCharacters(in: .whitespaces) else {
+                      prior.replacesTaskID == (tool == "replace_group_task" ? try GroupWaitRequest.uuid(object, "taskID") : nil),
+                      prior.task == task, (tool == "replace_group_task" || prior.workScope == (object["workScope"] as? String)?.trimmingCharacters(in: .whitespaces)) else {
                     throw RemoteHTTPError(409, "같은 requestID의 배정 내용이 다릅니다.")
                 }
                 return ["taskID": requestID.uuidString, "workerMemberID": memberID.uuidString, "alreadyRecorded": true,
                         "delivery": prior.deliveryError ?? (prior.isDelivered ? "sent" : "pending")]
             }
+            var original: SessionGroupAssignment?
+            if replacing {
+                guard let old = try groupOrchestration().current(groupID: groupID, workerMemberID: memberID),
+                      old.id == (try GroupWaitRequest.uuid(object, "taskID")), old.parentMemberID == callerMember.id,
+                      old.workerSessionID == worker.id, old.workerConversationID == worker.conversationID,
+                      old.canReplace, old.deliveryError != "unknown", !snapshot.paused, !group.isLeader(memberID),
+                      !groupWorkerActions.contains(worker.id) else { throw RemoteHTTPError(409, "원래 배정·대화 또는 진행 중인 전달을 확인해주세요.") }
+                if !old.isDelivered, try groupMailbox().submittedAt(old.id) != nil {
+                    throw RemoteHTTPError(409, "이전 작업 전송이 시작됐지만 결과가 불명입니다. 먼저 구성원 터미널을 확인해주세요.")
+                }
+                original = old
+                if old.isDelivered {
+                    if old.interruptCheckpoint == nil {
+                        let frame = try await remoteTerminal(sessionID: worker.id, realtime: true, textOnly: true)
+                        if !Self.groupComposerIdle(frame, agent: current.agent) { _ = try await interruptGroupTask(object) }
+                    }
+                    var idle = false
+                    for attempt in 0..<5 {
+                        if attempt > 0 { try await Task.sleep(for: .milliseconds(300)) }
+                        let frame = try await remoteTerminal(sessionID: worker.id, realtime: true, textOnly: true)
+                        if Self.groupComposerIdle(frame, agent: current.agent) { idle = true; break }
+                    }
+                    guard idle else { return ["stage":"awaitingStop","taskID":old.id.uuidString,"replacementSent":false] }
+                }
+            }
             guard groupWorkerActions.insert(worker.id).inserted else { throw RemoteHTTPError(409, "다른 요청이 이 구성원에게 전달 중입니다.") }
             defer { groupWorkerActions.remove(worker.id) }
-            // Claude registers its own status; the screen reading reports "unknown" when Claude shows a status line.
             if let status = await claudeStatuses([current])[worker.id] {
                 guard ClaudeSessionRegistration.acceptsPrompt(status) else {
                     throw RemoteHTTPError(409, "작업자가 대기 상태가 아닙니다. (Claude 상태: \(status)) 완료 보고를 받은 뒤 다시 지시하세요.")
                 }
             } else {
-                guard ![.working, .approval, .input, .ended].contains(current.phase) else {
+                guard let latest = sessions[worker.id], ![.working, .approval, .input, .ended].contains(latest.phase) else {
                     throw RemoteHTTPError(409, "작업자가 아직 작업 중이거나 응답을 기다리고 있습니다. 완료 보고를 받은 뒤 다시 지시하세요.")
                 }
             }
@@ -5601,7 +5763,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 guard assignment.workScope != "" else { throw RemoteHTTPError(400, "작업 소유 범위가 비었습니다.") }
             }
             assignment.workerConversationID = worker.conversationID
-            // Recorded before typing, so a fast completion always finds its task.
+            assignment.replacesTaskID = original?.id
+            if let original { assignment.workScope = original.workScope }
             var state = try groupOrchestration()
             if let current = state.current(groupID: group.id, workerMemberID: target.id),
                current.status == .working, current.parentMemberID != callerMember.id {
@@ -5617,14 +5780,34 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 throw RemoteHTTPError(409, "다른 구성원이 같은 작업 범위를 소유하고 있습니다: " + conflicts.joined(separator: ", "),
                     diagnostics: ["scopeConflicts": conflicts.joined(separator: ","), "delivery": "not_started"])
             }
+            if let original {
+                guard let latest = state.current(groupID: groupID, workerMemberID: memberID), latest.id == original.id,
+                      latest.canReplace, latest.isDelivered == original.isDelivered else {
+                    throw RemoteHTTPError(409, "교체할 작업이 바뀌었습니다.")
+                }
+                let (_, _, endpoint) = try await groupEvidenceTarget(object, groupID: groupID, memberID: memberID)
+                guard endpoint?.id == worker.id, endpoint?.conversationID == original.workerConversationID,
+                      !snapshot.paused, !(await nativeUserInputHasPriority(worker.id, backgroundOnly: true)) else {
+                    throw RemoteHTTPError(409, "작업자 연결이나 입력 상태가 바뀌었습니다.")
+                }
+                state = try groupOrchestration()
+                guard state.current(groupID: groupID, workerMemberID: memberID)?.id == original.id,
+                      state.current(groupID: groupID, workerMemberID: memberID)?.canReplace == true,
+                      !state.assignments.contains(where: { $0.id == assignment.id }) else { throw RemoteHTTPError(409, "현재 배정이 바뀌었습니다.") }
+            }
             state.begin(assignment); try saveGroupOrchestration(state)
-            // A worker with automatic approval off stops at its first permission
-            // prompt, so a group task turns it on before the task is typed.
             let approval = enableGroupWorkerApproval(worker.id)
             do {
                 let prompt = SessionGroupOrchestration.taskMessage(assignment)
                 try await sendGroupLine(current, text: prompt, groupTarget: worker) {
                     var expected: String?
+                    if original != nil {
+                        let frame = try await self.remoteTerminal(sessionID: worker.id, realtime: true, textOnly: true)
+                        guard Self.groupComposerIdle(frame, agent: current.agent), !self.snapshot.paused else {
+                            throw RemoteHTTPError(409, "작업자의 빈 대기 입력창을 다시 확인해주세요.", diagnostics:["delivery":"not_started"])
+                        }
+                        expected = frame.screen
+                    }
                     if current.agent == .claude, let channel = worker.claudePromptChannel {
                         let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
                         guard frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: .claude),
@@ -5647,10 +5830,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if var latest = try? groupOrchestration() {
                     if requestID != nil && (error as? RemoteHTTPError)?.diagnostics?["delivery"] != "not_started" {
                         latest.recordUncertainAssignment(assignment.id)
-                    } else { latest.cancel(assignment.id) }
+                    } else {
+                        latest.cancel(assignment.id)
+                        if let original { latest.restoreAfterFailedReplacement(original) }
+                    }
                     try? saveGroupOrchestration(latest)
                 }
-                // Only a task that never reached the terminal restores the previous choice.
                 if approval.changed, (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started" {
                     try? setAutomatic(worker.id, enabled: false)
                 }

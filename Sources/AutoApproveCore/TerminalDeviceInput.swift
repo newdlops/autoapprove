@@ -7,6 +7,15 @@ public enum TerminalDeviceInput {
         captureIdentity: @escaping @Sendable (Int32) throws -> TTYInputIdentity = { try TTYInputIdentity.capture(pid: $0) },
         run: (@Sendable (String) throws -> String)? = nil) throws -> TerminalDelivery {
         try input.validate()
+        if [.eraseLine,.escape].contains(input.kind) {
+            guard let pid = target.sourcePID, let identity = target.sourceIdentity,
+                  let current = try? captureIdentity(pid), identity.sameProcess(as: current),
+                  current.processGroup == current.foregroundGroup else { return .agentMissing }
+            let latest = try TerminalAdapter.screens(ttys:[target.tty], includeCursor:false, includeTitles:false, purpose:.validation)
+            guard latest.screens.first(where: { $0.tty == target.tty })?.contents == screen else { return .screenChanged }
+            return try TerminalKeyboard.deliver(target:target, expected:screen, agent:agent,
+                input:.init(kind:input.kind, relay:true), environment:try .live(sourcePID:pid), allowActivation:false)
+        }
         let codexReady = agent == .codex && CodexProgressScreen.emptyComposer(screen)
         let claudeClear = agent == .claude && input.text == "/clear" &&
             ClaudeComposerReadiness.isEmpty(screen) && ActivityDetector.detect(screen,agent:agent).phase != .working
