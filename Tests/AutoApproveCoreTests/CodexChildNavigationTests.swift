@@ -1,5 +1,6 @@
 #if DEBUG
 import Foundation
+import TerminalInputSupport
 @testable import AutoApproveCore
 
 private let navigationParent = "00000000-0000-4000-8000-000000000001"
@@ -60,32 +61,50 @@ private final class NavigationProbe: @unchecked Sendable {
 }
 extension ApprovalTests {
     func testOfficialChildNavigationEngineReservationAndUncertainReplay() async throws {
-        for uncertain in [false, true] {
+        for scenario in ["terminal", "missingIdentity", "uncertain"] {
+            let uncertain = scenario == "uncertain"
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-official-navigation-" + UUID().uuidString)
             let paths = AppPaths(directory: directory), probe = NavigationProbe()
             if uncertain { probe.uncertainAt = "approve" }
-            let records = ProcessDiscovery.parse("82001 1 ttys891 82001 82001 Mon Sep 21 09:00:00 2026 /usr/local/bin/codex")
+            let identity = TTYInputIdentity(pid: 82001, processGroup: 82001, uid: getuid(), effectiveUID: geteuid(), device: 42, startSeconds: 1800000000, startMicroseconds: 123)
+            let records = ProcessDiscovery.parse("82001 1 ttys891 82001 82001 \(identity.processStart) /usr/local/bin/codex")
             let process = records[0]
             var session = AgentSession(id: process.key, agent: .codex, pid: process.pid, started: process.started,
-                tty: "/dev/ttys891", cwd: "/tmp/approval-fixture", terminal: .iterm)
-            session.channel = .itermScreen
+                tty: "/dev/ttys891", cwd: "/tmp/approval-fixture", terminal: uncertain ? .iterm : .terminal)
+            session.channel = uncertain ? .itermScreen : .terminalScreen
             try paths.prepare()
             try AuditStore(path: paths.database).set("codexApprovalBinding:" + session.id,
                 String(decoding: try JSONEncoder().encode(CodexApprovalBinding(threadID: navigationParent, title: "owned fixture")), as: UTF8.self))
             let offline = CodexReplyTransport(prepare: { _, _ in throw AppError.message("owned fixture offline") },
                 send: { _, _ in throw AppError.message("owned fixture offline") }, prepareMessage: { _ in throw AppError.message("owned fixture offline") })
-            let engine = try ApprovalEngine(paths: paths, questionTransport: offline, processReader: { records }, screenAdapters: [.iterm: probe.adapter])
+            var adapter = probe.adapter
+            let input = adapter.input
+            if !uncertain {
+                adapter.input = { target, raw, agent, value in
+                    guard target.sourceIdentity == identity else { return .agentMissing }
+                    return try input(target, raw, agent, value)
+                }
+            }
+            let engine = try ApprovalEngine(paths: paths, questionTransport: offline, processReader: { records },
+                screenAdapters: [uncertain ? .iterm : .terminal: adapter],
+                terminalInputIdentity: { _ in scenario == "missingIdentity" ? nil : identity })
             defer { engine.stop(); try? FileManager.default.removeItem(at: directory) }
             engine.updateDiscovery([session], records: records)
             try engine.setAutomatic(session.id, enabled: true)
             engine.receiveScreen(sessionID: session.id, raw: navigationOverlay, generation: "owned")
             for _ in 0..<150 {
                 if uncertain ? engine.snapshot.sessions.first?.automatic == false : probe.inputs.count == 6 { break }
-                // Monitor updates during navigation must not dispatch an additional approval.
                 if probe.inputs.contains("o") { engine.receiveScreen(sessionID: session.id, raw: navigationOwn, generation: "owned") }
                 try await Task.sleep(for: .milliseconds(10))
             }
-            if uncertain {
+            if scenario == "missingIdentity" {
+                try expectEqual(probe.inputs, [])
+                try expectEqual(engine.snapshot.sessions.first?.pendingInTerminal, true)
+                try expectEqual(engine.snapshot.sessions.first?.automatic, true)
+                engine.receiveScreen(sessionID: session.id, raw: navigationOverlay, generation: "owned")
+                try await Task.sleep(for: .milliseconds(650))
+                try expectEqual(engine.snapshot.events.filter { $0.outcome.contains("agentMissing") }.count, 1)
+            } else if uncertain {
                 try expectEqual(engine.snapshot.sessions.first?.automatic, false)
                 try expectEqual(try AuditStore(path: paths.database).value("automatic:" + session.id), "false", "Uncertain child approval cannot replay after restart")
                 engine.receiveScreen(sessionID: session.id, raw: navigationOwn, generation: "resized")

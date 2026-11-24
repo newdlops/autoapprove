@@ -14044,17 +14044,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if let host, let adapter = self.screenAdapters[host] {
                 self.automaticInputSessions.insert(id)
                 defer { self.automaticInputSessions.remove(id); self.scheduleScreenApproval(id) }
-                // The agent's foreground job, for hosts that can name the process they would type into.
                 let job = live?.first { $0.pid == session.pid && $0.started == session.started }.map { agent in
                     (live ?? []).filter { $0.tty == agent.tty && $0.processGroup == agent.processGroup }.map(\.pid)
                 } ?? []
-                let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: job,
-                    sourcePID: session.pid, sourceStarted: session.started)
                 let approve = adapter.approve, raw = current.raw, kind = session.agent
+                let childDialog = kind == .codex && CodexChildApprovalNavigation.requiresNavigation(raw)
+                let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: job,
+                    sourcePID: session.pid, sourceStarted: session.started,
+                    sourceIdentity: childDialog && host == .terminal ? self.terminalInputIdentity(session.pid) : nil)
                 do {
                     let delivery: TerminalDelivery
                     var navigatedChild: CodexChildApprovalNavigation.Outcome?
-                    if kind == .codex && CodexChildApprovalNavigation.requiresNavigation(raw) {
+                    if childDialog {
                         let navigation = try await CodexChildApprovalNavigation.approve(target: target, initial: raw,
                             parentThreadID: session.codexApprovalBinding?.threadID, adapter: adapter, valid: { [weak self] in
                                 guard let self else { return false }
@@ -14069,7 +14070,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         event.outcome = delivery == .sent ? "초기화 전 승인 입력 전달" : "초기화 전 입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                         self.log(event); return
                     }
-                    if delivery != .sent { self.retryUnsentApproval(id, dispatchID: scheduledID, generation: state.generation) }
+                    if childDialog && delivery == .agentMissing {
+                        self.requireApprovalReview(id, dispatchID: scheduledID, generation: state.generation,
+                            requestIdentity: current.prompt.requestIdentity, detail: "하위 승인창을 연 Codex 프로세스를 확인하지 못했습니다. 원래 터미널을 확인해주세요.")
+                    } else if delivery != .sent {
+                        self.retryUnsentApproval(id, dispatchID: scheduledID, generation: state.generation)
+                    }
                     if delivery == .screenChanged {
                         await self.refreshRejectedApproval(session,target:target,generation:state.generation,
                             requestIdentity:current.prompt.requestIdentity,epoch:epoch,read:adapter.validationScreens ?? adapter.screens)
