@@ -293,7 +293,7 @@ public struct TerminalAppleEventReader {
                     let status = (error as NSError).code
                     if [-1743, -1744].contains(status) { throw TerminalAdapterError.permissionDenied }
                     if status == -1712 { throw TerminalReadEventError.timedOut }
-                    if error is TerminalAdapterError || error is CancellationError { throw error }
+                    if error is AutomationIPC.Failure || error is TerminalAdapterError || error is CancellationError { throw error }
                     if case TerminalReadEventError.timedOut = error { throw error }
                     if case TerminalReadEventError.incompatible = error { contentsBatchUnavailable() }
                     else if [-1700, -1708].contains(status) { contentsBatchUnavailable() }
@@ -331,7 +331,7 @@ public struct TerminalAppleEventReader {
                     // Titles are presentation metadata. A slow title query must
                     // never discard fresh terminal contents or block approvals.
                     if status == -1712 { titleReadTimedOut = true }
-                    if error is TerminalAdapterError || error is CancellationError { throw error }
+                    if error is AutomationIPC.Failure || error is TerminalAdapterError || error is CancellationError { throw error }
                     if case TerminalReadEventError.timedOut = error { titleReadTimedOut = true }
                     if case TerminalReadEventError.incompatible = error { titleBatchUnavailable(); titleReadTimedOut = true }
                     else if [-1700, -1708].contains(status) { titleBatchUnavailable(); titleReadTimedOut = true }
@@ -358,7 +358,7 @@ public struct TerminalAppleEventReader {
                         // A title may disappear after the screen was read. The
                         // contents still came from this exact TTY, not a neighbour.
                         // Optional metadata failure never invalidates that fresh read.
-                        if error is TerminalAdapterError || error is CancellationError { throw error }
+                        if error is AutomationIPC.Failure || error is TerminalAdapterError || error is CancellationError { throw error }
                         if error is TerminalReadEventError { titleReadTimedOut = true }
                         let status = (error as NSError).code
                         if status == -1712 { titleReadTimedOut = true }
@@ -385,7 +385,7 @@ public struct TerminalAppleEventReader {
                     }
                     result.screens.append(output)
                 } catch {
-                    if error is TerminalAdapterError || error is CancellationError { throw error }
+                    if error is AutomationIPC.Failure || error is TerminalAdapterError || error is CancellationError { throw error }
                     if case TerminalReadEventError.incompatible = error { throw error }
                     if case TerminalReadEventError.timedOut = error { throw error }
                     let status = (error as NSError).code
@@ -418,7 +418,7 @@ public struct TerminalAppleEventReader {
                     if status == -1743 { throw TerminalAdapterError.permissionDenied }
                     if [-1700, -1708].contains(status) { throw TerminalReadEventError.incompatible }
                     if status == -1712 { throw TerminalReadEventError.timedOut }
-                    if error is TerminalAdapterError || error is CancellationError || error is TerminalReadEventError { throw error }
+                    if error is AutomationIPC.Failure || error is TerminalAdapterError || error is CancellationError || error is TerminalReadEventError { throw error }
                     if status != -1728 { throw error }
                 }
             }
@@ -470,14 +470,27 @@ enum TerminalAppleEvents {
         return try inputMetadata(tty:tty,windowID:windowID,owner:owner)
     }
 
+    private static func send(_ event:NSAppleEventDescriptor, owner:TerminalProcessIdentity, timeout:TimeInterval, readOnly:Bool) throws -> NSAppleEventDescriptor {
+        let budget = min(timeout,2)
+        guard budget > 0 else { throw AutomationIPC.Failure.timeout }
+        return try AutomationIPC.shared.run(host:ScreenHost.terminal.title,readOnly:readOnly,budget:budget) {
+            guard TerminalProcessLookup.identity(pid:owner.pid) == owner else { throw AutomationIPC.Failure.invalidated }
+            let noConsent = NSAppleEventDescriptor.SendOptions(rawValue:UInt(kAEDoNotPromptForUserConsent))
+            let reply = try event.sendEvent(options:[.waitForReply,.neverInteract,noConsent],timeout:budget)
+            guard TerminalProcessLookup.identity(pid:owner.pid) == owner else { throw AutomationIPC.Failure.invalidated }
+            let status = reply.paramDescriptor(forKeyword:aeCode("errn"))?.int32Value ?? 0
+            if [-1743,-1744].contains(status) { throw TerminalAdapterError.permissionDenied }
+            if status == -1712 { throw NSError(domain:NSOSStatusErrorDomain,code:Int(status)) }
+            return reply
+        }
+    }
     private static func inputEvent(owner:TerminalProcessIdentity,subject:NSAppleEventDescriptor,value:NSAppleEventDescriptor?=nil,timeout:TimeInterval) throws -> NSAppleEventDescriptor {
         guard TerminalProcessLookup.identity(pid:owner.pid)==owner else {throw TerminalReadEventError.ambiguous}
         let event=NSAppleEventDescriptor(eventClass:aeCode("core"),eventID:aeCode(value == nil ? "getd":"setd"),targetDescriptor:.init(processIdentifier:owner.pid),returnID:-1,transactionID:0)
         event.setParam(subject,forKeyword:aeCode("----"))
         if let value {event.setParam(value,forKeyword:aeCode("data"))}
-        let noConsent=NSAppleEventDescriptor.SendOptions(rawValue:UInt(kAEDoNotPromptForUserConsent))
         let reply:NSAppleEventDescriptor
-        do {reply=try event.sendEvent(options:[.waitForReply,.neverInteract,noConsent],timeout:timeout)}
+        do {reply=try send(event,owner:owner,timeout:timeout,readOnly:value == nil)}
         catch {
             if [-1743,-1744].contains((error as NSError).code) {throw TerminalAdapterError.permissionDenied}
             throw error
@@ -501,12 +514,13 @@ enum TerminalAppleEvents {
     /// nil uses the existing script's initial consent/compatibility path. A
     /// revoked permission or timeout never starts a second read or launches Terminal.
     static func screens(ttys: [String], includeTitles: Bool = true, includeCursor: Bool = false,
-                        preflight: Bool = true, purpose: RemoteTerminalPerformance.NativePurpose = .other, freshTitles: Bool = false) throws -> TerminalSnapshot? {
+                        purpose: RemoteTerminalPerformance.NativePurpose = .other, freshTitles: Bool = false) throws -> TerminalSnapshot? {
         guard let application = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else {
             throw AppError.message("Terminal 앱을 먼저 실행해주세요.")
         }
         guard !ttys.isEmpty else { return TerminalSnapshot() }
         let pid = application.processIdentifier
+        guard let owner = TerminalProcessLookup.identity(pid:pid) else { throw AutomationIPC.Failure.invalidated }
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
         if titleCachePID != pid {
@@ -532,15 +546,7 @@ enum TerminalAppleEvents {
         })
         lock.unlock()
         if unsupported { return nil }
-        // Never request a new permission from a background read. Explicit setup
-        // retains the existing osascript consent behaviour if it is needed.
-        if preflight {
-            let access = readAccess(pid: pid)
-            if access == errAEEventNotPermitted { throw TerminalAdapterError.permissionDenied }
-            if access == errAEEventWouldRequireUserConsent { return nil }
-            guard access == noErr else { throw AppError.message("Terminal 자동화 상태를 확인하지 못했습니다. (\(access))") }
-        }
-        let reader = TerminalAppleEventReader(batchTitles: batchTitles, titleBatchUnavailable: {
+        let reader = TerminalAppleEventReader(timeout:5,batchTitles: batchTitles, titleBatchUnavailable: {
             lock.lock(); incompatibleTitlesPID = pid; lock.unlock()
         }, batchContents: batchContents, contentsBatchUnavailable: {
             lock.lock(); incompatibleContentsPID = pid; lock.unlock()
@@ -559,8 +565,7 @@ enum TerminalAppleEvents {
                 targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid), returnID: -1, transactionID: 0)
             event.setParam(subject, forKeyword: aeCode("----"))
             let reply: NSAppleEventDescriptor
-            let noConsent = NSAppleEventDescriptor.SendOptions(rawValue: UInt(kAEDoNotPromptForUserConsent))
-            do { reply = try event.sendEvent(options: [.waitForReply, .neverInteract, noConsent], timeout: timeout) }
+            do { reply = try send(event,owner:owner,timeout:timeout,readOnly:true) }
             catch {
                 if [-1743, -1744].contains((error as NSError).code) { throw TerminalAdapterError.permissionDenied }
                 throw error
@@ -602,14 +607,13 @@ enum TerminalAppleEvents {
             lock.unlock()
             return nil
         }
-        catch TerminalReadEventError.timedOut { throw AppError.message("Terminal 화면 조회 시간이 초과되었습니다.") }
+        catch TerminalReadEventError.timedOut { throw AutomationIPC.Failure.timeout }
     }
-    /// A compatibility read must obtain a fresh result; no completed grant is cached.
     static func readPermission() throws -> Bool {
         guard let application = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else {
             throw AppError.message("Terminal 앱을 먼저 실행해주세요.")
         }
-        let access = readAccess(pid: application.processIdentifier)
+        guard let access = try HostAutomationPermission.status(.terminal,application:application,eventClass:aeCode("core"),eventID:aeCode("getd"),cacheOnly:false) else { throw AutomationIPC.Failure.busy }
         if access == errAEEventNotPermitted || access == errAEEventWouldRequireUserConsent { return false }
         guard access == noErr else { throw AppError.message("Terminal 자동화 상태를 확인하지 못했습니다. (\(access))") }
         return true
@@ -617,12 +621,11 @@ enum TerminalAppleEvents {
     static func history(tty:String) throws -> String {
         guard let app=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Terminal").first else {throw AppError.message("Terminal 앱을 먼저 실행해주세요.")}
         let pid=app.processIdentifier
-        guard readAccess(pid:pid)==noErr else {throw TerminalAdapterError.permissionDenied}
-        let reader=TerminalAppleEventReader {subject,timeout in
+        guard let owner = TerminalProcessLookup.identity(pid:pid) else { throw AutomationIPC.Failure.invalidated }
+        let reader=TerminalAppleEventReader(timeout:5) {subject,timeout in
             let event=NSAppleEventDescriptor(eventClass:aeCode("core"),eventID:aeCode("getd"),targetDescriptor:.init(processIdentifier:pid),returnID:-1,transactionID:0)
             event.setParam(subject,forKeyword:aeCode("----"))
-            let noConsent=NSAppleEventDescriptor.SendOptions(rawValue:UInt(kAEDoNotPromptForUserConsent))
-            let reply=try event.sendEvent(options:[.waitForReply,.neverInteract,noConsent],timeout:timeout)
+            let reply=try send(event,owner:owner,timeout:timeout,readOnly:true)
             let status=reply.paramDescriptor(forKeyword:aeCode("errn"))?.int32Value ?? 0
             if [-1743,-1744].contains(status) {throw TerminalAdapterError.permissionDenied}
             guard status==0 else {throw NSError(domain:NSOSStatusErrorDomain,code:Int(status))}
@@ -630,9 +633,5 @@ enum TerminalAppleEvents {
             return value
         }
         return try reader.history(tty:tty)
-    }
-    private static func readAccess(pid: pid_t) -> OSStatus {
-        let target = NSAppleEventDescriptor(processIdentifier: pid)
-        return AEDeterminePermissionToAutomateTarget(target.aeDesc!, aeCode("core"), aeCode("getd"), false)
     }
 }

@@ -74,7 +74,6 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var name: String
     public var members: [SessionGroupMember]
-    /// Order supplies a stable default report recipient. Every leader has the same authority.
     public private(set) var leaderMemberIDs: [UUID]
     public var leaderMemberID: UUID? {
         get { leaderMemberIDs.first }
@@ -119,24 +118,36 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
 
     public func isLeader(_ id: UUID) -> Bool { leaderMemberIDs.contains(id) }
 
-    /// All leaders share direction of the top level. Lower tiers retain their own supervisors.
     public func canDirect(_ caller: UUID, worker: UUID) -> Bool {
-        guard let parent = parentID(of: worker) else { return false }
-        return caller == parent || (isLeader(caller) && isLeader(parent))
+        guard caller != worker, let parent = parentID(of: worker) else { return false }
+        if caller == parent { return true }
+        return !isLeader(worker) && isLeader(caller) && parentID(of: caller) == nil
+            && isLeader(parent) && parentID(of: parent) == nil
     }
 
-    /// The member that assigns work to `memberID` and receives its reports.
+    package func canManage(_ caller: UUID, member target: UUID) -> Bool {
+        guard isLeader(caller) else { return false }
+        if caller == target { return true }
+        if !members.contains(where: { isLeader($0.id) && $0.parentMemberID != nil }) { return true }
+        if canDirect(caller, worker: target) { return true }
+        var current = parentID(of: target)
+        var visited = Set<UUID>()
+        while let parent = current, visited.insert(parent).inserted {
+            if parent == caller { return true }
+            current = parentID(of: parent)
+        }
+        return false
+    }
+
     public func parentID(of memberID: UUID) -> UUID? {
-        guard let leader = leaderMemberID, !isLeader(memberID),
-              let member = members.first(where: { $0.id == memberID }) else { return nil }
-        return member.parentMemberID ?? leader
+        guard let member = members.first(where: { $0.id == memberID }) else { return nil }
+        return member.parentMemberID ?? (isLeader(memberID) ? nil : leaderMemberID)
     }
 
     public func children(of memberID: UUID) -> [SessionGroupMember] {
         members.filter { $0.id != memberID && parentID(of: $0.id) == memberID }
     }
 
-    /// Leader first, then each member under its parent. Without a leader, the saved order.
     public var treeOrder: [SessionGroupTreeEntry] {
         guard !leaderMemberIDs.isEmpty else {
             return members.map { SessionGroupTreeEntry(member: $0, depth: 0) }
@@ -148,20 +159,18 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
             result.append(SessionGroupTreeEntry(member: member, depth: depth))
             for child in children(of: member.id) { visit(child, depth + 1) }
         }
-        for id in leaderMemberIDs { if let root = members.first(where: { $0.id == id }) { visit(root, 0) } }
-        // A validated group has no unreachable member; keep any anyway so nothing disappears from view.
+        for id in leaderMemberIDs where parentID(of: id) == nil { if let root = members.first(where: { $0.id == id }) { visit(root, 0) } }
         for member in members where !visited.contains(member.id) { result.append(SessionGroupTreeEntry(member: member, depth: 1)) }
         return result
     }
 
-    /// Members that can direct `memberID` without creating a cycle: never itself or one of its descendants.
     public func parentCandidates(for memberID: UUID) -> [SessionGroupMember] {
-        guard leaderMemberID != nil, !isLeader(memberID) else { return [] }
+        guard leaderMemberID != nil, members.contains(where: { $0.id == memberID }) else { return [] }
         var descendants = Set<UUID>([memberID]), queue = [memberID]
         while let next = queue.popLast() {
             for child in children(of: next) where descendants.insert(child.id).inserted { queue.append(child.id) }
         }
-        return members.filter { !descendants.contains($0.id) }
+        return members.filter { !descendants.contains($0.id) && (!isLeader(memberID) || isLeader($0.id)) }
     }
 
     /// The new leader leaves its parent; every other link stays, so the tree remains acyclic.
@@ -193,13 +202,13 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
         return result
     }
 
-    /// Setting the leader as a parent stores nil, which already means "directly under the leader".
-    public func settingParent(_ parentID: UUID, for memberID: UUID) -> SessionGroup {
+    public func settingParent(_ parentID: UUID?, for memberID: UUID) -> SessionGroup {
+        guard let index = members.firstIndex(where: { $0.id == memberID }) else { return self }
+        if let parentID {
+            guard parentCandidates(for: memberID).contains(where: { $0.id == parentID }) else { return self }
+        } else if !isLeader(memberID) { return self }
         var result = self
-        guard parentCandidates(for: memberID).contains(where: { $0.id == parentID }) else { return result }
-        for index in result.members.indices where result.members[index].id == memberID {
-            result.members[index].parentMemberID = parentID == leaderMemberID ? nil : parentID
-        }
+        result.members[index].parentMemberID = !isLeader(memberID) && parentID == leaderMemberID ? nil : parentID
         return result
     }
 
@@ -252,22 +261,27 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
         return result
     }
 
-    /// Every member must reach the leader through existing parents, without a cycle.
     private func validateTree() throws {
         let invalid = AppError.message("그룹장과 상위 구성원 연결을 확인해주세요.")
-        guard let leader = leaderMemberID else {
+        guard leaderMemberID != nil else {
             guard members.allSatisfy({ $0.parentMemberID == nil }) else { throw invalid }
             return
         }
         let byID = Dictionary(uniqueKeysWithValues: members.map { ($0.id, $0) })
-        guard Set(leaderMemberIDs).count == leaderMemberIDs.count,
-              leaderMemberIDs.allSatisfy({ byID[$0] != nil && byID[$0]?.parentMemberID == nil }) else { throw invalid }
-        for member in members where !isLeader(member.id) {
-            var seen: Set<UUID> = [member.id], current = member
-            while let parent = current.parentMemberID, parent != leader {
-                guard seen.insert(parent).inserted, let next = byID[parent] else { throw invalid }
+        let leaders = Set(leaderMemberIDs)
+        guard leaders.count == leaderMemberIDs.count, leaders.allSatisfy({ byID[$0] != nil }) else { throw invalid }
+        var verified = Set<UUID>()
+        for member in members {
+            var path = Set<UUID>()
+            var current = member
+            while !verified.contains(current.id) {
+                guard path.insert(current.id).inserted else { throw invalid }
+                let isLeader = leaders.contains(current.id)
+                guard let parent = current.parentMemberID ?? (isLeader ? nil : leaderMemberID) else { break }
+                guard let next = byID[parent], !isLeader || leaders.contains(parent) else { throw invalid }
                 current = next
             }
+            verified.formUnion(path)
         }
     }
 }

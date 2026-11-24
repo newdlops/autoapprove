@@ -701,6 +701,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("OS permissions: web revision rejects revoked, ABA and exited policies",tests.testOSPermissionWebRevisionRejectsStalePolicyAndABARestore),
             ("Web interaction: explicit single/multiple/free-text answers and bounds", tests.testWebQuestionAnswersAreExplicitAndBounded),
             ("Web interaction: MCP ownership, expiry and no default answer", tests.testWebQuestionOwnershipExpiryAndNoDefaultAnswer),
+            ("Automation IPC: permission coalescing, cancellation and global limit",tests.testPermissionAndCancelledFlights),
+            ("Automation IPC: expired keyboard sample retains user priority",tests.testStaleKeyboardSampleRetainsPriority),
+            ("Automation IPC: blocked target isolation and late replies",tests.testBlockedAutomationIsolation),
             ("Group Goals: native CLI commands and user Goal evidence", tests.testNativeGroupGoalCommandsAndEvidence),
             ("Web interaction: MCP stdio initialization, tool list and errors", tests.testMCPStdioProtocolAndToolErrors),
             ("Web interaction: explicit screen capture, cache, permission and stop", tests.testTestScreenCaptureIsExplicitAndStops),
@@ -892,8 +895,10 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
         let filter = filterIndex.flatMap { CommandLine.arguments.indices.contains($0 + 1) ? CommandLine.arguments[$0 + 1] : nil }
         let selected = cases.filter { filter == nil || $0.0.localizedCaseInsensitiveContains(filter!) }
         if selected.isEmpty { print("No matching checks"); exit(1) }
+        setvbuf(stdout,nil,_IOLBF,0)
         var failures = 0
         for (name, run) in selected {
+            print("CHECK \(name)")
             do { try await run(); print("PASS \(name)") }
             catch { failures += 1; print("FAIL \(name): \(error.localizedDescription)") }
         }

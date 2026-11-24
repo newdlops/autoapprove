@@ -165,7 +165,7 @@ import AutoApproveCore
             }
             Text(group.leaderMemberID == nil
                  ? "구성원의 역할 메뉴에서 그룹장을 한 명 이상 지정할 수 있습니다."
-                 : "모든 그룹장은 그룹장 직속 구성원에게 작업을 지시하고 질문에 답할 수 있습니다. 작업을 받은 구성원은 권한 확인에서 멈추지 않도록 자동 승인이 켜집니다. 작업자가 응답을 마치면 결과 요약이 지시한 세션의 터미널에 입력됩니다.")
+                 : "그룹장은 직속 구성원에게 작업을 지시하고 질문에 답할 수 있습니다. 그룹장끼리는 역할 메뉴에서 상위 그룹장을 지정하세요. 작업을 받은 구성원은 권한 확인에서 멈추지 않도록 자동 승인이 켜집니다. 작업자가 응답을 마치면 결과 요약이 지시한 세션의 터미널에 입력됩니다.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Text("에이전트는 get_session_groups와 get_group_status로 구성원과 작업 상태를 확인합니다. 공유 서버는 자신의 대화 ID를 지정해야 할 수 있습니다. 상태는 새로고침할 때 확인합니다.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -284,15 +284,21 @@ import AutoApproveCore
                 Button("그룹장 해제") { clearLeader(member, in: group) }
             } else {
                 Button("그룹장으로 지정") { makeLeader(member, in: group) }
-                if group.leaderMemberID != nil {
-                    Menu("상위 구성원") {
-                        ForEach(group.parentCandidates(for: member.id)) { candidate in
-                            Button {
-                                setParent(candidate, for: member, in: group)
-                            } label: {
-                                if group.parentID(of: member.id) == candidate.id { Label(candidate.title, systemImage: "checkmark") }
-                                else { Text(candidate.title) }
-                            }
+            }
+            let leader = group.isLeader(member.id)
+            if leader ? group.leaderMemberIDs.count > 1 : group.leaderMemberID != nil {
+                Menu(leader ? "상위 그룹장" : "상위 구성원") {
+                    if leader {
+                        Button { setParent(nil, for: member, in: group) } label: {
+                            if member.parentMemberID == nil { Label("없음 (최상위)", systemImage: "checkmark") }
+                            else { Text("없음 (최상위)") }
+                        }
+                    }
+                    ForEach(group.parentCandidates(for: member.id)) { candidate in
+                        let title = candidate.nickname ?? (candidate.title.isEmpty ? candidate.agent.title : candidate.title)
+                        Button { setParent(candidate, for: member, in: group) } label: {
+                            if group.parentID(of: member.id) == candidate.id { Label(title, systemImage: "checkmark") }
+                            else { Text(title) }
                         }
                     }
                 }
@@ -303,7 +309,12 @@ import AutoApproveCore
     }
 
     private func roleText(_ member: SessionGroupMember, in group: SessionGroup) -> String {
-        if group.isLeader(member.id) { return "그룹장" }
+        if group.isLeader(member.id) {
+            if let parent = group.members.first(where: { $0.id == member.parentMemberID }) {
+                return "그룹장 · 상위 그룹장 " + (parent.nickname ?? (parent.title.isEmpty ? parent.agent.title : parent.title))
+            }
+            return "그룹장"
+        }
         guard let parent = group.parentID(of: member.id),
               let title = group.members.first(where: { $0.id == parent })?.title else { return "그룹장 없음" }
         return "지시: " + (title.isEmpty ? "구성원" : title)
@@ -336,8 +347,8 @@ import AutoApproveCore
         _ = persist(groups.map { $0.id == group.id ? changed : $0 }, message: "선택한 구성원의 그룹장 역할을 해제했습니다.")
     }
 
-    private func setParent(_ parent: SessionGroupMember, for member: SessionGroupMember, in group: SessionGroup) {
-        _ = persist(groups.map { $0.id == group.id ? group.settingParent(parent.id, for: member.id) : $0 }, message: "상위 구성원을 변경했습니다.")
+    private func setParent(_ parent: SessionGroupMember?, for member: SessionGroupMember, in group: SessionGroup) {
+        _ = persist(groups.map { $0.id == group.id ? group.settingParent(parent?.id, for: member.id) : $0 }, message: "상위 구성원을 변경했습니다.")
     }
 
     private func refreshIdentity(_ member: SessionGroupMember, in group: SessionGroup) async {

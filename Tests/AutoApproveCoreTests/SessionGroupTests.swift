@@ -648,6 +648,24 @@ extension ApprovalTests {
         }
         try expect(!peers.canDirect(b.id, worker: d.id))
         try expectEqual(try JSONDecoder().decode(SessionGroup.self, from: JSONEncoder().encode(peers)).validated(), peers)
+        let ranked = try peers.settingParent(c.id, for: a.id).validated()
+        try expectEqual(ranked.treeOrder.map(\.id), [c.id, a.id, b.id, d.id])
+        try expectEqual(ranked.treeOrder.map(\.depth), [0, 1, 2, 1])
+        try expect(ranked.canDirect(c.id, worker: a.id) && ranked.canDirect(a.id, worker: b.id))
+        try expect(!ranked.canDirect(a.id, worker: c.id) && !ranked.canDirect(a.id, worker: d.id))
+        try expect(ranked.settingParent(b.id, for: a.id) == ranked && ranked.settingParent(a.id, for: c.id) == ranked)
+        try expectEqual(ranked.settingParent(nil, for: a.id), peers)
+        try expectEqual(try JSONDecoder().decode(SessionGroup.self, from: JSONEncoder().encode(ranked)).validated(), ranked)
+        let third = ranked.addingLeader(d.id)
+        try expect(!third.canDirect(d.id, worker: a.id))
+        try expect(!third.canManage(d.id, member: a.id) && !third.canManage(a.id, member: c.id))
+        let chain = try third.settingParent(a.id, for: d.id).validated()
+        try expectEqual(chain.parentID(of: d.id), a.id)
+        try expect(!chain.canDirect(c.id, worker: d.id))
+        try expectNil(try chain.removingLeader(a.id).validated().parentID(of: d.id))
+        var broken = chain
+        broken.members[2].parentMemberID = d.id
+        try expectThrows(try broken.validated())
         let remaining = try peers.removingLeader(a.id).validated()
         try expectEqual(remaining.leaderMemberIDs, [c.id])
         try expectEqual(remaining.parentID(of: a.id), c.id)
@@ -1351,6 +1369,7 @@ extension ApprovalTests {
         let codex = try unwrapGroup(observed.first { $0.id == sessions[1].id }).member
         let disconnected = SessionGroupMember(agent: .codex, title: "offline", cwd: "/project", conversationID: UUID().uuidString, providerHome: home)
         let group = SessionGroup(name: "cross-agent", members: [parent, worker, codex, disconnected], leaderMemberID: parent.id)
+            .addingLeader(worker.id).settingParent(parent.id, for: worker.id)
         try SessionGroupStore(directory: directory).save([group])
         func call(_ tool: String, extra: JSONObject = [:]) async throws -> JSONObject {
             var args: JSONObject = ["owner": UUID().uuidString, "tool": tool, "agentKind": "codex", "conversationID": parentID,
@@ -1361,6 +1380,8 @@ extension ApprovalTests {
             let response = try await call(tool)
             let rows = (response["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject] ?? []
             let claude = rows.first { $0["id"] as? String == worker.id.uuidString }
+            try expectEqual(claude?["isLeader"] as? Bool, true)
+            try expectEqual(claude?["parentMemberID"] as? String, parent.id.uuidString)
             try expectEqual(claude?["model"] as? String, "claude-opus-5-5")
             try expectEqual(claude?["reasoningEffort"] as? String, "medium")
             try expectEqual(claude?["modelSettingsSource"] as? String, "owned_fixture")
@@ -1369,6 +1390,11 @@ extension ApprovalTests {
             for id in [parent.id, disconnected.id] { try expect(rows.first { $0["id"] as? String == id.uuidString }?["model"] is NSNull) }
             if tool == "get_group_status" { try expectEqual(claude?["canAssign"] as? Bool, true) }
         }
+        do {
+            _ = try await engine.mcpAction(["owner": UUID().uuidString, "tool": "assign_group_task", "sessionID": sessions[0].id,
+                "groupID": group.id.uuidString, "memberID": parent.id.uuidString, "task": "Inspect a fixture"])
+            throw AppError.message("A subordinate leader assigned work to its supervisor")
+        } catch let error as RemoteHTTPError { try expectEqual(error.status, 403) }
         _ = try await call("assign_group_task", extra: ["task": "Inspect the owned fixture"])
         try expectEqual(terminal.status(records[0].pid), "busy")
         let box = try SessionGroupMailbox(directory: directory)

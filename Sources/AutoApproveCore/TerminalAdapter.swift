@@ -62,6 +62,11 @@ public struct ScreenTarget: Equatable, Sendable {
 
 /// The per-host channel behind every screen connection. Tests replace these closures.
 public struct ScreenHostAdapter: Sendable {
+    var usesHostIPC = false
+    func isolatedRead<T>(_ host:ScreenHost,_ read:@escaping @Sendable () throws -> T) async throws -> T {
+        if usesHostIPC { return try await AutomationIPC.shared.read(host:host.title,body:read) }
+        return try await Task.detached(priority:.userInitiated,operation:read).value
+    }
     public var screens: @Sendable ([ScreenTarget]) throws -> TerminalSnapshot
     /// Explicit identity reads require a current title even when the monitor has cached one.
     var identityScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
@@ -137,6 +142,7 @@ public struct ScreenHostAdapter: Sendable {
             adapter.checkedTypeLine = { try TerminalAdapter.typeLine(target: $0, text: $1, expected: $2) }
             adapter.typeLine = { try TerminalAdapter.typeLine(target: $0, text: $1) }
             adapter.backgroundInput = { try TerminalDeviceInput.deliverBackground(target: $0, screen: $1, agent: $2, input: $3) }
+            adapter.usesHostIPC = terminalReader == nil
             if let terminalReader {
                 adapter.screens = { try terminalReader($0.map(\.tty)) }
                 adapter.identityScreens = nil
@@ -145,7 +151,7 @@ public struct ScreenHostAdapter: Sendable {
             }
             return adapter
         case .iterm:
-            return ScreenHostAdapter(screens: { try ITermAdapter.screens(ttys: $0.map(\.tty)) },
+            var adapter = ScreenHostAdapter(screens: { try ITermAdapter.screens(ttys: $0.map(\.tty)) },
                 approve: { try ITermAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
                 reveal: { try ITermAdapter.reveal(tty: $0.tty) },
                 resume: { try ITermAdapter.resume(target: $0, region: $1, text: $2) },
@@ -153,6 +159,8 @@ public struct ScreenHostAdapter: Sendable {
                 restart: { try ITermAdapter.restart(target:$0,expected:$1,command:$2) },
                 input: { try RemoteTerminalAdapter.input(host: .iterm, target: $0, expected: $1, agent: $2, input: $3) },
                 setTabLabel:{try TerminalTabLabelAdapter.apply(host:.iterm,target:$0,label:$1)})
+            adapter.usesHostIPC = true
+            return adapter
         case .orca:
             return ScreenHostAdapter(screens: { try OrcaAdapter.screens(targets: $0) },
                 approve: { try OrcaAdapter.approve(target: $0, expectedScreen: $1, agent: $2) },
@@ -170,12 +178,12 @@ public struct ScreenHostAdapter: Sendable {
 }
 
 enum AutomationScript {
-    static func run(_ body: String, app: String, denied: TerminalAdapterError, timeout: TimeInterval = 8) throws -> String {
-        // Keep repeated scripts and complete prompt text out of the command
-        // line. Standard input preserves their original Unicode bytes as well.
-        let result = try CommandRunner.run("/usr/bin/osascript", ["-l", "JavaScript"], timeout: timeout, input: Data(body.utf8))
+    static func run(_ body: String, app: String, denied: TerminalAdapterError, timeout: TimeInterval = 8, readOnly: Bool = false) throws -> String {
+        let result = try AutomationIPC.shared.run(host:app,readOnly:readOnly,budget:timeout) {
+            try CommandRunner.run("/usr/bin/osascript", ["-l", "JavaScript"], timeout: timeout, input: Data(body.utf8))
+        }
         guard result.status == 0 else {
-            if result.error.contains("-1743") { throw denied }
+            if result.error.contains("-1743") || result.error.contains("-1744") { AutomationIPC.shared.revokePermission(app); throw denied }
             throw AppError.message("\(app) 연결 실패: \(result.error.trimmingCharacters(in: .whitespacesAndNewlines))")
         }
         return result.output.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -406,20 +414,16 @@ public enum TerminalAdapter {
     private static func literal(_ object: Any) throws -> String { try AutomationScript.literal(object) }
     public static func screens(ttys: [String], includeCursor: Bool = true, includeTitles: Bool = true,
                                purpose: RemoteTerminalPerformance.NativePurpose = .other, freshTitles: Bool = false) throws -> TerminalSnapshot {
-        // Background monitoring immediately sends a no-consent Apple Event,
-        // which itself checks current TCC authorization. Avoid a separate
-        // synchronous AEDeterminePermissionToAutomateTarget XPC round trip on
-        // every poll; explicit, validation and compatibility reads still
-        // perform their fresh preflight.
         if let snapshot = try TerminalAppleEvents.screens(ttys: ttys, includeTitles: includeTitles,
-            includeCursor: includeCursor, preflight: purpose != .monitor, purpose: purpose, freshTitles: freshTitles) { return snapshot }
+            includeCursor: includeCursor, purpose: purpose, freshTitles: freshTitles) { return snapshot }
+        guard try TerminalAppleEvents.readPermission() else { throw TerminalAdapterError.permissionDenied }
         return try scriptScreens(ttys: ttys, includeCursor: includeCursor, includeTitles: includeTitles)
     }
     /// The engine has just checked Automation, including before cached frames.
     /// Each native send still enforces current OS permission without prompting.
     static func remoteScreens(ttys: [String], includeCursor: Bool = true) throws -> TerminalSnapshot {
         try TerminalRemoteRead.read(native: {
-            try TerminalAppleEvents.screens(ttys: ttys, includeTitles: false, includeCursor: includeCursor, preflight: false,
+            try TerminalAppleEvents.screens(ttys: ttys, includeTitles: false, includeCursor: includeCursor,
                 purpose: includeCursor ? .liveFrame : .firstFrame)
         }, fallbackPermission: {
             try TerminalAppleEvents.readPermission()
@@ -428,7 +432,7 @@ public enum TerminalAdapter {
         })
     }
     private static func scriptScreens(ttys: [String], includeCursor: Bool, includeTitles: Bool) throws -> TerminalSnapshot {
-        let output = try javascript(screenScript(ttys: ttys, includeCursor: includeCursor, includeTitles: includeTitles))
+        let output = try AutomationScript.run(screenScript(ttys:ttys,includeCursor:includeCursor,includeTitles:includeTitles),app:"Terminal",denied:.permissionDenied,timeout:5,readOnly:true)
         let data = Data(output.utf8)
         var snapshot = try JSONDecoder().decode(TerminalSnapshot.self, from: data)
         guard includeCursor else { return snapshot }

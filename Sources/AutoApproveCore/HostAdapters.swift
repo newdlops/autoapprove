@@ -1,4 +1,6 @@
 import Foundation
+import Carbon
+import AppKit
 
 /// iTerm2's scripting dictionary mirrors Terminal's tab model one level deeper: windows → tabs → sessions.
 public enum ITermAdapter {
@@ -39,7 +41,11 @@ public enum ITermAdapter {
     }
     """
     public static func screens(ttys: [String]) throws -> TerminalSnapshot {
-        let output = try javascript(screenScript(ttys: ttys))
+        if let app = NSRunningApplication.runningApplications(withBundleIdentifier:ScreenHost.iterm.bundleID).first {
+            guard let status = try HostAutomationPermission.status(.iterm,application:app,eventClass:typeWildCard,eventID:typeWildCard,cacheOnly:false) else { throw AutomationIPC.Failure.busy }
+            guard status == 0 else { throw TerminalAdapterError.automationDenied("iTerm2") }
+        } else { throw AppError.message("iTerm2 앱을 먼저 실행해주세요.") }
+        let output = try AutomationScript.run(screenScript(ttys:ttys),app:"iTerm2",denied:.automationDenied("iTerm2"),timeout:5,readOnly:true)
         return try JSONDecoder().decode(TerminalSnapshot.self, from: Data(output.utf8))
     }
     /// Exposed for contract tests against iTerm2's scripting dictionary, without sending Apple events.

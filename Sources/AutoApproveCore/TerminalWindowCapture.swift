@@ -71,6 +71,8 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
     private let requiresAccessibilityForMetadata: Bool
     private let permissions: @MainActor @Sendable () -> TerminalWindowPermissions
     private let automationPermission: @MainActor @Sendable () -> Bool
+    private let injectedQueryIPC = AutomationIPC()
+    private let usesLiveAutomation: Bool
     private let automationQuery: (@Sendable () -> Bool)?
     private var automationEpoch: UInt64 = 0
     private var pendingAutomation: (token: UUID, task: Task<Bool,Error>, completion: AutomationQueryCompletion)?
@@ -105,11 +107,8 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
         if let automationPermission { self.automationPermission = automationPermission }
         else if let permissions { self.automationPermission = { permissions().automation } }
         else { self.automationPermission = { Self.liveAutomationPermission(host) } }
-        // AppKit-bound injected permission providers keep their actor contract.
-        // The production non-prompting system query runs off the main actor.
-        if let automationQuery { self.automationQuery = automationQuery }
-        else if automationPermission == nil && permissions == nil { self.automationQuery = { Self.liveAutomationPermission(host) } }
-        else { self.automationQuery = nil }
+        self.usesLiveAutomation = automationQuery == nil && automationPermission == nil && permissions == nil
+        self.automationQuery = automationQuery
         if let keyboardPermission { self.keyboardPermission = keyboardPermission }
         else if let permissions { self.keyboardPermission = { permissions().keyboard } }
         else { self.keyboardPermission = { TerminalKeyboard.isAvailable } }
@@ -125,18 +124,26 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
     public var nonpromptAutomationGranted: Bool { automationPermission() }
     public func checkAutomationPermission() async throws -> Bool {
         try Task.checkCancellation()
+        if usesLiveAutomation {
+            let epoch = automationEpoch
+            let result = try await HostAutomationPermission.check(host)
+            guard epoch == automationEpoch else { throw CancellationError() }
+            return result
+        }
         guard let query = automationQuery else { return automationPermission() }
         let epoch = automationEpoch, task: Task<Bool,Error>
         if let pendingAutomation, !pendingAutomation.completion.isFinished { task = pendingAutomation.task }
         else {
             let token = UUID(), completion = AutomationQueryCompletion()
-            let worker = Task.detached(priority:.userInitiated) {
+            let worker = Task { [injectedQueryIPC,host] in
                 defer { completion.finish() }
-                return RemoteTerminalPerformance.shared.measure(.automationQuery,query)
+                return try await injectedQueryIPC.read(host:host.title,budget:2) {
+                    RemoteTerminalPerformance.shared.measure(.automationQuery,query)
+                }
             }
             task = Task { @MainActor [weak self] in
                 defer { if self?.pendingAutomation?.token == token { self?.pendingAutomation = nil } }
-                let result = await withTaskCancellationHandler(operation:{await worker.value},onCancel:{worker.cancel()})
+                let result = try await withTaskCancellationHandler(operation:{try await worker.value},onCancel:{worker.cancel()})
                 try Task.checkCancellation()
                 guard self?.automationEpoch == epoch else { throw CancellationError() }
                 return result
@@ -150,6 +157,7 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
     }
     public func requestPermissions() { request(); invalidate() }
     public func invalidate() {
+        if usesLiveAutomation { AutomationIPC.shared.invalidate(host.title) } else { injectedQueryIPC.invalidate(host.title) }
         automationEpoch &+= 1; pendingAutomation?.task.cancel(); pendingAutomation = nil
         for value in pending.values { value.task.cancel(); value.validation?.task.cancel() }; pending.removeAll()
     }
@@ -166,9 +174,8 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
     nonisolated private static func liveAutomationPermission(_ host: ScreenHost) -> Bool {
         guard let application = NSRunningApplication.runningApplications(withBundleIdentifier:host.bundleID).first,
               application.processIdentifier > 0 else { return false }
-        let descriptor = NSAppleEventDescriptor(processIdentifier:application.processIdentifier)
-        // This preflight cannot open the app or ask for Automation consent.
-        return AEDeterminePermissionToAutomateTarget(descriptor.aeDesc, typeWildCard, typeWildCard, false) == noErr
+        let status = try? HostAutomationPermission.status(host,application:application,eventClass:typeWildCard,eventID:typeWildCard,cacheOnly:Thread.isMainThread)
+        return status == noErr
     }
     private static func livePermissions(_ host: ScreenHost) -> TerminalWindowPermissions {
         TerminalWindowPermissions(screen: screenPermissionGranted, keyboard: TerminalKeyboard.isAvailable,

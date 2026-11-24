@@ -1184,14 +1184,26 @@ private extension AgentKind {
 
     // MARK: Graph
 
-    /// Never compressed: zoom and pan decide what part of it the area shows. The automatic layout
-    /// depends only on the size steps, so a message that keeps every step never moves a node.
-    /// Spacing uses the "전체" view's steps whatever the view, so switching views never moves a
-    /// node; every member has at least as many records there as in "최근", so circles drawn at the
-    /// current view's step always fit. Only the drawn diameters follow the current view.
+    private func circleOrder() -> [(id: UUID, depth: Int)] {
+        var leaders: [UUID] = []
+        var rings: [UUID: [UUID]] = [:]
+        var ancestry: [UUID] = []
+        for node in nodes {
+            if ancestry.count > node.depth { ancestry.removeLast(ancestry.count - node.depth) }
+            if node.isLeader {
+                leaders.append(node.id)
+                ancestry.append(node.id)
+            } else if let leader = ancestry.last {
+                rings[leader, default: []].append(node.id)
+                ancestry.append(leader)
+            }
+        }
+        return leaders.flatMap { leader in
+            [(id: leader, depth: 0)] + (rings[leader] ?? []).map { (id: $0, depth: 1) }
+        }
+    }
+
     private func place(layout: SessionGroupGraph.Layout, moved: [UUID: CGSize]) -> Placement {
-        // The matrix has no node points; fitting shows its grid, and when the grid is larger than
-        // the area its top left corner, where the leader's row and column start, stays in view.
         guard layout.drawsNodes else {
             let content = SessionGroupGraph.matrixContent(count: nodes.count)
             return Placement(base: [:], points: [:], diameters: [:], content: content, leader: content.origin, topAligned: true)
@@ -1199,7 +1211,8 @@ private extension AgentKind {
         let diameters = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.size(scope).diameter) })
         let spacing = Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0.size(.all).diameter) })
         let largest = spacing.values.max() ?? SessionGroupGraph.standardDiameter
-        let order = nodes.map { (id: $0.id, depth: $0.depth) }
+        let order = layout == .circle && nodes.contains(where: { $0.isLeader && $0.depth > 0 })
+            ? circleOrder() : nodes.map { (id: $0.id, depth: $0.depth) }
         let base: [UUID: CGPoint]
         if layout == .force, forceCache.ids == order.map(\.id), forceCache.depths == order.map(\.depth),
            forceCache.sizes == spacing, forceCache.edges == all {

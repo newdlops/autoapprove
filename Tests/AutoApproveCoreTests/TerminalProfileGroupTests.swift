@@ -8,7 +8,7 @@ extension ApprovalTests {
         var worker=SessionGroupMember(agent:.codex,title:"Worker",cwd:cwd,conversationID:UUID().uuidString.lowercased(),providerHome:home)
         var child=SessionGroupMember(agent:.claude,title:"Claude",cwd:cwd,conversationID:UUID().uuidString.lowercased(),providerHome:"/fixture/claude")
         leader.runtimeID="old-leader";worker.runtimeID="old-worker";child.runtimeID="old-claude";child.parentMemberID=worker.id
-        let group=SessionGroup(name:"Saved group",members:[leader,worker,child],leaderMemberID:leader.id).addingLeader(worker.id)
+        let group=SessionGroup(name:"Saved group",members:[leader,worker,child],leaderMemberID:leader.id).addingLeader(worker.id).settingParent(leader.id, for: worker.id)
         let entries=[leader,worker].map {TerminalProfileEntry(title:$0.title,agent:$0.agent.rawValue,cwd:$0.cwd,conversationID:$0.conversationID,providerHome:$0.providerHome)}
         let candidates=zip([leader,worker],entries).map {TerminalProfileCandidate(id:$0.0.runtimeID!,entry:$0.1)}
         let groups=TerminalProfileGroup.capture([group],candidates:candidates)
@@ -28,6 +28,10 @@ extension ApprovalTests {
         let current = SessionGroup(id: group.id, name: group.name, members: [replacement], leaderMemberID: replacement.id)
         let resolved = try TerminalProfileGroupRestore.resolveMemberIDs(groups, in: [current])
         try expectEqual(resolved[0].group.leaderMemberID, replacement.id)
+        try expectEqual(resolved[0].group.parentID(of: worker.id), replacement.id)
+        let restored = try TerminalProfileGroupRestore.merge(resolved, into: [current], restored: [entries[1].id])
+        try expectEqual(restored[0].parentID(of: worker.id), replacement.id)
+        try expect(restored[0].canDirect(replacement.id, worker: worker.id))
         try expect(resolved[0].links.contains { $0.memberID == replacement.id })
         try expectFalse(resolved[0].group.members.contains { $0.id == leader.id })
         try expectEqual(try TerminalProfileGroupRestore.resolveMemberIDs(resolved, in: [current]), resolved)

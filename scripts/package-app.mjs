@@ -15,7 +15,6 @@ const macOS = path.join(app, 'Contents/MacOS');
 const resources = path.join(app, 'Contents/Resources');
 await mkdir(macOS, { recursive: true });
 await mkdir(resources, { recursive: true });
-// Retire the original GUI name, which collided with the helper on case-insensitive APFS.
 try { await unlink(path.join(macOS, 'AutoApprove')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
 for (const binary of ['AutoApproveApp', 'autoapprove']) {
   const source = path.join(build,binary);
@@ -26,6 +25,16 @@ for (const binary of ['AutoApproveApp', 'autoapprove']) {
 if (configuration === 'release') {
   const archiveDirectory = path.resolve('.runtime/release-symbols', `${webVersion.version}-${webVersion.build}`);
   const symbols = stripReleaseSymbols(app, {archiveDirectory});
+  const uuids = file => execFileSync('/usr/bin/dwarfdump', ['--uuid', file], {encoding: 'utf8'})
+    .split('\n').flatMap(line => line.match(/^UUID: ([\da-f-]+ \([^)]+\))/i)?.[1] ?? []).sort().join(',');
+  for (const {name, originalSHA256} of symbols.files) {
+    const source = path.join(build, name + '.dSYM');
+    const expected = uuids(path.join(macOS, name));
+    if (!expected || uuids(source) !== expected) throw new Error('Diagnostic UUID mismatch for ' + name);
+    const target = path.join(archiveDirectory, name + '.' + originalSHA256 + '.dSYM');
+    await cp(source, target, {recursive: true});
+    if (uuids(target) !== expected) throw new Error('Archived diagnostic UUID mismatch for ' + name);
+  }
   console.log(`Release executable symbols: ${symbols.savedBytes} bytes removed; diagnostic originals stay in ${archiveDirectory}`);
 }
 await copyFile('dist/autoapprove-bridge.vsix', path.join(resources, 'autoapprove-bridge.vsix'));
@@ -39,7 +48,6 @@ const codexRuntime=process.argv.find(value=>value.startsWith('--codex-runtime=')
   || process.env.AUTOAPPROVE_CODEX_RUNTIME
   || await (await import('./fetch-official-codex.mjs')).ensureOfficialCodexRuntime();
 await (await import('./codex-runtime-resource.mjs')).copyCodexRuntime(codexRuntime,path.join(resources,'CodexRuntime'));
-// Remove retired payloads when reusing a bundle from an older build.
 for (const relative of ['Contents/MacOS/AutoApproveTTYService',
   'Contents/Library/LaunchDaemons/local.autoapprove.tty-input.plist',
   'Contents/Library/LaunchServices/local.autoapprove.tty-input']) {

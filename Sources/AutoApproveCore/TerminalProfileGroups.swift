@@ -123,7 +123,8 @@ public enum TerminalProfileGroupRestore {
             guard Set(members.map(\.id)).count == members.count else { throw AppError.message("프로필의 여러 구성원이 같은 대화에 연결됩니다.") }
             var group = SessionGroup(id: original.id, name: original.name, members: members)
             for leader in original.leaderMemberIDs { group = group.addingLeader(ids[leader] ?? leader) }
-            return TerminalProfileGroup(group: group, links: snapshot.links.map {
+            group.members = members
+            return TerminalProfileGroup(group: try group.validated(), links: snapshot.links.map {
                 .init(entryID: $0.entryID, memberID: ids[$0.memberID] ?? $0.memberID)
             })
         }
@@ -152,9 +153,10 @@ public enum TerminalProfileGroupRestore {
             for leader in snapshot.group.leaderMemberIDs where !hadLeader || !existingMemberIDs.contains(leader) {
                 result[gi] = result[gi].addingLeader(leader)
             }
-            if !hadLeader, result[gi].leaderMemberID != nil {
-                for saved in snapshot.group.members {
+            if result[gi].leaderMemberID != nil {
+                for saved in snapshot.group.members where !hadLeader || !existingMemberIDs.contains(saved.id) {
                     guard let index=result[gi].members.firstIndex(where:{$0.id==saved.id}) else{continue}
+                    if let parent = saved.parentMemberID, !result[gi].members.contains(where: { $0.id == parent }) { continue }
                     result[gi].members[index].parentMemberID=saved.parentMemberID
                 }
             }

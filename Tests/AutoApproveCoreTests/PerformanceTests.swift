@@ -160,7 +160,7 @@ extension ApprovalTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let frames = PollingScreens()
         let adapter = ScreenHostAdapter(screens: { _ in frames.read() }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter])
+        let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter], nativeKeyboardActivity: .inactive)
         defer { engine.stop() }
         let sessions = (0..<24).map {
             AgentSession(id: "process:\(910_000 + $0):large-screen", agent: .codex, pid: Int32(910_000 + $0),
@@ -208,7 +208,7 @@ extension ApprovalTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let frames = PollingScreens()
         let adapter = ScreenHostAdapter(screens: { _ in frames.read() }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter])
+        let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter], nativeKeyboardActivity: .inactive)
         defer { engine.stop() }
         let agents: [AgentKind] = [.codex, .claude, .codex, .claude, .codex, .claude, .codex, .codex]
         let sessions = agents.enumerated().map { index, agent in
@@ -259,7 +259,7 @@ extension ApprovalTests {
             defer { try? FileManager.default.removeItem(at: root) }
             let frames = DelayedLargeScreens(); defer { frames.finish() }
             let adapter = ScreenHostAdapter(screens: { frames.read($0) }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
-            let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter])
+            let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter], nativeKeyboardActivity: .inactive)
             defer { engine.stop() }
             let session = AgentSession(id: "process:42:stale-large", agent: .codex, pid: 42, started: "old",
                 tty: "/dev/fixture-stale", cwd: root.path, terminal: .terminal)
@@ -327,7 +327,7 @@ extension ApprovalTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let frames = PollingScreens()
         let adapter = ScreenHostAdapter(screens: { _ in frames.read() }, approve: { _, _, _ in .missingTarget }, reveal: { _ in nil })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter])
+        let engine = try ApprovalEngine(paths: AppPaths(directory: root), claudeRegistryReader: { _ in [] }, screenAdapters: [.terminal: adapter], nativeKeyboardActivity: .inactive)
         defer { engine.stop() }
         let sessions = (0..<16).map { index in
             AgentSession(id: "process:\(900_000 + index):batch", agent: index.isMultiple(of: 2) ? .codex : .claude,

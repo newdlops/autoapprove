@@ -28,6 +28,7 @@ public final class RemoteTerminalPerformance: @unchecked Sendable {
         public var maximumMS: Double
     }
     public struct Snapshot: Codable, Sendable {
+        var automationIPC: AutomationIPC.Metrics?
         public var sampleLimit: Int
         public var stages: [String:Summary]
         public var counters: [String:UInt64]
@@ -162,7 +163,7 @@ public final class RemoteTerminalPerformance: @unchecked Sendable {
             return (stage.rawValue,Summary(count:samples.count,failures:samples.failures,sampleCount:sorted.count,
                 medianMS:percentile(0.5),p95MS:percentile(0.95),maximumMS:sorted.last ?? 0))
         })
-        return Snapshot(sampleLimit:Self.sampleLimit,stages:summaries,counters:Dictionary(uniqueKeysWithValues:counts.map{($0.key.rawValue,$0.value)}),
+        return Snapshot(automationIPC:AutomationIPC.shared.snapshot(),sampleLimit:Self.sampleLimit,stages:summaries,counters:Dictionary(uniqueKeysWithValues:counts.map{($0.key.rawValue,$0.value)}),
             nativeReads:native)
     }
 }

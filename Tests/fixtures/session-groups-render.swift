@@ -98,7 +98,7 @@ final class GraphReadProbe: @unchecked Sendable {
     /// `extra` adds that many unconnected members under the four deepest members, for a graph wider than the window.
     /// `burst` adds that many recent messages from the leader to "api 정리", so message amounts differ widely.
     static func make(root: URL, name: String, now: Date = fixedNow, heavy: Bool = false, empty: Bool = false, extra: Int = 0,
-                     burst: Int = 0) throws -> GraphFixture {
+                     burst: Int = 0, rankedLeaders: Bool = false) throws -> GraphFixture {
         let directory = root.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: directory)
         // key, agent, connected nickname (nil: no nickname), stored title, folder, parent key
@@ -151,8 +151,11 @@ final class GraphReadProbe: @unchecked Sendable {
         for (index, entry) in plan.enumerated() {
             if let parent = entry.5, parent != "lead" { members[index].parentMemberID = ids[parent] }
         }
-        let group = empty ? SessionGroup(name: "디자인 회의", members: [])
+        var group = empty ? SessionGroup(name: "디자인 회의", members: [])
             : SessionGroup(name: "결제 리뷰", members: members, leaderMemberID: ids["lead"])
+        if rankedLeaders, let root = ids["lead"], let supervisor = ids["api"] {
+            group = group.addingLeader(supervisor).settingParent(root, for: supervisor)
+        }
         try SessionGroupStore(directory: directory).save([group])
         if !empty { try seedMessages(directory: directory, group: group, id: ids, now: now, heavy: heavy, burst: burst) }
         return GraphFixture(engine: engine, group: group, directory: directory, now: now, id: ids)
@@ -550,7 +553,7 @@ final class GraphReadProbe: @unchecked Sendable {
     let fixture = try GraphFixture.make(root: root, name: "graph-state")
     let empty = try GraphFixture.make(root: root, name: "graph-empty", empty: true)
     let wide = try GraphFixture.make(root: root, name: "graph-wide", extra: 12)
-    let uneven = try GraphFixture.make(root: root, name: "graph-uneven", burst: 24)
+    let uneven = try GraphFixture.make(root: root, name: "graph-uneven", burst: 24, rankedLeaders: true)
     let groupFile = fixture.directory.appendingPathComponent("session-groups.json")
     let original = try Data(contentsOf: groupFile)
     let scenes: [(String, GraphFixture, UUID?, SessionGroupGraph.Scope, SessionGroupGraph.Layout, Bool, Double?)] = [
@@ -880,6 +883,7 @@ func percentile(_ values: [Double], _ p: Double) -> Double {
         for i in members.indices.dropFirst(2) { members[i].parentMemberID = members[1].id }
         let group = SessionGroup(name: "세션 그룹 · 긴 프로젝트 협업 이름과 상태", members: members)
             .addingLeader(members[0].id).addingLeader(members[1].id)
+            .settingParent(members[0].id, for: members[1].id)
         try SessionGroupStore(directory: directory).save([group])
         if CommandLine.arguments.contains("--verify-refresh") {
             NSApp.setActivationPolicy(.regular)

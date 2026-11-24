@@ -1,6 +1,6 @@
 # AutoApprove
 
-**Codex·Claude Code·agy 구성원의 Goal 설정·중지·해제 · 0.2.403 빌드 430** [변경 사항](docs/releases/v0.2.403.md)
+**그룹장 위계 설정과 Terminal 자동화 경합 격리 · 0.2.404 빌드 431** [변경 사항](docs/releases/v0.2.404.md)
 
 **그룹장의 구성원 보관함·터미널 조회 · 0.2.392 빌드 419** [변경 사항](docs/releases/v0.2.392.md)
 
@@ -805,7 +805,7 @@ NODE_OPTIONS=--use-system-ca bash scripts/build.sh
 
 ```sh
 swift build --disable-sandbox --cache-path .build/cache
-.build/debug/autoapprove-checks
+python3 scripts/check-watchdog.py .build/debug/autoapprove-checks
 node scripts/remote-traffic-check.mjs
 node scripts/discovery-update-check.mjs
 swift build -c release
