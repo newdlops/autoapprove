@@ -70,6 +70,18 @@ public struct NativeKeyboardActivity:Sendable {
         value.sampler = sampler
         return value
     }()
+    func prepare(_ terminal:TerminalKind) {
+        guard ![.pty,.claudeBackground,.unknown].contains(terminal) else { return }
+        _ = sampler?.sample()
+    }
+
+    func waitForSample(_ terminal:TerminalKind) async {
+        guard let sampler, ![.pty,.claudeBackground,.unknown].contains(terminal) else { return }
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.1
+        while sampler.sample() == nil && ProcessInfo.processInfo.systemUptime < deadline && !Task.isCancelled {
+            try? await Task.sleep(for:.milliseconds(8))
+        }
+    }
     public func hasPriority(terminal:TerminalKind,tty:String) -> Bool {
         if sampler != nil && AutomationIPC.shared.blocksWrites(terminal.title) { return true }
         if let sampler, sampler.sample() == nil { return ![.pty,.claudeBackground,.unknown].contains(terminal) }

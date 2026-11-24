@@ -54,6 +54,7 @@ private final class RejectedResumeProbe: @unchecked Sendable {
     init(definite: Bool) { self.definite = definite }
     func resume() throws -> ResumeDelivery {
         lock.lock(); defer { lock.unlock() }; calls += 1
+        if definite && calls == 1 { throw AutomationIPC.InputNotStarted(.busy) }
         if calls <= 4 {
             throw RemoteHTTPError(503, "QA temporarily disconnected", diagnostics: ["delivery": definite ? "not_started" : "unknown"])
         }

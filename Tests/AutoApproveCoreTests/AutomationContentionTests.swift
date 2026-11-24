@@ -2,6 +2,31 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testInteractiveReadAndInputAdmissionRecover() async throws {
+        let gate = AutomationIPC(cooldown:0.02)
+        let entered = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0)
+        defer { release.signal() }
+        let monitor = Task { try await gate.read(host:"Terminal") { entered.signal(); release.wait(); return 1 } }
+        while entered.wait(timeout:.now()) != .success { try await Task.sleep(for:.milliseconds(1)) }
+        let validation = Task { try await gate.read(host:"Terminal",waitForSlot:true) { 2 } }
+        do {
+            _ = try gate.runInput(host:"Terminal",budget:1) { fatalError("Input ran while occupied") }
+            throw AppError.message("Expected an admission refusal")
+        } catch is AutomationIPC.InputNotStarted {}
+        try await Task.sleep(for:.milliseconds(50))
+        release.signal()
+        try expectEqual(try await monitor.value,1)
+        try expectEqual(try await validation.value,2)
+        let sent = try gate.runInput(host:"Terminal",budget:1) {
+            try gate.run(host:"Terminal",readOnly:false,budget:0.2) { 3 }
+        }
+        try expectEqual(sent,3)
+        do {
+            _ = try gate.runInput(host:"Terminal",budget:1) { throw AutomationIPC.Failure.busy }
+            throw AppError.message("Expected transport failure")
+        } catch AutomationIPC.Failure.busy {}
+    }
+
     func testBlockedAutomationIsolation() async throws {
         let gate = AutomationIPC(cooldown:0.04)
         let release = DispatchSemaphore(value:0), entered = DispatchSemaphore(value:0)

@@ -701,6 +701,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("OS permissions: web revision rejects revoked, ABA and exited policies",tests.testOSPermissionWebRevisionRejectsStalePolicyAndABARestore),
             ("Web interaction: explicit single/multiple/free-text answers and bounds", tests.testWebQuestionAnswersAreExplicitAndBounded),
             ("Web interaction: MCP ownership, expiry and no default answer", tests.testWebQuestionOwnershipExpiryAndNoDefaultAnswer),
+            ("Automation IPC: submitted and deferred inputs stay distinct",tests.testInteractiveReadAndInputAdmissionRecover),
+            ("Automation IPC: blocked approval resumes without a new screen event",tests.testApprovalRecoversWithoutAnotherScreenEvent),
             ("Automation IPC: permission coalescing, cancellation and global limit",tests.testPermissionAndCancelledFlights),
             ("Automation IPC: expired keyboard sample retains user priority",tests.testStaleKeyboardSampleRetainsPriority),
             ("Automation IPC: blocked target isolation and late replies",tests.testBlockedAutomationIsolation),

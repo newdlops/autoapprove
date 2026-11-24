@@ -63,10 +63,15 @@ public struct ScreenTarget: Equatable, Sendable {
 /// The per-host channel behind every screen connection. Tests replace these closures.
 public struct ScreenHostAdapter: Sendable {
     var usesHostIPC = false
-    func isolatedRead<T>(_ host:ScreenHost,_ read:@escaping @Sendable () throws -> T) async throws -> T {
-        if usesHostIPC { return try await AutomationIPC.shared.read(host:host.title,body:read) }
+    func isolatedRead<T>(_ host:ScreenHost,waitForSlot:Bool = true,_ read:@escaping @Sendable () throws -> T) async throws -> T {
+        if usesHostIPC { return try await AutomationIPC.shared.read(host:host.title,waitForSlot:waitForSlot,body:read) }
         return try await Task.detached(priority:.userInitiated,operation:read).value
     }
+    func dispatchInput<T>(_ host:ScreenHost,budget:TimeInterval = 30,_ body:@escaping @Sendable () throws -> T) throws -> T {
+        if usesHostIPC { return try AutomationIPC.shared.runInput(host:host.title,budget:budget,body:body) }
+        return try body()
+    }
+
     public var screens: @Sendable ([ScreenTarget]) throws -> TerminalSnapshot
     /// Explicit identity reads require a current title even when the monitor has cached one.
     var identityScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?

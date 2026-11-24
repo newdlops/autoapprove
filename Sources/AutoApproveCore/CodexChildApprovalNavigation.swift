@@ -85,7 +85,7 @@ enum CodexChildApprovalNavigation {
               Set(entries.map(\.id)).count == entries.count else { return nil }
         return entries
     }
-    static func approve(target: ScreenTarget, initial: String, parentThreadID: String?, adapter: ScreenHostAdapter,
+    static func approve(target: ScreenTarget, initial: String, parentThreadID: String?, adapter: ScreenHostAdapter, host: ScreenHost = .terminal,
                         valid: @escaping @Sendable () async -> Bool) async throws -> Outcome {
         guard let original = request(initial) else { throw AppError.message("하위 요청의 화면 연결을 확인하지 못했습니다.") }
         func check() async throws {
@@ -98,7 +98,8 @@ enum CodexChildApprovalNavigation {
             return try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
         }
         func read() async throws -> String {
-            let snapshot = try await work { try adapter.readForValidation([target]) }
+            try await check()
+            let snapshot = try await adapter.isolatedRead(host) { try adapter.readForValidation([target]) }
             let frames = snapshot.screens.filter { $0.tty == target.tty }
             guard frames.count == 1, !snapshot.failures.contains(where: { $0.tty == nil || $0.tty == target.tty }) else {
                 throw AppError.message("원래 터미널의 새 화면을 확인하지 못했습니다.")
@@ -117,7 +118,7 @@ enum CodexChildApprovalNavigation {
             throw AppError.message("하위 요청의 화면 이동 결과를 확인하지 못했습니다. 원래 터미널을 확인해주세요.")
         }
         func deliver(_ input: RemoteTerminalInput, frame: String) async throws -> TerminalDelivery {
-            try await work { try adapter.input(target, frame, .codex, input) }
+            try await work { try adapter.dispatchInput(host) { try adapter.input(target, frame, .codex, input) } }
         }
         func send(_ input: RemoteTerminalInput, frame: String) async throws {
             guard try await deliver(input, frame: frame) == .sent else {
@@ -126,6 +127,7 @@ enum CodexChildApprovalNavigation {
         }
         let opened: TerminalDelivery
         do { opened = try await deliver(.init(kind: .characters, text: "o"), frame: initial) }
+        catch let deferred as AutomationIPC.InputNotStarted { throw deferred }
         catch { throw Interrupted(reason: error.localizedDescription) }
         guard opened == .sent else { return Outcome(delivery: opened, approved: false) }
         do {
@@ -138,7 +140,7 @@ enum CodexChildApprovalNavigation {
             if let prompt = PromptDetector.detect(frame, agent: .codex) {
                 guard content(prompt) == original.content else { throw AppError.message("하위 요청이 바뀌었습니다.") }
                 let expected = frame
-                let delivery = try await work { try adapter.approve(target, expected, .codex) }
+                let delivery = try await work { try adapter.dispatchInput(host,budget:10) { try adapter.approve(target, expected, .codex) } }
                 guard delivery == .sent else { throw AppError.message("하위 요청의 승인 입력을 전달하지 못했습니다.") }
                 approved = true
                 frame = try await awaitFrame { childReady($0, label: original.label) }

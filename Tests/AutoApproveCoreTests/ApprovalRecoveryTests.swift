@@ -14,6 +14,7 @@ private final class ApprovalRecoveryProbe: @unchecked Sendable {
     private var calls: [(ScreenTarget, String)] = []
     var blockedTTY: String?
     var rejectFirst = false
+    var deferFirst = false
     var throwFirst = false
     var requiredFrame:String?
     var readsAtAcceptance:(@Sendable()->Int)?
@@ -21,6 +22,7 @@ private final class ApprovalRecoveryProbe: @unchecked Sendable {
     func approve(_ target: ScreenTarget, _ raw: String) throws -> TerminalDelivery {
         lock.lock(); calls.append((target, raw)); let first = calls.count == 1; lock.unlock()
         if first && target.tty == blockedTTY { _ = gate.wait(timeout: .now() + 5) }
+        if first && deferFirst { throw AutomationIPC.InputNotStarted(.busy) }
         if first && throwFirst { throw AppError.message("Fixture lost delivery receipt") }
         if let requiredFrame,raw != requiredFrame {return .screenChanged}
         if let count=readsAtAcceptance?() {lock.lock();acceptedReads.append(count);lock.unlock()}
@@ -183,6 +185,18 @@ extension ApprovalTests {
             if mode=="new-question" {try expectEqual(engine.snapshot.sessions.first?.phase,.input)}
         }
     }
+    func testApprovalRecoversWithoutAnotherScreenEvent() async throws {
+        let probe = ApprovalRecoveryProbe()
+        probe.deferFirst = true
+        let (engine,sessions,directory) = try recoveryEngine(probe,host:.terminal)
+        defer { engine.stop(); try? FileManager.default.removeItem(at:directory) }
+        let raw = recoveryPrompt("echo recovered")
+        engine.receiveScreen(sessionID:sessions[0].id,raw:raw,generation:"busy")
+        try await waitForRecovery({ probe.inputs.count == 2 },"Deferred approval did not resume")
+        try expectEqual(probe.inputs.map { $0.1 },[raw,raw])
+        try expect(engine.snapshot.sessions.first?.pendingInTerminal != true)
+    }
+
     func testApprovalReflowUnknownDeliveryNeverStartsRefreshOrRetry() async throws {
         let probe=ApprovalRecoveryProbe();probe.throwFirst=true
         let frames=DeliveredFrameProbe(recoveryPrompt("echo fresh-but-unknown"))

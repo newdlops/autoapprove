@@ -2243,7 +2243,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let adapterInput = codexStatusQuery && kind == .submit && host != .terminal
                     ? RemoteTerminalInput(kind: .message, text: input.text)
                     : input
-                let result = try await Task.detached { try write(target, observed.raw, session.agent, adapterInput) }.value
+                let result = try await Task.detached {
+                    try adapter.dispatchInput(host) { try write(target, observed.raw, session.agent, adapterInput) }
+                }.value
                 sent = result == .sent
             } else if let peerID = session.bridgeID, let peer = peers[peerID], let terminalID = session.terminalID {
                 let actionID = UUID().uuidString
@@ -2266,6 +2268,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             event.outcome = sent ? "웹 입력 전달" : "웹 입력 미전달 · 화면 변경"; _ = log(event)
             guard sent else { throw RemoteHTTPError(409, "현재 화면이나 CLI가 바뀌어 입력하지 않았습니다. 최신 화면을 확인해주세요.", diagnostics: ["delivery": "not_started", "retryable": "true"]) }
             return ["sent": true, "message": "터미널에 입력을 전달했습니다. 화면에서 반영 결과를 확인하세요."]
+        } catch let deferred as AutomationIPC.InputNotStarted {
+            deliveryStarted = false
+            event.outcome = "웹 입력 미전달 · 터미널 연결 대기"
+            _ = log(event)
+            throw RemoteHTTPError(409,deferred.localizedDescription,diagnostics:["delivery":"not_started","retryable":"true"])
         } catch {
             if event.outcome == "웹 입력 전달 확인 중" { event.outcome = "웹 입력 결과 미확인"; _ = log(event) }
             throw error
@@ -2350,7 +2357,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         throw RemoteHTTPError(error.status, error.localizedDescription, diagnostics: diagnostics)
                     }
                     outcome = error.diagnostics?["delivery"] ?? "unknown"
-                    if outcome == "not_started", error.diagnostics?["retryable"] == "true", attempt < 2 { continue }
+                    if outcome == "not_started", error.diagnostics?["retryable"] == "true", attempt < 2 {
+                        try await Task.sleep(for:.milliseconds(150 * (attempt + 1)))
+                        continue
+                    }
                     throw error
                 }
             }
@@ -2368,7 +2378,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions[id].map {AutomationIPC.shared.blocksWrites($0.terminal.title) || nativeKeyboardActivity.hasPriority(terminal:$0.terminal) || testScreens.remoteControl.hasInputPriority(terminal:$0.terminal)} ?? false
     }
     private func nativeUserInputHasPriority(_ id:String,backgroundOnly:Bool) async -> Bool {
-        guard backgroundOnly,let session=sessions[id] else {return nativeUserInputHasPriority(id)}
+        guard let session = sessions[id] else { return false }
+        await nativeKeyboardActivity.waitForSample(session.terminal)
+        guard backgroundOnly else { return nativeUserInputHasPriority(id) }
         if AutomationIPC.shared.blocksWrites(session.terminal.title) || testScreens.remoteControl.hasInputPriority(terminal:session.terminal) {return true}
         let keyboard=nativeKeyboardActivity
         return await Task.detached(priority:.userInitiated) {keyboard.hasPriority(terminal:session.terminal,tty:session.tty)}.value
@@ -7873,8 +7885,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 await observation.waitForChange(timeout: 0)
                 var seenRevision: UInt64?
                 while !Task.isCancelled, let self, !self.remoteInputStopped {
-                    guard self.screenConnections[host]?.enabled == true,
-                          self.screenConnections[host]?.permissionBlocked != true else {
+                    guard self.screenConnections[host]?.enabled == true else {
                         await observation.waitForChange()
                         continue
                     }
@@ -7882,6 +7893,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
                        retryAfter > Date() {
                         await observation.waitForChange(timeout: min(8,retryAfter.timeIntervalSinceNow))
                         continue
+                    }
+                    if self.screenConnections[host]?.permissionBlocked == true {
+                        guard self.screenAdapters[host]?.usesHostIPC == true else {
+                            await observation.waitForChange()
+                            continue
+                        }
+                        let connectionID = self.screenConnections[host]?.connectID
+                        let granted = try? await HostAutomationPermission.check(host)
+                        guard !Task.isCancelled, self.screenConnections[host]?.enabled == true,
+                              self.screenConnections[host]?.connectID == connectionID else { continue }
+                        guard granted == true else {
+                            self.screenConnections[host]?.retryAfter = Date().addingTimeInterval(15)
+                            continue
+                        }
+                        self.screenConnections[host]?.permissionBlocked = false
+                        seenRevision = nil
                     }
                     let targets = self.pollingTargets(host)
                     guard !targets.isEmpty else {
@@ -8785,6 +8812,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             } catch {
                 guard screenConnections[host]?.connectID == connectID else { return }
                 screenConnections[host]?.permissionBlocked = error is TerminalAdapterError
+                screenConnections[host]?.retryAfter = Date().addingTimeInterval(5)
+                screenPollSignals[host]?.notify()
                 updateHealth(host) { $0.requested = true; $0.connected = false; $0.status = error.localizedDescription }
                 return
             }
@@ -8841,6 +8870,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let targets = suppliedTargets ?? sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
         let title = host.title
+        if !targets.isEmpty { nativeKeyboardActivity.prepare(host.kind) }
         do {
             let reader = adapter.screens
             let readStartedAt = Date()
@@ -8895,7 +8925,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             // A large scrollback in many tabs must not monopolize the UI actor.
             // One bounded worker per host reads and parses; no policy or input is run here.
             let worker = Task.detached(priority: .utility) {
-                let result = requests.isEmpty ? TerminalSnapshot() : try await adapter.isolatedRead(host) { try reader(requests) }
+                let result = requests.isEmpty ? TerminalSnapshot() : try await adapter.isolatedRead(host,waitForSlot:false) { try reader(requests) }
                 var screensByTTY = reusedScreens
                 screensByTTY.reserveCapacity(result.screens.count)
                 for screen in result.screens where screensByTTY[screen.tty] == nil {
@@ -13176,8 +13206,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard !hasOSPermissionWait(id),!Task.isCancelled, automationRuntime.epoch(id) == automationEpoch, !automationNeedsFreshScreen.contains(id),
                   let state = capacityStates[id], state.scheduledID == scheduledID, state.phase == .waiting,
                   revision == scheduledRevision, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id), let session = sessions[id], session.automatic,
-                  // Preserve async questions in history, but do not let questions
-                  // followed by later user input block a fresh error/Goal retry.
                   session.unansweredQuestions.allSatisfy({ $0.hasLaterUserMessage == true }),
                   session.phase != .ended, (session.channel == state.channel || ScreenHost(kind:session.terminal)?.channel == state.channel), Date() >= state.deadline,
                   Date().timeIntervalSince(state.observedAt) < 6 else { return nil }
@@ -13186,7 +13214,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return (state, session, adapter)
         }
         guard current() != nil else {
-            // A later frame reschedules a stop that is still visible.
             if capacityStates[id]?.scheduledID == scheduledID { capacityStates[id]?.scheduledID = nil }
             return
         }
@@ -13203,7 +13230,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var event = AuditEvent(sessionID: id, summary: "\(state.stop.kind.title) · 이어서 진행 요청 (\(state.attempt))",
             outcome: "이어서 진행 요청 · 결과 미확인", source: state.channel.title, context: AuditContext(session: session),
             request: state.stop.region, answer: state.stop.continuationText)
-        // Persist the attempt before typing; a crash or lost result remains traceable.
         guard log(event) else { capacityStates[id]?.phase = .review; publish(); return }
         sessions[id]?.interruption?.resumeUncertain = true
         sessions[id]?.interruption?.resumeConfirmedAt = nil
@@ -13233,15 +13259,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         do {
             let delivery: ResumeDelivery
-            if let adapter {
-                if state.submitOnly, let complete = adapter.completeResume {
-                    let stop = state.stop
-                    delivery = try await Task.detached { try complete(target,stop) }.value
-                } else if state.submitOnly { delivery = .typed }
-                else { delivery = try await Task.detached { try adapter.resume(target,region,text) }.value }
+            if let adapter, let host = ScreenHost(channel: state.channel) {
+                let submitOnly = state.submitOnly, stop = state.stop
+                delivery = try await Task.detached {
+                    try adapter.dispatchInput(host) {
+                        if submitOnly { return try adapter.completeResume?(target, stop) ?? .typed }
+                        return try adapter.resume(target, region, text)
+                    }
+                }.value
             } else { delivery = try await resumeBridgeSession(session,stop:state.stop,submitOnly:state.submitOnly,automationEpoch:automationEpoch) }
-            // Always retain the actual result, but an old callback cannot change a
-            // replacement failure, a cancelled run, or a session that has ended.
             switch delivery {
             case .sent: event.outcome = "이어서 진행 요청 전달"
             case .draft: event.outcome = "재시도 입력 작성 확인 · Enter 제출 대기"
@@ -13256,25 +13282,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 sessions[id]?.interruption?.resumeConfirmedAt = Date()
                 capacityStates[id]?.phase = .sent; capacityStates[id]?.sentAt = Date(); capacityStates[id]?.unsent = 0
             case .draft:
-                // Only a complete, owned, unsubmitted body authorizes Return again.
-                // The text itself is never retyped by this path.
                 capacityStates[id]?.submitOnly = true
                 capacityStates[id]?.phase = .waiting
                 capacityStates[id]?.deadline = Date().addingTimeInterval(capacityUnsentRetryDelay)
             case .typed:
-                // Typed, but neither a draft nor a new message was visible: never type again.
                 capacityStates[id]?.phase = .review
             case .screenChanged, .missingTarget, .agentMissing:
-                // Nothing was typed. A temporary target or screen failure must not
-                // permanently stop recovery. Back off and require another fresh frame.
                 retryUnsentCapacity(id)
             }
         } catch {
-            let notStarted = (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started"
+            let notStarted = error is AutomationIPC.InputNotStarted || (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started"
             event.outcome = (notStarted ? "입력 미전달: " : "입력 확인 필요: ") + error.localizedDescription
             guard ownsDelivery() else { superseded = true; log(event); publish(); return }
             if notStarted { retryUnsentCapacity(id) }
-            // The write may have happened; an uncertain input is never repeated.
             else { capacityStates[id]?.phase = .review }
         }
         capacityStates[id]?.dispatchID = nil
@@ -14280,11 +14300,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return SystemCommandRisk.detect(operation+prompt.summary,cwd:cwd)
     }
     private func scheduleScreenApproval(_ id: String) {
-        // The visible parent terminal owns its approvals; the server monitor
-        // handles only child threads and must never race the terminal input.
         guard !hasOSPermissionWait(id) else {return}
         if systemSafetyStates[id]?.notice.isPending == true { scheduleSystemSafety(id); return }
-        guard !remoteInputStopped, !automationNeedsFreshScreen.contains(id), !hasBackgroundChildren(id), claudeParents[id] == nil, !userInputHasPriority(id), !automaticInputBusy(id),
+        guard !remoteInputStopped, !automationNeedsFreshScreen.contains(id), !hasBackgroundChildren(id), claudeParents[id] == nil, !automaticInputBusy(id),
               let session = sessions[id], session.agent != .shell, session.automatic,
               session.channel.isScreen, !snapshot.paused,
               let state = screens[id], state.isCurrent, !state.attempted, state.scheduledID == nil,
@@ -14298,9 +14316,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let delay = retryAfter.timeIntervalSinceNow
                 if delay > 0 { do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return } }
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, let self else { return }
+            await self.nativeKeyboardActivity.waitForSample(session.terminal)
+            guard !Task.isCancelled, !self.userInputHasPriority(id) else {
+                if self.screens[id]?.scheduledID == scheduledID { self.screens[id]?.scheduledID = nil }
+                return
+            }
             let live = try? await Task.detached { try reader() }.value
-            guard let self else { return }
             guard !Task.isCancelled, self.automationRuntime.epoch(id) == epoch, !self.automationNeedsFreshScreen.contains(id),
                   !self.hasOSPermissionWait(id),self.revision == scheduledRevision, !self.snapshot.paused, !self.userInputHasPriority(id), !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
                   self.sessions[id] != nil,
@@ -14318,12 +14340,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if self.screens[id]?.scheduledID == scheduledID { self.screens[id]?.scheduledID = nil }
                 return
             }
-            // Commit dispatch on the main actor. Pause cancels queued approvals, not an input already dispatched.
             self.screens[id]?.attempted = true; self.screens[id]?.scheduledID = nil; self.screens[id]?.dispatchID = scheduledID
             let host = ScreenHost(channel: session.channel)
             var event = AuditEvent(sessionID: id, summary: current.prompt.summary, outcome: "승인 시도 · 결과 미확인", source: "\(host?.title ?? "VS Code") 화면",
                 context: AuditContext(session: session), request: session.agent == .codex ? current.prompt.dialog : current.prompt.summary)
-            // Persist the attempt before dispatch; a crash or missing acknowledgement remains traceable.
             guard self.log(event) else {
                 self.sessions[id]?.pendingInTerminal = true
                 self.sessions[id]?.activityDetail = "승인 내역을 저장하지 못했습니다. 터미널에서 요청을 확인해주세요."
@@ -14346,14 +14366,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     var navigatedChild: CodexChildApprovalNavigation.Outcome?
                     if childDialog {
                         let navigation = try await CodexChildApprovalNavigation.approve(target: target, initial: raw,
-                            parentThreadID: session.codexApprovalBinding?.threadID, adapter: adapter, valid: { [weak self] in
+                            parentThreadID: session.codexApprovalBinding?.threadID, adapter: adapter, host: host, valid: { [weak self] in
                                 guard let self else { return false }
                                 let records = try? await Task.detached { try reader() }.value
                                 return await self.codexChildNavigationValid(session, epoch: epoch, records: records)
                             })
                         delivery = navigation.delivery; navigatedChild = navigation
                     } else {
-                        delivery = try await Task.detached { try approve(target, raw, kind) }.value
+                        delivery = try await Task.detached {
+                            try adapter.dispatchInput(host,budget:10) { try approve(target, raw, kind) }
+                        }.value
                     }
                     if Task.isCancelled || self.automationRuntime.epoch(id) != epoch {
                         event.outcome = delivery == .sent ? "초기화 전 승인 입력 전달" : "초기화 전 입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
@@ -14374,12 +14396,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         ? navigatedChild.map { $0.approved ? "하위 요청 승인 입력 전달 · 부모 화면 복귀 확인" : "처리된 하위 요청 화면 정리 · 부모 화면 복귀 확인" } ?? "승인 입력 전달"
                         : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                     self.log(event)
+                } catch is AutomationIPC.InputNotStarted {
+                    self.retryUnsentApproval(id,dispatchID:scheduledID,generation:state.generation)
+                    event.outcome = "승인 입력 미전달 · 연결이 비면 자동 재시도"
+                    self.log(event)
                 } catch {
                     if error is CodexChildApprovalNavigation.Interrupted,
                        self.sessions[id]?.pid == session.pid, self.sessions[id]?.started == session.started {
-                        // Navigation changes the visible request identity. A later child
-                        // frame must not bypass the original uncertain-write reservation.
-                        // Persist OFF so restart/resize cannot replay the possible approval.
                         do { try self.setAutomatic(id, enabled: false) }
                         catch { self.sessions[id]?.automatic = false }
                         self.sessions[id]?.pendingInTerminal = true
@@ -14389,7 +14412,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         event.outcome = "초기화 전 입력 확인 필요: \(error.localizedDescription)"
                         self.log(event); return
                     }
-                    // A transport error can occur after dispatch; never blindly repeat an uncertain write.
                     self.requireApprovalReview(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity,
                         detail: "승인 입력 결과를 확인하지 못했습니다. 터미널을 확인해주세요.")
                     event.outcome = "입력 확인 필요: \(error.localizedDescription)"; self.log(event)

@@ -49,6 +49,12 @@ package final class AutomationIPC: @unchecked Sendable {
             }
         }
     }
+    package struct InputNotStarted: LocalizedError {
+        let reason: Failure
+        package var errorDescription: String? { reason.errorDescription }
+        package init(_ reason: Failure) { self.reason = reason }
+    }
+
     package struct Metrics: Codable, Sendable {
         package var inFlight = 0
         var peak = 0, rejected = 0, timeouts = 0, cancelled = 0
@@ -75,6 +81,7 @@ package final class AutomationIPC: @unchecked Sendable {
     private let threadKey = UUID().uuidString
     private let lock = NSLock()
     private var active: [String:Flight] = [:]
+    private var waitingReaders: [String:[UUID]] = [:]
     private var reopen: [String:TimeInterval] = [:]
     private var metrics = Metrics()
     private var durations: [Double] = []
@@ -90,10 +97,11 @@ package final class AutomationIPC: @unchecked Sendable {
         permissions.removeValue(forKey:host)
         if reason == .timeout { metrics.timeouts += 1 } else { metrics.cancelled += 1 }
     }
-    private func reserve<T>(_ host:String, readOnly:Bool, budget:TimeInterval, body:@escaping () throws -> T) throws -> ResultFlight<T> {
+    private func reserve<T>(_ host:String, readOnly:Bool, budget:TimeInterval, ticket:UUID? = nil, body:@escaping () throws -> T) throws -> ResultFlight<T> {
         if let current = active[host], now >= current.deadline { expire(host,current,.timeout) }
         if let time = reopen[host], !readOnly || now < time || active[host] != nil { metrics.rejected += 1; throw Failure.open }
-        guard active.count < 2, active[host] == nil else { metrics.rejected += 1; throw Failure.busy }
+        guard active.count < 2, active[host] == nil,
+              !readOnly || waitingReaders[host]?.first == nil || waitingReaders[host]?.first == ticket else { metrics.rejected += 1; throw Failure.busy }
         let flight = ResultFlight<T>(budget:budget)
         flight.readOnly = readOnly
         active[host] = flight
@@ -171,9 +179,52 @@ package final class AutomationIPC: @unchecked Sendable {
         let flight = try lock.withLock { try reserve(host,readOnly:readOnly,budget:budget,body:body) }
         return try wait(flight,host:host)
     }
-    package func read<T>(host:String,budget:TimeInterval = 5,body:@escaping () throws -> T) async throws -> T {
+    package func runInput<T>(host:String,budget:TimeInterval,body:@escaping () throws -> T) throws -> T {
         try Task.checkCancellation()
-        let flight = try lock.withLock { try reserve(host,readOnly:true,budget:budget,body:body) }
+        let flight: ResultFlight<T>
+        do {
+            flight = try lock.withLock { try reserve(host,readOnly:false,budget:budget,body:body) }
+        } catch let reason as Failure {
+            throw InputNotStarted(reason)
+        }
+        return try wait(flight,host:host)
+    }
+
+    private func reserveRead<T>(host:String,budget:TimeInterval,waitForSlot:Bool,body:@escaping () throws -> T) async throws -> ResultFlight<T> {
+        let deadline = now + budget
+        let admissionDeadline = min(deadline, now + 0.8)
+        let ticket = UUID()
+        var queued = false
+        defer {
+            if queued {
+                lock.withLock {
+                    waitingReaders[host]?.removeAll { $0 == ticket }
+                    if waitingReaders[host]?.isEmpty == true { waitingReaders.removeValue(forKey:host) }
+                }
+            }
+        }
+        while true {
+            try Task.checkCancellation()
+            let flight: ResultFlight<T>? = try lock.withLock {
+                if queued && waitingReaders[host]?.contains(ticket) != true { throw Failure.invalidated }
+                if queued && now >= admissionDeadline { throw Failure.busy }
+                do { return try reserve(host,readOnly:true,budget:deadline-now,ticket:ticket,body:body) }
+                catch Failure.busy where waitForSlot && now < admissionDeadline {
+                    if !queued {
+                        guard (waitingReaders[host]?.count ?? 0) < 4 else { throw Failure.busy }
+                        waitingReaders[host,default:[]].append(ticket)
+                        queued = true
+                    }
+                    return nil
+                }
+            }
+            if let flight { return flight }
+            try await Task.sleep(for:.milliseconds(20))
+        }
+    }
+
+    package func read<T>(host:String,budget:TimeInterval = 5,waitForSlot:Bool = false,body:@escaping () throws -> T) async throws -> T {
+        let flight = try await reserveRead(host:host,budget:budget,waitForSlot:waitForSlot,body:body)
         do {
             while true {
                 try Task.checkCancellation()
@@ -232,6 +283,7 @@ package final class AutomationIPC: @unchecked Sendable {
     package func invalidate(_ host:String) {
         lock.withLock {
             permissions.removeValue(forKey:host)
+            waitingReaders.removeValue(forKey:host)
             if let flight = active[host] { expire(host,flight,.invalidated) }
         }
     }
