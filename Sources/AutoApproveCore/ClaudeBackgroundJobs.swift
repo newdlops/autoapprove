@@ -13,9 +13,11 @@ enum ClaudeBackgroundJobs {
         guard let owner = try ProcessDiscovery.read(pid:live.session.pid).first(where: { $0.key == live.id && $0.agent == .claude && "/dev/" + $0.tty == live.session.tty }) else { throw GroupJobProvider.stale() }
         var jobs: [GroupBackgroundJob] = []
         let children = try related(owner.pid,children:true)
-        for root in children where root.parent == owner.pid && root.pid == root.processGroup && root.processGroup != owner.processGroup && (root.tty != owner.tty || !root.isForeground) {
+        let wrappers = children.filter { $0.agent == nil && $0.processGroup == owner.processGroup }
+        let candidates = children + (try wrappers.prefix(16).flatMap { try related($0.pid,children:true) })
+        for root in candidates where root.pid == root.processGroup && root.processGroup != owner.processGroup && (root.tty != owner.tty || !root.isForeground) {
             let executable = URL(fileURLWithPath:root.executable).lastPathComponent
-            guard ["sh","bash","zsh"].contains(executable),
+            guard root.agent == nil, try owned(root,by:owner),
                   let file = taskFile(root:root,directory:directory,records:try related(root.pid,children:false)) else { continue }
             let nativeID = URL(fileURLWithPath:file).deletingPathExtension().lastPathComponent
             let arguments = ProcessEnvironment.arguments(root) ?? []
@@ -46,17 +48,23 @@ enum ClaudeBackgroundJobs {
         return try await Task.detached {
             let records = try related(pid,children:false)
             guard let owner = try ProcessDiscovery.read(pid:live.session.pid).first(where: { $0.key == live.id && $0.agent == .claude && "/dev/" + $0.tty == live.session.tty }),
-                  let root = records.first(where: { $0.key == job.item && $0.pid == pid && $0.parent == owner.pid &&
+                  let root = records.first(where: { $0.key == job.item && $0.pid == pid &&
                       $0.processGroup == pid && pid != owner.processGroup }),
                   (root.tty != owner.tty || !root.isForeground),
                   taskFile(root:root,directory:directory,records:records) == directory + "/" + job.process + ".output",
                   let identity = job.outputFileIdentity, identity == fileIdentity(directory + "/" + job.process + ".output"),
-                  try ProcessDiscovery.readAncestorChain(of:pid,through:owner.pid).map(\.key) == [root.key,owner.key],
+                  try owned(root,by:owner),
                   getpgid(pid) == pid else { throw GroupJobProvider.stale() }
             guard Darwin.kill(-pid,SIGTERM) == 0 else { throw POSIXError(POSIXErrorCode(rawValue:errno) ?? .EIO) }
             return true
         }.value
     })
+
+    private static func owned(_ root: ProcessRecord, by owner: ProcessRecord) throws -> Bool {
+        let chain = try ProcessDiscovery.readAncestorChain(of:root.pid,through:owner.pid)
+        return (2...3).contains(chain.count) && chain.first?.key == root.key && chain.last?.key == owner.key &&
+            chain.dropLast().allSatisfy { $0.agent == nil } && chain.dropFirst().dropLast().allSatisfy { $0.processGroup == owner.processGroup }
+    }
 
     private static func related(_ pid:Int32,children:Bool) throws -> [ProcessRecord] {
         var pids = [Int32](repeating:0,count:257)
@@ -85,7 +93,14 @@ enum ClaudeBackgroundJobs {
     private static func taskDirectory(_ live: SessionGroupLiveSession, thread: String) throws -> String {
         let project = live.session.cwd.replacingOccurrences(of:"[^a-zA-Z0-9]",with:"-",options:.regularExpression)
         guard !project.isEmpty, project.utf8.count <= 255 else { throw GroupJobProvider.stale() }
-        return "/private/tmp/claude-\(getuid())/" + project + "/" + thread + "/tasks"
+        let base = "/private/tmp/claude-\(getuid())"
+        let suffix = "/" + thread + "/tasks"
+        let expected = base + "/" + project + suffix
+        if FileManager.default.fileExists(atPath:expected) { return expected }
+        let projects = (try? FileManager.default.contentsOfDirectory(atPath:base)) ?? []
+        guard projects.count <= 1024 else { return expected }
+        let matches = projects.map { base + "/" + $0 + suffix }.filter { FileManager.default.fileExists(atPath:$0) }
+        return matches.count == 1 ? matches[0] : expected
     }
 
     private static func validID(_ id: String) -> Bool {

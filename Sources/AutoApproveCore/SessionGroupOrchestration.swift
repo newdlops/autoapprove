@@ -34,6 +34,7 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
     /// A record that still says so when the app starts never reached the worker and is dropped.
     public var pendingDelivery: Bool?
     public var workScope: String?
+    var closedWithoutReport: Bool?
     public var replacesTaskID: UUID?
     public var interruptCheckpoint: String?
 
@@ -73,6 +74,36 @@ public struct GroupWorkerQuestion: Codable, Equatable {
 /// Assignment history for every group. AutoApprove keeps only the reports a parent has not received yet;
 /// it does not relay arbitrary messages between sessions.
 public struct SessionGroupOrchestration: Codable, Equatable {
+    struct Queued: Codable, Equatable {
+        var assignment: SessionGroupAssignment
+        var parentConversation: String
+        var after: UUID
+        var hold: String?
+    }
+    var queue: [Queued]?
+    func ready(_ item: Queued) -> Bool {
+        guard queue?.first(where: { $0.assignment.groupID == item.assignment.groupID && $0.assignment.workerMemberID == item.assignment.workerMemberID })?.assignment.id == item.assignment.id,
+              current(groupID:item.assignment.groupID,workerMemberID:item.assignment.workerMemberID)?.status != .working,
+              let dependency = assignments.first(where:{ $0.id == item.after && $0.groupID == item.assignment.groupID }) else { return false }
+        return dependency.status == .reported || dependency.status == .completed
+    }
+    mutating func resolve(_ id: UUID, parent: UUID, session: String, close: Bool) throws {
+        guard let index = assignments.firstIndex(where: { $0.id == id }), assignments[index].status == .working else {
+            throw RemoteHTTPError(409,"지정한 작업이 이미 끝났거나 교체되었습니다.")
+        }
+        if close {
+            assignments[index].closedWithoutReport = true
+            assignments[index].completedAt = Date()
+            assignments[index].status = .reported
+            assignments[index].reportedAt = assignments[index].completedAt
+            assignments[index].question = nil
+            assignments[index].deliveryError = nil
+        } else {
+            assignments[index].parentMemberID = parent
+            assignments[index].parentSessionID = session
+            assignments[index].question?.reportedAt = nil
+        }
+    }
     public static let storeKey = "sessionGroupOrchestration"
     public static let limit = 300
     public static let maximumTaskLength = 4000
@@ -88,7 +119,7 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     }
 
     /// True while any task may still produce a report or a question.
-    public var needsWatching: Bool { assignments.contains { $0.status == .working || $0.status == .completed } }
+    public var needsWatching: Bool { queue?.isEmpty == false || assignments.contains { $0.status == .working || $0.status == .completed } }
 
     /// The worker's latest task that has not been replaced, finished or not.
     public func current(groupID: UUID, workerMemberID: UUID) -> SessionGroupAssignment? {
@@ -139,6 +170,10 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     @discardableResult
     public mutating func removeUndelivered() -> Int {
         let before = assignments.count
+        let queued = Set((queue ?? []).map { $0.assignment.id })
+        for index in assignments.indices where queued.contains(assignments[index].id) && assignments[index].pendingDelivery == true {
+            assignments[index].deliveryError = "unknown"
+        }
         assignments.removeAll { $0.status == .working && $0.pendingDelivery == true && $0.deliveryError != "unknown" && $0.replacesTaskID == nil }
         return before - assignments.count
     }
@@ -208,8 +243,9 @@ public struct SessionGroupOrchestration: Codable, Equatable {
     private mutating func prune() {
         var excess = assignments.count - Self.limit
         guard excess > 0 else { return }
+        let dependencies = Set((queue ?? []).map(\.after))
         assignments.removeAll { assignment in
-            guard excess > 0, assignment.status == .reported || assignment.status == .superseded else { return false }
+            guard excess > 0, !dependencies.contains(assignment.id), assignment.status == .reported || assignment.status == .superseded else { return false }
             excess -= 1
             return true
         }

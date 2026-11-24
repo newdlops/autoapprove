@@ -207,6 +207,7 @@ public final class SessionGroupMailbox {
                     message_id TEXT PRIMARY KEY, conversation TEXT NOT NULL, prompt TEXT NOT NULL, submitted REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS group_submit_enters (message_id TEXT PRIMARY KEY, submitted REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS group_manual_enters (message_id TEXT PRIMARY KEY, submitted REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS group_observed_turns (
                     message_id TEXT PRIMARY KEY, turn TEXT NOT NULL
                 );
@@ -462,6 +463,11 @@ public final class SessionGroupMailbox {
             """, [])
     }
 
+    func retireTaskNotice(_ id: UUID) throws {
+        try update("UPDATE messages SET acknowledged=coalesce(acknowledged,?),last_result='superseded' WHERE source_key=? AND acknowledged IS NULL",
+            [String(Date().timeIntervalSince1970),"missingReport:" + id.uuidString])
+    }
+
     func taskEvent(_ task: SessionGroupAssignment, kind: String) throws {
         try update("INSERT OR IGNORE INTO group_events(gid,member,ref,kind,at,age) VALUES(?,?,?,?,?,?)",
             [task.groupID.uuidString, task.workerMemberID.uuidString, task.id.uuidString, kind,
@@ -668,6 +674,7 @@ public final class SessionGroupMailbox {
         let query = try statement("""
             SELECT s.prompt FROM group_submissions s JOIN messages m ON m.id=s.message_id
             WHERE s.message_id=? AND s.conversation=? AND m.acknowledged IS NULL
+            AND NOT EXISTS (SELECT 1 FROM group_manual_enters e WHERE e.message_id=s.message_id AND e.submitted=s.submitted)
             AND NOT EXISTS (SELECT 1 FROM group_submit_enters e WHERE e.message_id=s.message_id AND e.submitted=s.submitted)
             """, [id.uuidString, conversation.lowercased()])
         defer { sqlite3_finalize(query) }
@@ -675,11 +682,30 @@ public final class SessionGroupMailbox {
         return String(cString: value)
     }
 
+    func claimManualEnter(_ id: UUID, conversation: String, prompt: String) throws -> Bool {
+        try update("""
+            INSERT INTO group_manual_enters(message_id,submitted)
+            SELECT s.message_id,s.submitted FROM group_submissions s WHERE s.message_id=? AND s.conversation=? AND s.prompt=?
+            AND NOT EXISTS (SELECT 1 FROM group_observed_turns t WHERE t.message_id=s.message_id)
+            AND NOT EXISTS (SELECT 1 FROM group_prompt_receipts r WHERE r.message_id=s.message_id)
+            ON CONFLICT(message_id) DO UPDATE SET submitted=excluded.submitted WHERE submitted<>excluded.submitted
+            """, [id.uuidString,conversation.lowercased(),prompt])
+        return sqlite3_changes(db) == 1
+    }
+
+    func releaseManualEnter(_ id: UUID, conversation: String, prompt: String) throws {
+        try update("""
+            DELETE FROM group_manual_enters WHERE message_id=? AND submitted=(
+                SELECT submitted FROM group_submissions WHERE message_id=? AND conversation=? AND prompt=?)
+            """,[id.uuidString,id.uuidString,conversation.lowercased(),prompt])
+    }
+
     func claimSubmitEnter(_ id: UUID, conversation: String, prompt: String, manualQuestion: Bool) throws -> Bool {
         try update("""
             INSERT INTO group_submit_enters(message_id,submitted)
             SELECT s.message_id,s.submitted FROM group_submissions s JOIN messages m ON m.id=s.message_id
             WHERE s.message_id=? AND s.conversation=? AND s.prompt=?
+            AND NOT EXISTS (SELECT 1 FROM group_manual_enters e WHERE e.message_id=s.message_id AND e.submitted=s.submitted)
             AND (m.acknowledged IS NULL OR (?='1' AND m.kind='question' AND m.last_result='direct_attempting'))
             ON CONFLICT(message_id) DO UPDATE SET submitted=excluded.submitted WHERE submitted<>excluded.submitted
             """, [id.uuidString, conversation.lowercased(), prompt, manualQuestion ? "1" : "0"])

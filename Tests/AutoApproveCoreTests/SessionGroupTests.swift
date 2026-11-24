@@ -995,6 +995,11 @@ extension ApprovalTests {
         try box.recordSubmission(message.id,conversation:workerMember.conversationID,prompt:prompt)
         writer.show("────────\n❯ " + prompt + "\n────────\n? for shortcuts",on:worker.session.tty)
         try expectEqual(try await action("explain_group_delivery",details)["stage"] as? String,"draftVisible")
+        try expectEqual(try await action("retry_group_submission",details)["stage"] as? String,"enterSent")
+        let enterCount = writer.writes.count
+        do { _ = try await action("retry_group_submission",details); throw AppError.message("submitted a duplicate Enter") }
+        catch is RemoteHTTPError {}
+        try expectEqual(writer.writes.count,enterCount)
         let preview = try await action("clear_group_composer")
         let token = try unwrapGroup(preview["draftToken"] as? String)
         writer.show("────────\n❯ #updated\n────────\n? for shortcuts",on:worker.session.tty)
@@ -1018,6 +1023,27 @@ extension ApprovalTests {
             catch is RemoteHTTPError {}
         }
         writer.show("검사 원본\n› ", on: worker.session.tty)
+
+        let next = UUID().uuidString
+        let queued: JSONObject = ["task":"후속 검증","afterTaskID":waitingID,"requestID":next]
+        try expectEqual(try await action("assign_group_task",queued)["stage"] as? String,"queued")
+        try expectEqual(try await action("assign_group_task",queued)["taskID"] as? String,next)
+        let management: JSONObject = ["taskID":waitingID,"action":"takeOwnership"]
+        do {
+            _ = try await action("manage_group_task",management.merging(["sessionID":worker.id]) { _,new in new })
+            throw AppError.message("worker took ownership")
+        } catch is RemoteHTTPError {}
+        _ = try await action("manage_group_task",management)
+        _ = try await action("manage_group_task",["taskID":waitingID,"action":"closeWithoutReport"])
+        try expect(try await waitForGroup(20) { (try? engine.sessionGroupAssignments().contains { $0.id.uuidString == next && $0.isDelivered }) == true })
+        try expectEqual(try engine.sessionGroupAssignments().first { $0.id.uuidString == waitingID }?.status,.reported)
+        try expectEqual(writer.writes.filter { $0.contains("후속 검증") }.count,1)
+        let command = try await action("send_group_message",["text":"다음 검증","asTask":true,"messageID":UUID().uuidString])
+        try expectNotNil(command["taskID"])
+        try expectEqual(ActivityDetector.backgroundCount("❯ \n1 shell still running",agent:.claude),1)
+        try expectEqual(ActivityDetector.detect("❯ \n1 shell still running",agent:.claude).phase,.idle)
+        try expectEqual(ActivityDetector.detect("❯ draft\n1 shell still running",agent:.claude).phase,.input)
+        try expectEqual(ActivityDetector.detect("Esc to interrupt\n❯ \n1 shell still running",agent:.claude).phase,.working)
 
         try engine.setPaused(true); defer { try? engine.setPaused(false) }
         let paused = try await assign("일시정지 중 작업")
