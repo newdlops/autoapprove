@@ -1,6 +1,6 @@
 # AutoApprove
 
-**Claude 백그라운드 셸 대기 상태와 git status 중단 · 0.2.398 빌드 425** [변경 사항](docs/releases/v0.2.398.md)
+**Claude Code 메시지 제출 보강 · 0.2.399 빌드 426** [변경 사항](docs/releases/v0.2.399.md)
 
 **그룹장의 구성원 보관함·터미널 조회 · 0.2.392 빌드 419** [변경 사항](docs/releases/v0.2.392.md)
 

@@ -4,6 +4,12 @@ import AutoApproveCore
 extension ApprovalTests {
     @MainActor func testClaudeMailboxComposerSeparatesCustomStatusFromDrafts() async throws {
         let original = "AutoApprove 요청 " + UUID().uuidString
+        try expectEqual(try TerminalAdapter.claudeLinePayload(original), "\u{1b}[200~" + original + "\u{1b}[201~")
+        try expectEqual(try TerminalAdapter.claudeLinePayload(""), "")
+        try expect((try? TerminalAdapter.claudeLinePayload("text\u{1b}[201~")) == nil)
+        let labeled = "━━━━ Opus ━━━━\n❯ " + original + "\n\n╌╌╌╌\n? for shortcuts"
+        try expect(ClaudeComposerReadiness.containsOnly(original, screen: labeled))
+        try expect(!ClaudeComposerReadiness.containsOnly(original, screen: labeled.replacingOccurrences(of: original, with: original + " 수정")))
         for ending in ["", "\r", "\n", "\r\n", "\r\r", "\n\n", " 편집", "\r편집"] {
             let buffer = original + ending
             let accepted = await ClaudeComposerReadiness.matchesBridgeDraft(original, visibleMatch: true) {

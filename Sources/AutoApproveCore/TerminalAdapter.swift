@@ -283,11 +283,15 @@ public enum TerminalAdapter {
         guard let result = TerminalDelivery(rawValue:output) else { throw AppError.message("같은 대화 복구 명령의 전달 결과를 확인하지 못했습니다.") }
         return result
     }
-    public static func typeLine(target: ScreenTarget, text: String, expected: String? = nil) throws -> TerminalDelivery {
+    package static func claudeLinePayload(_ text: String) throws -> String {
         guard text.count <= 8000, !text.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
             throw AppError.message("한 줄 메시지만 입력할 수 있습니다.")
         }
-        var request: JSONObject = ["tty": target.tty, "text": text]
+        guard !text.isEmpty else { return "" }
+        return "\u{1b}[200~" + text.precomposedStringWithCanonicalMapping + "\u{1b}[201~"
+    }
+    public static func typeLine(target: ScreenTarget, text: String, expected: String? = nil) throws -> TerminalDelivery {
+        var request: JSONObject = ["tty": target.tty, "text": try claudeLinePayload(text)]
         request["expected"] = expected
         let literal = try AutomationScript.literal(request)
         let output = try AutomationScript.run("""

@@ -19,12 +19,25 @@ public enum ClaudeComposerReadiness {
         return false
     }
 
+    private static func rule(_ row: String) -> Bool {
+        row.count >= 3 && row.allSatisfy { "─━╌".contains($0) }
+    }
+    private static func border(_ row: String) -> Bool {
+        if rule(row) { return true }
+        let line = "─━╌"
+        guard row.count >= 3, row.prefix(3).allSatisfy({ line.contains($0) }), let last = row.last, line.contains(last) else { return false }
+        let labels = row.split(whereSeparator: { line.contains($0) })
+        guard labels.count == 1, let label = labels.first, label.hasPrefix(" "), label.hasSuffix(" ") else { return false }
+        let name = label.trimmingCharacters(in: .whitespaces)
+        return !name.isEmpty && name.count <= 40
+    }
+
     package static func containsOnly(_ text: String, screen: String) -> Bool {
         let rows = PromptDetector.normalizedLines(screen).map { $0.trimmingCharacters(in: .whitespaces) }
-        guard let i = rows.lastIndex(where: { $0.hasPrefix("❯") }), i > 0, rows[i - 1].hasPrefix("───"),
-              let end = rows[(i + 1)...].firstIndex(where: { $0.count >= 3 && $0.allSatisfy { $0 == "─" } }) else { return false }
+        guard let i = rows.lastIndex(where: { $0.hasPrefix("❯") }), i > 0, border(rows[i - 1]),
+              let end = rows[(i + 1)...].firstIndex(where: border) else { return false }
         let footer = rows.dropFirst(end + 1).filter { !$0.isEmpty }
-        guard footer.count <= 8, !footer.contains(where: { $0.hasPrefix("───") }) else { return false }
+        guard footer.count <= 8, !footer.contains(where: border) else { return false }
         let first = String(rows[i].dropFirst()).trimmingCharacters(in: .whitespaces)
         var parts = [first] + Array(rows[(i + 1)..<end])
         if parts.count > 1, parts.last == "" { parts.removeLast() }
@@ -69,18 +82,6 @@ public enum ClaudeComposerReadiness {
               prompt + 2 < rows.count else { return false }
         let text = String(rows[prompt].dropFirst()).trimmingCharacters(in: .whitespaces)
         guard text.isEmpty || text.range(of: #"^Try [\"“].+[\"”]$"#, options: .regularExpression) != nil else { return false }
-        func rule(_ row: String) -> Bool {
-            row.count >= 3 && row.allSatisfy { "─━╌".contains($0) }
-        }
-        func border(_ row: String) -> Bool {
-            if rule(row) { return true }
-            let line = "─━╌"
-            guard row.prefix(3).allSatisfy({ line.contains($0) }), let last = row.last, line.contains(last) else { return false }
-            let labels = row.split(whereSeparator: { line.contains($0) })
-            guard labels.count == 1, let label = labels.first, label.hasPrefix(" "), label.hasSuffix(" ") else { return false }
-            let name = label.trimmingCharacters(in: .whitespaces)
-            return !name.isEmpty && name.count <= 40
-        }
         guard border(rows[prompt - 1]), border(rows[prompt + 1]) else { return false }
         let footer = rows.dropFirst(prompt + 2)
         return footer.count <= 8 && !footer.contains(where: rule) && !footer.contains(where: { $0.contains("```") }) &&
