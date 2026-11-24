@@ -865,7 +865,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     public func start(poll: Bool = true, webByDefault: Bool = false) throws {
         remoteInputStopped = false
-        if poll { groupClearDiscoveryReady = false }
+        if poll { groupClearDiscoveryReady = false; startBackgroundJobMonitor() }
         if var state = try? groupOrchestration(), state.removeUndelivered() > 0 { try? saveGroupOrchestration(state) }
         if let state = try? groupOrchestration(), state.needsWatching { scheduleGroupDelivery() }
         refreshGroupWaits()
@@ -931,6 +931,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     public func stop() {
+        backgroundJobMonitor?.cancel(); backgroundJobMonitor = nil; jobSnapshots.removeAll(); jobExitObservers.removeAll()
         groupClearTask?.cancel(); groupClearTask = nil
         groupIdentityObservationTask?.cancel()
         groupConnectionObservation = nil
@@ -3528,6 +3529,229 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return ids
     }
 
+    private var backgroundJobMonitor: Task<Void,Never>?
+    private var jobSnapshots: [String:(server:String,at:Date,count:Int,complete:Bool,ids:Set<String>)] = [:]
+    private var jobReads = Set<String>()
+    private var jobStops = Set<String>()
+    private var jobExitObservers: [String:BackgroundJobExitObservation] = [:]
+    package var groupJobProvider = GroupJobProvider.codex
+    private func jobProvider(_ live:SessionGroupLiveSession) -> GroupJobProvider {
+        live.session.agent == .claude ? ClaudeBackgroundJobs.provider : groupJobProvider
+    }
+
+    private func jobKey(_ group: UUID, _ member: UUID, _ live: SessionGroupLiveSession) -> String {
+        [group.uuidString,member.uuidString,live.id,live.conversationID ?? ""].joined(separator:"/")
+    }
+
+    private func currentJobEndpoint(_ live: SessionGroupLiveSession, group: SessionGroup, member: SessionGroupMember) -> Bool {
+        guard let session = sessions[live.id], session.phase != .ended, session.tty == live.session.tty,
+              let conversation = live.conversationID, conversation.lowercased() == member.conversationID.lowercased(),
+              let groups = try? SessionGroupStore(directory: paths.directory).load(),
+              groups.contains(where: { $0.id == group.id && $0.sameMembership(as:group) && $0.members.contains(member) }) else { return false }
+        return true
+    }
+
+    private func refreshBackgroundJobs(_ live: SessionGroupLiveSession, group: SessionGroup, member: SessionGroupMember) async throws -> [GroupBackgroundJob] {
+        guard [.codex,.claude].contains(live.session.agent), let conversation = live.conversationID else { throw GroupJobProvider.stale() }
+        let key = jobKey(group.id,member.id,live)
+        let box = try groupMailbox()
+        func stored() throws -> [GroupBackgroundJob] {
+            try box.backgroundJobs(group:group.id,member:member.id,session:live.id,conversation:conversation)
+        }
+        guard jobReads.insert(key).inserted else { throw RemoteHTTPError(409,"백그라운드 작업을 조회 중입니다.") }
+        defer { jobReads.remove(key) }
+        let provider = jobProvider(live)
+        let snapshot: GroupJobInventory
+        do { snapshot = try await Task.detached(priority:.utility) { try provider.inventory(live,group.id,member.id) }.value }
+        catch { jobSnapshots.removeValue(forKey:key); throw error }
+        guard !Task.isCancelled, currentJobEndpoint(live,group:group,member:member) else { throw GroupJobProvider.stale() }
+        let old = try stored().filter { $0.server == snapshot.server }
+        let known = Set(old.map(\.id)), running = Set(snapshot.jobs.map(\.id))
+        if live.session.agent == .claude {
+            for job in snapshot.jobs where jobExitObservers.count < 128 && jobExitObservers[job.id] == nil {
+                jobExitObservers[job.id] = BackgroundJobExitObservation(job:job)
+            }
+        }
+        for var job in snapshot.jobs where !known.contains(job.id) {
+            if live.session.agent == .codex, try groupOrchestration().current(groupID:group.id,workerMemberID:member.id) != nil {
+                let target = job
+                let evidence = try? await Task.detached(priority:.utility) { try provider.evidence(live,target) }.value
+                if let turn = evidence?.turn { job.taskID = try backgroundTaskID(job,turn:turn) }
+            }
+            guard !Task.isCancelled, currentJobEndpoint(live,group:group,member:member) else { throw GroupJobProvider.stale() }
+            try box.saveBackgroundJob(job)
+        }
+        for var job in old where job.finishedAt == nil && !running.contains(job.id) {
+            let inspected = job
+            let result = try? await Task.detached(priority:.utility) { try provider.evidence(live,inspected) }.value
+            guard !Task.isCancelled, currentJobEndpoint(live,group:group,member:member) else { throw GroupJobProvider.stale() }
+            if !snapshot.complete && result?.ended != true { continue }
+            job.finishedAt = Date()
+            let exited = jobExitObservers.removeValue(forKey:job.id)?.result() ?? result
+            job.exitCode = exited?.exitCode
+            if job.status == "stopping" { job.status = "stopped" }
+            else { job.status = exited?.failed == true ? "failed" : "ended" }
+            if let turn = result?.turn { job.taskID = try backgroundTaskID(job,turn:turn) }
+            try box.saveBackgroundJob(job,event:job.status == "failed" ? "backgroundJobFailed" : "backgroundJobEnded")
+        }
+        jobSnapshots[key] = (snapshot.server,Date(),snapshot.jobs.count,snapshot.complete,running)
+        return try stored().filter { $0.server == snapshot.server }
+    }
+
+    private func backgroundTaskID(_ job: GroupBackgroundJob, turn:String) throws -> UUID? {
+        let tasks = try groupOrchestration().assignments.filter { $0.groupID == job.group && $0.workerMemberID == job.member &&
+            $0.workerSessionID == job.session && $0.workerConversationID?.lowercased() == job.conversation }
+        return try groupMailbox().backgroundAssignment(turn:turn,candidates:tasks)
+    }
+
+    private func startBackgroundJobMonitor() {
+        guard backgroundJobMonitor == nil else { return }
+        backgroundJobMonitor = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for:.seconds(20)) } catch { return }
+                guard let self else { return }
+                guard let groups = try? SessionGroupStore(directory:self.paths.directory).load(), !groups.isEmpty,
+                      let observed = try? await self.readSessionGroupSessions(reconcile:false) else { continue }
+                for group in groups {
+                    for member in group.members where [.codex,.claude].contains(member.agent) {
+                        guard !Task.isCancelled else { return }
+                        guard let live = SessionGroupMatching.match(member,in:observed) else { continue }
+                        _ = try? await self.refreshBackgroundJobs(live,group:group,member:member)
+                    }
+                }
+                self.jobSnapshots = self.jobSnapshots.filter { Date().timeIntervalSince($0.value.at) < 120 }
+                let active = self.jobSnapshots.values.reduce(into:Set<String>()) { $0.formUnion($1.ids) }
+                self.jobExitObservers = self.jobExitObservers.filter { active.contains($0.key) }
+            }
+        }
+    }
+
+    private func groupBackgroundAction(_ object: JSONObject, stop: Bool) async throws -> JSONObject {
+        guard let gid = try GroupWaitRequest.uuid(object,"groupID") else { throw RemoteHTTPError(400,"그룹 ID가 필요합니다.") }
+        let selected = try GroupWaitRequest.uuid(object,"memberID")
+        let id = object["jobID"] as? String
+        guard object["jobID"] == nil || (id?.count == 64 && id?.allSatisfy(\.isHexDigit) == true),
+              (!stop && id == nil) || selected != nil && id != nil else { throw RemoteHTTPError(400,"개별 작업에는 구성원 ID와 조회한 작업 ID가 필요합니다.") }
+        func leader() async throws -> SessionGroup {
+            let (group,caller) = try await groupMailboxCaller(object,groupID:gid,verified:true)
+            guard group.isLeader(caller.id) else { throw RemoteHTTPError(403,"그룹장만 백그라운드 작업을 관리할 수 있습니다.") }
+            return group
+        }
+        let group = try await leader()
+        if let selected, !group.members.contains(where:{ $0.id == selected }) { throw GroupJobProvider.stale() }
+        let observed = try await readSessionGroupSessions(reconcile:false)
+        func inspect(_ member:SessionGroupMember) async throws -> JSONObject {
+            var row: JSONObject = ["memberID":member.id.uuidString,"name":member.nickname ?? member.title,"jobs":[],"canStop":false]
+            guard let live = SessionGroupMatching.match(member,in:observed) else {
+                if id != nil { throw GroupJobProvider.stale() }
+                row["source"] = "disconnected"; return row
+            }
+            var jobs: [GroupBackgroundJob]?
+            if [.codex,.claude].contains(live.session.agent) {
+                do { jobs = try await refreshBackgroundJobs(live,group:group,member:member) }
+                catch { if id != nil { throw error }; row["reason"] = error.localizedDescription }
+            }
+            if let jobs {
+                if let id {
+                    guard let conversation = live.conversationID,
+                          var job = try groupMailbox().backgroundJobs(group:gid,member:member.id,session:live.id,conversation:conversation,id:id).first,
+                          job.server == jobSnapshots[jobKey(gid,member.id,live)]?.server,
+                          let (_,_,confirmed) = try? await groupEvidenceTarget(object,groupID:gid,memberID:member.id),
+                          confirmed?.id == live.id, confirmed?.conversationID == live.conversationID else { throw GroupJobProvider.stale() }
+                    let provider = jobProvider(live)
+                    if stop {
+                        guard !snapshot.paused, !remoteInputStopped, !groupClearActive(gid) else { throw RemoteHTTPError(409,"작업 중단이 일시정지되어 있습니다.") }
+                        let box = try groupMailbox()
+                        guard let current = try box.backgroundJobs(group:gid,member:member.id,session:live.id,conversation:job.conversation,id:id).first else { throw GroupJobProvider.stale() }
+                        if current.status != "running" { return current.json }
+                        guard jobStops.insert(id).inserted else { throw RemoteHTTPError(409,"이 작업의 중단 요청을 확인 중입니다.") }
+                        defer { jobStops.remove(id) }
+                        job = current; job.status = "stopping"
+                        let reserved = job
+                        let accepted: Bool
+                        do {
+                            accepted = try await Task.detached {
+                                try await provider.stop(live,reserved) { @MainActor in
+                                let (_,_,endpoint) = try await self.groupEvidenceTarget(object,groupID:gid,memberID:member.id)
+                                let fresh = try await self.readSessionGroupSessions(runtimeID:live.id,reconcile:false,useStatusCache:false).first
+                                guard fresh?.conversationID?.lowercased() == reserved.conversation, fresh?.providerHome == live.providerHome,
+                                      !self.snapshot.paused, !self.remoteInputStopped, !self.groupClearActive(gid), endpoint?.id == live.id,
+                                      endpoint?.providerHome == live.providerHome, endpoint?.conversationID == live.conversationID,
+                                      try box.backgroundJobs(group:gid,member:member.id,session:live.id,conversation:reserved.conversation,id:id).first?.status == "running" else { throw GroupJobProvider.stale() }
+                                try box.saveBackgroundJob(reserved)
+                                }
+                            }.value
+                        } catch {
+                            if (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started",
+                               let latest = try box.backgroundJobs(group:gid,member:member.id,session:live.id,conversation:reserved.conversation,id:id).first,
+                               latest.status == "stopping" { try box.saveBackgroundJob(current) }
+                            throw error
+                        }
+                        if !accepted, var latest = try box.backgroundJobs(group:gid,member:member.id,session:live.id,conversation:job.conversation,id:id).first, latest.finishedAt == nil {
+                            latest.status = "running"
+                            try box.saveBackgroundJob(latest)
+                        }
+                        _ = try await refreshBackgroundJobs(live,group:group,member:member)
+                        guard try await leader().sameMembership(as:group), let after = try box.backgroundJobs(group:gid,member:member.id,session:live.id,conversation:job.conversation,id:id).first else { throw GroupJobProvider.stale() }
+                        return after.json
+                    }
+                    let target = job
+                    let evidence = try? await Task.detached { try provider.evidence(live,target) }.value
+                    guard try await leader().sameMembership(as:group) else { throw GroupJobProvider.stale() }
+                    if let turn = evidence?.turn { job.taskID = try backgroundTaskID(job,turn:turn) ?? job.taskID }
+                    var detail = job.json
+                    detail["recentOutput"] = evidence?.output
+                    if let code = evidence?.exitCode { detail["exitCode"] = code }
+                    return detail
+                }
+                let inventory = jobSnapshots[jobKey(gid,member.id,live)]
+                let visible = jobs.filter { inventory?.ids.contains($0.id) == true }
+                row["jobs"] = visible.map(\.json)
+                if inventory?.complete == true {
+                    row["backgroundRunning"] = inventory?.count
+                    row["source"] = "provider"
+                } else {
+                    let frame = try? await remoteTerminal(sessionID:live.id,realtime:true,textOnly:true)
+                    let footer = frame.flatMap { $0.outputReason == nil ? ActivityDetector.backgroundCount($0.screen,agent:live.session.agent) : nil }
+                    let identified = inventory?.count ?? 0
+                    row["identifiedRunning"] = identified
+                    row["backgroundRunning"] = footer.map { max($0,identified) } as Any? ?? NSNull()
+                    row["source"] = identified > 0 ? "verifiedProcesses" : footer == nil ? "unknown" : "countOnly"
+                }
+                 row["canStop"] = visible.contains(where: { $0.status == "running" })
+            } else {
+                if id != nil { throw GroupJobProvider.stale() }
+                let frame = try? await remoteTerminal(sessionID:live.id,realtime:true,textOnly:true)
+                let count = frame.flatMap { $0.outputReason == nil ? ActivityDetector.backgroundCount($0.screen,agent:live.session.agent) : nil }
+                row["backgroundRunning"] = count as Any? ?? NSNull()
+                row["source"] = count == nil ? "unknown" : "countOnly"
+            }
+            return row
+        }
+        if let selected, let member = group.members.first(where: { $0.id == selected }) {
+            let row = try await inspect(member)
+            guard try await leader().sameMembership(as:group) else { throw GroupJobProvider.stale() }
+            return id == nil ? ["groupID":gid.uuidString,"members":[row]] : row
+        }
+        var members = [JSONObject](repeating:[:],count:group.members.count)
+        try await withThrowingTaskGroup(of:(Int,JSONObject).self) { reads in
+            var next = 0
+            func schedule() {
+                guard next < group.members.count else { return }
+                let i = next, member = group.members[i]
+                next += 1
+                reads.addTask { (i,try await inspect(member)) }
+            }
+            for _ in 0..<min(4,group.members.count) { schedule() }
+            while let (i,row) = try await reads.next() {
+                members[i] = row
+                schedule()
+            }
+        }
+        guard try await leader().sameMembership(as:group) else { throw GroupJobProvider.stale() }
+        return ["groupID":gid.uuidString,"members":members]
+    }
+
     private func groupOverview(_ group: SessionGroup, observed: [SessionGroupLiveSession], models: [String: SessionGroupModelSettings], state: SessionGroupOrchestration) throws -> JSONObject {
         let inbox = try groupMailbox().inboxOperations(groupID: group.id)
         let formatter = ISO8601DateFormatter()
@@ -3546,6 +3770,27 @@ private struct ScreenAnalysisStorageKey: Hashable {
             var row: JSONObject = ["id": member.id.uuidString, "name": member.nickname ?? member.title, "composer": "unknown",
                 "phase": live.map { groupDisplayPhase($0.session, observation: $0).rawValue } ?? "disconnected",
                 "queued": inbox[member.id]?.queuedCount ?? 0, "unacknowledged": inbox[member.id]?.unacknowledgedCount ?? 0]
+            row["backgroundRunning"] = NSNull()
+            row["canAcceptTask"] = NSNull()
+            if let live {
+                if let entry = jobSnapshots[jobKey(group.id,member.id,live)], !entry.complete, Date().timeIntervalSince(entry.at) < 60 {
+                    row["backgroundIdentified"] = entry.count
+                }
+                if let entry = jobSnapshots[jobKey(group.id,member.id,live)], entry.complete, Date().timeIntervalSince(entry.at) < 60 {
+                    row["backgroundRunning"] = entry.count
+                } else if let frame, let count = ActivityDetector.backgroundCount(frame.raw,agent:live.session.agent) {
+                    row["backgroundRunning"] = count
+                }
+                if let frame {
+                    let agent = live.session.agent
+                    let activity = ActivityDetector.detect(frame.raw,agent:agent)
+                    row["canAcceptTask"] = !snapshot.paused && !groupClearActive(group.id) && !live.session.pendingInTerminal &&
+                        ![SessionPhase.approval,.ended].contains(live.session.phase) &&
+                        (live.claudeRegisteredStatus.map(ClaudeSessionRegistration.acceptsPrompt) ?? true) &&
+                        (activity.phase == .idle || agent == .agy && live.session.phase == .idle) &&
+                        Self.emptyGroupComposer(frame.raw,agent:agent) && !RemoteMessageReadiness.hasMenu(frame.raw,agent:agent)
+                }
+            } else { row["canAcceptTask"] = false }
             row["model"] = live.flatMap { models[$0.id]?.model }
             row["lastActivity"] = live.map { formatter.string(from: $0.session.lastActivity) }
             row["deliveryHold"] = inbox[member.id]?.lastDeliveryFailure.map { String($0.prefix(160)) }
@@ -5596,6 +5841,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             if let id = iterator.next() { reads.addTask { _ = try? await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true) } }
                         }
                     }
+                    let native = visibleGroups.flatMap { group in
+                        group.members.compactMap { member -> (SessionGroup,SessionGroupMember,SessionGroupLiveSession)? in
+                            guard [.codex,.claude].contains(member.agent), let live = SessionGroupMatching.match(member,in:observed),
+                                  Date().timeIntervalSince(jobSnapshots[jobKey(group.id,member.id,live)]?.at ?? .distantPast) > 20 else { return nil }
+                            return (group,member,live)
+                        }
+                    }
+                    var jobs = native.makeIterator()
+                    await withTaskGroup(of:Void.self) { reads in
+                        func schedule() {
+                            guard let (group,member,live) = jobs.next() else { return }
+                            reads.addTask { _ = try? await self.refreshBackgroundJobs(live,group:group,member:member) }
+                        }
+                        for _ in 0..<min(native.count,4) { schedule() }
+                        while await reads.next() != nil { schedule() }
+                    }
                     let latestGroups = try SessionGroupStore(directory: paths.directory).load()
                     guard visibleGroups.allSatisfy({ old in latestGroups.contains(where: { $0.id == old.id && $0.sameMembership(as: old) }) }) else {
                         throw RemoteHTTPError(409, "조회 중 그룹 연결이 바뀌었습니다. 다시 확인해주세요.")
@@ -5686,6 +5947,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
             return ["results": results]
+        case "list_group_background_jobs", "stop_group_background_job":
+            return try await groupBackgroundAction(object,stop:tool == "stop_group_background_job")
         case "watch_group_events", "explain_group_delivery":
             return try await groupObservation(tool, object)
         case "clear_group_composer":

@@ -181,6 +181,8 @@ public final class SessionGroupMailbox {
             try execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; CREATE TABLE IF NOT EXISTS messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,group_id TEXT NOT NULL,sender_id TEXT NOT NULL,recipient_id TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,created REAL NOT NULL,acknowledged REAL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,last_result TEXT,last_error TEXT,source_key TEXT UNIQUE); CREATE INDEX IF NOT EXISTS message_inbox ON messages(group_id,recipient_id,acknowledged,sequence); CREATE INDEX IF NOT EXISTS message_outbox ON messages(group_id,sender_id,sequence);")
             try execute("""
                 CREATE INDEX IF NOT EXISTS message_pending_age ON messages(created) WHERE \(Self.pendingFilter);
+                CREATE TABLE IF NOT EXISTS background_jobs(id TEXT PRIMARY KEY,gid TEXT NOT NULL,member TEXT NOT NULL,session TEXT NOT NULL,conversation TEXT NOT NULL,body TEXT NOT NULL,finished REAL);
+                CREATE INDEX IF NOT EXISTS background_job_member ON background_jobs(gid,member,session,conversation,finished);
                 CREATE TABLE IF NOT EXISTS group_events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, gid TEXT NOT NULL, member TEXT NOT NULL,
                     ref TEXT NOT NULL, kind TEXT NOT NULL, at REAL NOT NULL, age INTEGER NOT NULL DEFAULT 0,
@@ -467,7 +469,7 @@ public final class SessionGroupMailbox {
     }
 
     package func events(group: UUID, after cursor: Int) throws -> [JSONObject] {
-        let q = try statement("SELECT seq,member,ref,kind,at,age FROM group_events WHERE gid=? AND seq>? ORDER BY seq LIMIT 51", [group.uuidString, String(cursor)])
+        let q = try statement("SELECT e.seq,e.member,e.ref,e.kind,e.at,e.age,json_extract(j.body,'$.exitCode') FROM group_events e LEFT JOIN background_jobs j ON j.id=e.ref AND j.gid=e.gid WHERE e.gid=? AND e.seq>? ORDER BY e.seq LIMIT 51", [group.uuidString, String(cursor)])
         defer { sqlite3_finalize(q) }
         var page: [JSONObject] = []
         while true {
@@ -477,6 +479,7 @@ public final class SessionGroupMailbox {
                     "referenceID": String(cString: sqlite3_column_text(q, 2)), "event": String(cString: sqlite3_column_text(q, 3)),
                     "observedAt": ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: sqlite3_column_double(q, 4))),
                     "elapsedSeconds": Int(sqlite3_column_int64(q, 5))])
+                if sqlite3_column_type(q,6) != SQLITE_NULL { page[page.count-1]["exitCode"] = Int(sqlite3_column_int64(q,6)) }
             case SQLITE_DONE: return page
             default: throw AppError.message("그룹 이벤트를 읽지 못했습니다.")
             }

@@ -89,6 +89,21 @@ public enum ActivityDetector {
             monitoring: background)
     }
 
+    package static func backgroundCount(_ screen:String,agent:AgentKind) -> Int? {
+        let rows = nonemptyTail(screen)
+        let glyphs = agent == .codex ? "›»" : agent == .agy ? ">" : "❯"
+        guard let marker = rows.lastIndex(where: { $0.first.map { glyphs.contains($0) } == true }),
+              rows.count-marker <= 10 else { return nil }
+        let footer = Array(rows.dropFirst(marker+1))
+        var lines = footer
+        if let compact = compactClaudeFooter(footer) { lines.append(compact.text) }
+        for line in lines where isBackgroundHint(line) || isCompactClaudeFooter(line) {
+            let pattern = #"(?i)\b\d{1,4}(?= (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?|shells?)\b)"#
+            if let range = line.range(of:pattern,options:.regularExpression) { return Int(line[range]) }
+        }
+        return nil
+    }
+
     private static func isBackgroundHint(_ line: String) -> Bool {
         matches(line, #"(?i)^[•·⏵▶↳\s]*[0-9]+ (?:background (?:tasks?|terminals?|processes?|monitors?)|running tasks?)\b"#)
     }

@@ -734,6 +734,88 @@ extension ApprovalTests {
         try expectEqual(crowded.assignments.count, SessionGroupOrchestration.limit + 5, "Pending tasks are never dropped for space")
     }
 
+    @MainActor func testBackgroundJobOversight() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:dir) }
+        let rows = ProcessDiscovery.parse("""
+            104651 1 fixture1 104651 104651 Wed Oct 28 12:00:00 2026 /fixture/codex
+            104652 1 fixture2 104652 104652 Wed Oct 28 12:00:00 2026 /fixture/codex
+            104653 1 fixture3 104653 104653 Wed Oct 28 12:00:00 2026 /fixture/codex
+            """)
+        let sessions = rows.map { AgentSession(id:$0.key,agent:.codex,pid:$0.pid,started:$0.started,tty:"/dev/"+$0.tty,cwd:"/fixture",terminal:.iterm) }
+        let threads = Dictionary(uniqueKeysWithValues:rows.map { ($0.pid,UUID().uuidString.lowercased()) })
+        final class Fixture: @unchecked Sendable {
+            let lock = NSLock()
+            var stopped = Set<String>()
+            var calls: [String] = []
+            var failed = false
+            func list(_ key:String) -> [String] {
+                lock.lock(); defer { lock.unlock() }
+                return (stopped.contains(key) ? [] : ["server"]) + (failed ? [] : ["tests"])
+            }
+            func stop(_ key:String) {
+                lock.lock(); defer { lock.unlock() }
+                stopped.insert(key); calls.append(key)
+            }
+        }
+        let fixture = Fixture()
+        func engine() throws -> ApprovalEngine {
+            let e = try ApprovalEngine(paths:AppPaths(directory:dir),processReader:{ rows },codexGroupReader:{ r in
+                threads[r.pid].map { .init(threadID:$0,database:"/fixture/home/state_5.sqlite") }
+            },isolateByDefault:true)
+            e.groupJobProvider = .init(inventory:{ live,g,m in
+                .init(server:"fixture",jobs:fixture.list(live.id).map {
+                    .init(group:g,member:m,session:live.id,conversation:live.conversationID!,server:"fixture",process:$0,item:"item-"+$0,command:$0)
+                })
+            },evidence:{ _,job in
+                .init(output:"fixture output",exitCode:job.process == "tests" ? 42 : nil,failed:job.process == "tests")
+            },stop:{ live,_,authorize in
+                try await authorize()
+                fixture.stop(live.id)
+                return true
+            })
+            e.updateDiscovery(sessions,records:rows)
+            return e
+        }
+        var e = try engine()
+        defer { e.stop() }
+        let live = try await e.sessionGroupSessions()
+        let members = try sessions.map { session in try unwrapGroup(live.first { $0.id == session.id }).member }
+        let group = SessionGroup(name:"jobs",members:members,leaderMemberID:members[0].id)
+        try SessionGroupStore(directory:dir).save([group])
+        func call(_ tool:String,_ fields:JSONObject = [:]) async throws -> JSONObject {
+            try await e.mcpAction(["tool":tool,"owner":UUID().uuidString,"sessionID":sessions[0].id,"groupID":group.id.uuidString].merging(fields) { _,new in new })
+        }
+        let all = try unwrapGroup(try await call("list_group_background_jobs")["members"] as? [JSONObject])
+        try expectEqual(all.count,3)
+        let worker = try unwrapGroup(all.first { $0["memberID"] as? String == members[1].id.uuidString })
+        let jobs = try unwrapGroup(worker["jobs"] as? [JSONObject])
+        try expectEqual(jobs.count,2)
+        let job = try unwrapGroup(jobs.first { $0["providerJobID"] as? String == "server" })
+        try expect(job["recentOutput"] == nil)
+        let fields: JSONObject = ["memberID":members[1].id.uuidString,"jobID":try unwrapGroup(job["jobID"] as? String)]
+        let detail = try await call("list_group_background_jobs",fields)
+        try expectEqual(detail["recentOutput"] as? String,"fixture output")
+        for invalid in [["sessionID":sessions[1].id],["memberID":members[2].id.uuidString]] {
+            do {
+                _ = try await call("stop_group_background_job",fields.merging(invalid) { _,new in new })
+                throw AppError.message("unrelated caller or member stopped a job")
+            } catch is RemoteHTTPError {}
+        }
+        let stopped = try await call("stop_group_background_job",fields)
+        try expectEqual(stopped["status"] as? String,"stopped")
+        e.stop(); e = try engine()
+        try expectEqual(try await call("stop_group_background_job",fields)["status"] as? String,"stopped")
+        try expectEqual(fixture.calls,[sessions[1].id])
+        fixture.failed = true
+        _ = try await call("list_group_background_jobs",["memberID":members[1].id.uuidString])
+        let events = try unwrapGroup(try await call("watch_group_events")["events"] as? [JSONObject])
+        try expect(events.contains { $0["event"] as? String == "backgroundJobFailed" && $0["exitCode"] as? Int == 42 })
+        try expectEqual(events.filter { $0["event"] as? String == "backgroundJobEnded" }.count,1)
+        try expectEqual(ActivityDetector.backgroundCount("❯ \n⏵⏵ auto mode on · 2 shells",agent:.claude),2)
+        try expectEqual(ActivityDetector.backgroundCount("• 7 background tasks\n› \n? for shortcuts",agent:.codex),nil)
+    }
+
     @MainActor func testLargeGroupOverviewPayload() async throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }

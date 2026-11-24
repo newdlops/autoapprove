@@ -603,6 +603,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: worker question returns and completion becomes a report",tests.testGroupWorkerQuestionReturnsAndCompletionBecomesReport),
             ("Session groups: eleven-member overview payload", tests.testLargeGroupOverviewPayload),
             ("Session groups: overdue report notice survives restart", tests.testOverdueGroupAssignmentNotifiesOnce),
+            ("Session groups: background job oversight",tests.testBackgroundJobOversight),
             ("Session groups: a task turns on worker automatic approval",tests.testGroupTaskTurnsOnWorkerAutomaticApproval),
             ("Session groups: a worker choice question reaches the parent and is answered",tests.testGroupWorkerChoiceQuestionReachesParentAndIsAnswered),
             ("Session groups: list badges tell leaders from members",tests.testSessionGroupBadgesForSessionLists),
