@@ -191,14 +191,14 @@ public enum CodexResumeCheck {
             let compact = PromptDetector.fingerprint(transcript.components(separatedBy: .whitespacesAndNewlines).joined())
             guard PromptDetector.fingerprint(transcript) == stop.identity || compact == stop.continuationIdentity else { return false }
         }
-        // The continuation lives after the composer. Avoid scanning every row in
-        // potentially large scrollback to discover those few trailing rows.
         let tail = current[current.index(after: composer)..<current.endIndex].indices
             .filter { !current[$0].trimmingCharacters(in: .whitespaces).isEmpty }
         let text = stop.continuationText.precomposedStringWithCanonicalMapping
+        let goal = stop.agent == .codex && text == CodexCapacityStop.goalResumeText
         let ownedBody = footerVariants(footer, agent: stop.agent).contains { expectedFooter in
-            guard tail.count >= expectedFooter.count,
-                  tail.suffix(expectedFooter.count).map({ current[$0].trimmingCharacters(in: .whitespaces) }) == expectedFooter else { return false }
+            guard tail.count >= expectedFooter.count else { return false }
+            let actual = tail.suffix(expectedFooter.count).map { current[$0].trimmingCharacters(in: .whitespaces) }
+            guard actual == expectedFooter || (goal && actual.map(goalFooterRow) == expectedFooter.map(goalFooterRow)) else { return false }
             let end = expectedFooter.isEmpty ? current.endIndex : tail[tail.count - expectedFooter.count]
             let body = ([composerText(current[composer])] + current[(composer + 1)..<end].map { $0.trimmingCharacters(in: .whitespaces) }).filter { !$0.isEmpty }
             return body.joined() == text || body.joined(separator: " ") == text
@@ -209,6 +209,17 @@ public enum CodexResumeCheck {
         guard let active = activeRegionRows(current, heading: heading), active.last == current[composer] else { return false }
         let filled: ([String]) -> [String] = { $0.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }
         return filled(Array(active.dropLast())) == filled(Array(expected.dropLast()))
+    }
+    private static func goalFooterRow(_ row: String) -> String {
+        let lifecycle = row.replacingOccurrences(of: #"^·\s*(?=Goal (?:stalled|blocked) )"#, with: "", options: .regularExpression)
+        let status = lifecycle.replacingOccurrences(of: #"^(Goal (?:stalled|blocked) \(/goal resume\))\s*·\s*⚠\s*[0-9]+ warnings?\s*·\s*f2 to view$"#,
+                                             with: "$1", options: .regularExpression)
+        return status.components(separatedBy: "·").map { component in
+            let field = component.trimmingCharacters(in: .whitespaces)
+            return field.replacingOccurrences(of: #"^((?:weekly|5h|Context) )\d+(%(?: left| used))$"#,
+                                              with: "$1#$2", options: .regularExpression)
+                .replacingOccurrences(of: #"^\d+(?:\.\d+)?[KMB]?( (?:in|out))$"#, with: "#$1", options: .regularExpression)
+        }.joined(separator: "·")
     }
     private static func footerVariants(_ footer: String, agent: AgentKind) -> [[String]] {
         let original = rows(footer).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
@@ -340,6 +351,13 @@ enum CodexResumeScript {
       const hidden = original.map(row => row.replace(/← for agents\\s*·\\s*\\? for shortcuts|\\? for shortcuts/g, '').trim()).filter(Boolean);
       return original.join('\\n') === hidden.join('\\n') ? [original] : [original, hidden];
     }
+    function goalFooterRow(row) {
+      const lifecycle = row.replace(/^·\\s*(?=Goal (?:stalled|blocked) )/, '');
+      const status = lifecycle.replace(/^(Goal (?:stalled|blocked) \\(\\/goal resume\\))\\s*·\\s*⚠\\s*[0-9]+ warnings?\\s*·\\s*f2 to view$/, '$1');
+      return status.split('·').map(field => field.trim()
+        .replace(/^((?:weekly|5h|Context) )\\d+(%(?: left| used))$/, '$1#$2')
+        .replace(/^\\d+(?:\\.\\d+)?[KMB]?( (?:in|out))$/, '#$1')).join('·');
+    }
     function draftReady(rows, region, text, footer) {
       const expected = resumeRows(region), last = lastComposer(rows);
       if (last < 0 || resumeBlocked(rows) || resumeRunning(rows) || (resumeAgent(region) === 'codex' && goalHeld(rows)) || footer == null) return false;
@@ -347,7 +365,9 @@ enum CodexResumeScript {
       const owned = resumeFooters(footer, resumeAgent(region)).some(expectedFooter => {
         if (tail.length < expectedFooter.length) return false;
         const actual = expectedFooter.length ? tail.slice(-expectedFooter.length).map(i => rows[i].trim()) : [];
-        if (actual.join('\\n') !== expectedFooter.join('\\n')) return false;
+        if (actual.join('\\n') !== expectedFooter.join('\\n') &&
+            !(text === '/goal resume' && resumeAgent(region) === 'codex' &&
+              actual.map(goalFooterRow).join('\\n') === expectedFooter.map(goalFooterRow).join('\\n'))) return false;
         const end = expectedFooter.length ? tail[tail.length - expectedFooter.length] : rows.length;
         const body = [composerText(rows[last]), ...rows.slice(last + 1, end).map(row => row.trim())].filter(Boolean);
         return body.join('') === text || body.join(' ') === text;

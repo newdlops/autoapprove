@@ -51,10 +51,26 @@ extension ApprovalTests {
         let before = blockedGoalFrame(), stop = CodexCapacityStop.detect(before, agent: .codex)!
         let draft = before.replacingOccurrences(of: "› Ask Codex to do anything", with: "› /goal resume")
         let pursuing = before.replacingOccurrences(of: "Goal stalled (/goal resume)", with: "Pursuing goal")
+        let status = "model high · project · Ready · Context 84% used · weekly 46% left · 1.41M out"
+        let initial = before.replacingOccurrences(of: "? for shortcuts · ", with: status + "\n← for agents · ? for shortcuts  ")
+            + " · ⚠ 6 warnings · f2 to view"
+        let changedFooter = status.replacingOccurrences(of: "46%", with: "45%").replacingOccurrences(of: "1.41M", with: "1.42M")
+        let waiting = draft.replacingOccurrences(of: "? for shortcuts · ", with: changedFooter + "\n")
+        let owned = CodexCapacityStop.detect(initial, agent: .codex)!
+        try expect(CodexResumeCheck.draftReady(waiting, stop: owned))
+        for edited in [waiting.replacingOccurrences(of: "weekly", with: "monthly"),
+                       waiting.replacingOccurrences(of: "project", with: "another"),
+                       waiting.replacingOccurrences(of: "› /goal resume", with: "› /goal resume\nuser note"),
+                       waiting.replacingOccurrences(of: "› /goal resume", with: "› resume\n\n› /goal resume"),
+                       waiting.replacingOccurrences(of: "Goal stalled", with: "Goal paused")] {
+            try expectFalse(CodexResumeCheck.draftReady(edited, stop: owned))
+        }
         for host in [ScreenHost.terminal, .iterm] {
             for (frames, expected, count) in [([before, draft, pursuing], "sent", 2),
                                              ([before, draft, pursuing.replacingOccurrences(of: "Pursuing goal", with: "Pursuing\ngoal")], "sent", 2),
                                              ([before, draft, before], "typed", 2),
+                                             ([initial, waiting, pursuing], "sent", 2),
+                                             ([initial, waiting.replacingOccurrences(of: "project", with: "another")], "typed", 1),
                                              ([before.replacingOccurrences(of: "Goal stalled", with: "Goal paused")], "screenChanged", 0),
                                              ([before.replacingOccurrences(of: "› Ask Codex to do anything", with: "› user draft")], "screenChanged", 0)] {
                 let context = JSContext()!
@@ -68,9 +84,10 @@ extension ApprovalTests {
                 function Application(id) { return {running: () => true, windows: () => [{tabs: () => [Object.assign(tab, {sessions: () => [tab]})]}],
                   doScript: value => writes.push(value)}; }
                 """)
+                let region = frames.first == initial ? owned.region : stop.region
                 let script = host == .terminal
-                    ? try TerminalAdapter.resumeScript(tty: "/dev/ttys901", region: stop.region, text: stop.continuationText)
-                    : try ITermAdapter.resumeScript(target: ScreenTarget(tty: "/dev/ttys901", jobPIDs: [42]), region: stop.region, text: stop.continuationText)
+                    ? try TerminalAdapter.resumeScript(tty: "/dev/ttys901", region: region, text: stop.continuationText)
+                    : try ITermAdapter.resumeScript(target: ScreenTarget(tty: "/dev/ttys901", jobPIDs: [42]), region: region, text: stop.continuationText)
                 let result = context.evaluateScript(script)
                 try expectNil(context.exception)
                 try expectEqual(result?.toString(), expected)

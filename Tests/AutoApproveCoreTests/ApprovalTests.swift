@@ -707,6 +707,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Automation IPC: permission coalescing, cancellation and global limit",tests.testPermissionAndCancelledFlights),
             ("Automation IPC: expired keyboard sample retains user priority",tests.testStaleKeyboardSampleRetainsPriority),
             ("Automation IPC: blocked target isolation and late replies",tests.testBlockedAutomationIsolation),
+            ("Goal resume: revalidate the owned draft after status footer changes", tests.testBlockedGoalScriptsVerifyTheLifecycleFooter),
             ("Group Goals: native CLI commands and user Goal evidence", tests.testNativeGroupGoalCommandsAndEvidence),
             ("Web interaction: MCP stdio initialization, tool list and errors", tests.testMCPStdioProtocolAndToolErrors),
             ("Web interaction: explicit screen capture, cache, permission and stop", tests.testTestScreenCaptureIsExplicitAndStops),
