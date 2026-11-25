@@ -1209,6 +1209,86 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return try await terminalProfileCandidates(mode,sessionIDs:sessionIDs)
     }
 
+    private struct ProfileConversation {
+        let revision = UUID()
+        let session: AgentSession
+        let id: UUID
+        let home: String?
+        let name: String?
+
+        func matches(_ current: AgentSession, home: String?) -> Bool {
+            guard self.home == home, session.pid == current.pid, session.started == current.started,
+                  session.tty == current.tty, session.cwd == current.cwd, session.terminal == current.terminal else { return false }
+            return current.terminalTitle == session.terminalTitle ||
+                (name != nil && name == CodexProfileConversationBinding.terminalName(current.terminalTitle, cwd: current.cwd))
+        }
+    }
+    private var profileConversations: [String: ProfileConversation] = [:]
+    private var profileConversationQueries: [String: UUID] = [:]
+
+    public func resolveProfileConversation(_ candidate: TerminalProfileCandidate) async throws -> TerminalProfileCandidate {
+        let runtime = candidate.id
+        let changed = AppError.message("조회하는 동안 원래 탭이나 대화가 바뀌었습니다. 현재 세션을 다시 불러와주세요.")
+        guard let original = sessions[runtime], original.agent == .codex, original.phase != .ended,
+              original.cwd == candidate.entry.cwd, original.agent.rawValue == candidate.entry.agent,
+              candidate.tty.map({ $0 == original.tty }) ?? true,
+              (original.terminal == .iterm && candidate.entry.host == .iterm ||
+                original.terminal == .terminal && candidate.entry.host == .terminal) else { throw changed }
+        guard profileConversationQueries[runtime] == nil else { throw AppError.message("이미 이 탭의 대화를 조회하고 있습니다.") }
+        profileConversations = profileConversations.filter { sessions[$0.key].map { $0.phase != .ended } == true }
+        profileConversations.removeValue(forKey: runtime)
+        let ticket = UUID(), epoch = observationEpoch
+        profileConversationQueries[runtime] = ticket
+        defer { if profileConversationQueries[runtime] == ticket { profileConversationQueries.removeValue(forKey: runtime) } }
+        func observe() async throws -> SessionGroupLiveSession {
+            let rows = try await readSessionGroupSessions(runtimeID: runtime, reconcile: false, useStatusCache: false, priority: .userInitiated)
+            try Task.checkCancellation()
+            guard observationEpoch == epoch, profileConversationQueries[runtime] == ticket, var row = rows.first, row.id == runtime, !row.providerIdentityAmbiguous,
+                  row.session.pid == original.pid, row.session.started == original.started,
+                  row.session.tty == original.tty, row.session.cwd == original.cwd, row.session.terminal == original.terminal else { throw changed }
+            if let expected = candidate.entry.providerHome, row.providerHome != expected {
+                guard row.conversationID == nil, try await questionTransport.queueHome(original).home == expected,
+                      profileConversationQueries[runtime] == ticket, observationEpoch == epoch else { throw changed }
+                row.providerHome = expected
+            }
+            return row
+        }
+        let first = try await observe()
+        let id: String
+        var name: String?
+        if let known = first.conversationID.flatMap(UUID.init(uuidString:)) {
+            id = known.uuidString.lowercased()
+        } else {
+            guard remoteCanRead(original) else { throw AppError.message("연결 설정에서 이 탭의 터미널 앱을 연결한 뒤 다시 조회해주세요.") }
+            if let named = await groupNamedConversation(original), named.home == first.providerHome {
+                id = named.id
+                name = named.name
+            } else {
+                id = try await statusConversationID(original, backgroundOnly: true, markRepeatedCard: true)
+            }
+        }
+        guard let uuid = UUID(uuidString: id) else { throw changed }
+        var evidence = first
+        evidence.conversationID = uuid.uuidString.lowercased()
+        let settingsReader = profileExecutionSettingsReader
+        let settings = await Task.detached(priority: .userInitiated) { [evidence] in settingsReader(evidence) }.value
+        let last = try await observe()
+        guard last.providerHome == first.providerHome,
+              last.conversationID.map({ UUID(uuidString: $0) == uuid }) ?? (first.conversationID == nil),
+              (last.session.codexApprovalBinding?.threadID).map({ UUID(uuidString: $0) == uuid }) ?? true,
+              last.session.terminalTitle == original.terminalTitle || (name != nil && CodexProfileConversationBinding.terminalName(last.session.terminalTitle, cwd: original.cwd) == name)
+        else { throw changed }
+        if last.conversationID == nil {
+            profileConversations[runtime] = ProfileConversation(session: last.session, id: uuid, home: last.providerHome, name: name)
+        }
+        var result = candidate
+        result.entry.conversationID = uuid.uuidString.lowercased()
+        result.entry.providerHome = last.providerHome
+        result.entry.executionSettings = settings
+        result.detail = nil
+        return result
+    }
+
     private func terminalProfileCandidates(_ mode:ProfileObservation, sessionIDs:Set<String>?) async throws -> [TerminalProfileCandidate] {
         let collectChoices = mode == .captureSessions || mode == .captureLayout
         let allowScreenIdentity = mode == .captureLayout || mode == .validateWithScreen
@@ -1228,6 +1308,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var namedCodexBindings:[String:String]=[:]
         var layoutNamedBindings=Set<String>()
         var explicitCodexBindings:[String:String]=[:]
+        var profileRevisions:[String:UUID]=[:]
         for session in targets {
             try Task.checkCancellation()
             guard let identity=identities[session.id], identity.session.tty==session.tty, identity.session.cwd==session.cwd else {
@@ -1239,6 +1320,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             var choices:[CodexProfileConversation]=[],detail:String?
             if let id=identity.conversationID.flatMap(UUID.init(uuidString:)) {entry.conversationID=id.uuidString.lowercased()}
             if session.agent == .codex {
+                if let proof = profileConversations[session.id],
+                   [identity.conversationID, session.codexApprovalBinding?.threadID].compactMap({ $0 }).contains(where: { UUID(uuidString: $0) != proof.id }) {
+                    profileConversations.removeValue(forKey: session.id)
+                }
                 if entry.conversationID.isEmpty {
                     do {
                         let target=try await questionTransport.queueHome(session)
@@ -1265,8 +1350,23 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             }
                         }
                         if !entry.conversationID.isEmpty {detail=nil}
-                        else if detail==nil {detail="현재 대화를 확인하지 못했습니다. 이어갈 대화를 선택하거나 새 CLI 실행을 명시적으로 선택해주세요."}
-                    } catch {if detail==nil {detail="현재 대화를 확인하지 못했습니다: "+error.localizedDescription}}
+                        else if detail==nil {
+                            detail = choices.isEmpty ? "이 탭에 연결된 Codex 대화 ID를 확인할 수 없습니다." :
+                                "이 작업 폴더의 대화 목록만으로는 현재 탭의 대화를 식별할 수 없습니다."
+                        }
+                    } catch {
+                        if entry.conversationID.isEmpty && detail == nil { detail = "현재 대화를 확인하지 못했습니다: "+error.localizedDescription }
+                    }
+                }
+                if session.codexApprovalBinding == nil, !identity.providerIdentityAmbiguous, identity.conversationID == nil,
+                   let proof = profileConversations[session.id], proof.matches(session, home: entry.providerHome),
+                   remoteCanRead(session) {
+                    if !entry.conversationID.isEmpty, UUID(uuidString: entry.conversationID) != proof.id {
+                        throw AppError.message("저장할 대화와 탭의 대화 이름이 다릅니다. 현재 탭을 다시 조회해주세요.")
+                    }
+                    entry.conversationID = proof.id.uuidString.lowercased()
+                    profileRevisions[session.id] = proof.revision
+                    detail = nil
                 }
                 if allowScreenIdentity, entry.conversationID.isEmpty, let named=await groupNamedConversation(session) {
                     entry.conversationID=named.id;entry.providerHome=named.home;detail=nil
@@ -1279,7 +1379,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if ![TerminalKind.terminal,.iterm].contains(session.terminal) {
                 detail=(detail.map {$0+" "} ?? "")+"이 세션은 새 Terminal 창에서 복원합니다."
             }
-            result.append(.init(id:session.id,entry:entry,conversations:choices,detail:detail,tty:session.terminal == .terminal ? session.tty:nil))
+            result.append(.init(id:session.id,entry:entry,conversations:choices,detail:detail,tty:session.terminal == .terminal ? session.tty:nil, canQueryConversation: session.agent == .codex && [.terminal,.iterm].contains(session.terminal)))
         }
         let terminalTTYs=result.filter {$0.entry.host == .terminal}.compactMap(\.tty)
         if mode == .captureLayout && !terminalTTYs.isEmpty {
@@ -1326,6 +1426,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard observationEpoch == epoch, !remoteInputStopped,result.allSatisfy({candidate in
             guard let original=targetsByID[candidate.id],let current=sessions[candidate.id],current.phase != .ended, !isBackgroundGroupSession(current),
                   current.tty == original.tty, current.terminal == original.terminal, let process=fresh[original.pid] else {return false}
+            if let revision = profileRevisions[candidate.id] {
+                guard let proof = profileConversations[candidate.id], proof.revision == revision,
+                      current.codexApprovalBinding == nil, proof.matches(current, home: candidate.entry.providerHome),
+                      groupMCPIdentity(for: current, home: candidate.entry.providerHome)?.conversationID.map({ $0 == proof.id }) ?? true else { return false }
+            }
             if let thread=explicitCodexBindings[candidate.id],current.codexApprovalBinding?.threadID != thread {return false}
             if let name=namedCodexBindings[candidate.id] {
                 let matches=CodexProfileConversationBinding.terminalName(current.terminalTitle,cwd:current.cwd)==name
@@ -2090,7 +2195,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Scrollback never enters screen analysis, approval receipts or input revisions.
     public func remoteTerminalHistory(sessionID:String,snapshot:String?=nil,page:Int?=nil,refresh:Bool=false) async throws -> TerminalHistoryPage {
         guard !remoteInputStopped,let session=sessions[sessionID],session.phase != .ended,session.terminal == .terminal,
-              remoteCanRead(session),let history=screenAdapters[.terminal]?.history else {
+              remoteCanRead(session),let adapter=screenAdapters[.terminal],let history=adapter.history else {
             throw RemoteHTTPError(409,"이 세션의 전체 기록을 읽을 수 없습니다. Mac 기본 Terminal 연결을 확인해주세요.")
         }
         if let capture=nativeWindowCapture(for:session),try await !capture.checkAutomationPermission() {throw TerminalAdapterError.permissionDenied}
@@ -2102,7 +2207,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if terminalHistoryStore==nil {terminalHistoryStore=TerminalHistoryStore(directory:paths.directory.appendingPathComponent("terminal-history-cache",isDirectory:true))}
         let result=try await terminalHistoryStore!.page(sessionID:sessionID,source:source,snapshot:snapshot,page:page,refresh:refresh,capture:{
             guard try verify() else {throw RemoteHTTPError(409,"원래 CLI가 바뀌어 기록을 읽지 않았습니다.")}
-            let text=try history(target)
+            let text=try await adapter.isolatedRead(.terminal) { try history(target) }
             guard try verify() else {throw RemoteHTTPError(409,"기록을 읽는 동안 원래 CLI가 바뀌었습니다.")}
             return text
         })
@@ -2853,13 +2958,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// counts, on explicit refresh, without retaining or recording scrollback.
     private func groupStatusHistory<T: Sendable>(_ original: AgentSession, project: @escaping @Sendable (String) -> T) async throws -> T? {
         guard original.agent == .codex, original.terminal == .terminal,
-              remoteCanRead(original), let history = screenAdapters[.terminal]?.history else { return nil }
+              remoteCanRead(original), let adapter = screenAdapters[.terminal], let history = adapter.history else { return nil }
         let verify = remoteProcessVerifier
         let target = ScreenTarget(tty: original.tty, handle: original.screenHandle,
                                   sourcePID: original.pid, sourceStarted: original.started)
         let proof = try await Task.detached(priority: .utility) {
             guard try verify(original) else { throw AppError.message("원래 터미널 연결이 바뀌었습니다.") }
-            let text = try history(target)
+            let text = try await adapter.isolatedRead(.terminal) { try history(target) }
             guard try verify(original) else { throw AppError.message("기록을 읽는 동안 터미널 연결이 바뀌었습니다.") }
             return project(String(text.suffix(160_000)))
         }.value
@@ -5464,7 +5569,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 reason = "원래 셸이 터미널의 포그라운드로 돌아오지 않았습니다."
                 continue
             }
-            let frame = try? await Task.detached(operation: { try adapter.readForValidation([target]) }).value
+            let frame = try? await adapter.readForValidation([target], host: host)
             guard let prompt = frame?.screens.first(where: { $0.tty == target.tty })?.contents else {
                 reason = "원래 탭의 화면을 읽지 못했습니다."
                 continue
@@ -5477,14 +5582,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
             updateRestart(id, .launching, "같은 터미널에서 같은 대화를 다시 열고 있습니다.")
             do {
                 let delivery:TerminalDelivery=try await Task.detached {
-                    try codexContext?.verifyUnchanged()
-                    return try restart(target,prompt,command)
+                    try adapter.dispatchInput(host) {
+                        try codexContext?.verifyUnchanged()
+                        guard try context.verifiedShell(in: reader()) != nil else { return .agentMissing }
+                        return try restart(target,prompt,command)
+                    }
                 }.value
                 sent = delivery == .sent
                 if !sent {
                     reason = delivery == .screenChanged ? "입력 직전에 셸 화면이 바뀌었습니다." : "터미널이 원래 셸 입력 대상을 확인하지 못했습니다."
                     lastReason = ""
                 }
+            }
+            catch let error as AutomationIPC.InputNotStarted {
+                reason = error.localizedDescription
+                continue
             }
             catch { return fail("다시 시작 명령을 입력하지 못했습니다: \(error.localizedDescription)." + manual) }
         }
@@ -5958,9 +6070,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func submitRemainingClaudeDraft(_ text: String, session: AgentSession, live: SessionGroupLiveSession?,
                                            target: ScreenTarget, adapter: ScreenHostAdapter, messageID: UUID?, manualQuestion: Bool = false) async -> TerminalDelivery? {
         guard !text.isEmpty, !Task.isCancelled, !snapshot.paused, !remoteInputStopped,
-              let type = adapter.typeLine, let frame = try? await Task.detached(operation: {
-                  try adapter.readForValidation([target])
-              }).value.screens.first(where: { $0.tty == target.tty }),
+              let host = ScreenHost(kind: session.terminal), let type = adapter.typeLine,
+              let frame = try? await adapter.readForValidation([target], host: host).screens.first(where: { $0.tty == target.tty }),
               !RemoteMessageReadiness.hasMenu(frame.contents, agent: .claude) else { return nil }
         var matches = ClaudeComposerReadiness.containsOnly(text, screen: frame.contents)
         if let channel = live?.claudePromptChannel, adapter.checkedTypeLine != nil {
@@ -5978,13 +6089,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         do {
             let result = try await Task.detached {
-                if let checked = adapter.checkedTypeLine { return try checked(target, "", frame.contents) }
-                return try type(target, "")
+                try adapter.dispatchInput(host) {
+                    if let checked = adapter.checkedTypeLine { return try checked(target, "", frame.contents) }
+                    return try type(target, "")
+                }
             }.value
             if result == .screenChanged, let messageID, let conversation = live?.conversationID {
                 try groupMailbox().releaseSubmitEnter(messageID, conversation: conversation, prompt: text)
             }
             return result
+        } catch is AutomationIPC.InputNotStarted {
+            if let messageID, let conversation = live?.conversationID {
+                do { try groupMailbox().releaseSubmitEnter(messageID, conversation: conversation, prompt: text) }
+                catch { return .agentMissing }
+            }
+            return nil
         } catch { return .agentMissing }
     }
 
@@ -9046,10 +9165,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             } catch {
                 guard screenConnections[host]?.connectID == connectID, !remoteInputStopped else { return }
-                screenConnections[host]?.permissionBlocked = error is TerminalAdapterError
+                let denied = error is TerminalAdapterError
+                let now = ProcessInfo.processInfo.systemUptime
+                let confirmed = !denied && snapshot.health.screen(host).connected && sessions.values.contains {
+                    $0.terminal == host.kind && $0.phase != .ended && screenReadSucceeded.contains($0.id) &&
+                        lastConfirmedScreenRead[$0.id].map { now - $0 < 20 } == true
+                }
+                screenConnections[host]?.permissionBlocked = denied
                 screenConnections[host]?.retryAfter = Date().addingTimeInterval(5)
                 screenPollSignals[host]?.notify()
-                updateHealth(host) { $0.requested = true; $0.connected = false; $0.connecting = false; $0.status = error.localizedDescription }
+                updateHealth(host) {
+                    $0.requested = true; $0.connected = confirmed; $0.connecting = false
+                    $0.status = confirmed ? "터미널 권한 조회 지연 · 자동 재확인 중" : error.localizedDescription
+                }
                 return
             }
             guard screenConnections[host]?.connectID == connectID, !remoteInputStopped else { return }
@@ -9068,6 +9196,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         unchangedScreenReads[host] = 0
         if host == .tmux { tmuxRelay.stop() }
         for id in sessions.keys where sessions[id]?.terminal == host.kind {
+            profileConversations.removeValue(forKey: id)
+            profileConversationQueries.removeValue(forKey: id)
             cancelRemoteInitialRead(id)
             remoteScreenReads.removeValue(forKey: id)?.task.cancel(); remoteFrames.removeValue(forKey: id)
             remoteMonitorFrames.removeValue(forKey: id)
@@ -10416,12 +10546,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         automationNeedsFreshScreen.remove(sessionID)
         let previousFrame = remoteObservedScreens[sessionID]
         if session.agent == .codex,
-           groupStatusIdentities[sessionID] != nil || groupMCPIdentities.values.contains(where: { $0.runtimeID == sessionID }),
+           profileConversationQueries[sessionID] != nil || profileConversations[sessionID] != nil || groupStatusIdentities[sessionID] != nil || groupMCPIdentities.values.contains(where: { $0.runtimeID == sessionID }),
            !screenContentsUnchanged, raw.contains(">_ OpenAI Codex (v"),
            !ScreenTextEquality.identical(previousFrame?.raw, raw),
            CodexStatusIdentity.isWelcomeReset(raw) {
-            // A reset can retain its PID. Historical brand headers in ordinary
-            // work output must not erase a previously verified conversation.
+            profileConversationQueries.removeValue(forKey: sessionID)
+            profileConversations.removeValue(forKey: sessionID)
             groupStatusIdentities.removeValue(forKey: sessionID)
             discardGroupMCPIdentities(for: sessionID)
         }
@@ -10738,7 +10868,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func safetyRead(_ original: AgentSession) async throws -> String {
         if let host = ScreenHost(channel: original.channel), let adapter = screenAdapters[host] {
             let target = ScreenTarget(tty: original.tty, handle: original.screenHandle, sourcePID: original.pid, sourceStarted: original.started)
-            let snapshot = try await Task.detached { try adapter.readForValidation([target]) }.value
+            let snapshot = try await adapter.readForValidation([target], host: host)
             guard let screen = snapshot.screens.first(where: { $0.tty == original.tty }) else { throw AppError.message("원본 화면 연결이 필요합니다.") }
             return screen.contents
         }
@@ -11693,11 +11823,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                    let current=sessions[next.key],let host=ScreenHost(kind:current.terminal),
                    let adapter=screenAdapters[host] {
                     let target=ScreenTarget(tty:current.tty,handle:current.screenHandle,jobPIDs:[next.pid],sourcePID:next.pid,sourceStarted:next.started)
-                    var snapshot=try await Task.detached(priority:.utility){try adapter.readForValidation([target])}.value
+                    var snapshot=try await adapter.readForValidation([target], host: host)
                     let pickerDeadline=Date().addingTimeInterval(5)
                     while Date()<pickerDeadline,!snapshot.screens.contains(where:{$0.contents.contains("Resume paused goal?")}) {
                         try await Task.sleep(for:.milliseconds(250))
-                        snapshot=try await Task.detached(priority:.utility){try adapter.readForValidation([target])}.value
+                        snapshot=try await adapter.readForValidation([target], host: host)
                     }
                     if snapshot.failures.isEmpty,snapshot.screens.count==1,let raw=snapshot.screens.first?.contents,
                        raw.contains("Resume paused goal?"),raw.contains("Mark it active and continue when idle"),
@@ -11711,7 +11841,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         var ready=false
                         while Date()<readyDeadline {
                             try await Task.sleep(for:.milliseconds(250))
-                            let screen=try await Task.detached(priority:.utility){try adapter.readForValidation([target])}.value
+                            let screen=try await adapter.readForValidation([target], host: host)
                             if screen.failures.isEmpty,screen.screens.count==1,let contents=screen.screens.first?.contents,
                                CodexGoalScreen.ready(contents) {ready=true;break}
                         }
@@ -12121,7 +12251,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let rows=try await Task.detached(priority:.utility){try reader()}.value
             guard let shell=original.verifiedShell(in:rows) else{throw RemoteHTTPError(409,"원래 터미널의 빈 셸을 기다리고 있습니다.",diagnostics:["delivery":"not_started"])}
             let target=ScreenTarget(tty:member.tty,handle:original.session.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
-            let frame=try await Task.detached(priority:.utility){try adapter.readForValidation([target]).screens.first(where:{$0.tty==member.tty})?.contents}.value
+            let frame=try await adapter.readForValidation([target], host: host).screens.first(where:{$0.tty==member.tty})?.contents
             guard let frame,SessionExitRecovery.emptyShellPrompt(frame),let home=entry.providerHome else{throw RemoteHTTPError(409,"원래 셸의 빈 입력창을 기다리고 있습니다.",diagnostics:["delivery":"not_started"])}
             let command=try await Task.detached(priority:.utility) {
                 var environment=ProcessInfo.processInfo.environment
@@ -12275,7 +12405,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         func screen(_ target:ScreenTarget) async throws->String {
             try authorized()
-            let result=try await Task.detached(priority:.utility){try adapter.readForValidation([target])}.value
+            let result=try await adapter.readForValidation([target], host: host)
             guard result.failures.isEmpty,result.screens.count==1,let raw=result.screens.first?.contents else {
                 throw AppError.message("재연결할 터미널 화면을 확인하지 못했습니다.")
             }
@@ -12535,10 +12665,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for home in codexAttachmentHomes.sorted() {await attachStandaloneCodexSessions(home:home)}
     }
     private func identifyStandaloneCodex(_ original:AgentSession,home:String,adapter:ScreenHostAdapter,allowWorking:Bool=false,authorized:()->Bool) async throws->String? {
+        guard let host = ScreenHost(kind: original.terminal) else { return nil }
         let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[original.pid],sourcePID:original.pid,sourceStarted:original.started)
         func read() async throws->String {
             guard authorized() else{throw CancellationError()}
-            let result=try await Task.detached(priority:.utility){try adapter.readForValidation([target])}.value
+            let result=try await adapter.readForValidation([target], host: host)
             guard authorized(),result.failures.isEmpty,result.screens.count==1,let raw=result.screens.first?.contents else{throw AppError.message("원본 화면을 확인하지 못했습니다.")}
             return raw
         }
@@ -12668,7 +12799,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 var selectedIdle=false
                 if sessionIDs?.contains(id)==true,original.phase == .unknown,let adapter=screenAdapters[host] {
                     let target=ScreenTarget(tty:original.tty,handle:original.screenHandle,jobPIDs:[original.pid],sourcePID:original.pid,sourceStarted:original.started)
-                    let observed=try await Task.detached(priority:.utility){try adapter.readForValidation([target])}.value
+                    let observed=try await adapter.readForValidation([target], host: host)
                     selectedIdle=observed.failures.isEmpty && observed.screens.count==1 && observed.screens.first.map{CodexGoalScreen.ready($0.contents)}==true
                 }
                 guard (original.phase == .idle || selectedIdle || explicit && (original.phase == .working || original.phase == .unknown)),!original.pendingInTerminal,!original.needsReview else {
@@ -12733,7 +12864,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 func screen(_ target:ScreenTarget) async throws->String {
                     guard authorized(id) else{throw CancellationError()}
-                    let result=try await Task.detached(priority:.utility){try adapter.readForValidation([target])}.value
+                    let result=try await adapter.readForValidation([target], host: host)
                     guard authorized(id),result.failures.isEmpty,result.screens.count==1,let raw=result.screens.first?.contents else{throw AppError.message("원본 터미널 화면을 확인하지 못했습니다.")}
                     return raw
                 }
@@ -13637,7 +13768,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let target=ScreenTarget(tty:original.tty,jobPIDs:live.filter {$0.tty==process.tty && $0.processGroup==process.processGroup}.map(\.pid),sourcePID:original.pid,sourceStarted:original.started,sourceIdentity:identity)
             func read() async throws -> String {
                 guard authorized() else {throw CancellationError()}
-                let snapshot=try await Task.detached(priority:.utility) {try adapter.readForValidation([target])}.value
+                let snapshot=try await adapter.readForValidation([target], host: .terminal)
                 guard authorized(),snapshot.failures.isEmpty,snapshot.screens.filter({$0.tty==target.tty}).count==1,let raw=snapshot.screens.first(where:{$0.tty==target.tty})?.contents else {throw AppError.message("원래 Codex 화면을 새로 확인하지 못했습니다.")}
                 return raw
             }
@@ -14045,7 +14176,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 exitRecoveries[id]?.deadline = Date().addingTimeInterval(30); publish(); return
             }
             let target = ScreenTarget(tty:context.session.tty,handle:context.session.screenHandle,jobPIDs:[shell.pid],sourcePID:shell.pid,sourceStarted:shell.started)
-            let first = try await Task.detached { try adapter.readForValidation([target]).screens.first(where:{$0.tty == target.tty})?.contents }.value
+            let first = try await adapter.readForValidation([target], host: host).screens.first(where:{$0.tty == target.tty})?.contents
             guard mayLaunch() else { return }
             guard let first, SessionExitRecovery.emptyShellPrompt(first) else {
                 exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)
@@ -14083,7 +14214,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard mayLaunch() else { return }
             let fresh = try await Task.detached { try reader() }.value
             guard mayLaunch(), context.verifiedShell(in:fresh) != nil else { return }
-            let screen = try await Task.detached { try adapter.readForValidation([target]).screens.first(where:{$0.tty == target.tty})?.contents }.value
+            let screen = try await adapter.readForValidation([target], host: host).screens.first(where:{$0.tty == target.tty})?.contents
             guard mayLaunch() else { return }
             guard screen == first else { exitRecoveries[id]?.deadline = Date().addingTimeInterval(30); return }
             context.state = "launching"; context.deadline = Date(); context.attempts += 1; exitRecoveries[id] = context
@@ -14096,8 +14227,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             publish()
             launched = true
             let delivery = try await Task.detached {
-                try launchContext?.verifyUnchanged()
-                return try restart(target,first,command)
+                try adapter.dispatchInput(host) {
+                    try launchContext?.verifyUnchanged()
+                    return try restart(target,first,command)
+                }
             }.value
             guard owns("launching") else { return }
             if delivery == .sent {
@@ -14114,9 +14247,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 sessions[id]?.interruption?.recoveryDetail = "복구 명령이 전달되지 않았습니다. 원본 셸을 다시 확인합니다."
             }
         } catch {
-            // Cancellation while reading must not revive its captured recovery plan.
-            // Once writing started, retain uncertainty even if controls changed during the write.
             guard launched ? owns("launching") : mayLaunch() else { return }
+            if error is AutomationIPC.InputNotStarted { sessions[id]?.interruption?.resumeUncertain = false }
             let uncertain = sessions[id]?.interruption?.resumeUncertain == true
             exitRecoveries[id]?.state = uncertain ? "review" : "scheduled"
             exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)

@@ -104,7 +104,7 @@ public actor TerminalHistoryStore {
         files?.remove(entry.snapshot.file)
     }
     public func page(sessionID:String,source:String,snapshot id:String?=nil,page requested:Int?=nil,refresh:Bool=false,
-                     capture:@escaping @Sendable () throws -> String) async throws -> TerminalHistoryPage {
+                     capture:@escaping @Sendable () async throws -> String) async throws -> TerminalHistoryPage {
         guard !stopped else {throw RemoteHTTPError(410,"터미널 기록 연결이 종료됐습니다.")}
         let now=clock()
         for (key,entry) in entries where now.timeIntervalSince(entry.touched)>lifetime {discard(key)}
@@ -122,14 +122,12 @@ public actor TerminalHistoryStore {
                 if files==nil {files=try TerminalHistoryFiles(directory)}
                 let files=files!,limit=maximumBytes
                 ticket=UUID()
-                task=Task.detached(priority:.utility) {try files.store(capture(),source:source,sessionID:sessionID,at:now,limit:limit)}
+                task=Task.detached(priority:.utility) {try await files.store(capture(),source:source,sessionID:sessionID,at:now,limit:limit)}
                 pending=(source,ticket,task)
             }
             do {value=try await task.value}
             catch {if pending?.id==ticket {pending=nil};throw error}
             guard !stopped else {files?.remove(value.file);throw CancellationError()}
-            // Only the first resumed waiter publishes. A late coalesced waiter
-            // cannot replace a newer refresh with its preceding snapshot.
             if pending?.id==ticket {
                 pending=nil;entries[value.id]=Entry(snapshot:value,touched:now);latest[source]=value.id
                 while entries.count>4 || entries.values.reduce(0,{$0+$1.snapshot.totalBytes})>maximumBytes {

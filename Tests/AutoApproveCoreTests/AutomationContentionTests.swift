@@ -56,6 +56,25 @@ extension ApprovalTests {
         try expect(try await occupied.value)
     }
 
+    @MainActor func testWindowRefreshPreservesHostInput() async throws {
+        let started = DispatchSemaphore(value: 0), finish = DispatchSemaphore(value: 0)
+        defer { finish.signal() }
+        let host = ScreenHost.terminal
+        let pending = Task.detached {
+            try AutomationIPC.shared.runInput(host: host.title, budget: 3) {
+                started.signal()
+                return finish.wait(timeout: .now() + 2) == .success
+            }
+        }
+        let entered = await Task.detached { started.wait(timeout: .now() + 1) == .success }.value
+        try expect(entered)
+        let capture = TerminalWindowCapture(host: host, requestPermissions: {})
+        capture.requestPermissions()
+        capture.invalidate()
+        finish.signal()
+        try expect(try await pending.value)
+    }
+
     func testInteractiveReadAndInputAdmissionRecover() async throws {
         let gate = AutomationIPC(cooldown:0.02)
         let entered = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0)

@@ -79,7 +79,7 @@ struct SessionProfilesWindow: View {
         }
         .task {await controller.reload()}
         .sheet(item:$controller.draft) {draft in
-            SessionProfileEditor(draft:draft,save:controller.save,cancel:{controller.draft=nil})
+            SessionProfileEditor(draft:draft,resolve:{try await controller.resolveConversation(draftID:draft.id,rowID:$0)},save:controller.save,cancel:{controller.draft=nil})
         }
     }
     private func detail(_ profile:TerminalSessionProfile) -> some View {
@@ -210,15 +210,19 @@ private struct ProfileDraftRow:Identifiable {
     var entry:TerminalProfileEntry
     var choices:[CodexProfileConversation]
     var detail:String?
+    var canQueryConversation = false
     var startsNewCLI=false
 }
 
 struct SessionProfileEditor:View {
     let draft:SessionProfileDraft
+    let resolve: ((String) async throws -> TerminalProfileCandidate)?
     let save:(TerminalSessionProfile) async throws -> Void
     let cancel:()->Void
     @State private var name:String
     @State private var rows:[ProfileDraftRow]
+    @State private var resolving: String?
+    @State private var lookupTask: Task<Void,Never>?
     @State private var saving=false
     @State private var error:String?
     @FocusState private var nameFocused:Bool
@@ -230,10 +234,33 @@ struct SessionProfileEditor:View {
             entry.wrappedValue.executionSettings = value.isEmpty ? nil : value
         })
     }
-    init(draft:SessionProfileDraft,save:@escaping (TerminalSessionProfile) async throws -> Void,cancel:@escaping ()->Void) {
-        self.draft=draft;self.save=save;self.cancel=cancel
+    init(draft:SessionProfileDraft,resolve:((String) async throws -> TerminalProfileCandidate)? = nil,save:@escaping (TerminalSessionProfile) async throws -> Void,cancel:@escaping ()->Void) {
+        self.draft=draft;self.resolve=resolve;self.save=save;self.cancel=cancel
         _name=State(initialValue:draft.name)
-        _rows=State(initialValue:draft.candidates.map {.init(id:$0.id,entry:$0.entry,choices:$0.conversations,detail:$0.detail)})
+        _rows=State(initialValue:draft.candidates.map {.init(id:$0.id,entry:$0.entry,choices:$0.conversations,detail:$0.detail,canQueryConversation:$0.canQueryConversation)})
+    }
+    private func query(_ id: String) {
+        guard resolving == nil, let resolve, let index = rows.firstIndex(where: { $0.id == id }) else { return }
+        let initialSettings = rows[index].entry.executionSettings
+        resolving = id
+        lookupTask = Task { @MainActor in
+            defer { resolving = nil; lookupTask = nil }
+            do {
+                let candidate = try await resolve(id)
+                try Task.checkCancellation()
+                rows[index].entry.conversationID = candidate.entry.conversationID
+                rows[index].entry.providerHome = candidate.entry.providerHome
+                if rows[index].entry.executionSettings == initialSettings {
+                    rows[index].entry.executionSettings = candidate.entry.executionSettings
+                }
+                if !rows[index].choices.isEmpty && !rows[index].choices.contains(where: { $0.id == candidate.entry.conversationID }) {
+                    rows[index].choices.append(.init(id: candidate.entry.conversationID, title: "현재 탭의 대화"))
+                }
+                rows[index].detail = "현재 탭의 대화 ID를 확인했습니다."
+            } catch {
+                if !Task.isCancelled { rows[index].detail = error.localizedDescription }
+            }
+        }
     }
     private var profile:TerminalSessionProfile {get throws {
         let included=rows.filter(\.included)
@@ -312,13 +339,23 @@ struct SessionProfileEditor:View {
                                     .font(.system(.callout,design:.monospaced)).accessibilityLabel("\(row.entry.title) 대화 ID")
                                     .help("자동 확인한 대화를 저장하거나 이어갈 대화의 UUID를 입력하세요.")
                                 if !row.entry.resumesConversation {
-                                    Label {Text("이어갈 대화를 확인해주세요").foregroundStyle(.primary)}
-                                        icon: {Image(systemName:"exclamationmark.triangle").foregroundStyle(.orange)}
-                                        .font(.caption)
+                                    HStack {
+                                        Label {Text("이어갈 대화를 확인해주세요").foregroundStyle(.primary)}
+                                            icon: {Image(systemName:"exclamationmark.triangle").foregroundStyle(.orange)}
+                                            .font(.caption)
+                                        if draft.capturesLiveSessions, row.canQueryConversation, resolve != nil {
+                                            if resolving == row.id { ProgressView().controlSize(.small); Text("조회 중…").font(.caption) }
+                                            else {
+                                                Button("이 탭의 대화 ID 조회") { query(row.id) }
+                                                    .controlSize(.small).disabled(resolving != nil || saving)
+                                                    .help("이 탭의 대화를 확인합니다. 필요하면 빈 Codex 입력창에 /status를 보냅니다.")
+                                            }
+                                        }
+                                    }
                                 }
                                 if let detail=row.detail {Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal:false,vertical:true)}
                                 }
-                            }.padding(.leading,20).disabled(!row.included)
+                            }.padding(.leading,20).disabled(!row.included || resolving == row.id)
                             Divider()
                         }
                     }
@@ -335,8 +372,8 @@ struct SessionProfileEditor:View {
                 Button("프로필 저장") {
                     saving=true;error=nil
                     Task {do {try await save(profile)} catch {self.error=error.localizedDescription};saving=false}
-                }.keyboardShortcut(.defaultAction).disabled(saving || validationError != nil)
+                }.keyboardShortcut(.defaultAction).disabled(saving || resolving != nil || validationError != nil)
             }
-        }.padding(24).frame(width:700,height:620).onAppear {nameFocused=true}
+        }.padding(24).frame(width:700,height:620).onAppear {nameFocused=true}.onDisappear {lookupTask?.cancel()}
     }
 }

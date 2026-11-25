@@ -76,7 +76,7 @@ package final class AutomationIPC: @unchecked Sendable {
         var result: Result<Value, Error>?
         init(budget: TimeInterval) { super.init(budget); finished.enter() }
     }
-    static let shared = AutomationIPC()
+    package static let shared = AutomationIPC()
     private let workers = IPCWorkers()
     private let threadKey = UUID().uuidString
     private let lock = NSLock()

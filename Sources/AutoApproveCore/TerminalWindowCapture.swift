@@ -116,7 +116,11 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
             if requiresAccessibilityForMetadata { _ = TerminalKeyboard.requestPermission() }
             _ = Self.requestScreenPermission()
         }
-        self.metadata = metadata ?? { tty in try await Task.detached { try TerminalAdapter.windowMetadata(tty: tty, host: host) }.value }
+        self.metadata = metadata ?? { tty in
+            try await AutomationIPC.shared.read(host: host.title, budget: 4, waitForSlot: true) {
+                try TerminalAdapter.windowMetadata(tty: tty, host: host)
+            }
+        }
         self.captureImage = capture ?? { try await Self.captureVerifiedWindow($0, ownerBundleID: expectedOwner) }
     }
     deinit { pendingAutomation?.task.cancel(); for value in pending.values { value.task.cancel(); value.validation?.task.cancel() } }
@@ -155,9 +159,13 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
         guard automationEpoch == epoch else { throw CancellationError() }
         return result
     }
-    public func requestPermissions() { request(); invalidate() }
+    public func requestPermissions() {
+        request()
+        if usesLiveAutomation { AutomationIPC.shared.revokePermission(host.title) }
+        invalidate()
+    }
     public func invalidate() {
-        if usesLiveAutomation { AutomationIPC.shared.invalidate(host.title) } else { injectedQueryIPC.invalidate(host.title) }
+        if !usesLiveAutomation { injectedQueryIPC.invalidate(host.title) }
         automationEpoch &+= 1; pendingAutomation?.task.cancel(); pendingAutomation = nil
         for value in pending.values { value.task.cancel(); value.validation?.task.cancel() }; pending.removeAll()
     }
@@ -182,8 +190,16 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
             automation: liveAutomationPermission(host))
     }
 
+    private func capturePermissions() async throws -> TerminalWindowPermissions {
+        if !usesLiveAutomation { return permissions() }
+        let automation = try await checkAutomationPermission()
+        return TerminalWindowPermissions(screen: Self.screenPermissionGranted, keyboard: keyboardPermission(), automation: automation)
+    }
+
     public func read(_ target: TerminalCaptureTarget, validateIdentity: @escaping @Sendable () throws -> Bool) async throws -> TerminalNativeDisplay {
-        let granted = permissions()
+        let epoch = automationEpoch
+        let granted = try await capturePermissions()
+        guard epoch == automationEpoch else { throw CancellationError() }
         let value: Pending
         let cached: Bool
         if let existing = pending[target], existing.permissions == granted,
@@ -254,11 +270,14 @@ public struct TerminalCaptureTarget: Hashable, Sendable {
                 result = try await validation.task.value; try Task.checkCancellation()
                 guard pending[target]?.token == value.token else { throw RemoteHTTPError(409, "원본 창 연결이 바뀌었습니다. 다시 연결해주세요.") }
                 if pending[target]?.validation?.token == validation.token { pending[target]?.validation = nil }
-                if result.state != .live { pending.removeValue(forKey: target) }
+
             }
             if pending[target]?.observedAt == nil { pending[target]?.observedAt = Date() }
-            // A revoked grant must never leave a cached image live.
-            if let required = permissionState() { return required }
+            let latest = try await capturePermissions()
+            try Task.checkCancellation()
+            guard epoch == automationEpoch, pending[target]?.token == value.token else { throw CancellationError() }
+            if cached && result.state != .live { pending.removeValue(forKey: target) }
+            if let required = Self.permissionState(latest, host: host, requiresAccessibility: requiresAccessibilityForMetadata) { return required }
             return result
         } catch {
             if pending[target]?.token == value.token { pending.removeValue(forKey: target) }

@@ -115,6 +115,7 @@ struct SessionProfileEntryFilter:Equatable {
     @Published private(set) var message:String?
     @Published private(set) var results:[UUID:TerminalProfileRestoreResult]=[:]
     private let captureForSaving:@MainActor (Bool, Set<String>?) async throws -> [TerminalProfileCandidate]
+    private let queryConversation: (@MainActor (TerminalProfileCandidate) async throws -> TerminalProfileCandidate)?
     private let activeSessions:@MainActor () async throws -> [TerminalProfileCandidate]
     private let captureGroups:@MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup]
     private let restoreGroups:@MainActor (TerminalSessionProfile,[TerminalProfileRestoreResult],[TerminalProfileCandidate]) async throws -> Void
@@ -126,12 +127,14 @@ struct SessionProfileEntryFilter:Equatable {
     init(store:TerminalProfileStore,capture:@escaping @MainActor () async throws -> [TerminalProfileCandidate],
          activeSessions:(@MainActor () async throws -> [TerminalProfileCandidate])? = nil,
          captureForSaving:(@MainActor (Bool, Set<String>?) async throws -> [TerminalProfileCandidate])? = nil,
+         queryConversation:(@MainActor (TerminalProfileCandidate) async throws -> TerminalProfileCandidate)? = nil,
          captureGroups:@escaping @MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup] = {_ in []},
          restoreGroups:@escaping @MainActor (TerminalSessionProfile,[TerminalProfileRestoreResult],[TerminalProfileCandidate]) async throws -> Void = {_,_,_ in},
          launch:(@Sendable (TerminalProfileEntry,String?) async throws -> String)? = nil,
          selectTab:(@Sendable (String) async throws -> Void)? = nil) {
         self.store=store;self.activeSessions=activeSessions ?? capture
         self.captureForSaving=captureForSaving ?? { _,_ in try await capture() }
+        self.queryConversation=queryConversation
         self.captureGroups=captureGroups;self.restoreGroups=restoreGroups
         self.launch=launch ?? {try await TerminalProfileLauncher.launch($0,anchorTTY:$1)}
         if let selectTab {self.selectTab=selectTab}
@@ -142,6 +145,7 @@ struct SessionProfileEntryFilter:Equatable {
         self.init(store:TerminalProfileStore(directory:engine.paths.directory.appendingPathComponent("session-profiles",isDirectory:true)),
                   capture:{try await engine.terminalProfileCandidates(includeLayout:false)},
                   captureForSaving:{try await engine.terminalProfileSaveCandidates(readWindowLayout:$0,sessionIDs:$1)},
+                  queryConversation:engine.resolveProfileConversation,
                   captureGroups:{try engine.terminalProfileGroups(candidates:$0)},
                   restoreGroups:{try await engine.restoreTerminalProfileGroups($0,results:$1,previous:$2)})
     }
@@ -205,6 +209,19 @@ struct SessionProfileEntryFilter:Equatable {
             }
             draft=snapshot
         } catch {self.error=error.localizedDescription}
+    }
+    func resolveConversation(draftID: UUID, rowID: String) async throws -> TerminalProfileCandidate {
+        guard let draft, draft.id == draftID, draft.capturesLiveSessions,
+              let index = draft.candidates.firstIndex(where: { $0.id == rowID }),
+              draft.candidates[index].canQueryConversation, let queryConversation else {
+            throw AppError.message("현재 프로필에서 조회할 탭을 다시 선택해주세요.")
+        }
+        let candidate = try await queryConversation(draft.candidates[index])
+        try Task.checkCancellation()
+        guard self.draft?.id == draftID, candidate.id == rowID, candidate.entry.id == draft.candidates[index].entry.id,
+              candidate.entry.resumesConversation else { throw AppError.message("조회 중 선택한 세션이 바뀌었습니다.") }
+        self.draft?.candidates[index] = candidate
+        return candidate
     }
     func edit(_ profile:TerminalSessionProfile) {
         let candidates=profile.entries.map {TerminalProfileCandidate(id:$0.id.uuidString,entry:$0)}

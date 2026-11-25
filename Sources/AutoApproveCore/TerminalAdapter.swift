@@ -121,8 +121,10 @@ public struct ScreenHostAdapter: Sendable {
         self.setTabLabel=setTabLabel
         self.history=history;self.replacementShell=replacementShell;self.replacementShellValid=replacementShellValid
     }
-    /// Validation consumes only fresh text. A channel failure must propagate;
-    /// retrying through presentation could compare a different original frame.
+    func readForValidation(_ targets: [ScreenTarget], host: ScreenHost) async throws -> TerminalSnapshot {
+        try await isolatedRead(host) { try self.readForValidation(targets) }
+    }
+
     public func readForValidation(_ targets: [ScreenTarget]) throws -> TerminalSnapshot {
         try (validationScreens ?? screens)(targets)
     }
@@ -357,12 +359,10 @@ public enum TerminalAdapter {
         })();
         """
     }
-    /// Reads the exact native window's selected TTY. It never activates/selects a tab.
-    /// The caller preflights Automation without prompting before running this helper.
     public static func windowMetadata(tty: String, host: ScreenHost = .terminal) throws -> TerminalWindowMetadata? {
         guard [.terminal, .iterm].contains(host) else { return nil }
         let output = try AutomationScript.run(windowMetadataScript(tty: tty, host: host), app: host.title,
-            denied: host == .terminal ? .permissionDenied : .automationDenied(host.title), timeout: 3)
+            denied: host == .terminal ? .permissionDenied : .automationDenied(host.title), timeout: 3, readOnly: true)
         return try windowMetadata(output:output,tty:tty,host:host)
     }
     /// Verify scripting selection against the current WindowServer owner.

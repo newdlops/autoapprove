@@ -521,14 +521,30 @@ extension ApprovalTests {
         func refresh() async throws -> String {
             try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: group.members[0].id).conversationID
         }
+        let captured = try await engine.terminalProfileSaveCandidates(readWindowLayout: false)
+        guard let candidate = captured.first, candidate.canQueryConversation else { throw AppError.message("Missing profile lookup") }
+        try expectEqual(candidate.entry.conversationID, "")
+        let resolved = try await engine.resolveProfileConversation(candidate)
+        try expectEqual(resolved.entry.conversationID, screen.id)
+        try expectEqual(resolved.entry.id, candidate.entry.id)
+        let validated = try await engine.terminalProfileSaveCandidates(readWindowLayout: false, sessionIDs: [session.id])
+        try expectEqual(validated.first?.entry.conversationID, screen.id)
+        try expectNil(try await engine.sessionGroupSessions().first?.conversationID)
+        engine.receiveScreen(sessionID: session.id, raw: ">_ OpenAI Codex (v0.169.0)\nmodel: fixture\ndirectory: /project" + footer, generation: "fixture-reset", source: .terminalScreen)
+        let reset = try await engine.terminalProfileSaveCandidates(readWindowLayout: false, sessionIDs: [session.id])
+        try expectEqual(reset.first?.entry.conversationID, "")
+        try expect(screen.inputs.isEmpty)
         try expectEqual(try await refresh(), screen.id)
         try expect(screen.inputs.isEmpty, "Named session is identified without touching the draft")
         try sql("INSERT INTO threads VALUES('\(UUID().uuidString)','고유 이름','/project',0)")
         do { _ = try await refresh(); throw AppError.message("Duplicate name accepted") }
         catch { try expect(error.localizedDescription.contains("입력")) }
         try expect(screen.inputs.isEmpty)
+        do { _ = try await engine.resolveProfileConversation(candidate); throw AppError.message("Duplicate title accepted for profile") }
+        catch { try expect(error.localizedDescription.contains("입력")) }
+        try expect(screen.inputs.isEmpty)
         screen.setScreen(card + footer)
-        try expectEqual(try await refresh(), screen.id, "An identical card after the directory boundary is fresh")
+        try expectEqual(try await engine.resolveProfileConversation(candidate).entry.conversationID, screen.id, "Repeated status card identifies the selected tab")
         try expectEqual(screen.inputs, ["/pwd\r", "/status\r"])
     }
 

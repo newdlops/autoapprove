@@ -239,9 +239,10 @@ public struct TerminalProfileCandidate: Identifiable, Sendable {
     public var entry: TerminalProfileEntry
     public var conversations: [CodexProfileConversation]
     public var detail: String?
-    /// Live-only anchor; never encoded in a profile file.
+    public var canQueryConversation: Bool
     public var tty:String?
-    public init(id: String,entry: TerminalProfileEntry,conversations: [CodexProfileConversation] = [],detail: String? = nil,tty:String?=nil) {
+    public init(id: String,entry: TerminalProfileEntry,conversations: [CodexProfileConversation] = [],detail: String? = nil,tty:String?=nil, canQueryConversation: Bool = false) {
+        self.canQueryConversation = canQueryConversation
         self.id=id;self.entry=entry;self.conversations=conversations;self.detail=detail;self.tty=tty
     }
 }

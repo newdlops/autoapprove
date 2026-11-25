@@ -714,6 +714,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Web interaction: explicit single/multiple/free-text answers and bounds", tests.testWebQuestionAnswersAreExplicitAndBounded),
             ("Web interaction: MCP ownership, expiry and no default answer", tests.testWebQuestionOwnershipExpiryAndNoDefaultAnswer),
             ("Automation IPC: verified connection recovers after a monitor timeout",tests.testMonitorRecoversVerifiedConnectionAfterTimeout),
+            ("Automation IPC: window refresh preserves another tab input",tests.testWindowRefreshPreservesHostInput),
             ("Automation IPC: submitted and deferred inputs stay distinct",tests.testInteractiveReadAndInputAdmissionRecover),
             ("Automation IPC: blocked approval resumes without a new screen event",tests.testApprovalRecoversWithoutAnotherScreenEvent),
             ("Automation IPC: permission coalescing, cancellation and global limit",tests.testPermissionAndCancelledFlights),

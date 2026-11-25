@@ -186,6 +186,22 @@ private actor LaunchLog {
         await captures.captureCurrent(replacing:changed,readWindowLayout:true)
         try check(requests.last?.0==true && captures.error=="Layout unavailable" && captures.draft==nil,"Exact layout errors stay visible")
         try check(try TerminalProfileStore.read(store.file(changed.id))==bytes,"Failed exact capture leaves the existing profile intact")
+        var queries = [String]()
+        let lookup = SessionProfilesController(store:store,capture:{[]},captureForSaving:{_,_ in
+            [.init(id:"selected",entry:liveEntry,canQueryConversation:true), .init(id:"other",entry:pinned)]
+        },queryConversation:{candidate in
+            queries.append(candidate.id)
+            var result = candidate
+            result.entry.conversationID = conversation
+            return result
+        })
+        await lookup.captureCurrent()
+        let lookupDraft = lookup.draft!
+        do { _ = try await lookup.resolveConversation(draftID:UUID(),rowID:"selected"); throw AppError.message("Accepted stale editor") }
+        catch { try check(queries.isEmpty,"Stale editor cannot run a query") }
+        let resolved = try await lookup.resolveConversation(draftID:lookupDraft.id,rowID:"selected")
+        try check(queries == ["selected"] && resolved.entry.conversationID == conversation,"Only the selected runtime was queried")
+        try check(lookup.draft?.candidates[0].entry.id == liveEntry.id && lookup.draft?.candidates[1].entry.conversationID == pinned.conversationID,"Other rows and entry identities survive a query")
         print("PASS \(checks) profile selection checks; production controller/restorer, exact repo roots, hidden-row exclusion, draft-free filter state, no real Terminal launch")
     }
 }
