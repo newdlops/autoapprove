@@ -1,4 +1,3 @@
-// Owned stdio and fake Unix bridge only; no user terminal or real group calls.
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {once} from 'node:events';
@@ -37,8 +36,23 @@ try {
  assert.equal((await call({threadId:b},{conversationID:a})).isError,true);
  assert.equal((await call({threadId:a,'x-codex-turn-metadata':{thread_id:b}})).isError,true);
  assert.equal(calls.length,3,'Mismatched evidence must not reach the bridge');
+ const root=randomUUID(),parent=randomUUID();
+ const subagentMeta={threadId:b,sessionId:root,'x-codex-turn-metadata':{
+  thread_id:b,session_id:root,parent_thread_id:parent,subagent_kind:'thread_spawn',thread_source:'subagent'
+ }};
+ assert.equal((await call(subagentMeta,{codexCallerSessionID:a,codexCallerParentID:a,codexCallerRuntimeID:'wrong'})).isError,false);
+ const childCall=calls.at(-1);
+ assert.equal(childCall.conversationID,b);
+ assert.equal(childCall.codexCallerSource,'codex_subagent_metadata');
+ assert.equal(childCall.codexCallerSessionID,root);
+ assert.equal(childCall.codexCallerParentID,parent);
+ assert.equal(childCall.codexCallerRuntimeID,undefined);
+ assert.equal((await call(subagentMeta,{conversationID:root})).isError,true);
+ assert.equal((await call({...subagentMeta,sessionId:a})).isError,true);
+ assert.equal((await call({'x-codex-turn-metadata':{thread_source:'subagent',session_id:root}})).isError,true);
+ assert.equal(calls.length,4);
  child.stdin.end();assert.equal((await closed)[0],0);child=null;
- console.log(JSON.stringify({passed:5,perCallConversation:true,processIdentityIgnored:true,claimedIdentityRejected:true,transport:'owned_unix_socket'}));
+ console.log(JSON.stringify({perCallConversation:true,subagentConversation:true,processIdentityIgnored:true,claimedIdentityRejected:true,transport:'owned_unix_socket'}));
 } finally {
  reader?.close();if(child&&child.exitCode===null){child.kill();await closed;}
  await new Promise(resolve=>server.close(resolve));await rm(home,{recursive:true,force:true});

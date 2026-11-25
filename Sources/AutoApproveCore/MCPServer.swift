@@ -19,10 +19,10 @@ public enum MCPToolProfile: String {
     var instructions: String {
         var parts: [String] = []
         if self != .desktop {
-            parts.append("같은 Mac의 그룹 도구로 통신하세요. 다른 스레드·전송 경로로 우회하지 마세요. 필수 대기는 wait_group_dependencies 또는 ask_group_question(blocksProgress=true), 자유 질문 회신은 reply_group_question(inReplyTo: 원래 messageID)입니다. 터미널 본문은 그대로 사용하고 참조만 받으면 get_group_messages로 원문을 읽으세요. 상태 점검은 get_group_status(view: overview), 장문 발신은 includeReceiptText=false를 쓰세요. 배정·재개에 연결된 최종 응답은 자동 보고됩니다. 그룹장은 권한 요청을 category=permissionRequest로 구분하고 priority=urgent부터 처리하세요. 첫 줄에 결과와 남은 문제를 적으세요.")
+            parts.append("같은 Mac의 그룹 도구로 통신하세요. Codex 서브에이전트는 get_session_groups를 인자 없이 호출하고 conversationID를 생략하세요. 메시지는 원래 구성원 명의로 전달됩니다. 다른 스레드·전송 경로로 우회하지 마세요. 필수 대기는 wait_group_dependencies 또는 ask_group_question(blocksProgress=true), 자유 질문 회신은 reply_group_question(inReplyTo: 원래 messageID)입니다. 터미널 본문은 그대로 사용하고 참조만 받으면 get_group_messages로 원문을 읽으세요. 상태 점검은 get_group_status(view: overview), 장문 발신은 includeReceiptText=false를 쓰세요. 배정·재개에 연결된 최종 응답은 자동 보고됩니다. 그룹장은 권한 요청을 category=permissionRequest로 구분하고 priority=urgent부터 처리하세요. 첫 줄에 결과와 남은 문제를 적으세요.")
         }
         if self == .all || self == .orchestrator {
-            parts.append("직속 작업은 assign_group_task, 현재 선택지·위임된 승인만 answer_group_question으로 처리하세요. ask_user 뒤 get_user_answers에서 명시적 응답을 확인하세요.")
+            parts.append("그룹장의 서브에이전트도 assign_group_task로 직속 작업을 배정할 수 있습니다. 승인 응답·세션 초기화는 본인이 처리하세요. 현재 선택지·위임된 승인만 answer_group_question으로 처리하세요. ask_user 뒤 get_user_answers에서 명시적 응답을 확인하세요.")
         }
         if self != .orchestrator { parts.append("desktop_ 도구로 사용자 포커스·마우스를 유지하며 백그라운드에서 조작하세요.") }
         if self == .all { parts.append("사용자가 원할 때만 화면 공유를 시작하고 시험 뒤 종료하세요.") }
@@ -49,7 +49,7 @@ public enum AutoApproveMCPServer {
             tool("ask_user", "휴대폰 웹에 선택지·직접 답변 폼을 게시합니다. 기본값을 답변으로 처리하지 않습니다. 반환된 requestID로 get_user_answers에서 사용자가 보낸 답변을 확인하세요.",
                  ["title": string, "questions": ["type": "array", "items": field, "minItems": 1, "maxItems": 8]], ["questions"]),
             tool("get_user_answers", "이 MCP 연결에서 게시한 질문의 응답을 확인합니다. waiting이면 아직 답변이 없습니다. answered의 answers만 실제 사용자 응답입니다.", ["requestID": string], ["requestID"], readOnly: true),
-            tool("get_session_groups", "현재 그룹·역할·연결·모델 기록을 조회합니다. 공유 서버는 conversationID를 지정하세요. 연결이 끊기고 canReconnect=true이면 reconnect_group_member로 복구하세요.", ["conversationID": string], readOnly: true),
+            tool("get_session_groups", "현재 그룹·역할·연결·모델 기록을 조회합니다. Codex는 conversationID를 생략하세요. 서브에이전트는 원래 구성원의 그룹과 역할을 조회합니다. 연결이 끊기고 canReconnect=true이면 reconnect_group_member로 복구하세요.", ["conversationID": string], readOnly: true),
             tool("reconnect_group_member", "canReconnect=true인 자신·직속 구성원(그룹장 없으면 같은 그룹)의 현재 대화를 재확인합니다. 초안·승인창이 있으면 보류합니다. 성공 후 connected와 conversationID를 확인하세요.",
                  ["groupID": string, "memberID": string, "conversationID": string], ["groupID", "memberID"]),
             tool("send_group_message", "같은 그룹의 다른 구성원에게 일반 메시지를 저장합니다. accepted는 접수입니다. deliveryStage와 delivered는 deliveryObservedAt 시점이며 이후 확인은 explain_group_delivery를 사용하세요. 새 messageID와 supersedes=[이전 ID]는 대기 중인 자기 일반 메시지들을 원자적으로 대체합니다. 재시도에는 같은 ID를 쓰세요. 작업 지시·승인 권한은 부여하지 않습니다. 그룹장은 asTask=true로 직속 구성원에게 정식 배정할 수 있습니다.",
@@ -215,25 +215,21 @@ public enum AutoApproveMCPServer {
             if let value = response(message, profile: profile, call: { tool, arguments in
                 var params = arguments; params["tool"] = tool; params["owner"] = owner
                 let groupTool = ["wait_group_dependencies", "update_group_wait", "complete_group_task", "get_session_groups", "get_group_status", "get_group_topology", "set_group_relationship", "assign_group_task", "assign_group_tasks", "list_group_background_jobs","stop_group_background_job","watch_group_events","explain_group_delivery","get_group_member_goal","manage_group_member_goal","manage_group_task","retry_group_submission","replace_group_task","clear_group_composer","interrupt_group_task", "cancel_group_messages", "set_group_message_priority", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "get_group_member_terminal", "ack_group_messages", "clear_session_group", "clear_group_member", "set_group_member_title", "set_group_member_tab_color", "get_group_clear_status"].contains(tool)
-                // Only this process may attribute the caller; never trust a supplied session or agent kind.
                 params.removeValue(forKey: "codexCallerRuntimeID")
                 if groupTool {
                     params.removeValue(forKey: "sessionID"); params.removeValue(forKey: "agentKind")
                     params.removeValue(forKey: "codexCallerHome"); params.removeValue(forKey: "codexCallerConversationID")
                     params.removeValue(forKey: "codexCallerSource")
+                    params.removeValue(forKey: "codexCallerSessionID")
+                    params.removeValue(forKey: "codexCallerParentID")
                 }
-                // Handshake/list/ping and owner-scoped replies need no process
-                // scan. Resolve attribution freshly only when it is used.
                 if tool == "ask_user" || tool == "start_screen_share" || groupTool {
                     let environment = ProcessInfo.processInfo.environment
                     let parent = getppid()
                     let enclosing = try? ProcessDiscovery.enclosingAgent(of: parent)
                     let agent = getppid() == parent ? enclosing : nil
-                    // Codex's per-call metadata identifies the conversation even
-                    // when its MCP parent is a shared daemon, not a terminal CLI.
-                    // A Claude child launched from Codex may inherit its exec
-                    // environment. Keep Claude's existing attribution path.
                     let callID = groupTool && agent?.agent != .agy && agent?.agent != .claude ? try CodexGroupIdentity.conversationID(in: message) : nil
+                    let isSubagent = groupTool && agent?.agent != .agy && agent?.agent != .claude && CodexGroupIdentity.isSubagentCall(message)
                     let codexID = callID ?? (groupTool && agent?.agent != .agy && agent?.agent != .claude ?
                         environment["CODEX_THREAD_ID"].flatMap(UUID.init(uuidString:))?.uuidString.lowercased() : nil)
                     if let id = codexID {
@@ -242,14 +238,16 @@ public enum AutoApproveMCPServer {
                         }
                         params["agentKind"] = AgentKind.codex.rawValue
                         params["conversationID"] = id
-                        // Official Codex filters CODEX_HOME out of the default
-                        // MCP environment. The parent can locate the account
-                        // home, but never supplies the conversation identity.
                         let homeEnvironment = environment["CODEX_HOME"] != nil ? environment :
                             (agent.flatMap(ProcessEnvironment.read) ?? environment)
                         params["codexCallerHome"] = CodexGroupIdentity.home(environment: homeEnvironment)
+                        if isSubagent {
+                            let context = try CodexGroupIdentity.subagentParents(in: message)
+                            params["codexCallerSessionID"] = context.session?.uuidString.lowercased()
+                            params["codexCallerParentID"] = context.parent?.uuidString.lowercased()
+                        }
                         params["codexCallerConversationID"] = id
-                        params["codexCallerSource"] = callID == nil ? "codex_exec_context" : "codex_mcp_metadata"
+                        params["codexCallerSource"] = isSubagent ? CodexGroupDelegation.source : (callID == nil ? "codex_exec_context" : "codex_mcp_metadata")
                         if callID != nil, let agent, agent.agent == .codex, agent.isForeground,
                            TerminalProfileLauncher.validTTY("/dev/" + agent.tty), CodexGroupIdentity.allowsTerminalAttribution(message) {
                             params["codexCallerRuntimeID"] = agent.key

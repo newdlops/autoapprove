@@ -3303,9 +3303,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return observed
     }
 
-    /// Per-call conversation evidence takes precedence over the MCP host process.
-    /// A daemon can serve multiple conversations and need not have a visible TUI.
-    private func sessionGroupCaller(_ object: JSONObject, observed: [SessionGroupLiveSession], recovery: Bool = false) throws -> (session: SessionGroupLiveSession, attribution: String) {
+    private func sessionGroupCaller(_ object: JSONObject, observed: [SessionGroupLiveSession], recovery: Bool = false) async throws -> (session: SessionGroupLiveSession, attribution: String) {
         if let id = object["sessionID"] as? String, let session = sessions[id], session.agent == .claude,
            isBackgroundGroupSession(session) || !observed.contains(where: { $0.id == id }) {
             throw RemoteHTTPError(409, "그룹을 호출한 Claude의 독립 터미널을 확인하지 못했습니다.")
@@ -3319,13 +3317,34 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let claimed, UUID(uuidString: claimed) == uuid else {
                 throw RemoteHTTPError(409, "지정한 대화 ID가 이 Codex 호출의 대화와 다릅니다.")
             }
-            let attribution = object["codexCallerSource"] as? String == "codex_exec_context" ? "codex_exec_context" : "codex_mcp_metadata"
+            let source = object["codexCallerSource"] as? String
+            let delegated = source == CodexGroupDelegation.source
+            let effectiveID: UUID
+            if delegated {
+                guard case .child(let ancestry?) = await CodexGroupDelegation.lineage(of: uuid, home: home),
+                      ancestry.matches(object, child: uuid) else {
+                    throw RemoteHTTPError(403, "서브에이전트와 원래 구성원 대화의 연결이 종료되었거나 바뀌었습니다.")
+                }
+                effectiveID = ancestry.root
+            } else { effectiveID = uuid }
             let endpoints = observed.filter { $0.session.agent == .codex && $0.session.phase != .ended &&
-                $0.providerHome == home && $0.conversationID.flatMap(UUID.init(uuidString:)) == uuid }
-            if endpoints.count == 1, let endpoint = endpoints.first { return (endpoint, attribution) }
-            let caller = AgentSession(id: "codex-mcp:" + home + ":" + uuid.uuidString, agent: .codex, pid: 0,
-                                      started: "", tty: "", cwd: "", terminal: .unknown)
-            return (.init(session: caller, conversationID: uuid.uuidString, providerHome: home), attribution)
+                $0.providerHome == home && $0.conversationID.flatMap(UUID.init(uuidString:)) == effectiveID }
+            if delegated && (endpoints.count > 1 || endpoints.first?.providerIdentityAmbiguous == true) {
+                throw RemoteHTTPError(409, "원래 구성원의 Codex 터미널을 유일하게 확인하지 못했습니다.")
+            }
+            var endpoint: SessionGroupLiveSession
+            if endpoints.count == 1, let live = endpoints.first {
+                endpoint = live
+            } else {
+                let caller = AgentSession(id: "codex-mcp:" + home + ":" + effectiveID.uuidString, agent: .codex, pid: 0,
+                                          started: "", tty: "", cwd: "", terminal: .unknown)
+                endpoint = .init(session: caller, conversationID: effectiveID.uuidString, providerHome: home)
+            }
+            if delegated {
+                endpoint.codexGroupDelegate = .init(threadID: uuid, requiresLeader: !CodexGroupDelegation.memberTools.contains(object["tool"] as? String ?? ""))
+                return (endpoint, CodexGroupDelegation.source)
+            }
+            return (endpoint, source == "codex_exec_context" ? "codex_exec_context" : "codex_mcp_metadata")
         }
         if let direct = (object["sessionID"] as? String).flatMap({ id in observed.first { $0.id == id } }) {
             if let claimed, !(recovery && direct.conversationID == nil), UUID(uuidString: claimed) != direct.conversationID.flatMap(UUID.init(uuidString:)) {
@@ -3353,7 +3372,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (found, "provided_conversation_id")
     }
 
-    private func groupMemberIsCaller(_ member: SessionGroupMember, caller: SessionGroupLiveSession, observed: [SessionGroupLiveSession]) -> Bool {
+    private func groupMemberIsCaller(_ member: SessionGroupMember, in group: SessionGroup, caller: SessionGroupLiveSession, observed: [SessionGroupLiveSession]) -> Bool {
+        if let delegate = caller.codexGroupDelegate {
+            guard !delegate.requiresLeader || group.isLeader(member.id), member.providerHome == caller.providerHome,
+                  let id = UUID(uuidString: member.conversationID), id == caller.conversationID.flatMap(UUID.init(uuidString:)) else { return false }
+            if caller.session.pid == 0, let current = SessionGroupMatching.connection(member, in: observed),
+               current.providerIdentityAmbiguous || current.conversationID.flatMap(UUID.init(uuidString:)).map({ $0 != id }) == true {
+                return false
+            }
+        }
         if caller.session.pid == 0, caller.session.agent == .codex {
             return member.agent == .codex && member.providerHome == caller.providerHome &&
                 UUID(uuidString: member.conversationID) == caller.conversationID.flatMap(UUID.init(uuidString:))
@@ -3362,9 +3389,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func recoveryMember(in group: SessionGroup, caller: SessionGroupLiveSession, observed: [SessionGroupLiveSession]) -> SessionGroupMember? {
-        let verified = group.members.filter { groupMemberIsCaller($0, caller: caller, observed: observed) }
+        let verified = group.members.filter { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }
         if !verified.isEmpty { return verified.count == 1 ? verified.first : nil }
-        guard caller.session.pid > 0 else { return nil }
+        guard caller.session.pid > 0, caller.codexGroupDelegate == nil else { return nil }
         let candidates = group.members.filter { member in
             if member.runtimeID == caller.id, SessionGroupMatching.connection(member, in: observed)?.id == caller.id {
                 return caller.conversationID == nil || group.isLeader(member.id)
@@ -3376,11 +3403,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func canReconnectGroupMember(_ member: SessionGroupMember, group: SessionGroup, caller: SessionGroupLiveSession,
                                          callerMember: SessionGroupMember, observed: [SessionGroupLiveSession]) -> Bool {
-        if !groupMemberIsCaller(callerMember, caller: caller, observed: observed) {
+        guard caller.codexGroupDelegate == nil else { return false }
+        if !groupMemberIsCaller(callerMember, in: group, caller: caller, observed: observed) {
             return member.id == callerMember.id && recoveryMember(in: group, caller: caller, observed: observed)?.id == member.id
         }
         guard SessionGroupMatching.connection(member, in: observed) != nil ||
-                (groupMemberIsCaller(callerMember, caller: caller, observed: observed) &&
+                (groupMemberIsCaller(callerMember, in: group, caller: caller, observed: observed) &&
                  SessionGroupMatching.replacement(member, in: observed, selected: nil) != nil) else { return false }
         return member.id == callerMember.id || group.canDirect(callerMember.id, worker: member.id) ||
             group.leaderMemberID == nil
@@ -3388,7 +3416,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func reconnectGroupMember(_ object: JSONObject, groupID: UUID, memberID: UUID) async throws -> JSONObject {
         let observed = try await sessionGroupSessions()
-        let (caller, _) = try sessionGroupCaller(object, observed: observed, recovery: true)
+        let (caller, _) = try await sessionGroupCaller(object, observed: observed, recovery: true)
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
               let callerMember = recoveryMember(in: group, caller: caller, observed: observed),
               let member = group.members.first(where: { $0.id == memberID }) else {
@@ -3397,7 +3425,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed) else {
             throw RemoteHTTPError(409, "재연결할 수 있는 원래 터미널을 확인하지 못했거나 재연결 권한이 없습니다. canReconnect가 true인 구성원만 재연결할 수 있습니다. 종료된 터미널은 자동으로 다시 실행하지 않습니다.")
         }
-        let repairedSelf = member.id == callerMember.id && !groupMemberIsCaller(member, caller: caller, observed: observed)
+        let repairedSelf = member.id == callerMember.id && !groupMemberIsCaller(member, in: group, caller: caller, observed: observed)
         let refreshed = try await refreshSessionGroupMemberID(groupID: groupID, memberID: memberID, expectedGroup: group,
                                                               expectedConversationID: repairedSelf ? caller.conversationID : nil, expectedRuntimeID: repairedSelf ? caller.id : nil)
         let fresh = try await readSessionGroupSessions(reconcile: false)
@@ -3700,10 +3728,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let requestedID = (object["messageID"] as? String).flatMap(UUID.init(uuidString:))
         guard object["messageID"] == nil || requestedID != nil else { throw RemoteHTTPError(400, "messageID는 UUID로 지정해주세요.") }
         let observed = try await sessionGroupSessions()
-        let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
+        let (caller, attribution) = try await sessionGroupCaller(object, observed: observed)
         guard object["supersedes"] == nil || attribution != "provided_conversation_id" else { throw RemoteHTTPError(403, "발신 세션을 확인하지 못했습니다.") }
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
-              let sender = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }),
+              let sender = group.members.first(where: { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }),
               UUID(uuidString: sender.conversationID) != nil, caller.conversationID.flatMap(UUID.init(uuidString:)) != nil,
               let recipient = group.members.first(where: { $0.id == memberID }), recipient.id != sender.id else {
             throw RemoteHTTPError(403, "확인된 현재 세션에서 같은 그룹의 다른 구성원에게만 보낼 수 있습니다.")
@@ -3757,20 +3785,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func groupMailboxCaller(_ object: JSONObject, groupID: UUID, verified: Bool = false) async throws -> (SessionGroup, SessionGroupMember) {
         let observed = try await sessionGroupSessions()
-        let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
+        let (caller, attribution) = try await sessionGroupCaller(object, observed: observed)
         guard !verified || attribution != "provided_conversation_id" else { throw RemoteHTTPError(403, "발신 세션을 확인하지 못했습니다.") }
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
-              let member = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }),
+              let member = group.members.first(where: { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }),
               UUID(uuidString: member.conversationID) != nil else { throw RemoteHTTPError(403, "현재 세션의 그룹 수신함만 조회하거나 수신 확인할 수 있습니다.") }
         return (group, member)
     }
 
     private func groupEvidenceTarget(_ object: JSONObject, groupID: UUID, memberID: UUID, workerControl: Bool = false) async throws -> (SessionGroup, SessionGroupMember, SessionGroupLiveSession?) {
         let observed = try await readSessionGroupSessions(reconcile: false)
-        let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
+        let (caller, attribution) = try await sessionGroupCaller(object, observed: observed)
         guard attribution != "provided_conversation_id",
               let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
-              let leader = group.members.first(where: { group.isLeader($0.id) && groupMemberIsCaller($0, caller: caller, observed: observed) }),
+              let leader = group.members.first(where: { group.isLeader($0.id) && groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }),
               !workerControl || (group.isLeader(memberID) ? group.canDirect(leader.id, worker: memberID) : group.canManage(leader.id, member: memberID)),
               let target = group.members.first(where: { $0.id == memberID }) else {
             throw RemoteHTTPError(403, "현재 그룹의 그룹장 세션에서 같은 그룹의 구성원을 지정해주세요.")
@@ -4396,9 +4424,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
               let id = try GroupWaitRequest.uuid(object,"taskID"), let action = object["action"] as? String,
               ["takeOwnership","closeWithoutReport","cancelQueued"].contains(action) else { throw RemoteHTTPError(400,"대상 작업과 처리 방법을 지정해주세요.") }
         let observed = try await sessionGroupSessions()
-        let (caller,proof) = try sessionGroupCaller(object,observed:observed)
+        let (caller,proof) = try await sessionGroupCaller(object,observed:observed)
         guard proof != "provided_conversation_id", let group = try SessionGroupStore(directory:paths.directory).load().first(where:{ $0.id == gid }),
-              let leader = group.members.first(where:{ groupMemberIsCaller($0,caller:caller,observed:observed) }),
+              let leader = group.members.first(where:{ groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }),
               group.isLeader(leader.id), group.canDirect(leader.id,worker:mid), !groupClearActive(gid) else { throw RemoteHTTPError(403,"현재 직속 구성원의 그룹장만 처리할 수 있습니다.") }
         var state = try groupOrchestration()
         if action == "cancelQueued" {
@@ -6053,12 +6081,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         -> (group: SessionGroup, caller: SessionGroupLiveSession, callerMember: SessionGroupMember,
             target: SessionGroupMember, worker: SessionGroupLiveSession, current: AgentSession) {
         let observed = try await sessionGroupSessions()
-        let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
+        let (caller, attribution) = try await sessionGroupCaller(object, observed: observed)
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }) else {
             throw RemoteHTTPError(404, "그룹을 찾지 못했습니다. get_group_status로 현재 그룹을 확인해주세요.")
         }
         guard group.leaderMemberID != nil else { throw RemoteHTTPError(409, "이 그룹에는 그룹장이 없습니다. 관리 창의 세션 그룹에서 그룹장을 지정해주세요.") }
-        guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else {
+        guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }) else {
             throw RemoteHTTPError(403, "현재 세션은 이 그룹의 구성원으로 확인되지 않았습니다.")
         }
         guard let target = group.members.first(where: { $0.id == memberID }),
@@ -6478,7 +6506,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try await performGroupMCPAction(object, queuedID:nil)
     }
 
-    private func performGroupMCPAction(_ object: JSONObject, queuedID: UUID?) async throws -> JSONObject {
+    private func performGroupMCPAction(_ request: JSONObject, queuedID: UUID?) async throws -> JSONObject {
+        let object = try await CodexGroupDelegation.request(request)
         guard let owner = object["owner"] as? String, UUID(uuidString: owner) != nil,
               let tool = object["tool"] as? String else { throw RemoteHTTPError(400, "MCP 연결 정보가 필요합니다.") }
         if tool == "connection_initialized" {
@@ -6501,11 +6530,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         switch tool {
         case "get_group_topology", "set_group_relationship":
             let observed = try await sessionGroupSessions()
-            let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
+            let (caller, attribution) = try await sessionGroupCaller(object, observed: observed)
             let store = SessionGroupStore(directory: paths.directory), groups = try store.load()
             guard attribution != "provided_conversation_id", let sourceID = try GroupWaitRequest.uuid(object, "groupID"),
                   let source = groups.first(where: { $0.id == sourceID }),
-                  let actor = source.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }),
+                  let actor = source.members.first(where: { groupMemberIsCaller($0, in: source, caller: caller, observed: observed) }),
                   source.isLeader(actor.id) else { throw RemoteHTTPError(403, "현재 세션이 그룹장인 그룹을 지정해주세요.") }
             let whole = source.hasGroupAuthority(actor.id)
             let scope = whole ? SessionGroup.downstream(of: sourceID, in: groups) : [sourceID]
@@ -6552,9 +6581,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)) else { throw RemoteHTTPError(400, "groupID와 memberID(UUID)를 지정해주세요.") }
             let observed = try await sessionGroupSessions()
-            let (caller, _) = try sessionGroupCaller(object, observed: observed)
+            let (caller, _) = try await sessionGroupCaller(object, observed: observed)
             guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
-                  let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else { throw RemoteHTTPError(403, "현재 세션이 속한 그룹만 변경할 수 있습니다.") }
+                  let callerMember = group.members.first(where: { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }) else { throw RemoteHTTPError(403, "현재 세션이 속한 그룹만 변경할 수 있습니다.") }
             guard group.leaderMemberID == nil || group.canManage(callerMember.id, member: memberID) || (tool == "set_group_member_title" && callerMember.id == memberID) else { throw RemoteHTTPError(403, "다른 구성원의 이름이나 탭 색상 변경은 그룹장만 요청할 수 있습니다.") }
             guard !groupClearActive(groupID) else { throw RemoteHTTPError(409, "그룹 초기화가 끝난 뒤 탭 표시를 변경해주세요.") }
             guard let member = group.members.first(where: { $0.id == memberID }) else { throw RemoteHTTPError(404, "이 그룹에서 지정한 구성원을 찾지 못했습니다.") }
@@ -6616,9 +6645,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 selectedMemberID = id
             } else { selectedMemberID = nil }
             let observed = try await sessionGroupSessions()
-            let (caller, _) = try sessionGroupCaller(object, observed: observed)
+            let (caller, _) = try await sessionGroupCaller(object, observed: observed)
             guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
-                  let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else { throw RemoteHTTPError(403, "현재 세션이 속한 그룹만 조회하거나 초기화할 수 있습니다.") }
+                  let callerMember = group.members.first(where: { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }) else { throw RemoteHTTPError(403, "현재 세션이 속한 그룹만 조회하거나 초기화할 수 있습니다.") }
             var jobs = try loadGroupClears()
             if tool == "get_group_clear_status" {
                 guard let previous = jobs.last(where: { $0.groupID == groupID && (suppliedRequest == nil || suppliedRequest == $0.id) }) else { throw RemoteHTTPError(404, "초기화 요청을 찾지 못했습니다.") }
@@ -6722,7 +6751,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     "message": "메시지를 조회했습니다."]
         case "get_session_groups":
             let observed = try await sessionGroupSessions()
-            let (caller, attribution) = try sessionGroupCaller(object, observed: observed, recovery: true)
+            let (caller, attribution) = try await sessionGroupCaller(object, observed: observed, recovery: true)
             let groups = try SessionGroupStore(directory: paths.directory).load()
             let matching = groups.compactMap { group in recoveryMember(in: group, caller: caller, observed: observed).map { (group, $0) } }
             let modelSettings = await groupModelSettings(matching.map { $0.0 }, observed: observed)
@@ -6743,7 +6772,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),
                             "modelSettingsRecordedAt": live.flatMap { modelSettings[$0.id]?.recordedAt }.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
                             "isCaller": member.id == callerMember.id, "sameAgent": member.agent == caller.session.agent,
-                            "canAskQuestion": member.id != callerMember.id && Self.canAddressGroupMember(member, live: live) && UUID(uuidString: callerMember.conversationID) != nil && groupMemberIsCaller(callerMember, caller: caller, observed: observed),
+                            "canAskQuestion": member.id != callerMember.id && Self.canAddressGroupMember(member, live: live) && UUID(uuidString: callerMember.conversationID) != nil && groupMemberIsCaller(callerMember, in: group, caller: caller, observed: observed),
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
                             "isLeader": group.isLeader(member.id),
                             "parentMemberIDs": group.parentIDs(of: member.id).map(\.uuidString),
@@ -6764,6 +6793,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return ["groups": output, "agent": "claude", "attribution": attribution, "transport": "local_terminal",
                         "networkRequired": false, "reason": reason, "message": detail]
             }
+            if let child = caller.codexGroupDelegate?.threadID {
+                return ["groups": output, "agent": "codex", "attribution": attribution, "transport": "local_terminal", "networkRequired": false,
+                        "callerConversationID": child.uuidString.lowercased(), "actingAsConversationID": caller.conversationID ?? "",
+                        "message": output.isEmpty ? "원래 Codex 대화가 속한 그룹이 없습니다." : "원래 구성원 명의로 사용할 수 있는 그룹입니다. 후속 호출의 conversationID는 생략하세요."]
+            }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
                     "transport": "local_terminal", "networkRequired": false,
                     "message": "현재 세션의 그룹을 조회했습니다."]
@@ -6776,10 +6810,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 throw RemoteHTTPError(400, "reportView는 full 또는 compact여야 합니다.")
             }
             let observed = try await sessionGroupSessions()
-            let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
+            let (caller, attribution) = try await sessionGroupCaller(object, observed: observed)
             let groups = try SessionGroupStore(directory: paths.directory).load()
             let state = try groupOrchestration()
-            let visibleGroups = groups.filter { $0.members.contains { groupMemberIsCaller($0, caller: caller, observed: observed) } }
+            let visibleGroups = groups.filter { group in group.members.contains { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) } }
             let modelSettings = await groupModelSettings(visibleGroups, observed: observed)
             guard let mode = (object["view"] ?? "full") as? String, ["overview","full"].contains(mode) else { throw RemoteHTTPError(400,"view는 overview 또는 full이어야 합니다.") }
             let ids = Set(visibleGroups.flatMap(\.members).compactMap { SessionGroupMatching.match($0, in: observed)?.id })
@@ -6829,7 +6863,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let memberStatuses = await claudeStatuses(observed.map(\.session))
             let includeGraph = try GroupWaitRequest.flag(object, "includeWaitGraph")
             let output: [JSONObject] = try groups.compactMap { group in
-                guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }) else { return nil }
+                guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }) else { return nil }
                 let warnings = SessionGroupMatching.identityWarnings(group, live: observed)
                 let members: [JSONObject] = group.treeOrder.map { entry in
                     let member = entry.member, live = SessionGroupMatching.match(member, in: observed)

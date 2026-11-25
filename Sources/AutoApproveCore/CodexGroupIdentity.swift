@@ -1,21 +1,33 @@
 import Foundation
 
-/// Codex supplies these fields outside the model's tool arguments on every MCP call.
-/// Do not use the shared daemon's PID as the identity of an attached terminal.
 public enum CodexGroupIdentity {
-    public static func conversationID(in message: JSONObject, environment: [String: String] = [:]) throws -> String? {
-        let params = message["params"] as? JSONObject ?? [:]
-        let meta = params["_meta"] as? JSONObject ?? [:]
-        let turn = meta["x-codex-turn-metadata"] as? JSONObject ?? [:]
-        let values = [meta["threadId"], turn["thread_id"], turn["session_id"]].compactMap { $0 }
-        // A helper launched by Codex exec receives its thread in the inherited
-        // execution context. Per-call metadata always wins on shared helpers.
-        guard !values.isEmpty else { return environment["CODEX_THREAD_ID"].flatMap(UUID.init(uuidString:))?.uuidString.lowercased() }
+    private static func agreedUUID(_ fields: [Any?]) throws -> UUID? {
+        let values = fields.compactMap { $0 }
+        guard !values.isEmpty else { return nil }
         let ids = values.compactMap { ($0 as? String).flatMap(UUID.init(uuidString:)) }
-        guard ids.count == values.count, Set(ids).count == 1, let id = ids.first else {
+        guard ids.count == values.count, Set(ids).count == 1 else {
             throw AppError.message("Codex 호출의 대화 식별 정보가 서로 다릅니다. MCP 연결을 다시 확인해주세요.")
         }
-        return id.uuidString.lowercased()
+        return ids.first
+    }
+
+    public static func conversationID(in message: JSONObject, environment: [String: String] = [:]) throws -> String? {
+        let meta = (message["params"] as? JSONObject)?["_meta"] as? JSONObject ?? [:]
+        let turn = turnMetadata(message)
+        if isSubagentCall(message) {
+            guard let id = try agreedUUID([meta["threadId"], turn["thread_id"]]) else {
+                throw AppError.message("Codex 서브에이전트의 호출 대화 ID를 확인하지 못했습니다.")
+            }
+            return id.uuidString.lowercased()
+        }
+        let id = try agreedUUID([meta["threadId"], turn["thread_id"], turn["session_id"]])
+        return (id ?? environment["CODEX_THREAD_ID"].flatMap(UUID.init(uuidString:)))?.uuidString.lowercased()
+    }
+
+    static func subagentParents(in message: JSONObject) throws -> (session: UUID?, parent: UUID?) {
+        let meta = (message["params"] as? JSONObject)?["_meta"] as? JSONObject ?? [:]
+        let turn = turnMetadata(message)
+        return (try agreedUUID([meta["sessionId"], turn["session_id"]]), try agreedUUID([turn["parent_thread_id"]]))
     }
 
     public static func home(environment: [String: String]?) -> String? {
@@ -25,14 +37,21 @@ public enum CodexGroupIdentity {
         return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
-    /// A subagent's conversation is valid for attribution but cannot replace
-    /// the root conversation assigned to its enclosing terminal.
-    package static func allowsTerminalAttribution(_ message: JSONObject) -> Bool {
+    private static func turnMetadata(_ message: JSONObject) -> JSONObject {
         let params = message["params"] as? JSONObject
         let meta = params?["_meta"] as? JSONObject
-        let turn = meta?["x-codex-turn-metadata"] as? JSONObject
-        return turn?["parent_thread_id"] == nil && turn?["subagent_kind"] == nil &&
-            (turn?["thread_source"] == nil || turn?["thread_source"] as? String == "user")
+        return meta?["x-codex-turn-metadata"] as? JSONObject ?? [:]
+    }
+
+    static func isSubagentCall(_ message: JSONObject) -> Bool {
+        let turn = turnMetadata(message)
+        return turn["parent_thread_id"] is String || turn["subagent_kind"] is String || turn["thread_source"] as? String == "subagent"
+    }
+
+    package static func allowsTerminalAttribution(_ message: JSONObject) -> Bool {
+        let turn = turnMetadata(message)
+        return !isSubagentCall(message) && ["parent_thread_id", "subagent_kind"].allSatisfy { turn[$0] == nil || turn[$0] is NSNull } &&
+            (turn["thread_source"] == nil || turn["thread_source"] is NSNull || turn["thread_source"] as? String == "user")
     }
 
     public static func refreshed(_ groups: [SessionGroup], live: [SessionGroupLiveSession]) -> [SessionGroup] {

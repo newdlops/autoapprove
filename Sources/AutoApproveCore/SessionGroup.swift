@@ -386,7 +386,6 @@ public struct SessionGroupTabShell: Codable, Equatable, Sendable {
     }
 }
 
-/// Current observation, kept separate from the persisted group entry.
 public struct SessionGroupLiveSession: Identifiable, Equatable {
     public var session: AgentSession
     public var conversationID: String?
@@ -394,6 +393,7 @@ public struct SessionGroupLiveSession: Identifiable, Equatable {
     public var messagingName: String?
     var tabShell: SessionGroupTabShell?
     var providerIdentityAmbiguous = false
+    var codexGroupDelegate: CodexGroupDelegation.Caller?
     var codexIdentityFromMCP = false
     var inheritsClaudeConfigHome = false
     var claudePromptChannel: String?
