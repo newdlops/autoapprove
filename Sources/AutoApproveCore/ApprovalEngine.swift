@@ -413,6 +413,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var pollTask: Task<Void, Never>?
     private var historyPollTask: Task<Void, Never>?
     private var screenPollTasks: [ScreenHost: Task<Void, Never>] = [:]
+    private var requestedScreenRefresh: [ScreenHost: Set<String>] = [:]
     private var unchangedScreenReads: [ScreenHost: Int] = [:]
     // Each session keeps its own monitor cadence. One question screen must not
     // make every other tab of the same host read at the question cadence:
@@ -567,6 +568,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var codexManagedServerAutomaticHomes:Set<String>=[]
     private var codexManagedServerStartTask:Task<CodexManagedServerStatus,Error>?
     private let codexAccountTargetReader: @Sendable ([ProcessRecord]) async throws -> [CodexAccountTransitionTarget]
+    private let codexAccountProcessReader: @Sendable () throws -> [ProcessRecord]
     private var codexAccountCoordinators: [String: CodexAccountTransitionCoordinator] = [:]
     private var codexMigrationCoordinator:CodexSessionMigrationCoordinator?
     private var codexMigrationHeldClients:Set<CodexMigrationClientID>=[]
@@ -756,6 +758,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         else if let processReader { self.singleProcessReader = { _ in try processReader() } }
         else { self.singleProcessReader = { try ProcessDiscovery.read(pid: $0) } }
         self.discoveryReader = processReader ?? { try ProcessDiscovery.readSessions() }
+        self.codexAccountProcessReader = codexAccountTargets == nil ? self.discoveryReader : self.processReader
         self.remoteProcessVerifier = { session in
             // A first screen already exists in the monitor. Verify its live
             // owner without launching a second process on the handshake path.
@@ -1048,6 +1051,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         revision &+= 1; pollTask?.cancel(); pollTask = nil
         historyPollTask?.cancel(); historyPollTask = nil
         for task in screenPollTasks.values { task.cancel() }; screenPollTasks.removeAll()
+        requestedScreenRefresh.removeAll()
         gitBranchTask?.cancel(); gitBranchTask = nil
         keepAwakeTask?.cancel(); keepAwakeTask = nil
         mouseActivityTask?.cancel(); mouseActivityTask = nil
@@ -2610,7 +2614,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let observation = remoteTerminalChanges[sessionID]!.observe()
         if let host = sessions[sessionID].flatMap({ ScreenHost(kind: $0.terminal) }) {
             unchangedScreenReads[host] = 0
-            screenPollSignals[host]?.notify()
+            requestScreenRefresh(host, ids: [sessionID])
         }
         if sessions[sessionID]?.terminal == .terminal {
             observation.observeNativeCursor { [weak self] in
@@ -8198,6 +8202,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
     }
 
+    private func requestScreenRefresh(_ host: ScreenHost, ids: Set<String>? = nil) {
+        guard screenConnections[host]?.enabled == true else { return }
+        let targets = ids ?? Set(pollingTargets(host).map(\.id))
+        requestedScreenRefresh[host, default: []].formUnion(targets)
+        screenPollSignals[host]?.notify()
+    }
+
     private struct ScreenPollingIdentity: Hashable {
         let sessionID: String
         let tty: String
@@ -8276,7 +8287,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let observation = screenPollSignals[host]?.observe() else { continue }
             screenPollTasks[host] = Task { [weak self] in
                 await observation.waitForChange(timeout: 0)
-                var seenRevision: UInt64?
+                var refreshAll = true
                 var refreshPending = Set<String>()
                 while !Task.isCancelled, let self, !self.remoteInputStopped {
                     guard self.screenConnections[host]?.enabled == true else {
@@ -8302,21 +8313,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             continue
                         }
                         self.screenConnections[host]?.permissionBlocked = false
-                        seenRevision = nil
+                        refreshAll = true
                     }
                     let targets = self.pollingTargets(host)
                     guard !targets.isEmpty else {
+                        refreshPending.removeAll()
+                        self.requestedScreenRefresh.removeValue(forKey: host)
                         await observation.waitForChange()
                         continue
                     }
-                    let revision = self.screenPollSignals[host]?.revision
                     let ids = targets.map(\.id)
+                    let requested = self.requestedScreenRefresh.removeValue(forKey: host) ?? []
+                    let added = refreshAll ? Set(ids) : requested.intersection(ids)
+                    refreshAll = false
+                    refreshPending.formUnion(added)
                     refreshPending.formIntersection(ids)
-                    if revision != seenRevision {
-                        refreshPending = Set(ids)
-                        for id in ids { self.unchangedSessionReads[id] = 0 }
-                    }
-                    seenRevision = revision
+                    for id in added { self.unchangedSessionReads[id] = 0 }
                     let started = ProcessInfo.processInfo.systemUptime
                     let intervals = self.screenReadIntervals(host, targets: targets)
                     let due = RemoteTerminalPolling.monitorBatch(ids, pending: refreshPending, intervals: intervals,
@@ -8965,7 +8977,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let nextPolling = pollingIdentities()
         for host in ScreenHost.allCases where previousPolling[host] != nextPolling[host] {
             unchangedScreenReads[host] = 0
-            screenPollSignals[host]?.notify()
+            let added = (nextPolling[host] ?? []).subtracting(previousPolling[host] ?? [])
+            requestScreenRefresh(host, ids: Set(added.map(\.sessionID)))
         }
         if previousPolling != nextPolling {
             let monitored = Set(nextPolling.values.flatMap { $0.map(\.sessionID) })
@@ -9097,7 +9110,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             remoteInputUntil.removeAll(); readableQuestionSessions.removeAll()
             unchangedScreenReads.removeAll(); hosts.formUnion(screenConnections.keys)
         }
-        for host in hosts { unchangedScreenReads[host] = 0; screenPollSignals[host]?.notify() }
+        for host in hosts {
+            unchangedScreenReads[host] = 0
+            requestScreenRefresh(host, ids: allSessions ? nil : Set(members))
+        }
         let count = allSessions ? sessions.values.filter { $0.phase != .ended }.count : members.count
         let automatic = selected.map { effectiveAutomatic($0.id) } ?? sessions.values.contains { $0.phase != .ended && effectiveAutomatic($0.id) }
         let result = AutomationResetResult(sessionCount: count, cancelledTasks: cancelledTasks,
@@ -9139,7 +9155,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 scheduleSystemSafety(member); scheduleScreenApproval(member)
                 if let current = sessions[member], let host = ScreenHost(kind: current.terminal) {
                     unchangedScreenReads[host] = 0
-                    screenPollSignals[host]?.notify()
+                    requestScreenRefresh(host, ids: [member])
                 }
             }
             historyPollSignal.notify()
@@ -9175,7 +9191,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         publish()
         if !paused {
             for host in ScreenHost.allCases { unchangedScreenReads[host] = 0 }
-            screenPollSignals.values.forEach { $0.notify() }; historyPollSignal.notify()
+            for host in ScreenHost.allCases { requestScreenRefresh(host) }
+            historyPollSignal.notify()
         }
         claudeHookSignals.values.forEach { $0.notify() }
         Task { await evaluateKeepAwake() }
@@ -9216,7 +9233,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 screenConnections[host]?.permissionBlocked = denied
                 screenConnections[host]?.retryAfter = Date().addingTimeInterval(5)
-                screenPollSignals[host]?.notify()
+                requestScreenRefresh(host)
                 updateHealth(host) {
                     $0.requested = true; $0.connected = confirmed; $0.connecting = false
                     $0.status = confirmed ? "터미널 권한 조회 지연 · 자동 재확인 중" : error.localizedDescription
@@ -9229,12 +9246,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
         screenConnections[host]?.permissionBlocked = false; screenConnections[host]?.retryAfter = .distantPast
         updateHealth(host) { $0.requested = true; $0.status = "연결 확인 중…" }
         await refreshScreenHost(host, reportConnecting: true); publish()
-        screenPollSignals[host]?.notify()
+        requestScreenRefresh(host)
     }
     public func disconnectScreenHost(_ host: ScreenHost) {
         if screenAdapters[host]?.usesHostIPC == true { AutomationIPC.shared.invalidate(host.title) }
         screenConnections[host]?.connectID = nil
         screenConnections[host]?.enabled = false; revision &+= 1
+        requestedScreenRefresh.removeValue(forKey: host)
         screenPollSignals[host]?.notify()
         unchangedScreenReads[host] = 0
         if host == .tmux { tmuxRelay.stop() }
@@ -9561,7 +9579,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             publish()
             unchangedScreenReads[host] = 0
             for target in targets { screenReadSucceeded.remove(target.id); unchangedSessionReads[target.id] = 0 }
-            screenPollSignals[host]?.notify()
+            requestScreenRefresh(host, ids: Set(targets.map(\.id)))
             return nil
         }
     }
@@ -11363,7 +11381,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         defer {
             groupPolicyEdits.removeValue(forKey: editID)
             for id in targets where !settingSessionPolicy(id) {
-                if let host = sessions[id].flatMap({ ScreenHost(kind: $0.terminal) }) { screenPollSignals[host]?.notify() }
+                if let host = sessions[id].flatMap({ ScreenHost(kind: $0.terminal) }) { requestScreenRefresh(host, ids: [id]) }
             }
         }
         if let discoveryTask { await discoveryTask.value }
@@ -11553,7 +11571,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if waiting {cancelCodexProgressCheck(id);codexProgressTrackers.removeValue(forKey:id);if sessions[id]?.codexProgressRecovery?.phase != .review {sessions[id]?.codexProgressRecovery=nil}}
             if osPermissionBlocked.contains(id) && !waiting {
                 automationNeedsFreshScreen.insert(id);invalidateRemoteRead(id)
-                if let host=sessions[id].flatMap({ScreenHost(kind:$0.terminal)}) {screenPollSignals[host]?.notify()}
+                if let host=sessions[id].flatMap({ScreenHost(kind:$0.terminal)}) {requestScreenRefresh(host, ids: [id])}
             }
             if waiting {osPermissionBlocked.insert(id)} else {osPermissionBlocked.remove(id)}
             sessions[id]?.osPermissionWaiting=osPermissionRequests.values.contains {!$0.isManagementApp && $0.isPending && $0.sessionID==id}
@@ -13587,7 +13605,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
               codexAccountTransitionEnabled || codexAccountTransitionHeld else { return }
         codexAccountTransitionBusy = true; defer {if epoch==codexAccountTransitionEpoch {codexAccountTransitionBusy = false}}
         do {
-            let reader = processReader
+            let reader = codexAccountProcessReader
             let records = try await Task.detached(priority: .utility) { try reader() }.value
             let targets = try await codexAccountTargetReader(records)
             guard !Task.isCancelled, epoch == codexAccountTransitionEpoch else { return }

@@ -126,7 +126,8 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
         guard !checking else { return }
         checking = true; defer { checking = false }
         do {
-            let idleCheck = !state.held && loginRequestID == nil && preStoppedGoals.isEmpty
+            let explicitLogin = loginRequestID != nil && loginRequestID != state.loginRequestID
+            let idleCheck = !state.held && !explicitLogin && (preStoppedGoals.isEmpty || loginRequestID != nil)
             let observe = idleCheck ? (services.observeForIdleCheck ?? services.observe) : services.observe
             let observed = try await observe(target)
             try Task.checkCancellation()
@@ -189,7 +190,6 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
                 changed(state); return
             }
             if !state.held {
-                let explicitLogin = loginRequestID != nil && loginRequestID != state.loginRequestID
                 if state.phase == .cancelled, !explicitLogin, observed.savedAccount == nil || observed.savedAccount == state.account { return }
                 guard let account = observed.savedAccount, account != observed.serverAccount || explicitLogin else {
                     // Preserve the completion summary until a later account

@@ -1,10 +1,14 @@
 import Foundation
 import Darwin
 
-/// The official daemon CLI may invoke its managed binary even for a version
-/// query. Verify the selected package before invoking daemon subcommands.
 enum CodexManagedPackageSelection {
     static func verify(home:String,executable:@Sendable(String)throws->Void)throws {
+        guard let selected = try selectedExecutable(home: home) else { return }
+        do {try executable(selected)}
+        catch {throw AppError.message(CodexFeatureSupport.legacyRuntimeUnavailable)}
+    }
+
+    static func selectedExecutable(home: String) throws -> String? {
         func exists(_ path:String)throws->Bool {
             var info=stat()
             if lstat(path,&info)==0{return true}
@@ -22,11 +26,10 @@ enum CodexManagedPackageSelection {
                 }
             }
         }
-        guard try exists(root+"/current") else{return}
+        guard try exists(root+"/current") else{return nil}
         let packaged=root+"/current/bin/codex",legacy=root+"/current/codex"
         let selected=try exists(packaged) ? packaged:legacy
         guard FileManager.default.isExecutableFile(atPath:selected) else{throw AppError.message(CodexFeatureSupport.legacyRuntimeUnavailable)}
-        do {try executable(selected)}
-        catch {throw AppError.message(CodexFeatureSupport.legacyRuntimeUnavailable)}
+        return selected
     }
 }

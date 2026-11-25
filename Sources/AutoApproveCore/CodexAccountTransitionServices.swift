@@ -96,10 +96,11 @@ extension CodexAccountTransitionServices {
                 return try await CodexAccountContinuationLocal.resume(target,runtime:runtime,expected:expected,original:original,receipt:receipt)
             }
         })
+        let idleProbe = CodexAccountIdleProbe()
         services.observeForIdleCheck = { target in
             try await CodexAccountBackground.run {
                 let runtime = try CodexAccountRuntime(target, verifyExecutable: verifyExecutable)
-                return try CodexAccountTransitionLocal.observe(target, runtime: runtime, idleCheck: true)
+                return try idleProbe.observe(target, runtime: runtime)
             }
         }
         return services
@@ -137,7 +138,8 @@ enum CodexAccountTransitionLocal {
             $0.pid == witness.pid && $0.started == witness.started && "/dev/" + $0.tty == witness.tty && $0.agent == .codex
         } == true
     }
-    static func identity(_ target: CodexAccountTransitionTarget,runtime:CodexAccountRuntime) throws -> String {
+    static func identity(_ target: CodexAccountTransitionTarget,runtime:CodexAccountRuntime,
+                         reportVerified: ((String, [String]) -> Void)? = nil) throws -> String {
         try runtime.validate(target)
         guard target.home.hasPrefix("/"),
               let socket = CodexQueueConnection.socketPath(home: target.home) else { throw AppError.message("이 Codex의 관리형 로컬 서버를 찾지 못했습니다.") }
@@ -165,6 +167,7 @@ enum CodexAccountTransitionLocal {
               currentSocket.st_dev==info.st_dev,currentSocket.st_ino==info.st_ino else {
             throw AppError.message("공식 서버 확인 중 연결이 바뀌었습니다. 기존 세션은 유지했습니다.")
         }
+        reportVerified?(managed, peer)
         return digest([socket, String(info.st_dev), String(info.st_ino), current, String(binary.st_dev), String(binary.st_ino), String(managedInfo.st_ino)]+peer)
     }
     static func supported(_ version: String) -> Bool {
@@ -188,8 +191,8 @@ enum CodexAccountTransitionLocal {
         return digest([user, workspace])
     }
     static func observe(_ target: CodexAccountTransitionTarget, runtime: CodexAccountRuntime,
-                        idleCheck: Bool = false) throws -> CodexAccountTransitionObservation {
-        let before = try identity(target,runtime:runtime)
+                        idleCheck: Bool = false, reportVerified: ((String, [String]) -> Void)? = nil) throws -> CodexAccountTransitionObservation {
+        let before = try identity(target,runtime:runtime, reportVerified: reportVerified)
         let saved = try CodexAccountMetadataProcess.read(target,runtime:runtime)
         let connection = try CodexQueueConnection(home: target.home)
         let current = try account(connection.request("accountSession/list", ["refreshWorkspaceMetadata": false]))

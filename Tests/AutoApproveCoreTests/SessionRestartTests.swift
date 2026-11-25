@@ -94,6 +94,15 @@ extension ApprovalTests {
         await coordinator.check(now: start.addingTimeInterval(3))
         try expectEqual(restarts, 1)
         try expectEqual(idleChecks, 1)
+        var completed = coordinator.state
+        completed.phase = .complete
+        let restored = CodexAccountTransitionCoordinator(target: target, state: completed, services: services, save: { _ in })
+        await restored.check(loginRequestID: completed.loginRequestID, preStoppedGoals: threads)
+        try expectEqual(restored.state.phase, .complete)
+        try expectEqual(idleChecks, 2)
+        await restored.check(loginRequestID: UUID().uuidString)
+        try expectEqual(restored.state.phase, .stopping)
+        try expectEqual(idleChecks, 2)
     }
 
     func testSessionRestartCommandKeepsKnownOptionsOnly() throws {

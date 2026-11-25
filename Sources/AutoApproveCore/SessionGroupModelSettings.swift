@@ -35,11 +35,13 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         }
     }
     package typealias GroupTurn = (prompt: String, date: Date, response: WorkCompletion)
+    private enum Field: Hashable { case model, completion, groupTurns, goal }
     private struct Cached {
         var goal: ClaudeGroupGoalEvidence?
-        var groupTurns: [UUID: GroupTurn]
+        var groupTurns: [UUID: GroupTurn] = [:]
         var path: String, identity: Identity, value: SessionGroupModelSettings?
-        var finalTurn: FinalTurn?, completionLoaded: Bool
+        var finalTurn: FinalTurn?
+        var fields: Set<Field> = []
     }
     private struct FinalTurn {
         var completion: WorkCompletion
@@ -59,7 +61,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
             let brain = URL(fileURLWithPath: home).deletingLastPathComponent().appendingPathComponent("antigravity-cli/brain")
             return agy(brain: brain, id: id)
         }
-        return claude(live, home: home, id: id, includeCompletion: false)?.value
+        return claude(live, home: home, id: id, field: .model)?.value
     }
 
     private func agy(brain: URL, id: String) -> SessionGroupModelSettings? {
@@ -95,7 +97,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
                     source: "agy_transcript", recordedAt: (row["created_at"] as? String).flatMap(Self.date))
                 if settings.model != nil { value = settings; break }
             }
-            cache[path] = Cached(goal:nil, groupTurns: [:], path: path, identity: identity, value: value, finalTurn: nil, completionLoaded: false)
+            cache[path] = Cached(path: path, identity: identity, value: value, fields: [.model])
             if let value { return value }
         }
         return nil
@@ -103,7 +105,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
 
     public func completion(_ live: SessionGroupLiveSession, after: Date, task: String? = nil) -> WorkCompletion? {
         guard let uuid = live.conversationID.flatMap(UUID.init(uuidString:)), let home = live.providerHome,
-              home.hasPrefix("/"), let turn = claude(live, home: home, id: uuid.uuidString.lowercased(), includeCompletion: true)?.finalTurn,
+              home.hasPrefix("/"), let turn = claude(live, home: home, id: uuid.uuidString.lowercased(), field: .completion)?.finalTurn,
               turn.completion.date >= after, turn.completion.date <= Date().addingTimeInterval(5) else { return nil }
         if let task {
             guard let promptAt = turn.promptAt, promptAt >= after, promptAt <= turn.completion.date,
@@ -117,13 +119,13 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
     package func groupTurns(_ live: SessionGroupLiveSession) -> [UUID: GroupTurn] {
         guard let id = live.conversationID.flatMap(UUID.init(uuidString:))?.uuidString.lowercased(),
               let home = live.providerHome, home.hasPrefix("/") else { return [:] }
-        return claude(live, home: home, id: id, includeCompletion: true)?.groupTurns ?? [:]
+        return claude(live, home: home, id: id, field: .groupTurns)?.groupTurns ?? [:]
     }
 
     func claudeGoal(_ live: SessionGroupLiveSession) -> ClaudeGroupGoalEvidence? {
         guard let id = live.conversationID.flatMap(UUID.init(uuidString:))?.uuidString.lowercased(),
               let home = live.providerHome, home.hasPrefix("/") else { return nil }
-        return claude(live, home:home, id:id, includeCompletion:true)?.goal
+        return claude(live, home:home, id:id, field: .goal)?.goal
     }
 
     private static func groupTurns(_ bytes: Data, id: String) -> [UUID: GroupTurn] {
@@ -158,12 +160,12 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         return turns
     }
 
-    private func claude(_ live: SessionGroupLiveSession, home: String, id: String, includeCompletion: Bool) -> Cached? {
+    private func claude(_ live: SessionGroupLiveSession, home: String, id: String, field: Field) -> Cached? {
         guard live.session.agent == .claude else { return nil }
         lock.lock(); defer { lock.unlock() }
         let key = home + "\n" + id
         if let previous = cache[key], let identity = Identity(previous.path), previous.identity == identity,
-           !includeCompletion || previous.completionLoaded { return previous }
+           previous.fields.contains(field) { return previous }
         let projects = URL(fileURLWithPath: home).appendingPathComponent("projects", isDirectory: true)
         let encoded = live.session.cwd.replacingOccurrences(of: "[^a-zA-Z0-9]", with: "-", options: .regularExpression)
         let direct = projects.appendingPathComponent(encoded, isDirectory: true).appendingPathComponent(id + ".jsonl").path
@@ -181,17 +183,27 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         let start = max(0, before.size - 1_048_576)
         guard (try? handle.seek(toOffset: UInt64(start))) != nil,
               var bytes = try? handle.read(upToCount: Int(before.size - start)), let end = bytes.lastIndex(of: 10) else { return nil }
-        if includeCompletion, bytes.last != 10 { return nil }
+        if field != .model, bytes.last != 10 { return nil }
         bytes = Data(bytes[...end])
         if start > 0 {
             guard let first = bytes.firstIndex(of: 10) else { return nil }
             bytes = Data(bytes[bytes.index(after: first)...])
         }
-        let value = Self.claude(bytes, id: id)
-        let completion = includeCompletion ? Self.claudeCompletion(bytes, id: id) : nil
+        var result: Cached
+        if let previous = cache[key], previous.path == path, previous.identity == before {
+            result = previous
+        } else {
+            result = Cached(path: path, identity: before, value: nil)
+        }
+        switch field {
+        case .model: result.value = Self.claude(bytes, id: id)
+        case .completion: result.finalTurn = Self.claudeCompletion(bytes, id: id)
+        case .groupTurns: result.groupTurns = Self.groupTurns(bytes, id: id)
+        case .goal: result.goal = ClaudeGroupGoalEvidence.read(bytes, id: id, complete: start == 0)
+        }
         guard Identity(path) == before else { return nil }
+        result.fields.insert(field)
         if cache.count >= 256, cache[key] == nil { cache.removeAll(keepingCapacity: true) }
-        let result = Cached(goal:includeCompletion ? ClaudeGroupGoalEvidence.read(bytes,id:id,complete:start == 0) : nil, groupTurns: includeCompletion ? Self.groupTurns(bytes, id: id) : [:], path: path, identity: before, value: value, finalTurn: completion, completionLoaded: includeCompletion)
         cache[key] = result
         return result
     }
