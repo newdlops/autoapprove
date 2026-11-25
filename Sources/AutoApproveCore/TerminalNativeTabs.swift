@@ -132,6 +132,80 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
         guard groups.count<=1 else {throw AppError.message("Terminal의 탭 묶음을 구분하지 못했습니다.")}
         return groups.first
     }
+    private typealias WindowNumber = @convention(c) (AXUIElement, UnsafeMutablePointer<UInt32>) -> AXError
+    private static let windowNumber: WindowNumber? = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow").map {
+        unsafeBitCast($0, to: WindowNumber.self)
+    }
+
+    private func number(of window: AXUIElement) -> UInt32? {
+        var number: UInt32 = 0
+        guard Self.windowNumber?(window, &number) == .success, number > 0 else { return nil }
+        return number
+    }
+
+    struct FrontWindow {
+        let element: AXUIElement
+        let number: UInt32
+    }
+
+    func frontWindow() -> FrontWindow? {
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.5
+        guard services.foreground(ownerPID), let value = try? attribute(application, kAXFocusedWindowAttribute, deadline: deadline),
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        let window = value as! AXUIElement
+        return number(of: window).map { FrontWindow(element: window, number: $0) }
+    }
+
+    func returnFocus(to previous: FrontWindow?, afterOpening newWindow: UInt32) {
+        guard let previous, previous.number != newWindow, number(of: previous.element) == previous.number,
+              (try? check()) != nil, frontWindow()?.number == newWindow else { return }
+        _ = services.action(previous.element, kAXRaiseAction)
+    }
+
+    func tabBar(windowID: UInt32) throws -> TerminalNativeTabGroup? {
+        try check()
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        guard let windows = try attribute(application, kAXWindowsAttribute, deadline: deadline) as? [AXUIElement],
+              windows.count <= 512, let window = windows.first(where: { number(of: $0) == windowID }) else { return nil }
+        return try group(window, deadline: deadline)
+    }
+
+    private func barWindow(_ state: TerminalNativeTabGroup, deadline: TimeInterval) throws -> AXUIElement? {
+        guard state.id > 0, state.id <= elements.count,
+              let value = try attribute(elements[state.id - 1], kAXWindowAttribute, deadline: deadline),
+              CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    func pressNewTab(in state: TerminalNativeTabGroup, windowID: UInt32, posting: () -> Void) throws {
+        try check()
+        let deadline = ProcessInfo.processInfo.systemUptime + 1
+        guard let window = try barWindow(state, deadline: deadline), number(of: window) == windowID,
+              try group(window, deadline: deadline) == state,
+              let items = try attribute(elements[state.id - 1], kAXChildrenAttribute, deadline: deadline) as? [AXUIElement] else {
+            throw AppError.message("탭을 추가할 Terminal 창이 바뀌었습니다.")
+        }
+        let buttons = try items.filter { try attribute($0, kAXRoleAttribute, deadline: deadline) as? String == kAXButtonRole }
+        guard buttons.count == 1, (try attribute(buttons[0], kAXEnabledAttribute, deadline: deadline) as? NSNumber)?.boolValue == true,
+              let current = try barWindow(state, deadline: deadline), number(of: current) == windowID else {
+            throw AppError.message("원래 창의 새 탭 버튼을 확인하지 못했습니다.")
+        }
+        try Task.checkCancellation()
+        posting()
+        guard services.action(buttons[0], kAXPressAction) == .success else { throw AppError.message("새 탭 버튼의 응답을 확인하지 못했습니다.") }
+    }
+
+    func addedWindow(in original: TerminalNativeTabGroup) throws -> UInt32? {
+        try check()
+        let deadline = ProcessInfo.processInfo.systemUptime + 1
+        guard let window = try barWindow(original, deadline: deadline),
+              let state = try group(window, deadline: deadline), state.id == original.id,
+              state.tabs.count == original.tabs.count + 1,
+              let oldIndex = original.tabs.firstIndex(of: original.selected),
+              state.tabs.firstIndex(of: state.selected) == oldIndex + 1 else { return nil }
+        return number(of: window)
+    }
+
     private func rememberFocus(deadline:TimeInterval) throws {
         originalWindow=nil
         if observesForeground {originalApplication=NSWorkspace.shared.frontmostApplication}

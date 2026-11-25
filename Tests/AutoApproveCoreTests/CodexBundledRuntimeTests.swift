@@ -104,6 +104,49 @@ extension ApprovalTests {
         guard reply.status==0,reply.output.trimmingCharacters(in:.whitespacesAndNewlines)=="codex-cli "+version,
               CodexAccountTransitionLocal.supported(version) else {throw AppError.message("Fixture version mismatch")}
     }
+    func testProfileBatchReuseRequiresSameServer() async throws {
+        let fixture = try BundledRuntimeFixture()
+        let bundle = try CodexBundledRuntime.inspect(root: fixture.root.path, release: fixture.release)
+        let entry = TerminalProfileEntry(title: "Test", agent: "codex", cwd: fixture.root.path, conversationID: UUID().uuidString, providerHome: fixture.root.path)
+        let batch = CodexProfileLaunchBatch(), calls = BundledLaunchCalls()
+        let services = CodexManagedServerServices(inspect: { _, _ in .init(phase: .running, version: bundle.version, detail: "") },
+                                                 prepare: { _, _ in throw AppError.message("Unexpected server start") })
+        for generation: UInt32 in [1, 1, 2, 2] {
+            let identity = CodexNativePeerIdentity(source: "fixture", pid: 42, effectiveUid: getuid(), effectiveGid: getgid(), auditPidVersion: generation)
+            let runtime = try await batch.runtime(for: entry, peer: { _ in identity }, attest: { _ in identity }) {
+                await calls.record(entry.cwd)
+                return try await CodexProfileLaunchRuntime.resolve(entry: entry, runtime: bundle, server: services)
+            }
+            try runtime.verifyUnchanged()
+        }
+        try expectEqual(calls.homes.count, 2)
+    }
+
+    func testProfileShellReadsLongCommandOnce() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("aa-restore-test-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let payload = String(repeating: "한글 '/example/$PATH ", count: 400)
+        let output = directory.appendingPathComponent("received")
+        let command = "/usr/bin/printf '%s' " + HookInstaller.quote(payload) + " >> " + HookInstaller.quote(output.path)
+        let file = try TerminalProfileCommandFile(command: command, directory: directory)
+        let attributes = try FileManager.default.attributesOfItem(atPath: file.url.path)
+        try expectEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        let line = ". " + HookInstaller.quote(file.url.path)
+        try expect(line.utf8.count < 512)
+        try expectEqual(try CommandRunner.run("/bin/zsh", ["-f", "-c", line]).status, 0)
+        try file.waitForShell(timeout: 0)
+        try expect(try CommandRunner.run("/bin/zsh", ["-f", "-c", line]).status != 0)
+        let waiting = try TerminalProfileCommandFile(command: command, directory: directory)
+        do {
+            try waiting.waitForShell(timeout: 0)
+            try expect(false, "An unread command must time out")
+        } catch is AppError {}
+        try expect(waiting.withdraw())
+        try expect(try CommandRunner.run("/bin/sh", [waiting.url.path]).status != 0)
+        try expectEqual(try Data(contentsOf: output), Data(payload.utf8))
+    }
+
     func testProfileLaunchAttestsNewerServerAfterStart() async throws {
         let f=try BundledRuntimeFixture(),runtime=try CodexBundledRuntime.inspect(root:f.root.path,release:f.release),calls=BundledLaunchCalls()
         let cliPath=f.root.appendingPathComponent("managed-codex")

@@ -1,12 +1,8 @@
 import Foundation
 import Darwin
 
-/// Original CLI/server operations used by the app's restart coordinator.
-/// Terminal delivery and collaboration-group restoration stay in the engine.
 enum CodexCohortRuntime {
-    /// A stopped official daemon can leave a real socket inode behind. File
-    /// existence is not liveness; only connection refusal/absence means absent.
-    private static func peer(home:String)throws->CodexNativePeerIdentity? {
+    static func peer(home:String)throws->CodexNativePeerIdentity? {
         guard let path=CodexQueueConnection.socketPath(home:home) else {
             let entry=URL(fileURLWithPath:home).appendingPathComponent("app-server-control/app-server-control.sock").path
             var info=stat(),target=stat()
@@ -60,15 +56,10 @@ enum CodexCohortRuntime {
                 let target=CodexAccountTransitionTarget(home:plan.sourceHome,executable:cli.executable)
                 let runtime=try CodexAccountRuntime(target)
                 let server=try CodexAccountTransitionLocal.identity(target,runtime:runtime)
-                // Stop future Goal work and flush current work/accounting using
-                // the same original lifecycle used by account reconnection.
                 let roots=plan.original.entries.map(\.conversationID)
                 let movingRoots=Set(plan.original.entries.filter{plan.movingEntryIDs.contains($0.id)}.map(\.conversationID))
                 var settled=Set<String>()
                 while true {
-                    // A running parent may have spawned a child after the
-                    // preview. Refresh after each parent is stopped, and keep
-                    // previously captured children across a cold archive retry.
                     let fresh=try CodexMigrationThread.captureScope(connection:connection,home:plan.sourceHome,rootIDs:roots)
                     var byID=Dictionary(uniqueKeysWithValues:context.scope.map{($0.id,$0)})
                     var changed=false
@@ -107,8 +98,6 @@ enum CodexCohortRuntime {
                             try await save(context)
                         }
                         if let goal=context.originalGoals[item.id],goal.status == .active {
-                            // Exclude an independent rollout writer while
-                            // deferring automatic work before native attachment.
                             let lease=try CodexOfficialWriterLease(home:plan.sourceHome,threadIDs:[item.id])
                             defer{lease.close()}
                             let access=try CodexOfficialGoalStateAccess(home:plan.sourceHome,userHome:context.launch.userHome,executable:cli.executable)
@@ -119,8 +108,6 @@ enum CodexCohortRuntime {
                                   snapshot.row.timeUsedSeconds>=goal.timeUsedSeconds else{throw AppError.message("독립 실행의 보존할 Goal이 바뀌었습니다.")}
                             _=try access.deferContinuation(snapshot)
                         }
-                        // No parent message or model turn is injected. A Goal
-                        // was paused/deferred above before this lifecycle hook.
                         _=try connection.request("thread/resume",["threadId":item.id,"excludeTurns":true],classifyError:true)
                     }
                     let current=try CodexAccountTransitionLocal.thread(connection,id:item.id,home:plan.sourceHome,allowSubagent:true)
@@ -167,8 +154,6 @@ enum CodexCohortRuntime {
                     guard result.status==0 else{throw AppError.message("원래 Codex 서버의 재시작 응답을 확인하지 못했습니다. 저장한 단계에서 연결 상태를 다시 확인합니다.")}
                 }
             } else {
-                // Native start owns stale-socket cleanup and daemon locks. The
-                // app neither deletes socket files nor repeats an uncertain stop.
                 let result=try cli.run(["app-server","daemon","start"],timeout:90)
                 guard result.status==0 else{throw AppError.message("종료된 Codex 서버의 시작 결과를 확인하지 못했습니다.")}
             }
@@ -186,16 +171,12 @@ enum CodexCohortRuntime {
             for thread in context.movingThreads.sorted() {
                 guard let id=context.transfers[thread],let path=context.archivedPaths?[thread] else{throw AppError.message("이동할 대화의 저장 기록이 없습니다.")}
                 if try service.completed(id:id){continue}
-                // A failed read is not absence. Only a genuinely missing state
-                // permits preparing a new request; other errors remain errors.
                 let journal=try CodexMigrationJournal(store:AuditStore(path:database))
                 if try journal.load(id:id.uuidString.lowercased())==nil {
                     try service.prepare(id:id,sourceHome:plan.sourceHome,destinationHome:plan.destinationHome,threadID:thread,archivedPath:path,checkpoint:{try Task.checkCancellation()})
                 }
                 _=try service.advance(id:id,checkpoint:{try Task.checkCancellation()})
             }
-            // Native unarchive updates the official index and moves the file.
-            // Later TUI launch selects the UUID, never the obsolete archive path.
             let connection=try CodexQueueConnection(home:plan.destinationHome)
             for thread in context.movingThreads.sorted() {
                 guard let id=context.transfers[thread] else{throw AppError.message("대화 이전 요청의 식별자가 없습니다.")}
@@ -208,8 +189,6 @@ enum CodexCohortRuntime {
                 let response=try connection.request("thread/read",["threadId":thread,"includeTurns":false])
                 guard let row=response["thread"] as? JSONObject,let path=row["path"] as? String else{throw AppError.message("목적지의 대화 이력을 확인하지 못했습니다.")}
                 if path.contains("/archived_sessions/"){_=try connection.request("thread/unarchive",["threadId":thread],classifyError:true)}
-                // Let the original server initialize its own paginated store;
-                // this read neither selects a TUI nor starts a model turn.
                 _=try connection.request("thread/turns/list",["threadId":thread,"limit":1,"itemsView":"notLoaded"])
                 let sourceLease=try CodexOfficialWriterLease(home:plan.sourceHome,threadIDs:[thread])
                 let targetLease=try CodexOfficialWriterLease(home:plan.destinationHome,threadIDs:[thread])
@@ -261,9 +240,6 @@ enum CodexCohortRuntime {
                 _=try CodexOfficialExecutable.verifyServer(connection)
                 let metadata=try connection.request("thread/read",["threadId":id,"includeTurns":false])["thread"] as? JSONObject
                 if (metadata?["status"] as? JSONObject)?["type"] as? String=="notLoaded" {
-                    // A child has no selected TUI to load it after a cold
-                    // handoff. Attest its preserved Goal before attaching the
-                    // original lifecycle; never infer identity from its PID.
                     guard let goal=try CodexSessionAttachment.goalIfPresent(home:home,threadID:id),
                           goal.instanceID==original.instanceID,goal.objective==original.objective,
                           goal.tokenBudget==original.tokenBudget,goal.createdAt==original.createdAt,

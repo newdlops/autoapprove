@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import AppKit
 
 enum TerminalProfileScriptQueries {
     static let windowIDs = """
@@ -15,11 +16,15 @@ enum TerminalProfileScriptQueries {
 
     function inventory(){
       const ids=app.windows.id(),real=realWindowIDs(ids);
-      const groups=real.length===ids.length
+      let groups=real.length===ids.length
         ? app.windows.tabs.tty()
         : real.map(id=>app.windows.byId(id).tabs.tty());
-      if(!Array.isArray(groups)||real.length!==groups.length||
-         JSON.stringify(ids)!==JSON.stringify(app.windows.id())||groups.some(tabs=>!Array.isArray(tabs)))
+      if(JSON.stringify(ids)!==JSON.stringify(app.windows.id())){
+        const current=realWindowIDs(app.windows.id());
+        if(current.length!==real.length||current.some(id=>!real.includes(id)))throw Error('Terminal 창·탭 구성이 바뀌었습니다.');
+        groups=real.map(id=>app.windows.byId(id).tabs.tty());
+      }
+      if(!Array.isArray(groups)||real.length!==groups.length||groups.some(tabs=>!Array.isArray(tabs)))
         throw Error('Terminal 창·탭 구성이 바뀌었습니다.');
       const rows=[],seen=new Set();
       groups.forEach((tabs,index)=>tabs.forEach(tty=>{
@@ -261,7 +266,7 @@ public enum TerminalProfileTopology {
 public enum TerminalProfileTabOpener {
     private struct Prepared:Codable {var tty:String;var windowID:UInt32;var ttys:[String]}
     private static let lock=NSLock()
-    public static func prepareScript(anchorTTY:String,settingsName:String? = nil) throws -> String {
+    public static func prepareScript(anchorTTY:String,settingsName:String? = nil,select:Bool = true) throws -> String {
         guard TerminalProfileLauncher.validTTY(anchorTTY) else {throw AppError.message("원래 Terminal 탭을 확인하지 못했습니다.")}
         let wanted=try AutomationScript.literal(anchorTTY)
         let settings=try AutomationScript.literal(settingsName as Any? ?? NSNull())
@@ -273,7 +278,7 @@ public enum TerminalProfileTabOpener {
           const rows=inventory(),anchor=rows.find(row=>row.tty===wanted),ttys=rows.map(row=>row.tty);
           if(!anchor)throw Error('원래 Terminal 탭이 닫혔거나 이동했습니다.');
           const {window,tab}=exactTab(anchor);
-          window.miniaturized=false;window.selectedTab=tab;window.index=1;app.activate();
+          \(select ? "window.miniaturized=false;window.selectedTab=tab;window.index=1;app.activate();" : "")
           return JSON.stringify({tty:wanted,windowID:Number(window.id()),ttys});
         })();
         """
@@ -302,6 +307,83 @@ public enum TerminalProfileTabOpener {
         })();
         """
     }
+    public static func openForProfile(anchorTTY: String, settingsName: String?) throws -> String {
+        var posted = false
+        do {
+            let owner = try TerminalProcessLookup.running()
+            let reader = try TerminalNativeTabReader.terminal(owner: owner)
+            func run(_ body: String) throws -> String {
+                try AutomationScript.run(body, app: "Terminal", denied: .permissionDenied, timeout: 6)
+            }
+            let initial = try JSONDecoder().decode(Prepared.self, from: Data(run(prepareScript(anchorTTY: anchorTTY, settingsName: settingsName, select: false)).utf8))
+            guard initial.tty == anchorTTY, initial.ttys.contains(anchorTTY) else { throw AppError.message("탭을 추가할 원래 창이 닫혔습니다.") }
+            let previousFocus = reader.frontWindow()
+            func locate() throws -> TerminalNativeTabGroup? {
+                if let bar = try reader.tabBar(windowID: initial.windowID) { return bar }
+                _ = try run(TerminalProfileLauncher.selectionScript(anchorTTY, activate: false))
+                return try reader.tabBar(windowID: initial.windowID)
+            }
+            guard var bar = try locate() else {
+                if NSWorkspace.shared.frontmostApplication?.processIdentifier == owner.pid {
+                    do { return try open(anchorTTY: anchorTTY, settingsName: settingsName) }
+                    catch let error as RemoteHTTPError {
+                        posted = error.diagnostics?["tab_creation"] == "unknown"
+                        throw error
+                    }
+                }
+                throw AppError.message("원래 창의 탭 막대를 찾지 못했습니다. Terminal의 보기 메뉴에서 탭 막대를 표시해주세요.")
+            }
+            do { try reader.pressNewTab(in: bar, windowID: initial.windowID) { posted = true } }
+            catch {
+                guard !posted, let fresh = try locate() else { throw error }
+                bar = fresh
+                try reader.pressNewTab(in: fresh, windowID: initial.windowID) { posted = true }
+            }
+            let previous = try AutomationScript.literal(initial.ttys)
+            let windowID: UInt32
+            do {
+                windowID = try TerminalProfileReadiness.wait(timeout: 0.5, message: "새 탭 선택을 확인하지 못했습니다.") {
+                    try reader.addedWindow(in: bar)
+                }
+            } catch {
+                try Task.checkCancellation()
+                let text = try run("""
+                (() => {
+                  const app=Application('com.apple.Terminal'), previous=new Set(\(previous));
+                  \(TerminalProfileScriptQueries.inventory)
+                  const rows=inventory(), added=rows.filter(row=>!previous.has(row.tty));
+                  if(added.length!==1 || rows.length!==previous.size+1)throw Error('추가된 탭 하나를 구분하지 못했습니다.');
+                  const {window,tab}=exactTab(added[0]);window.selectedTab=tab;window.index=1;
+                  return String(added[0].windowID);
+                })();
+                """)
+                guard let candidate = UInt32(text) else { throw AppError.message("새 탭의 창을 확인하지 못했습니다.") }
+                windowID = try TerminalProfileReadiness.wait(message: "새 탭이 원래 창에 추가됐는지 확인하지 못했습니다.") {
+                    try reader.addedWindow(in: bar) == candidate ? candidate : nil
+                }
+            }
+            reader.returnFocus(to: previousFocus, afterOpening: windowID)
+            let result = try run("""
+            (() => {
+              const app = Application('com.apple.Terminal'), previous = new Set(\(previous));
+              const window = app.windows.byId(\(windowID));
+              if (!window.exists() || Number(window.id()) !== \(windowID)) throw Error('새 탭이 닫혔습니다.');
+              const tty = window.selectedTab().tty();
+              if (!tty || previous.has(tty)) throw Error('새 탭의 터미널 장치를 확인하지 못했습니다.');
+              return tty;
+            })();
+            """)
+            guard TerminalProfileLauncher.validTTY(result), TerminalProcessLookup.identity(pid: owner.pid) == owner else {
+                throw AppError.message("새 Terminal 탭의 장치가 바뀌었습니다.")
+            }
+            return result
+        } catch {
+            var details = ["command_delivery": "not_started"]
+            details[posted ? "tab_creation" : "delivery"] = posted ? "unknown" : "not_started"
+            throw RemoteHTTPError(409, error.localizedDescription, diagnostics: details)
+        }
+    }
+
     public static func open(anchorTTY:String,settingsName:String? = nil,environment suppliedEnvironment:TerminalKeyboard.Environment? = nil,
                             nativeGroupReader:(() throws -> TerminalNativeTabGroup?)? = nil,
                             nativeTabSelector:((TerminalNativeTabGroup,TerminalNativeTabGroup) throws -> Void)? = nil) throws -> String {

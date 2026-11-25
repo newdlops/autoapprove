@@ -364,6 +364,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                 }
             }
         }
+        let batch = CodexProfileLaunchBatch()
         let selectedEntries=entries.filter {selected.contains($0.id)}
         for (position,entry) in selectedEntries.enumerated() {
             let key=group(entry)
@@ -384,7 +385,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                 dispatched[entry.key]=Receipt(tty:nil)
                 do {
                     let anchor = key.flatMap {anchors[$0]}
-                    let tty=try await launch(entry,anchor)
+                    let tty=try await CodexProfileLaunchBatch.$current.withValue(batch) { try await launch(entry,anchor) }
                     if entry.host == .terminal, terminal == nil {terminal = await terminalProcess()}
                     dispatched[entry.key]=Receipt(tty:tty,terminal:entry.host == .terminal ? terminal:nil)
                     knownTTYs[entry.key]=tty
@@ -422,14 +423,66 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
 public enum TerminalProfileLauncher {
     public static func validTTY(_ tty:String)->Bool {tty.range(of:#"^/dev/ttys[0-9]+$"#,options:.regularExpression) != nil}
     public static func script(_ entry: TerminalProfileEntry,targetTTY:String?=nil,nativeRuntimeRoot:String?=nil) throws -> String {
-        try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:nil)
+        try script(entry,targetTTY:targetTTY,command:entry.resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot))
     }
-    static func script(_ entry:TerminalProfileEntry,targetTTY:String?,nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?,compatibleCLI:CodexCLIContext?=nil,standalone:Bool=false) throws ->String {
-        let entry=try entry.validated(),command=try AutomationScript.literal(entry.resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:bundledRuntime,compatibleCLI:compatibleCLI,standalone:standalone))
+    static func script(_ entry:TerminalProfileEntry,targetTTY:String?,command rawCommand:String,commandFile:TerminalProfileCommandFile? = nil) throws ->String {
+        let command=try AutomationScript.literal(rawCommand)
         if entry.host == .iterm {
-            return "const app=Application('com.googlecode.iterm2'); app.activate(); const window=app.createWindowWithDefaultProfile({command:\(command)}); JSON.stringify({tty:window.currentSession().tty()});"
+            return "const app=Application('com.googlecode.iterm2'); const window=app.createWindowWithDefaultProfile({command:\(command)}); JSON.stringify({tty:window.currentSession().tty()});"
         }
         let target=try AutomationScript.literal(targetTTY as Any? ?? NSNull()),settings=try AutomationScript.literal(entry.terminalTab?.settingsName as Any? ?? NSNull()),title=try AutomationScript.literal(entry.terminalTab?.customTitle as Any? ?? NSNull())
+        if let commandFile {
+            let path=try AutomationScript.literal(HookInstaller.quote(commandFile.url.path))
+            return """
+            (()=>{
+              ObjC.import('Foundation');
+              const app=Application('com.apple.Terminal'),target=\(target),settings=\(settings),title=\(title);
+              let commandAttempted=false,created=false;
+              try {
+                const profile=settings===null ? null:app.settingsSets.byName(settings);
+                if(profile!==null&&!profile.exists())throw Error('저장한 Terminal 설정 프로필이 없습니다.');
+                \(TerminalProfileScriptQueries.inventory)
+                function frontWindow(){
+                  try {return app.frontmost() ? realWindowIDs(app.windows.id())[0] : null;}catch(_){return null;}
+                }
+                function returnFocus(previous,opened){
+                  if(previous && previous!==opened && frontWindow()===opened){
+                    try {const window=app.windows.byId(previous);if(window.exists())window.index=1;}catch(_){}
+                  }
+                }
+                let tty=target, previous=null;
+                if(tty===null){
+                  const before=new Set(inventory().map(row=>row.tty));
+                  previous=frontWindow();
+                  created=true;
+                  tty=app.doScript('').tty();
+                  if(!tty||before.has(tty))throw Error('새 Terminal 창의 탭을 확인하지 못했습니다.');
+                }
+                const row=inventory().find(row=>row.tty===tty);
+                if(!row)throw Error('복원할 Terminal 탭이 닫혔습니다.');
+                if(created)returnFocus(previous,row.windowID);
+                const {tab}=exactTab(row),deadline=Date.now()+8000;
+                let shell;
+                do {
+                  const jobs=tab.processes().map(p=>String(p).trim().split(/\\s+/)[0].split('/').pop().replace(/^-/,'')).filter(p=>p!=='login');
+                  if(jobs.length===1 && /^(zsh|bash|sh|fish|tcsh|csh|dash|ksh)$/.test(jobs[0]) && !tab.busy()){
+                    shell=jobs[0];break;
+                  }
+                  $.NSThread.sleepForTimeInterval(0.05);
+                }while(Date.now()<deadline);
+                if(!shell)throw Error('복원할 탭의 빈 셸을 확인하지 못했습니다.');
+                if(profile!==null && tab.currentSettings().name()!==settings)tab.currentSettings=profile;
+                if(title!==null && tab.customTitle()!==title)tab.customTitle=title;
+                if(tab.tty()!==tty||tab.busy())throw Error('복원할 탭이 바뀌었습니다.');
+                previous=frontWindow();
+                commandAttempted=true;
+                app.doScript((['fish','tcsh','csh'].includes(shell)?'/bin/sh ':'. ')+\(path),{in:tab});
+                returnFocus(previous,row.windowID);
+                return JSON.stringify({tty});
+              }catch(error){return JSON.stringify({error:String(error.message||error),commandAttempted,created});}
+            })();
+            """
+        }
         return """
         (()=>{
           const app=Application('com.apple.Terminal'),target=\(target),settings=\(settings),title=\(title);
@@ -459,47 +512,70 @@ public enum TerminalProfileLauncher {
         """
     }
     public static func launch(_ entry: TerminalProfileEntry,anchorTTY:String?=nil,
-                              openTab:@escaping @Sendable (String,String?) throws -> String = {try TerminalProfileTabOpener.open(anchorTTY:$0,settingsName:$1)},
+                              openTab:@escaping @Sendable (String,String?) throws -> String = {try TerminalProfileTabOpener.openForProfile(anchorTTY:$0,settingsName:$1)},
                               execute:(@Sendable (String,TerminalProfileEntry.Host) throws -> String)? = nil) async throws -> String {
         let entry=try entry.validated()
+        let batch = CodexProfileLaunchBatch.current
         return try await Task.detached(priority:.userInitiated) {
+            @Sendable func prepare() async throws -> CodexProfileLaunchRuntime {
+                if let runtime = try CodexBundledRuntime.bundled() {
+                    return try await CodexProfileLaunchRuntime.resolve(entry: entry, runtime: runtime, server: .local(executable: runtime.executable))
+                }
+                guard let candidate = try CodexCLIContext.resolve(home: entry.providerHome ?? NSHomeDirectory()+"/.codex", userHome: NSHomeDirectory(), executable: nil) else {
+                    throw AppError.message("공식 Codex CLI를 찾지 못했습니다. Codex를 설치한 뒤 다시 복원해주세요.")
+                }
+                let cli = try CodexOfficialExecutable.context(candidate)
+                return try await CodexProfileLaunchRuntime.resolveInstalled(entry: entry, cli: cli, server: .local(executable: cli.executable))
+            }
             let launchRuntime:CodexProfileLaunchRuntime?
             do {
-                if entry.agent == "codex" {
-                    if let runtime=try CodexBundledRuntime.bundled() {
-                        launchRuntime=try await CodexProfileLaunchRuntime.resolve(entry:entry,runtime:runtime,server:.local(executable:runtime.executable))
-                    } else {
-                        guard let candidate=try CodexCLIContext.resolve(home:entry.providerHome ?? NSHomeDirectory()+"/.codex",userHome:NSHomeDirectory(),executable:nil) else {
-                            throw AppError.message("공식 Codex CLI를 찾지 못했습니다. Codex를 설치한 뒤 다시 복원해주세요.")
-                        }
-                        let cli=try CodexOfficialExecutable.context(candidate)
-                        launchRuntime=try await CodexProfileLaunchRuntime.resolveInstalled(entry:entry,cli:cli,server:.local(executable:cli.executable))
-                    }
-                } else {launchRuntime=nil}
+                if entry.agent != "codex" { launchRuntime = nil }
+                else if let batch { launchRuntime = try await batch.runtime(for: entry, prepare: prepare) }
+                else { launchRuntime = try await prepare() }
             } catch {
                 throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["delivery":"not_started"])
             }
             func deliver() throws -> String {
+                let command:String, file:TerminalProfileCommandFile?
+                do {
+                    command=try entry.resumeCommand(nativeRuntimeRoot:nil,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed,standalone:launchRuntime?.standalone ?? false)
+                    file=entry.host == .terminal ? try TerminalProfileCommandFile(command:command):nil
+                } catch { throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["command_delivery":"not_started"]) }
+                defer { file?.withdraw() }
                 var targetTTY:String?
                 if entry.host == .terminal,let anchorTTY {
                     targetTTY=try openTab(anchorTTY,entry.terminalTab?.settingsName)
                 }
-                try launchRuntime?.verifyUnchanged()
-                let body=try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nil,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed,standalone:launchRuntime?.standalone ?? false)
-                let text:String
+                let body=try script(entry,targetTTY:targetTTY,command:file == nil ? command:"",commandFile:file)
                 do {
-                    if let execute {text=try execute(body,entry.host)}
-                    else {text=try AutomationScript.run(body,app:entry.host == .iterm ? "iTerm2":"Terminal",denied:entry.host == .iterm ? .automationDenied("iTerm2"):.permissionDenied)}
+                    try launchRuntime?.verifyUnchanged()
+                    let text:String
+                    do {
+                        if let execute {text=try execute(body,entry.host)}
+                        else {text=try AutomationScript.run(body,app:entry.host == .iterm ? "iTerm2":"Terminal",denied:entry.host == .iterm ? .automationDenied("iTerm2"):.permissionDenied,timeout:entry.host == .terminal ? 12:8)}
+                    }
+                    catch let error as TerminalAdapterError {
+                        throw RemoteHTTPError(403,error.localizedDescription,diagnostics:entry.host == .iterm ? ["delivery":"not_started"]:nil)
+                    }
+                    guard let object=try JSONSerialization.jsonObject(with:Data(text.utf8)) as? JSONObject else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
+                    if let failure=object["error"] as? String {
+                        var diagnostics:[String:String]=[:]
+                        if object["commandAttempted"] as? Bool == false {diagnostics["command_delivery"]="not_started"}
+                        if object["created"] as? Bool == true {diagnostics["tab_creation"]="unknown"}
+                        throw RemoteHTTPError(409,failure,diagnostics:diagnostics)
+                    }
+                    guard let tty=object["tty"] as? String,validTTY(tty) else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
+                    try file?.waitForShell()
+                    return tty
+                } catch {
+                    if let file, file.withdraw() {
+                        var diagnostics=(error as? RemoteHTTPError)?.diagnostics ?? [:]
+                        diagnostics["command_delivery"]="not_started"
+                        if targetTTY != nil {diagnostics["tab_creation"]="unknown"}
+                        throw RemoteHTTPError(409,error.localizedDescription,diagnostics:diagnostics)
+                    }
+                    throw error
                 }
-                catch let error as TerminalAdapterError {
-                    throw RemoteHTTPError(403,error.localizedDescription,diagnostics:targetTTY==nil ? ["delivery":"not_started"]:nil)
-                }
-                guard let object=try JSONSerialization.jsonObject(with:Data(text.utf8)) as? JSONObject else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
-                if let failure=object["error"] as? String {
-                    throw RemoteHTTPError(409,failure,diagnostics:object["commandAttempted"] as? Bool == false ? ["command_delivery":"not_started"]:nil)
-                }
-                guard let tty=object["tty"] as? String,validTTY(tty) else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
-                return tty
             }
             guard execute == nil, entry.host == .terminal else { return try deliver() }
             do {
@@ -540,11 +616,11 @@ public enum TerminalProfileLauncher {
         guard validTTY(tty) else {throw AppError.message("선택할 Terminal 탭을 확인하지 못했습니다.")}
         _ = try await Task.detached(priority:.utility) {
             try AutomationIPC.shared.run(host:"Terminal",readOnly:false,budget:6,admissionWait:3) {
-                try AutomationScript.run(selectionScript(tty),app:"Terminal",denied:.permissionDenied,timeout:6)
+                try AutomationScript.run(selectionScript(tty,activate:false,preserveForeground:true),app:"Terminal",denied:.permissionDenied,timeout:6)
             }
         }.value
     }
-    public static func selectionScript(_ tty:String) throws -> String {
+    public static func selectionScript(_ tty:String,activate:Bool = true,preserveForeground:Bool = false) throws -> String {
         guard validTTY(tty) else {throw AppError.message("선택할 Terminal 탭을 확인하지 못했습니다.")}
         let target=try AutomationScript.literal(tty)
         return """
@@ -553,7 +629,8 @@ public enum TerminalProfileLauncher {
           \(TerminalProfileScriptQueries.inventory)
           const row=inventory().find(row=>row.tty===\(target));
           if(!row)throw Error('선택할 탭이 닫혔거나 바뀌었습니다.');
-          const {window,tab}=exactTab(row);window.selectedTab=tab;window.miniaturized=false;window.index=1;app.activate();return 'selected';
+          \(preserveForeground ? "if(app.frontmost() && app.windows[0].selectedTab().tty()!==row.tty)return 'user selection preserved';" : "")
+          const {window,tab}=exactTab(row);window.selectedTab=tab;window.miniaturized=false;window.index=1;\(activate ? "app.activate();" : "")return 'selected';
         })();
         """
     }
