@@ -71,6 +71,14 @@ public struct OSPermissionPolicy:Codable,Equatable,Sendable {
     }
 }
 
+public struct GroupOSPermissionResult: Identifiable {
+    public enum Outcome { case changed, alreadySet, skipped }
+    public let id: UUID
+    public let member: String
+    public let outcome: Outcome
+    public let detail: String
+}
+
 struct OSPermissionPolicyEnvelope:Codable {var source:String;var policy:OSPermissionPolicy}
 
 /// Only observed, supported buttons from the original OS dialog are exposed.

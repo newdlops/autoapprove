@@ -18,6 +18,7 @@ import AutoApproveCore
     @State private var notice: String?
     @State private var showTopology = false
     @State private var composeGroup: SessionGroup?
+    @State private var permissionGroup: SessionGroup?
     @Environment(\.openWindow) private var openWindow
     private struct LeaderRepair {
         let group: SessionGroup
@@ -113,6 +114,11 @@ import AutoApproveCore
                 }
             }
         }
+        .sheet(item: $permissionGroup) { group in
+            GroupOSPermissionSheet(group: group) { kinds, allow in
+                try await engine.applyGroupOSPermissions(group, kinds: kinds, allow: allow)
+            }
+        }
         .sheet(item: $composeGroup) { group in
             SessionGroupMessageSheet(group: group, engine: engine) {
                 notice = "그룹 메시지를 로컬 수신함에 저장했습니다."
@@ -188,6 +194,8 @@ import AutoApproveCore
             }
             HStack {
                 Spacer()
+                Button("그룹 OS 권한…") { permissionGroup = group }
+                    .disabled(loading || group.members.isEmpty)
                 Button("메시지 보내기…") { composeGroup = group }
                     .disabled(loading || group.members.filter { UUID(uuidString: $0.conversationID) != nil }.count < 2)
                 Menu("세션 추가", systemImage: "plus") {
@@ -548,6 +556,78 @@ import AutoApproveCore
             return group
         }
         if persist(remaining, message: "그룹을 삭제했습니다.") { selectedID = nil }
+    }
+}
+
+@MainActor struct GroupOSPermissionSheet: View {
+    let group: SessionGroup
+    let apply: (Set<OSPermissionKind>, Bool) async throws -> [GroupOSPermissionResult]
+    @Environment(\.dismiss) private var dismiss
+    @State private var kinds = Set<OSPermissionKind>()
+    @State private var allow = true
+    @State private var applying = false
+    @State private var results: [GroupOSPermissionResult]?
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("그룹 OS 권한").font(.title2.weight(.semibold))
+            Text("\(group.name) · 구성원 \(group.members.count)개")
+                .font(.callout).foregroundStyle(.secondary)
+            if let results {
+                let changed = results.filter { $0.outcome == .changed }.count
+                let skipped = results.filter { $0.outcome == .skipped }.count
+                Text("변경 \(changed)개 · 이미 설정됨 \(results.count - changed - skipped)개 · 미적용 \(skipped)개")
+                    .font(.headline)
+                List(results) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(row.member)
+                        Text(row.detail).font(.callout)
+                            .foregroundStyle(row.outcome == .skipped ? Color.orange : Color.secondary)
+                    }.padding(.vertical, 3)
+                }.frame(height: 220)
+            } else {
+                Text("선택한 권한을 현재 연결된 구성원의 OS 권한 정책에 적용합니다. 자동 승인은 각 세션에 등록한 앱과 직접 연결한 요청에 적용됩니다.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Picker("변경 방식", selection: $allow) {
+                    Text("허용 추가").tag(true)
+                    Text("허용 해제").tag(false)
+                }.pickerStyle(.segmented).disabled(applying)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), alignment: .leading)], alignment: .leading, spacing: 10) {
+                    ForEach(OSPermissionKind.automaticCases, id: \.self) { kind in
+                        Toggle(kind.title, isOn: Binding(get: { kinds.contains(kind) }, set: { selected in
+                            if selected { kinds.insert(kind) } else { kinds.remove(kind) }
+                        })).toggleStyle(.checkbox)
+                    }
+                }.disabled(applying)
+            }
+            if let error {
+                Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+            }
+            HStack {
+                if applying {
+                    ProgressView().controlSize(.small)
+                    Text("구성원 연결 확인 중…").font(.callout)
+                }
+                Spacer()
+                if results != nil {
+                    Button("다시 설정") { results = nil; error = nil }
+                    Button("완료") { dismiss() }.keyboardShortcut(.defaultAction)
+                } else {
+                    Button("취소") { dismiss() }.keyboardShortcut(.cancelAction).disabled(applying)
+                    Button("그룹 전체에 적용") {
+                        applying = true; error = nil
+                        Task {
+                            defer { applying = false }
+                            do { results = try await apply(kinds, allow) }
+                            catch { self.error = error.localizedDescription }
+                        }
+                    }.keyboardShortcut(.defaultAction).disabled(kinds.isEmpty || applying)
+                }
+            }
+        }
+        .padding(24).frame(width: 460)
+        .interactiveDismissDisabled(applying)
     }
 }
 

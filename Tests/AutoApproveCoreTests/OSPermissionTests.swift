@@ -181,6 +181,57 @@ extension ApprovalTests {
         try expectNil(engine.snapshot.osPermissions?.requests.first {$0.id==detached.id}?.sessionID)
         try expectEqual(fixture.presses,[first.id,next.id])
     }
+    func testGroupOSPermissionEditsOnlySelectedKindsAndMembers() async throws {
+        let fixture = OSFixture(), root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (engine, _) = try await osEngine(fixture, root: root)
+        defer { engine.stop() }
+        let others = ProcessDiscovery.parse("""
+        100903 1 ttys903 100903 100903 Wed Oct 28 22:03:00 2026 /fixture/agy
+        100904 1 ttys904 100904 100904 Wed Oct 28 22:04:00 2026 /fixture/codex
+        """)
+        let records = fixture.records + others
+        fixture.replace(records)
+        let live = records.map { AgentSession(id: $0.key, agent: $0.agent!, pid: $0.pid, started: $0.started,
+                                             tty: "/dev/" + $0.tty, cwd: "/fixture/project", terminal: .terminal) }
+        engine.updateDiscovery(live, records: records, directories: Dictionary(uniqueKeysWithValues: live.map { ($0.id, $0.cwd) }))
+        var members = live.prefix(3).map { session in
+            var member = SessionGroupMember(agent: session.agent, title: session.agent.title, cwd: session.cwd, conversationID: "")
+            member.runtimeID = session.id
+            return member
+        }
+        members.append(.init(agent: .codex, title: "Offline", cwd: "/fixture/project", conversationID: UUID().uuidString.lowercased()))
+        let group = SessionGroup(name: "Permissions", members: members)
+        let store = SessionGroupStore(directory: root)
+        try store.save([group])
+        try engine.setOSPermissionPolicy(live[0].id, allowed: [.camera])
+        try engine.setOSPermissionPolicy(live[1].id, allowed: [.files])
+        let request = fixture.request()
+        fixture.set([request]); await engine.refreshOSPermissions()
+        try engine.assignOSPermission(live[0].id, requestID: request.id, token: request.immutableToken, remember: true)
+        func policy(_ i: Int) -> OSPermissionPolicy? { engine.snapshot.sessions.first { $0.id == live[i].id }?.osPermissionPolicy }
+        let first = try await engine.applyGroupOSPermissions(group, kinds: [.files], allow: true)
+        try expectEqual(first.map(\.outcome), [.changed, .alreadySet, .changed, .skipped])
+        try expectEqual(Set(policy(0)!.allowed), [.files, .camera]); try expectEqual(policy(0)?.targets, [fixture.target])
+        try expectNil(policy(3)); try expectEqual(engine.snapshot.sessions.first { $0.id == live[2].id }?.automatic, false)
+        let revision = policy(0)?.revision
+        let retry = try await engine.applyGroupOSPermissions(group, kinds: [.files], allow: true)
+        try expectEqual(retry.map(\.outcome), [.alreadySet, .alreadySet, .alreadySet, .skipped]); try expectEqual(policy(0)?.revision, revision)
+        let revoke = try await engine.applyGroupOSPermissions(group, kinds: [.files], allow: false)
+        try expectEqual(revoke.map(\.outcome), [.changed, .changed, .changed, .skipped])
+        try expectEqual(policy(0)?.allowed, [.camera]); try expectEqual(policy(0)?.targets, [fixture.target])
+        do {
+            _ = try await engine.applyGroupOSPermissions(group, kinds: [.authentication], allow: true)
+            try expect(false, "Authentication must be rejected")
+        } catch let error as AppError { try expect(error.localizedDescription.contains("선택")) }
+        var updated = group; updated.members.removeFirst()
+        try store.save([updated], expected: [group])
+        do {
+            _ = try await engine.applyGroupOSPermissions(group, kinds: [.files], allow: true)
+            try expect(false, "Stale membership must be rejected")
+        } catch let error as AppError { try expect(error.localizedDescription.contains("그룹 구성")) }
+        try expectEqual(policy(0)?.allowed, [.camera])
+    }
     func testOSPermissionSharedControllersAreOneRequestOnly() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-os-shared-"+UUID().uuidString),fixture=OSFixture();defer{try? FileManager.default.removeItem(at:root)}
         fixture.target=OSPermissionTarget(name:"Terminal",bundleID:"com.apple.Terminal",path:"/System/Applications/Utilities/Terminal.app",requirement:"anchor apple and identifier com.apple.Terminal",pid:800,started:"same host")

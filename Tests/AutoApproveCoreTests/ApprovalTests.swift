@@ -645,6 +645,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("OS permissions: uncertain manual response cannot retry or auto allow",tests.testOSPermissionManualUncertainResponseCannotBeRetriedOrAutoAllowed),
             ("OS permissions: explicit kinds, app enrollment and session isolation",tests.testOSPermissionDefaultsAndSessionIsolation),
             ("OS permissions: route launched disk requests and recheck before approval",tests.testOSPermissionLaunchedDiskRequestsStayWithOriginalSession),
+            ("OS permissions: group policy edits preserve session scope and handle offline members",tests.testGroupOSPermissionEditsOnlySelectedKindsAndMembers),
             ("OS permissions: shared controllers are current-request only",tests.testOSPermissionSharedControllersAreOneRequestOnly),
             ("OS permissions: manager setup stays manual without blocking CLI work",tests.testOSPermissionManagerSetupIsManualAndIndependent),
             ("OS permissions: pause, OFF, revocation, typing and original process races",tests.testOSPermissionPauseOffRevocationAndProcessChange),

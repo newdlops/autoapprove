@@ -11025,6 +11025,44 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions[session.id]?.osPermissionPolicy=policy
         osPermissionPolicySources[session.id]=osPermissionSource(session)
     }
+    public func applyGroupOSPermissions(_ expected: SessionGroup, kinds: Set<OSPermissionKind>, allow: Bool) async throws -> [GroupOSPermissionResult] {
+        guard !kinds.isEmpty, kinds.isSubset(of: Set(OSPermissionKind.automaticCases)) else {
+            throw AppError.message("일괄 변경할 권한을 선택해주세요.")
+        }
+        let observed = try await readSessionGroupSessions(reconcile: false)
+        try Task.checkCancellation()
+        let groups = try SessionGroupStore(directory: paths.directory).load()
+        guard !groupClearActive(expected.id), let group = groups.first(where: { $0.id == expected.id }),
+              group.sameMembership(as: expected) else {
+            throw AppError.message("그룹 구성이 바뀌었거나 초기화 중입니다. 그룹을 새로고침한 뒤 다시 열어주세요.")
+        }
+        let matches = group.members.map { SessionGroupMatching.match($0, in: observed) }
+        let owners = Dictionary(grouping: matches.compactMap { $0 }, by: \.id)
+        var results: [GroupOSPermissionResult] = []
+        withScreenPublicationBatch {
+            for (member, match) in zip(group.members, matches) {
+                func record(_ outcome: GroupOSPermissionResult.Outcome, _ detail: String) {
+                    results.append(.init(id: member.id, member: member.diagnosticLabel, outcome: outcome, detail: detail))
+                }
+                guard let match, owners[match.id]?.count == 1, let session = sessions[match.id],
+                      session.phase != .ended, osPermissionSource(session) == osPermissionSource(match.session) else {
+                    record(.skipped, "실행 중인 구성원 세션을 고유하게 확인할 수 없습니다.")
+                    continue
+                }
+                let existing = Set(osPermissionPolicySources[session.id] == osPermissionSource(session) ? session.osPermissionPolicy?.allowed ?? [] : [])
+                let updated = allow ? existing.union(kinds) : existing.subtracting(kinds)
+                guard updated != existing else { record(.alreadySet, "이미 설정됨"); continue }
+                do {
+                    try setOSPermissionPolicy(session.id, allowed: Array(updated))
+                    record(.changed, allow ? "허용 적용" : "허용 해제")
+                } catch {
+                    record(.skipped, error.localizedDescription)
+                }
+            }
+        }
+        return results
+    }
+
     public func setOSPermissionPolicy(_ id:String,allowed:[OSPermissionKind]) throws {
         guard !allowed.contains(.authentication) else {throw RemoteHTTPError(400,"Mac 사용자 인증은 자동 승인 정책으로 허용할 수 없습니다.")}
         guard let session=sessions[id],session.agent != .shell,session.pid>0,session.phase != .ended else {throw RemoteHTTPError(404,"실행 중인 Codex·Claude 세션을 선택해주세요.")}
