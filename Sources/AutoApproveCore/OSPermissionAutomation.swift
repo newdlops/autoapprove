@@ -7,7 +7,7 @@ import Security
 public final class OSPermissionAutomation:@unchecked Sendable {
     public static let system = OSPermissionAutomation()
     public static var live:OSPermissionServices {
-        .init(scan:{try system.scan(targets:$0)},approve:{request,authorized in system.approve(request,authorized:authorized)},respond:{request,button,authorized in system.respond(request,button:button,authorized:authorized)})
+        .init(scan:{try system.scan(targets:$0)},approve:{request,authorized in system.approve(request,authorized:authorized)},prepareApproval:{try system.prepareApproval($0,target:$1)},respond:{request,button,authorized in system.respond(request,button:button,authorized:authorized)})
     }
     private let lock=NSLock()
     private let ownerVerifier:@Sendable (NSRunningApplication)->Bool
@@ -74,6 +74,24 @@ public final class OSPermissionAutomation:@unchecked Sendable {
     private static let allows:Set<String>=["Allow","OK","Allow While Using the App","허용","확인","앱을 사용하는 동안 허용"]
     private static let openSettings:Set<String>=["Open System Settings","Open Settings","시스템 설정 열기","설정 열기","시스템 설정"]
     private static let denies:Set<String>=["Don't Allow","Don’t Allow","Do Not Allow","Deny","Cancel","Not Now","허용 안 함","허용하지 않음","거부","취소","나중에"]
+    private static func settingsSwitch(in tree:Node,target:OSPermissionTarget,kind:OSPermissionKind)->Node? {
+        let headings=tree.all.filter {![kAXButtonRole,kAXCheckBoxRole].contains($0.role)}.flatMap(\.texts)
+        let names:[String]
+        switch kind {
+        case .accessibility:names=["Accessibility","손쉬운 사용","Device Control and Data Access","기기 제어 및 데이터 접근"]
+        case .screenRecording:names=["Screen Recording","Screen & System Audio Recording","화면 기록","화면 및 시스템 오디오 녹음"]
+        case .fullDiskAccess:names=["Full Disk Access","전체 디스크 접근 권한","전체 디스크 접근"]
+        case .appManagement:names=["App Management","앱 관리"]
+        default:return nil
+        }
+        guard headings.contains(where:names.contains) else {return nil}
+        let rows=tree.all.filter {node in
+            [kAXRowRole,kAXGroupRole].contains(node.role) && node.all.count<40 && node.all.contains {$0.texts.contains(target.name)} && node.all.filter {$0.role==kAXCheckBoxRole || $0.role=="AXSwitch"}.count==1
+        }
+        let switches=rows.flatMap(\.all).filter {$0.role==kAXCheckBoxRole || $0.role=="AXSwitch"}
+        guard let first=switches.first, switches.allSatisfy({CFEqual($0.element,first.element)}) else {return nil}
+        return first
+    }
     private static func responseButton(_ node:Node)->OSPermissionButton? {
         guard node.role==kAXButtonRole,node.enabled else {return nil}
         let choices=node.texts.compactMap {title -> OSPermissionButton? in
@@ -152,22 +170,7 @@ public final class OSPermissionAutomation:@unchecked Sendable {
                     for (target,kind) in expected where targets.contains(where:{$0.matches(target)}) {
                         guard let current=allApps.map({$0.first(where:{$0.processIdentifier==target.pid})}) ?? NSRunningApplication(processIdentifier:target.pid),
                               Self.target(current)==target else {continue}
-                        let headings=tree.all.filter {![kAXButtonRole,kAXCheckBoxRole].contains($0.role)}.flatMap(\.texts)
-                        let names:[String]
-                        switch kind {
-                        case .accessibility:names=["Accessibility","손쉬운 사용","Device Control and Data Access","기기 제어 및 데이터 접근"]
-                        case .screenRecording:names=["Screen Recording","Screen & System Audio Recording","화면 기록","화면 및 시스템 오디오 녹음"]
-                        case .fullDiskAccess:names=["Full Disk Access","전체 디스크 접근 권한","전체 디스크 접근"]
-                        case .appManagement:names=["App Management","앱 관리"]
-                        default:continue
-                        }
-                        guard headings.contains(where:names.contains) else {continue}
-                        let rows=tree.all.filter {node in
-                            [kAXRowRole,kAXGroupRole].contains(node.role) && node.all.count<40 && node.all.contains {$0.texts.contains(target.name)} && node.all.filter {$0.role==kAXCheckBoxRole || $0.role=="AXSwitch"}.count==1
-                        }
-                        let switches=rows.flatMap(\.all).filter {$0.role==kAXCheckBoxRole || $0.role=="AXSwitch"}
-                        let unique=Dictionary(grouping:switches,by:{CFHash($0.element)})
-                        guard unique.count==1,let button=unique.values.first?.first else {continue}
+                        guard let button=Self.settingsSwitch(in:tree,target:target,kind:kind) else {continue}
                         if button.value=="1" {lock.lock();settings.removeValue(forKey:target.id);lock.unlock();continue}
                         guard button.enabled,button.value=="0" else {continue}
                         let token=String(CFHash(window)),action=String(CFHash(button.element))
@@ -199,38 +202,47 @@ public final class OSPermissionAutomation:@unchecked Sendable {
         guard AXIsProcessTrusted() else {return .init(available:false,detail:"Mac의 손쉬운 사용에서 AutoApprove를 허용하면 OS 권한창을 확인하고 세션 정책으로 조작할 수 있습니다.")}
         return .init(available:true,detail:"OS 권한은 등록한 앱과 이 세션에서 허용한 종류에만 적용합니다.",requests:try handles(targets:targets).map(\.request))
     }
+    private func prepareApproval(_ request:OSPermissionRequest,target:OSPermissionTarget) throws -> OSPermissionServices.PreparedApproval? {
+        guard !request.isManagementApp,request.action != .manual,request.requester==target else {return nil}
+        let fresh=try handles(targets:[target]).filter {$0.request.immutableToken==request.immutableToken}
+        guard fresh.count==1,let handle=fresh.first else {return nil}
+        return { authorized in self.press(request,target:target,handle:handle,authorized:authorized) }
+    }
     @MainActor public func approve(_ request:OSPermissionRequest,authorized:@MainActor ()->Bool)->OSPermissionDelivery {
         guard !request.isManagementApp else {return .unavailable("AutoApprove 자체의 권한은 Mac에서 직접 설정해주세요.")}
         guard request.action != .manual,authorized(),let target=request.requester else {return .unavailable("이 요청은 Mac에서 직접 인증하거나 요청 앱을 확인해야 합니다.")}
         do {
-            let fresh=try handles(targets:[target]).filter {$0.request.immutableToken==request.immutableToken}
-            guard fresh.count==1,let handle=fresh.first,authorized(),
-                  let requester=NSRunningApplication(processIdentifier:target.pid),Self.target(requester)==target,
-                  let owner=NSRunningApplication(processIdentifier:request.ownerPID),ownerVerifier(owner),
-                  (try? ProcessDiscovery.read(pid:request.ownerPID).first?.started)==request.ownerStarted else {
-                return .unavailable("원래 OS 권한창·요청 앱·세션 정책이 바뀌어 조작하지 않았습니다.")
-            }
-            // The authorization closure runs immediately before this one native action.
-            var budget=500
-            guard authorized(),let tree=Self.node(handle.window,budget:&budget),
-                  let button=tree.all.first(where:{CFEqual($0.element,handle.button)}),button.enabled else {return .unavailable("정책 또는 OS 버튼이 바뀌어 조작하지 않았습니다.")}
-            if request.action == .enableSetting {
-                guard button.value=="0",[kAXCheckBoxRole,"AXSwitch"].contains(button.role) else {return .unavailable("OS 권한 스위치가 이미 바뀌어 누르지 않았습니다.")}
-            } else {
-                guard let dialog=Self.requestNode(tree),!dialog.all.contains(where:{$0.role==kAXTextFieldRole || $0.role=="AXSecureTextField"}),
-                      dialog.all.filter({![kAXButtonRole,kAXCheckBoxRole].contains($0.role)}).flatMap(\.texts).joined(separator:"\n")==request.content,
-                      button.role==kAXButtonRole,button.texts.contains(where:request.action == .allow ? Self.allows.contains:Self.openSettings.contains) else {return .unavailable("OS 요청 내용이나 허용 버튼이 바뀌어 누르지 않았습니다.")}
-            }
-            AXUIElementSetMessagingTimeout(handle.button,0.5)
-            guard authorized() else {return .unavailable("OS 입력 직전에 정책이 바뀌어 누르지 않았습니다.")}
-            let error=AXUIElementPerformAction(handle.button,kAXPressAction as CFString)
-            if request.action == .enableSetting {lock.lock();settings.removeValue(forKey:target.id);lock.unlock()}
-            guard error == .success else {return .uncertain("OS 권한 입력 결과를 확인하지 못했습니다 (AX \(error.rawValue)). 원래 Mac에서 확인해주세요.")}
-            if request.action == .openSettings {
-                lock.lock();settings[target.id]=(target,request.kind);lock.unlock()
-            }
-            return .sent
+            guard let prepared=try prepareApproval(request,target:target) else {return .unavailable("원래 OS 권한창을 확인하지 못했습니다.")}
+            return prepared(authorized)
         } catch {return .unavailable(String(error.localizedDescription.prefix(1000)))}
+    }
+    @MainActor private func press(_ request:OSPermissionRequest,target:OSPermissionTarget,handle:Handle,authorized:@MainActor ()->Bool)->OSPermissionDelivery {
+        guard authorized(),
+              let requester=NSRunningApplication(processIdentifier:target.pid),Self.target(requester)==target,
+              let owner=NSRunningApplication(processIdentifier:request.ownerPID),ownerVerifier(owner),
+              (try? ProcessDiscovery.read(pid:request.ownerPID).first?.started)==request.ownerStarted else {
+            return .unavailable("원래 OS 권한창·요청 앱·세션 정책이 바뀌어 조작하지 않았습니다.")
+        }
+        var budget=500
+        let deadline=ProcessInfo.processInfo.systemUptime+0.35
+        guard let tree=Self.node(handle.window,budget:&budget,deadline:deadline),budget>0,ProcessInfo.processInfo.systemUptime<deadline,
+              let button=tree.all.first(where:{CFEqual($0.element,handle.button)}),button.enabled else {return .unavailable("정책 또는 OS 버튼이 바뀌어 조작하지 않았습니다.")}
+        if request.action == .enableSetting {
+            guard button.value=="0",let current=Self.settingsSwitch(in:tree,target:target,kind:request.kind),CFEqual(current.element,button.element) else {return .unavailable("OS 권한 스위치가 이미 바뀌어 누르지 않았습니다.")}
+        } else {
+            guard let dialog=Self.requestNode(tree),!dialog.all.contains(where:{$0.role==kAXTextFieldRole || $0.role=="AXSecureTextField"}),
+                  dialog.all.filter({![kAXButtonRole,kAXCheckBoxRole].contains($0.role)}).flatMap(\.texts).joined(separator:"\n")==request.content,
+                  button.role==kAXButtonRole,button.texts.contains(where:request.action == .allow ? Self.allows.contains:Self.openSettings.contains) else {return .unavailable("OS 요청 내용이나 허용 버튼이 바뀌어 누르지 않았습니다.")}
+        }
+        AXUIElementSetMessagingTimeout(handle.button,0.5)
+        guard authorized() else {return .unavailable("OS 입력 직전에 정책이 바뀌어 누르지 않았습니다.")}
+        let error=AXUIElementPerformAction(handle.button,kAXPressAction as CFString)
+        if request.action == .enableSetting {lock.lock();settings.removeValue(forKey:target.id);lock.unlock()}
+        guard error == .success else {return .uncertain("OS 권한 입력 결과를 확인하지 못했습니다 (AX \(error.rawValue)). 원래 Mac에서 확인해주세요.")}
+        if request.action == .openSettings {
+            lock.lock();settings[target.id]=(target,request.kind);lock.unlock()
+        }
+        return .sent
     }
     @MainActor public func respond(_ request:OSPermissionRequest,button choice:OSPermissionButton,authorized:@MainActor ()->Bool)->OSPermissionDelivery {
         guard !request.isManagementApp,request.action != .manual,request.action != .enableSetting,

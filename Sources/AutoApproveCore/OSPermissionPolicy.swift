@@ -178,8 +178,16 @@ enum OSPermissionLaunch:Equatable,Sendable {
 public struct OSPermissionServices:Sendable {
     public var ancestry:@Sendable (Int32) throws -> [ProcessRecord]
     public var scan:@Sendable ([OSPermissionTarget]) throws -> OSPermissionMonitorStatus
+    public typealias PreparedApproval = @MainActor @Sendable (@MainActor () -> Bool) -> OSPermissionDelivery
     public var approve:@MainActor @Sendable (OSPermissionRequest,@MainActor ()->Bool)->OSPermissionDelivery
+    private var prepare: (@Sendable (OSPermissionRequest, OSPermissionTarget) throws -> PreparedApproval?)?
+    public func prepareApproval(_ request:OSPermissionRequest,_ target:OSPermissionTarget) throws -> PreparedApproval? {
+        if let prepare {return try prepare(request,target)}
+        return { [approve] authorized in approve(request,authorized) }
+    }
     public var respond:@MainActor @Sendable (OSPermissionRequest,OSPermissionButton,@MainActor ()->Bool)->OSPermissionDelivery
-    public init(ancestry:@escaping @Sendable (Int32) throws -> [ProcessRecord] = {try ProcessDiscovery.readAncestorChain(of:$0,through:1)},scan:@escaping @Sendable ([OSPermissionTarget]) throws -> OSPermissionMonitorStatus,approve:@escaping @MainActor @Sendable (OSPermissionRequest,@MainActor ()->Bool)->OSPermissionDelivery,respond:@escaping @MainActor @Sendable (OSPermissionRequest,OSPermissionButton,@MainActor ()->Bool)->OSPermissionDelivery={_,_,_ in .unavailable("OS 요청 버튼 응답을 지원하지 않는 연결입니다.")}) {self.ancestry=ancestry;self.scan=scan;self.approve=approve;self.respond=respond}
+    public init(ancestry:@escaping @Sendable (Int32) throws -> [ProcessRecord] = {try ProcessDiscovery.readAncestorChain(of:$0,through:1)},scan:@escaping @Sendable ([OSPermissionTarget]) throws -> OSPermissionMonitorStatus,approve:@escaping @MainActor @Sendable (OSPermissionRequest,@MainActor ()->Bool)->OSPermissionDelivery,prepareApproval:(@Sendable (OSPermissionRequest,OSPermissionTarget) throws -> PreparedApproval?)?=nil,respond:@escaping @MainActor @Sendable (OSPermissionRequest,OSPermissionButton,@MainActor ()->Bool)->OSPermissionDelivery={_,_,_ in .unavailable("OS 요청 버튼 응답을 지원하지 않는 연결입니다.")}) {self.ancestry=ancestry;self.scan=scan;self.respond=respond
+        self.approve=approve;self.prepare=prepareApproval
+    }
     public static let inactive=Self(scan:{_ in .init(available:false,detail:"격리된 실행 환경입니다.")},approve:{_,_ in .unavailable("OS 입력 연결이 없습니다.")})
 }

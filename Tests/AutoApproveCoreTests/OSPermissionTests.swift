@@ -36,16 +36,18 @@ private final class OSFixture:@unchecked Sendable {
         .init(kind:kind,requester:target ?? self.target,ownerPID:77,ownerStarted:"OS same start",ownerBundleID:"com.apple.UserNotificationCenter",windowToken:suffix,content:"\"Permission QA\" would like to access the camera. "+suffix,action:action,actionToken:"allow-"+suffix,buttons:[.init(id:"allow-"+suffix,title:"Allow",kind:.allow),.init(id:"deny-"+suffix,title:"Don't Allow",kind:.deny)])
     }
 }
-@MainActor private func osEngine(_ fixture:OSFixture,root:URL) async throws -> (ApprovalEngine,[String]) {
+@MainActor private func osEngine(_ fixture:OSFixture,root:URL,
+    readCodex:(@Sendable (ProcessRecord) throws -> CodexThreadLocation?)? = nil,
+    prepare:(@Sendable (OSPermissionRequest,OSPermissionTarget) throws -> OSPermissionServices.PreparedApproval?)? = nil) async throws -> (ApprovalEngine,[String]) {
     let service=OSPermissionServices(ancestry:{fixture.ancestry($0)},scan:{_ in fixture.scan()},approve:{request,authorized in
         fixture.beforeApproval?()
         guard authorized() else {return .unavailable("Synthetic authorization was revoked")};fixture.pressed(request.id);return fixture.result
-    },respond:{request,button,authorized in
+    },prepareApproval:prepare,respond:{request,button,authorized in
         fixture.beforeApproval?()
         guard authorized() else {return .unavailable("Synthetic authorization was revoked")};fixture.pressed(request.id+":"+button.id);return fixture.result
     })
     let adapter=ScreenHostAdapter(screens:{targets in .init(screens:targets.map {.init(tty:$0.tty,contents:"• Working (12s • esc to interrupt)\n› Ask Codex to do anything")})},approve:{_,_,_ in fixture.pressed("TERMINAL_APPROVAL");return .sent},reveal:{_ in nil},input:{_,_,_,_ in fixture.pressed("TERMINAL_INPUT");return .sent})
-    let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{fixture.processes()},screenAdapters:[.terminal:adapter],nativeKeyboardActivity:.init(idleSeconds:{fixture.idle()},frontmostBundle:{"com.apple.Terminal"}),osPermissionServices:service)
+    let engine=try ApprovalEngine(paths:.init(directory:root),processReader:{fixture.processes()},screenAdapters:[.terminal:adapter],codexGroupReader:readCodex,nativeKeyboardActivity:.init(idleSeconds:{fixture.idle()},frontmostBundle:{"com.apple.Terminal"}),osPermissionServices:service)
     var sessions=ProcessDiscovery.sessions(fixture.records)
     sessions.sort {$0.agent.rawValue>$1.agent.rawValue}
     for index in sessions.indices {sessions[index].terminal = .terminal}
@@ -56,8 +58,10 @@ private final class OSFixture:@unchecked Sendable {
 }
 @MainActor private func osUntil(_ predicate:()->Bool) async throws {
     let end=Date().addingTimeInterval(3)
-    while !predicate(),Date()<end {try await Task.sleep(for:.milliseconds(10))}
-    if !predicate() {throw AppError.message("OS permission fixture did not reach its gate")}
+    while !predicate() {
+        guard Date()<end else {throw AppError.message("OS permission fixture did not reach its gate")}
+        try await Task.sleep(for:.milliseconds(10))
+    }
 }
 
 extension ApprovalTests {
@@ -181,6 +185,68 @@ extension ApprovalTests {
         try expectNil(engine.snapshot.osPermissions?.requests.first {$0.id==detached.id}?.sessionID)
         try expectEqual(fixture.presses,[first.id,next.id])
     }
+    func testGroupPolicyHasPriorityDuringDiscovery() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString), fixture=OSFixture()
+        defer {try? FileManager.default.removeItem(at:root)}
+        let release=DispatchSemaphore(value:0), started=DispatchSemaphore(value:0)
+        let (engine,_)=try await osEngine(fixture,root:root,readCodex:{ _ in
+            started.signal()
+            guard release.wait(timeout:.now()+5) == .success else {throw AppError.message("Discovery gate timed out")}
+            return nil
+        })
+        defer {release.signal();engine.stop()}
+        let live=fixture.records.map { AgentSession(id:$0.key,agent:$0.agent!,pid:$0.pid,started:$0.started,tty:"/dev/"+$0.tty,cwd:"/fixture/project",terminal:.terminal) }
+        engine.updateDiscovery(live,records:fixture.records,directories:Dictionary(uniqueKeysWithValues:live.map {($0.id,$0.cwd)}))
+        let session=live.first {$0.agent == .codex}!
+        var member=SessionGroupMember(agent:session.agent,title:"Codex",cwd:session.cwd,conversationID:"")
+        member.runtimeID=session.id
+        let group=SessionGroup(name:"Priority",members:[member])
+        try SessionGroupStore(directory:root).save([group])
+        let request=fixture.request("group-priority",kind:.files)
+        fixture.set([request]);await engine.refreshOSPermissions()
+        try engine.assignOSPermission(session.id,requestID:request.id,token:request.immutableToken,remember:true)
+        try engine.setOSPermissionPolicy(session.id,allowed:[.files])
+        let edit=Task {try await engine.applyGroupOSPermissions(group,kinds:[.files],allow:false)}
+        try await osUntil {started.wait(timeout:.now()) == .success}
+        await engine.refreshOSPermissions()
+        try expectEqual(fixture.presses,[])
+        try expectEqual(engine.snapshot.osPermissions?.requests.first?.phase,.waiting)
+        release.signal()
+        let rows=try await edit.value
+        try expectEqual(rows.map(\.outcome),[.changed])
+        await engine.refreshOSPermissions();try expectEqual(fixture.presses,[])
+        try engine.setOSPermissionPolicy(session.id,allowed:[.files])
+        await engine.refreshOSPermissions();try expectEqual(fixture.presses,[request.id])
+    }
+
+    func testPolicyRevocationDuringAutomaticPreparationKeepsRequestPending() async throws {
+        let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString), fixture=OSFixture()
+        defer {try? FileManager.default.removeItem(at:root)}
+        let started=DispatchSemaphore(value:0), release=DispatchSemaphore(value:0)
+        let (engine,ids)=try await osEngine(fixture,root:root,prepare:{request,_ in
+            started.signal()
+            guard release.wait(timeout:.now()+5) == .success else {throw AppError.message("Preparation gate timed out")}
+            return {authorized in
+                guard authorized() else {return .unavailable("Policy changed")}
+                fixture.pressed(request.id);return .sent
+            }
+        })
+        defer {release.signal();engine.stop()}
+        let id=ids[0],request=fixture.request("in-flight")
+        fixture.set([request]);await engine.refreshOSPermissions()
+        try engine.assignOSPermission(id,requestID:request.id,token:request.immutableToken,remember:true)
+        try engine.setOSPermissionPolicy(id,allowed:[.camera])
+        let pending=Task {await engine.refreshOSPermissions()}
+        try await osUntil {started.wait(timeout:.now()) == .success}
+        try engine.setOSPermissionPolicy(id,allowed:[])
+        try engine.setOSPermissionPolicy(id,allowed:[.camera])
+        release.signal();await pending.value
+        try expectEqual(fixture.presses,[])
+        try expectEqual(engine.snapshot.osPermissions?.requests.first?.phase,.waiting)
+        release.signal();await engine.refreshOSPermissions()
+        try expectEqual(fixture.presses,[request.id])
+    }
+
     func testGroupOSPermissionEditsOnlySelectedKindsAndMembers() async throws {
         let fixture = OSFixture(), root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

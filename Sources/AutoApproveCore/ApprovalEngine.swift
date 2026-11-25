@@ -142,6 +142,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var osPermissionBlocked=Set<String>()
     private var osPermissionActing:String?
     private var osPermissionEpoch=UUID()
+    private struct GroupPolicyEdit {
+        let sessions: Set<String>
+        let agents: Set<AgentKind>
+        let kinds: Set<OSPermissionKind>
+    }
+    private var groupPolicyEdits: [UUID: GroupPolicyEdit] = [:]
+    private func settingSessionPolicy(_ id: String) -> Bool {
+        groupPolicyEdits.values.contains { $0.sessions.contains(id) }
+    }
+    private func settingPermission(_ kind: OSPermissionKind, for agent: AgentKind) -> Bool {
+        groupPolicyEdits.values.contains { $0.agents.contains(agent) && $0.kinds.contains(kind) }
+    }
     private struct OSPermissionTransition {var target:OSPermissionTarget;var kind:OSPermissionKind;var sessionID:String;var source:String;var until:Date}
     private var osPermissionTransitions:[String:OSPermissionTransition]=[:]
     private var remoteInputUntil: [String: Date] = [:]
@@ -2403,12 +2415,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return await Task.detached(priority:.userInitiated) {keyboard.hasPriority(terminal:session.terminal,tty:session.tty)}.value
     }
     private func userInputHasPriority(_ id:String) -> Bool {
-        codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)
+        settingSessionPolicy(id) || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)
     }
     private func userInputHasPriority(_ id:String,backgroundOnly:Bool) async -> Bool {
-        if codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) {return true}
+        if settingSessionPolicy(id) || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) {return true}
         let native=await nativeUserInputHasPriority(id,backgroundOnly:backgroundOnly)
-        return native || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id)
+        return native || settingSessionPolicy(id) || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id)
     }
     func remoteTerminalObservation(sessionID: String) -> RemoteTerminalObservation {
         if remoteTerminalChanges[sessionID] == nil { remoteTerminalChanges[sessionID] = RemoteTerminalChangeSignal() }
@@ -2952,7 +2964,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         session.terminal == .claudeBackground || claudeParents[session.id] != nil || registeredBackgroundClaude.contains(session.id)
     }
 
-    private func readSessionGroupSessions(runtimeID: String? = nil, reconcile: Bool = true, useStatusCache: Bool = true) async throws -> [SessionGroupLiveSession] {
+    private func readSessionGroupSessions(runtimeID: String? = nil, reconcile: Bool = true, useStatusCache: Bool = true, priority: TaskPriority = .utility) async throws -> [SessionGroupLiveSession] {
         let candidates = runtimeID.map { sessions[$0].map { [$0] } ?? [] } ?? Array(sessions.values)
         let originals = candidates.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 && !isBackgroundGroupSession($0) }
         guard !originals.isEmpty || runtimeID == nil else { return [] }
@@ -2960,14 +2972,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let readAll = processReader, readOne = singleProcessReader, pid = runtimeID == nil ? nil : originals.first?.pid
         let reader: @Sendable () throws -> [ProcessRecord] = { if let pid { return try readOne(pid) }; return try readAll() }
         let registry = claudeRegistryReader, codexReader = codexGroupReader, codexEnvironment = codexGroupEnvironment
-        let records = try await Task.detached(priority: .utility) { try reader() }.value
+        let records = try await Task.detached(priority: priority) { try reader() }.value
         let agyRevisions = agyEvents.mapValues(\.revision)
         var terminalEnvironments: [String: [String: String]] = [:]
         var result: [SessionGroupLiveSession] = []
         for original in originals {
             try Task.checkCancellation()
             guard let record = records.first(where: { $0.key == original.id && $0.agent == original.agent && "/dev/" + $0.tty == original.tty }) else { continue }
-            let environment = await Task.detached(priority: .utility) {
+            let environment = await Task.detached(priority: priority) {
                 original.agent == .codex ? codexEnvironment(record) : ProcessEnvironment.read(record)
             }.value
             terminalEnvironments[original.id] = environment
@@ -2975,7 +2987,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             var claudeActivity: ClaudeSessionActivity?
             if original.agent == .codex {
                 home = CodexGroupIdentity.home(environment: environment)
-                let location = try? await Task.detached(priority: .utility) {
+                let location = try? await Task.detached(priority: priority) {
                     try codexReader(record)
                 }.value
                 if let location, UUID(uuidString: location.threadID) != nil {
@@ -2984,7 +2996,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             } else if original.agent == .agy {
                 home = AgyHookInstaller.file.deletingLastPathComponent().path
-                conversation = await Task.detached(priority: .utility) {
+                conversation = await Task.detached(priority: priority) {
                     ProcessOpenFiles.agyConversation(pid: record.pid, started: record.started)
                 }.value ?? agyEvents[original.id]?.conversationId
             } else {
@@ -2993,9 +3005,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let path = environment["CLAUDE_CONFIG_DIR"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude").path
                     home = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
                     let directory = URL(fileURLWithPath: path)
-                    rows = await Task.detached(priority: .utility) { ClaudeSessionRegistry.read(records: [record], directory: directory) }.value
+                    rows = await Task.detached(priority: priority) { ClaudeSessionRegistry.read(records: [record], directory: directory) }.value
                 } else {
-                    rows = await Task.detached(priority: .utility) { registry([record]) }.value
+                    rows = await Task.detached(priority: priority) { registry([record]) }.value
                 }
                 let registrations = rows.filter { $0.processID == original.id }
                 guard !registrations.contains(where: { $0.kind == "bg" }) else { continue }
@@ -3019,7 +3031,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             observation.claudeRegisteredActivity = claudeActivity
             result.append(observation)
         }
-        let latest = try await Task.detached(priority: .utility) { try reader() }.value
+        let latest = try await Task.detached(priority: priority) { try reader() }.value
         let byPID = Dictionary(latest.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
         let observed = result.compactMap { observation -> SessionGroupLiveSession? in
             guard let current = sessions[observation.id], current.phase != .ended, !isBackgroundGroupSession(current),
@@ -11029,7 +11041,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !kinds.isEmpty, kinds.isSubset(of: Set(OSPermissionKind.automaticCases)) else {
             throw AppError.message("일괄 변경할 권한을 선택해주세요.")
         }
-        let observed = try await readSessionGroupSessions(reconcile: false)
+        let editID = UUID()
+        let cached = groupConnectionObservation?.sessions ?? []
+        let targets = Set(expected.members.compactMap(\.runtimeID) + expected.members.compactMap { SessionGroupMatching.match($0, in: cached)?.id })
+        groupPolicyEdits[editID] = GroupPolicyEdit(sessions: targets, agents: Set(expected.members.map(\.agent)), kinds: kinds)
+        defer {
+            groupPolicyEdits.removeValue(forKey: editID)
+            for id in targets where !settingSessionPolicy(id) {
+                if let host = sessions[id].flatMap({ ScreenHost(kind: $0.terminal) }) { screenPollSignals[host]?.notify() }
+            }
+        }
+        let observed = try await readSessionGroupSessions(reconcile: false, priority: .userInitiated)
         try Task.checkCancellation()
         let groups = try SessionGroupStore(directory: paths.directory).load()
         guard !groupClearActive(expected.id), let group = groups.first(where: { $0.id == expected.id }),
@@ -11072,7 +11094,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         try saveOSPermissionPolicy(session,policy)
         osPermissionTransitions=osPermissionTransitions.filter {$0.value.sessionID != id || allowed.contains($0.value.kind)}
         for (key,claim) in osPermissionClaims where claim.sessionID==id && osPermissionRequests[key].map({!allowed.contains($0.kind)})==true {osPermissionClaims.removeValue(forKey:key)}
-        // Every already-queued terminal action must use a fresh policy observation.
         cancelCodexProgressCheck(id);codexProgressTrackers.removeValue(forKey:id)
         publish()
     }
@@ -11273,28 +11294,38 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if before != snapshot.osPermissions {publish()}
             guard osPermissionActing==nil,!snapshot.paused,!scanned.requests.contains(where:{!$0.isManagementApp && $0.action == .manual && $0.isPending}) else {return}
             for request in osPermissionRequests.values.sorted(by:{$0.observedAt<$1.observedAt}) where request.phase == .waiting && seen.contains(request.id) {
-                guard !request.isManagementApp,request.action != .manual,let id=request.sessionID,let original=sessions[id],original.automatic,original.phase != .ended,
-                      osPermissionPolicySources[id]==osPermissionSource(original),original.osPermissionPolicy?.allowed.contains(request.kind)==true,request.requester != nil,
-                      !userInputHasPriority(id),!automaticInputBusy(id),!osPermissionReceipts.contains(request.id) else {continue}
-                guard original.osPermissionPolicy?.permits(request)==true || osPermissionClaims[request.id].map({$0.sessionID==id && $0.token==request.immutableToken && $0.source==osPermissionSource(original)})==true else {continue}
-                let reader=singleProcessReader,pid=original.pid,automationEpoch=automationRuntime.epoch(id)
-                let records=try await Task.detached(priority:.utility) {try reader(pid)}.value
-                guard epoch==osPermissionEpoch,automationRuntime.epoch(id)==automationEpoch,!remoteInputStopped,!snapshot.paused,
-                      osPermissionActing==nil,osPermissionRequests[request.id]?.phase == .waiting,!osPermissionReceipts.contains(request.id),
-                      records.contains(where:{$0.pid==pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent}) else {continue}
+                guard !request.isManagementApp,request.action != .manual,let id=request.sessionID,let original=sessions[id],let target=request.requester else {continue}
+                let automationEpoch=automationRuntime.epoch(id)
+                func policyAllowsInput() -> Bool {
+                    guard !Task.isCancelled,epoch==osPermissionEpoch,automationRuntime.epoch(id)==automationEpoch,
+                          !remoteInputStopped,!snapshot.paused,!settingPermission(request.kind,for:original.agent),!userInputHasPriority(id),
+                          let current=sessions[id],current.automatic,current.phase != .ended,osPermissionSource(current)==osPermissionSource(original),
+                          osPermissionPolicySources[id]==osPermissionSource(current),current.osPermissionPolicy?.revision==original.osPermissionPolicy?.revision,
+                          current.osPermissionPolicy?.allowed.contains(request.kind)==true,osPermissionRequests[request.id]?.immutableToken==request.immutableToken,
+                          osPermissionRequests[request.id]?.sessionID==id else {return false}
+                    return current.osPermissionPolicy?.permits(request)==true || osPermissionClaims[request.id].map {
+                        $0.sessionID==id && $0.token==request.immutableToken && $0.source==osPermissionSource(current)
+                    }==true
+                }
+                guard policyAllowsInput(),!automaticInputBusy(id),!osPermissionReceipts.contains(request.id) else {continue}
+                let reader=singleProcessReader
+                let prepared = try await Task.detached(priority:.utility) {
+                    guard try reader(original.pid).contains(where:{$0.pid==original.pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent})
+                    else {return nil as OSPermissionServices.PreparedApproval?}
+                    return try service.prepareApproval(request,target)
+                }.value
+                guard let prepared,policyAllowsInput(),!automaticInputBusy(id),osPermissionRequests[request.id]?.phase == .waiting,
+                      !osPermissionReceipts.contains(request.id) else {continue}
                 osPermissionActing=request.id;defer {osPermissionActing=nil}
                 var event=AuditEvent(sessionID:id,summary:"OS 권한 정책 승인 · "+request.kind.title,outcome:"허용 입력 전 확인",source:"세션 OS 권한 정책",context:AuditContext(session:original),request:request.content)
                 guard log(event) else {continue}
                 var receipt=request;receipt.phase = .uncertain;receipt.detail="조작 시작 기록이 있습니다. 결과 미확인 시 자동 반복하지 않습니다."
                 try store.set("osPermissionReceipt:"+request.id,String(decoding:JSONEncoder().encode(receipt),as:UTF8.self));osPermissionReceipts.insert(request.id)
                 osPermissionRequests[request.id]?.phase = .approving
-                let delivery=service.approve(request) { [self] in
-                    guard epoch==osPermissionEpoch,automationRuntime.epoch(id)==automationEpoch,!remoteInputStopped,!snapshot.paused,!userInputHasPriority(id),
-                          let current=sessions[id],osPermissionSource(current)==osPermissionSource(original),current.automatic,current.phase != .ended,
-                          osPermissionPolicySources[id]==osPermissionSource(current),current.osPermissionPolicy?.allowed.contains(request.kind)==true,osPermissionRequests[request.id]?.immutableToken==request.immutableToken else {return false}
-                    guard let live=try? singleProcessReader(original.pid),live.contains(where:{$0.pid==original.pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent}) else {return false}
-                    guard verifiedOSPermissionLaunch(request,session:current) else {return false}
-                    return current.osPermissionPolicy?.permits(request)==true || osPermissionClaims[request.id].map {$0.sessionID==id && $0.token==request.immutableToken && $0.source==osPermissionSource(current)}==true
+                let delivery=prepared { [self] in
+                    guard policyAllowsInput(),let live=try? singleProcessReader(original.pid),
+                          live.contains(where:{$0.pid==original.pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent}) else {return false}
+                    return verifiedOSPermissionLaunch(request,session:original)
                 }
                 switch delivery {
                 case .sent:
