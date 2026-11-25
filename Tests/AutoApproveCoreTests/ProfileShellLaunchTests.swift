@@ -13,6 +13,7 @@ extension ApprovalTests {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
         let entry = TerminalProfileEntry(title: "Fixture", agent: "claude", cwd: cwd.path, conversationID: UUID().uuidString.lowercased())
         let target = "/dev/ttys980"
+        let finished = DispatchSemaphore(value: 0)
         let tty = try await TerminalProfileLauncher.launch(entry, anchorTTY: "/dev/ttys979", openTab: { _, _ in target }, execute: { body, _ in
             try expect(!body.contains(entry.cwd) && !body.contains(entry.conversationID))
             let context = JSContext()!
@@ -22,8 +23,16 @@ extension ApprovalTests {
                 process.executableURL = URL(fileURLWithPath: "/bin/zsh")
                 process.arguments = ["-f", "-c", input]
                 process.environment = ["PATH": root.path + ":/usr/bin:/bin"]
-                do { try process.run(); process.waitUntilExit(); return process.terminationStatus == 0 }
-                catch { return false }
+                DispatchQueue.global().async {
+                    do {
+                        try AutomationIPC.shared.runInput(host: "Terminal", budget: 3, admissionWait: 3) {
+                            try process.run()
+                            process.waitUntilExit()
+                            if process.terminationStatus == 0 { finished.signal() }
+                        }
+                    } catch { return }
+                }
+                return true
             }
             context.setObject(shell, forKeyedSubscript: "deliver" as NSString)
             context.evaluateScript("""
@@ -45,6 +54,7 @@ extension ApprovalTests {
             return reply
         })
         try expectEqual(tty, target)
+        try expect(await waitForFixtureSignal(finished, timeout: .seconds(2)))
         let lines = try String(contentsOf: cwd.appendingPathComponent("delivered"), encoding: .utf8).split(separator: "\n").map(String.init)
         try expectEqual(lines.count, 3)
         try expectEqual(URL(fileURLWithPath: lines[0]).resolvingSymlinksInPath().path, cwd.resolvingSymlinksInPath().path)

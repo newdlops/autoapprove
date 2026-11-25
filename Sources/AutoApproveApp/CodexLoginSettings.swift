@@ -131,14 +131,14 @@ import AutoApproveCore
         }
         .task {
             visible=true;job=scopedJob
-            var reportedBusy=accounts.busy
+            var reportedBusy=accounts.codexLoginActive
             onLoginActivityChanged?(reportedBusy)
             await reloadTargets(preferJob:true)
             while !Task.isCancelled {
-                let busy=accounts.busy
+                let busy=accounts.codexLoginActive
                 if busy != reportedBusy{reportedBusy=busy;onLoginActivityChanged?(busy)}
                 let next=scopedJob
-                otherLogin=accounts.busy && (next?.active != true || !belongsToSelection(next))
+                otherLogin=busy && (next?.active != true || !belongsToSelection(next))
                 let succeeded=next?.phase=="succeeded" && (job?.phase != "succeeded" || next?.id != job?.id)
                 let changed=next?.id != job?.id || next?.phase != job?.phase
                 let relevant=belongsToSelection(next) || belongsToSelection(job)

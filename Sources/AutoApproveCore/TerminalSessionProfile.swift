@@ -535,13 +535,13 @@ public enum TerminalProfileLauncher {
             } catch {
                 throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["delivery":"not_started"])
             }
-            func deliver() throws -> String {
-                let command:String, file:TerminalProfileCommandFile?
-                do {
-                    command=try entry.resumeCommand(nativeRuntimeRoot:nil,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed,standalone:launchRuntime?.standalone ?? false)
-                    file=entry.host == .terminal ? try TerminalProfileCommandFile(command:command):nil
-                } catch { throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["command_delivery":"not_started"]) }
-                defer { file?.withdraw() }
+            let command:String, file:TerminalProfileCommandFile?
+            do {
+                command=try entry.resumeCommand(nativeRuntimeRoot:nil,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed,standalone:launchRuntime?.standalone ?? false)
+                file=entry.host == .terminal ? try TerminalProfileCommandFile(command:command):nil
+            } catch { throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["command_delivery":"not_started"]) }
+            defer { file?.withdraw() }
+            @Sendable func deliver() throws -> String {
                 var targetTTY:String?
                 if entry.host == .terminal,let anchorTTY {
                     targetTTY=try openTab(anchorTTY,entry.terminalTab?.settingsName)
@@ -565,7 +565,6 @@ public enum TerminalProfileLauncher {
                         throw RemoteHTTPError(409,failure,diagnostics:diagnostics)
                     }
                     guard let tty=object["tty"] as? String,validTTY(tty) else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
-                    try file?.waitForShell()
                     return tty
                 } catch {
                     if let file, file.withdraw() {
@@ -577,12 +576,21 @@ public enum TerminalProfileLauncher {
                     throw error
                 }
             }
-            guard execute == nil, entry.host == .terminal else { return try deliver() }
+            let host = entry.host == .iterm ? "iTerm2" : "Terminal"
+            let tty: String
             do {
-                return try AutomationIPC.shared.runInput(host:"Terminal",budget:24,admissionWait:3,body:deliver)
+                tty = try AutomationIPC.shared.runInput(host: host, budget: 24, admissionWait: 5, body: deliver)
             } catch let error as AutomationIPC.InputNotStarted {
                 throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["delivery":"not_started"])
             }
+            do {
+                try file?.waitForShell()
+            } catch {
+                var diagnostics = ["tab_creation": "unknown"]
+                if file?.withdraw() == true { diagnostics["command_delivery"] = "not_started" }
+                throw RemoteHTTPError(409,error.localizedDescription,diagnostics:diagnostics)
+            }
+            return tty
         }.value
     }
     public static func placeWindow(tty:String,bounds:TerminalWindowBounds) async throws {

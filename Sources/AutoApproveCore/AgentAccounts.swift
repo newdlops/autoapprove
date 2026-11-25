@@ -14,7 +14,8 @@ public struct NativeCodexLoginState: Equatable, Sendable {
 /// session manager, inventory, output streams, audit log or receipt archive.
 @MainActor public final class AgentAccounts {
     private final class Job {
-        let id:String,owner:String,agent:String,expires:Date,tty:String
+        let id:String,owner:String,agent:String,expires:Date
+        var tty:String?
         let services:AgentAccountServices
         var browser=false
         var codexHome:String?
@@ -23,9 +24,9 @@ public struct NativeCodexLoginState: Equatable, Sendable {
         let writer=UUID().uuidString
         var phase="starting",url:String?,code:String?,message:String?,submitted=false
         var nativeFinishNotified=false
-        init(id:String,owner:String,agent:String,terminal:ManagedPTY,now:Date,services:AgentAccountServices) {
+        init(id:String,owner:String,agent:String,terminal:ManagedPTY?,now:Date,services:AgentAccountServices) {
             self.services=services
-            self.id=id;self.owner=owner;self.agent=agent;self.terminal=terminal;tty=terminal.descriptor.tty;expires=now.addingTimeInterval(600)
+            self.id=id;self.owner=owner;self.agent=agent;self.terminal=terminal;tty=terminal?.descriptor.tty;expires=now.addingTimeInterval(600)
         }
         var active:Bool {["starting","waiting","verifying"].contains(phase)}
         func finish(_ phase:String,_ message:String?=nil) {
@@ -72,7 +73,9 @@ public struct NativeCodexLoginState: Equatable, Sendable {
               let home=job.resolvedCodexHome ?? job.codexHome else{return}
         job.nativeFinishNotified=true;nativeCodexLoginDidEnd?(home)
     }
-    public var privateTTYs:Set<String> {Set(jobs.values.map(\.tty)).union(retiredTTYs.filter{$0.value>Date()}.keys)}
+    public var privateTTYs:Set<String> {Set(jobs.values.compactMap(\.tty)).union(retiredTTYs.filter{$0.value>Date()}.keys)}
+    public var codexLoginActive: Bool { hasActiveLogin("codex") }
+    private func hasActiveLogin(_ agent: String) -> Bool { jobs.values.contains { $0.agent == agent && $0.active } }
     public var busy:Bool {jobs.values.contains(where:\.active)}
     public func hello(node:String,pin:RemoteTunnelPIN?) -> JSONObject {
         ["version":1,"node":node,"keyID":crypto.id,"publicKey":crypto.publicKey,"pinConfigured":pin != nil,"time":Date().timeIntervalSince1970*1000]
@@ -80,7 +83,7 @@ public struct NativeCodexLoginState: Equatable, Sendable {
     public func stop() {
         generation=UUID();checking?.cancel();checking=nil
         retiredTTYs=retiredTTYs.filter{$0.value>Date()}
-        for job in jobs.values {retiredTTYs[job.tty]=Date().addingTimeInterval(60);job.task?.cancel();job.finish("cancelled")}
+        for job in jobs.values {if let tty = job.tty { retiredTTYs[tty]=Date().addingTimeInterval(60) };job.task?.cancel();job.finish("cancelled")}
         jobs.removeAll();grants.removeAll();seen.removeAll();cached=[];cachedAt = .distantPast;crypto=AgentAccountCrypto()
     }
     public func encrypted(_ envelope:JSONObject,node:String,pin:RemoteTunnelPIN?) async throws -> JSONObject {
@@ -161,12 +164,38 @@ public struct NativeCodexLoginState: Equatable, Sendable {
         }
     }
     private func begin(agent:String,id:String,owner:String,services:AgentAccountServices) throws -> Job {
-        guard !jobs.values.contains(where:{$0.agent==agent && $0.active}) else {throw RemoteHTTPError(409,"이 Mac에서 해당 도구의 로그인이 진행 중입니다. 이전 로그인을 취소한 뒤 시작해주세요.")}
+        guard !hasActiveLogin(agent) else {throw RemoteHTTPError(409,"이 Mac에서 해당 도구의 로그인이 진행 중입니다. 이전 로그인을 취소한 뒤 시작해주세요.")}
         jobs=jobs.filter{$0.value.expires.addingTimeInterval(120)>Date() || $0.value.active}
         guard jobs.count<16 else {throw RemoteHTTPError(429,"로그인 요청이 많습니다. 잠시 후 다시 시도해주세요.")}
-        let terminal=try services.launch(agent),job=Job(id:id,owner:owner,agent:agent,terminal:terminal,now:Date(),services:services)
-        jobs[id]=job;let epoch=generation
-        job.task=Task{[weak self,weak job] in guard let self,let job else {return};await self.follow(job,epoch:epoch)}
+        let prepare = services.prepareLaunch
+        let terminal = try prepare == nil ? services.launch(agent) : nil
+        let job = Job(id:id,owner:owner,agent:agent,terminal:terminal,now:Date(),services:services)
+        jobs[id] = job
+        let epoch = generation
+        job.task = Task { [weak self, weak job] in
+            guard let self, let job else { return }
+            if let prepare {
+                let work = Task.detached(priority: .userInitiated) { try prepare(agent) }
+                do {
+                    let spawn = try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
+                    guard !Task.isCancelled, self.generation == epoch, job.active else { return }
+                    guard job.expires > Date() else {
+                        job.finish("expired", "인증 시간이 만료됐습니다. 다시 로그인해주세요.")
+                        self.notifyNativeLoginFinished(job)
+                        return
+                    }
+                    let terminal = try spawn()
+                    job.terminal = terminal
+                    job.tty = terminal.descriptor.tty
+                } catch {
+                    guard self.generation == epoch, job.active else { return }
+                    job.finish("failed", "로그인 실행을 준비하지 못했습니다. CLI 설치와 계정 설정을 확인해주세요.")
+                    self.notifyNativeLoginFinished(job)
+                    return
+                }
+            }
+            await self.follow(job,epoch:epoch)
+        }
         return job
     }
     private func follow(_ job:Job,epoch:UUID) async {

@@ -311,7 +311,8 @@ extension ApprovalTests {
     }
 
     @MainActor func testExitedRecoveryRestoresExactConversationAndNeverReplays() async throws {
-        for uncertain in [false,true] {
+        for outcome in ["sent", "uncertain", "foregroundChanged"] {
+            let uncertain = outcome == "uncertain"
             let directory = URL(fileURLWithPath:"/private/tmp/aa-exit-"+UUID().uuidString)
             defer {try? FileManager.default.removeItem(at:directory)}
             let records = ProcessDiscovery.parse("""
@@ -321,7 +322,14 @@ extension ApprovalTests {
             let probe = ExitProbe(); probe.records = records; probe.uncertain = uncertain
             let adapter = ScreenHostAdapter(screens:{ targets in TerminalSnapshot(screens:targets.map {TerminalScreen(tty:$0.tty,contents:probe.screen)}) },approve:{_,_,_ in .sent},reveal:{_ in nil},restart:{_,_,command in try probe.launch(command)},
                 validationScreens:{ targets in
-                    probe.lock.withLock { probe.validationReads += 1 }
+                    probe.lock.withLock {
+                        probe.validationReads += 1
+                        if outcome == "foregroundChanged", probe.validationReads == 2, var foreign = probe.records.first {
+                            foreign.pid = 99
+                            foreign.executable = "/bin/cat"
+                            probe.records.append(foreign)
+                        }
+                    }
                     return TerminalSnapshot(screens:targets.map {TerminalScreen(tty:$0.tty,contents:probe.screen)}) })
             let paths = AppPaths(directory:directory)
             let engine = try ApprovalEngine(paths:paths,claudeRegistryReader:{_ in []},processReader:{probe.read()},screenAdapters:[.terminal:adapter])
@@ -334,6 +342,12 @@ extension ApprovalTests {
             var shell = records[0]; shell.foregroundGroup = shell.processGroup; probe.records = [shell]
             engine.updateDiscovery([],records:[shell]); try await Task.sleep(for:.milliseconds(30)); engine.updateDiscovery([],records:[shell])
             try await Task.sleep(for:.milliseconds(1400))
+            if outcome == "foregroundChanged" {
+                try expect(probe.commands.isEmpty, "A foreground job that appeared after validation must not receive the resume command")
+                try expectEqual(engine.snapshot.sessions.first?.interruption?.recoveryStatus, "scheduled")
+                engine.stop()
+                continue
+            }
             try expectEqual(probe.commands.count,1)
             try expect(probe.lock.withLock { probe.validationReads } >= 2, "Exit recovery must freshly compare the original contents twice")
             try expect(probe.commands[0].contains("'--resume' '00000000-0000-4000-8000-000000000061'"))

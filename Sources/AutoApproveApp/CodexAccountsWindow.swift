@@ -61,16 +61,16 @@ struct CodexAccountsLayout<Content:View>:View {
                 if loadingGroups{ProgressView().controlSize(.small).accessibilityLabel("로그인 그룹 확인 중")}
                 Spacer()
                 Button("새 로그인 그룹",systemImage:"plus") {
-                    guard !engine.agentAccounts.busy else{groupError="진행 중인 로그인을 마친 뒤 새 그룹을 만들어주세요.";return}
+                    guard !engine.agentAccounts.codexLoginActive else{groupError="진행 중인 로그인을 마친 뒤 새 그룹을 만들어주세요.";return}
                     newGroup=true
-                }.disabled(loadingGroups || loginBusy || engine.agentAccounts.busy)
+                }.disabled(loadingGroups || loginBusy || engine.agentAccounts.codexLoginActive)
                     .help("별도 로그인 홈을 준비합니다. 만든 뒤 해당 그룹에서 브라우저 로그인을 시작할 수 있습니다.")
             }
             DisclosureGroup("그룹 설정",isExpanded:$groupSettings) {
                 CodexLoginGroupSettings(groups:groups,rename:{id,name in
                     let group=try await engine.renameCodexLoginGroup(id:id,name:name)
                     await reloadGroups();return group
-                }).disabled(loadingGroups || loginBusy || engine.agentAccounts.busy)
+                }).disabled(loadingGroups || loginBusy || engine.agentAccounts.codexLoginActive)
             }
             if let groupError {
                 VStack(alignment:.leading,spacing:6) {
@@ -134,7 +134,7 @@ struct CodexAccountsLayout<Content:View>:View {
         .onDisappear{groupsRequest=UUID();loadingGroups=false}
         .sheet(isPresented:$newGroup,onDismiss:{focusHome=requestedHome}) {
             CodexNewLoginGroupSheet(create:{name in
-                guard !engine.agentAccounts.busy else{throw AppError.message("진행 중인 로그인을 마친 뒤 새 그룹을 만들어주세요.")}
+                guard !engine.agentAccounts.codexLoginActive else{throw AppError.message("진행 중인 로그인을 마친 뒤 새 그룹을 만들어주세요.")}
                 let group=try await engine.createCodexLoginGroup(name:name)
                 await reloadGroups();requestedHome=group.home;newGroup=false
             },cancel:{newGroup=false})

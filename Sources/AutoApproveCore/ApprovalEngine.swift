@@ -197,6 +197,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let groupTranscriptReader: SessionGroupModelSettingsReader
     private var groupRecoveryAt = Date.distantPast
     private let groupClaudeCompletionReader: @Sendable (SessionGroupLiveSession, Date, String) -> WorkCompletion?
+    private let terminalProcessReader: @Sendable (String, Int32) throws -> [ProcessRecord]
     private let groupProcessReader: @Sendable (Set<Int32>) throws -> [ProcessRecord]
     private let singleProcessReader: @Sendable (Int32) throws -> [ProcessRecord]
     private let discoveryReader: @Sendable () throws -> [ProcessRecord]
@@ -752,6 +753,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.groupModelSettingsReader = groupModelSettingsReader ?? { modelReader.read($0) }
         self.profileExecutionSettingsReader = profileExecutionSettingsReader ?? (processReader == nil ? { TerminalProfileExecutionSettingsReader.read($0) } : { _ in nil })
         self.groupClaudeCompletionReader = groupClaudeCompletionReader ?? { modelReader.completion($0, after: $1, task: $2) }
+        if let processReader { self.terminalProcessReader = { _, _ in try processReader() } }
+        else { self.terminalProcessReader = { try ProcessDiscovery.terminalRecords(tty: $0, including: $1) } }
         if let processReader { self.groupProcessReader = { _ in try processReader() } }
         else { self.groupProcessReader = { try ProcessDiscovery.sessionRecords(for: $0) } }
         if let singleProcessReader { self.singleProcessReader = singleProcessReader }
@@ -1161,6 +1164,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if cloudflareStatus.busy || tunnelPINSetupID != nil {return "외부 접속 설정 중이라 업데이트를 기다립니다. 설정을 마치면 적용합니다."}
         if tunnelStatus.active && (!allowTunnelRestart || tunnelStatus.provider == .quick) { return tunnelStatus.provider == .quick && allowTunnelRestart ? "임시 주소는 앱 재시작 시 바뀝니다. Mac에서 임시 연결을 종료하면 업데이트합니다." : "외부 터널이 연결되어 업데이트를 기다립니다. 연결을 종료하면 적용합니다." }
         if codexDiagnostics.busy || diagnosticCollectingRequest != nil {return "Codex 진단이 진행 중입니다. 완료하거나 취소한 뒤 업데이트합니다."}
+        if !sessionRestartTasks.isEmpty || !exitRecoveryTasks.isEmpty { return "세션의 재시작과 복구가 끝난 뒤 업데이트합니다." }
         if agentAccounts.busy {return "AI 계정 로그인이 진행 중입니다. 인증을 마치거나 취소한 뒤 업데이트합니다."}
         if managedPTY.inventory.contains(where: { (try? managedPTY.terminal($0.ptyID).isRunning) == true }) { return "별도 PTY가 실행 중이라 업데이트를 기다립니다. 원본 터미널은 계속 실행됩니다." }
         if !remoteInputSessions.isEmpty || !remotePTYInput.isEmpty || !automaticInputSessions.isEmpty ||
@@ -1329,7 +1333,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let targetsByID = Dictionary(uniqueKeysWithValues: targets.map { ($0.id, $0) })
         guard targets.count<=128 else {throw AppError.message("프로필에는 최대 128개 세션을 저장합니다.")}
-        let reader=processReader
+        let reader=groupProcessReader
+        let pids = Set(targets.map(\.pid))
         let observed=try await readSessionGroupSessions(selectedIDs: Set(targetsByID.keys), reconcile:false, priority:.userInitiated)
         let identities=Dictionary(uniqueKeysWithValues:observed.map {($0.id,$0)})
         var result:[TerminalProfileCandidate]=[]
@@ -1450,7 +1455,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
         }
-        let fresh=try await Task.detached(priority:.userInitiated) {ProcessDiscovery.index(try reader())}.value
+        let fresh=try await Task.detached(priority:.userInitiated) {ProcessDiscovery.index(try reader(pids))}.value
         try Task.checkCancellation()
         guard observationEpoch == epoch, !remoteInputStopped,result.allSatisfy({candidate in
             guard let original=targetsByID[candidate.id],let current=sessions[candidate.id],current.phase != .ended, !isBackgroundGroupSession(current),
@@ -5466,9 +5471,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let observed = try? await readSessionGroupSessions(runtimeID: id, reconcile: false)
             conversation = valid(observed?.first?.conversationID)
         }
-        let reader = processReader
+        let scopedReader = terminalProcessReader
+        @Sendable func reader() throws -> [ProcessRecord] { try scopedReader(original.tty, original.pid) }
         guard let records = try? await Task.detached(operation: { try reader() }).value,
-              let process = records.first(where: { $0.key == id && $0.agent == original.agent }) else {
+              let process = records.first(where: { $0.key == id && $0.agent == original.agent && "/dev/" + $0.tty == original.tty }) else {
             return fail("CLI 프로세스를 확인하지 못했습니다.")
         }
         let chain = ProcessDiscovery.ancestors(of: process.parent, records: records)
@@ -5666,11 +5672,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try? await Task.sleep(for: .seconds(1))
             guard let live = try? await Task.detached(operation: { try reader() }).value else { continue }
             let index = ProcessDiscovery.index(live)
-            let next = live.first { candidate in
+            let replacements = live.filter { candidate in
                 candidate.agent == original.agent && candidate.tty == process.tty && candidate.key != id &&
                 ProcessDiscovery.ancestors(of: candidate.parent, byPID: index).contains { $0.pid == shell.pid && $0.started == shell.started }
             }
-            guard let next, sessions[next.key] != nil else { continue }
+            guard replacements.count == 1, let next = replacements.first, let replacement = sessions[next.key], replacement.phase != .ended else { continue }
             if wasAutomatic {
                 try? store.set("automatic:\(next.key)", "true")
                 sessions[next.key]?.automatic = true
@@ -11782,7 +11788,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return home
     }
     public func copyCodexLoginToIndependentHome(sessionID:String,independentID:UUID) async throws {
-        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
+        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.codexLoginActive else {
             throw AppError.message("진행 중인 로그인·전환을 마친 뒤 독립 로그인을 준비해주세요.")
         }
         let epoch=codexAccountTransitionEpoch
@@ -11958,7 +11964,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     func prepareCodexSessionMigration(sessionID:String,destinationHome:String) async throws->CodexSessionMigrationState {
         try CodexFeatureSupport.requireSessionMove()
-        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
+        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.codexLoginActive else {
             throw AppError.message("진행 중인 로그인·계정 전환을 마친 뒤 이동해주세요.")
         }
         let epoch=codexAccountTransitionEpoch
@@ -11996,7 +12002,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Observe current terminal Session IDs and the actual shared-server cohort.
     /// A private TUI connection census is not part of this preparation.
     public func prepareCodexCohortMove(sessionID:String,destinationHome:String) async throws ->CodexSessionMovePlan {
-        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
+        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.codexLoginActive else {
             throw AppError.message("진행 중인 계정 변경을 먼저 마쳐주세요.")
         }
         try validateCodexLoginHome(destinationHome)
@@ -12017,7 +12023,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Enroll one independent writer after persisting its /status identity.
     /// The existing managed server and its unrelated clients remain running.
     public func prepareStandaloneCodexCohortMove(sessionID:String,destinationHome:String,automaticEnrollment:Bool=false) async throws->CodexSessionMovePlan {
-        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else{throw AppError.message("진행 중인 계정 변경을 먼저 마쳐주세요.")}
+        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.codexLoginActive else{throw AppError.message("진행 중인 계정 변경을 먼저 마쳐주세요.")}
         try validateCodexLoginHome(destinationHome)
         let standalone=try await codexStandaloneSession(sessionID:sessionID)
         let source=standalone.home,destination=try CodexAccountTransitionTarget.canonicalHome(destinationHome)
@@ -12562,7 +12568,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     func executeCodexSessionMigration(id:String) async throws->CodexSessionMigrationState {
         try CodexFeatureSupport.requireSessionMove()
-        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
+        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.codexLoginActive else {
             throw AppError.message("진행 중인 로그인·계정 전환을 마친 뒤 이동해주세요.")
         }
         let coordinator=try sessionMigrationCoordinator()
@@ -12716,12 +12722,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     /// One automatic attempt per home and manager lifetime, including failures.
     public func ensureCodexManagedServers() async {
-        guard !Task.isCancelled,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else{return}
+        guard !Task.isCancelled,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.codexLoginActive else{return}
         let epoch=codexAccountTransitionEpoch
         do {
             let homes=try await codexServerSetupHomes(includeStoredGroups:false)
             for home in Set(homes+[try CodexAccountTransitionTarget.canonicalHome(NSHomeDirectory()+"/.codex")]).sorted() {
-                guard !Task.isCancelled,epoch==codexAccountTransitionEpoch,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else{return}
+                guard !Task.isCancelled,epoch==codexAccountTransitionEpoch,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.codexLoginActive else{return}
                 guard codexManagedServerAutomaticHomes.insert(home).inserted else{continue}
                 do {
                     let status=try await codexManagedServerStatus(home:home)
@@ -12794,7 +12800,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Automatic enrollment waits for a fresh empty idle composer. Explicit
     /// moves use the same coordinator and can quiesce active work themselves.
     func attachOfficialStandaloneCodexSessions(home:String,sessionIDs:Set<String>?=nil,allowActive:Bool=false) async {
-        guard !Task.isCancelled,!snapshot.paused,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy,
+        guard !Task.isCancelled,!snapshot.paused,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.codexLoginActive,
               officialAttachmentHomes.insert(home).inserted else{return}
         defer{officialAttachmentHomes.remove(home)}
         if sessionIDs==nil,(try? codexIndependentLoginStore.requiresStandalone(home:home))==true{return}
@@ -12842,7 +12848,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             codexSessionAttachmentNotice=CodexFeatureSupport.standaloneAttachmentUnavailable
             return
         }
-        guard !Task.isCancelled,!snapshot.paused,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else{return}
+        guard !Task.isCancelled,!snapshot.paused,!remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.codexLoginActive else{return}
         if sessionIDs==nil,(try? codexIndependentLoginStore.contains(home:home))==true {return}
         let epoch=codexAccountTransitionEpoch,reader=processReader
         codexAccountTransitionBusy=true
@@ -13244,7 +13250,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     public func prepareCodexManagedServer(home:String) async throws ->CodexManagedServerStatus {
         try validateCodexLoginHome(home)
         let selectedHome=home
-        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.busy else {
+        guard !remoteInputStopped,!codexAccountTransitionBusy,!codexAccountTransitionHeld,!agentAccounts.codexLoginActive else {
             throw AppError.message(codexAccountControlBlockReason() ?? "현재 연결 상태를 확인해주세요.")
         }
         let epoch=codexAccountTransitionEpoch,reader=processReader
@@ -13415,9 +13421,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private func codexAccountControlBlockReason()->String? {
         if remoteInputStopped {return "앱이 종료 중이어서 새 로그인·전환 요청을 받지 않습니다."}
-        if agentAccounts.busy {return agentAccounts.nativeCodexLogin?.active == true
+        if agentAccounts.codexLoginActive {return agentAccounts.nativeCodexLogin?.active == true
             ? "브라우저 로그인이 진행 중입니다. 브라우저에서 로그인을 완료하거나 로그인 취소를 누른 뒤 다시 확인해주세요."
-            : "Claude 또는 Codex 로그인이 진행 중입니다. 해당 로그인의 완료·취소 상태를 확인해주세요."}
+            : "Codex 로그인이 진행 중입니다. 해당 로그인의 완료·취소 상태를 확인해주세요."}
         if let state=codexAccountTransitionStates.sorted(by:{$0.key<$1.key}).first(where:{$0.value.held})?.value {
             return "기존 계정 전환을 확인 중입니다. "+state.detail
         }
@@ -13431,12 +13437,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let joinedExisting=codexAccountTransitionStates[home]?.held == true
         while codexAccountTransitionBusy {
             guard !Task.isCancelled,epoch==codexAccountTransitionEpoch,!remoteInputStopped else{throw CancellationError()}
-            if agentAccounts.busy {throw AppError.message(codexAccountControlBlockReason()!)}
+            if agentAccounts.codexLoginActive {throw AppError.message(codexAccountControlBlockReason()!)}
             guard Date()<deadline else{throw AppError.message(codexAccountControlBlockReason() ?? "현재 서버·세션 확인이 끝나기를 기다립니다.")}
             try await Task.sleep(for:.milliseconds(100))
         }
         guard epoch==codexAccountTransitionEpoch,!Task.isCancelled else{throw CancellationError()}
-        if remoteInputStopped || agentAccounts.busy {throw AppError.message(codexAccountControlBlockReason()!)}
+        if remoteInputStopped || agentAccounts.codexLoginActive {throw AppError.message(codexAccountControlBlockReason()!)}
         if joinedExisting || codexAccountTransitionHeld {
             guard joinedExisting || codexAccountTransitionStates[home]?.held == true else{throw AppError.message(codexAccountControlBlockReason()!)}
             if codexAccountTransitionStates[home]?.held == true {
@@ -13568,7 +13574,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard attachmentEpoch==codexAccountTransitionEpoch,!Task.isCancelled else{throw CancellationError()}
         let attachmentDeadline=Date().addingTimeInterval(125)
         while codexSessionAttachments.values.contains(where:{$0.home==attachmentHome && [.needsPause,.pauseReserved,.waitingPause,.needsTab,.tabReserved,.ready,.exitReserved,.waitingShell,.launchReserved,.verifying].contains($0.phase)}) {
-            guard !Task.isCancelled,attachmentEpoch==codexAccountTransitionEpoch,!remoteInputStopped,!agentAccounts.busy else{throw CancellationError()}
+            guard !Task.isCancelled,attachmentEpoch==codexAccountTransitionEpoch,!remoteInputStopped,!agentAccounts.codexLoginActive else{throw CancellationError()}
             guard Date()<attachmentDeadline else{throw AppError.message("기존 세션 연결 결과를 확인하고 있습니다. 같은 종료·실행 입력을 반복하지 않습니다.")}
             try await Task.sleep(for:.seconds(2));await ensureCodexManagedServers()
         }
@@ -13589,7 +13595,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let targets=try await codexLoginTargets()
         try Task.checkCancellation()
         guard epoch==codexAccountTransitionEpoch,!remoteInputStopped else {throw CancellationError()}
-        guard !codexAccountTransitionHeld,!agentAccounts.busy else {throw AppError.message(codexAccountControlBlockReason() ?? "현재 연결 상태를 확인해주세요.")}
+        guard !codexAccountTransitionHeld,!agentAccounts.codexLoginActive else {throw AppError.message(codexAccountControlBlockReason() ?? "현재 연결 상태를 확인해주세요.")}
         guard targets.contains(where:{$0.home==home}) else {
             if let issue=codexSessionAttachments.values.filter({$0.home==home && $0.phase == .review}).sorted(by:{$0.context.session.pid<$1.context.session.pid}).first {
                 throw AppError.message("기존 세션 연결을 완료하지 못했습니다. "+issue.detail)
@@ -14238,7 +14244,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             sessions[id]?.interruption?.recoveryDetail = "이 원본 터미널은 종료 후 자동 복구 입력을 지원하지 않습니다. Mac에서 같은 대화를 다시 열어주세요."
             exitRecoveries[id]?.state = "unavailable"; persistInterruption(id); saveExitRecoveries(); publish(); return
         }
-        let reader = processReader
+        let scopedReader = terminalProcessReader, original = context.session
+        @Sendable func reader() throws -> [ProcessRecord] { try scopedReader(original.tty, original.pid) }
         var launched = false
         do {
             let live = try await Task.detached { try reader() }.value
@@ -14298,12 +14305,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard log(event) else { exitRecoveries[id]?.state = "review"; return }
             publish()
             launched = true
-            let delivery = try await Task.detached {
-                try adapter.dispatchInput(host) {
-                    try launchContext?.verifyUnchanged()
-                    return try restart(target,first,command)
-                }
-            }.value
+            let expected = context
+            let delivery = try await adapter.restartInput(host) {
+                guard try expected.verifiedShell(in: reader())?.key == shell.key else { return .agentMissing }
+                try launchContext?.verifyUnchanged()
+                return try restart(target,first,command)
+            }
             guard owns("launching") else { return }
             if delivery == .sent {
                 exitRecoveries[id]?.state = "awaiting"; exitRecoveries[id]?.conversationID = context.conversationID
@@ -14320,10 +14327,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         } catch {
             guard launched ? owns("launching") : mayLaunch() else { return }
-            if error is AutomationIPC.InputNotStarted { sessions[id]?.interruption?.resumeUncertain = false }
+            let rejected = error as? AutomationIPC.InputNotStarted
+            if rejected != nil, launched {
+                sessions[id]?.interruption?.resumeUncertain = false
+                exitRecoveries[id]?.attempts = max(0, context.attempts - 1)
+            }
             let uncertain = sessions[id]?.interruption?.resumeUncertain == true
             exitRecoveries[id]?.state = uncertain ? "review" : "scheduled"
-            exitRecoveries[id]?.deadline = Date().addingTimeInterval(30)
+            exitRecoveries[id]?.deadline = Date().addingTimeInterval(rejected?.reason == .busy ? 1 : 30)
             sessions[id]?.interruption?.recoveryStatus = uncertain ? "review" : "scheduled"
             sessions[id]?.interruption?.recoveryDetail = uncertain ? "복구 입력의 결과를 확인하지 못했습니다. 같은 명령을 다시 보내지 않습니다." : "원본 터미널 연결을 다시 확인합니다. \(error.localizedDescription)"
         }

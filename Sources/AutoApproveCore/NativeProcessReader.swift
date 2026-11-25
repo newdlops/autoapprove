@@ -27,6 +27,23 @@ enum NativeProcessReader {
             return try records(entries: entries.filter { selected.contains($0.kp_proc.p_pid) })
         }
     }
+    static func terminalRecords(tty: String, including pid: Int32) throws -> [ProcessRecord] {
+        var device = stat()
+        guard TerminalProfileLauncher.validTTY(tty), lstat(tty, &device) == 0,
+              device.st_mode & S_IFMT == S_IFCHR else { return try read() }
+        return try autoreleasepool {
+            let entries = try snapshot(pid: nil)
+            let byPID = Dictionary(entries.map { ($0.kp_proc.p_pid, $0.kp_eproc.e_ppid) }, uniquingKeysWith: { first, _ in first })
+            var selected = Set<Int32>()
+            for entry in entries where entry.kp_eproc.e_tdev == device.st_rdev || entry.kp_proc.p_pid == pid {
+                var current = entry.kp_proc.p_pid
+                while current > 0, selected.insert(current).inserted, let parent = byPID[current] {
+                    current = parent
+                }
+            }
+            return try records(entries: entries.filter { selected.contains($0.kp_proc.p_pid) })
+        }
+    }
     static func readAncestorChain(of pid:Int32,through ancestor:Int32?) throws -> [ProcessRecord] {
         try autoreleasepool {
             func readChain() throws -> [ProcessRecord] {

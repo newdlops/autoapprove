@@ -630,6 +630,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session profiles: optional conversation starts CLI and saves separate entries",tests.testTerminalProfileFreshCLICommandsAndPrivateFiles),
             ("Session profiles: fresh CLI tabs and bounded duplicate launch receipts",tests.testTerminalProfileFreshCLIRestoreKeepsTabsAndReceipts),
             ("Session profiles: duplicate prevention, missing folder and uncertain delivery",tests.testTerminalProfileRestoreDeduplicationAndPartialFailure),
+            ("Account login: independent providers, duplicate rejection and cancellation before private PTY launch", tests.testAccountLoginIsolationAndCancellationDuringPreparation),
+            ("Session restart: scoped process reads include same-terminal jobs and a moved original PID", tests.testRestartSnapshotIncludesOtherJobsOnTheSameTTY),
             ("Session profiles: targeted background shell consumes the quoted conversation once",tests.testProfileLauncherDeliversToBackgroundShell),
             ("Session profiles: tab confirmation failure never creates a fallback window",tests.testTerminalProfileTabFailureNeverCreatesWindow),
             ("Session profiles: uncertain first window preserves siblings and independent windows",tests.testTerminalProfileUncertainWindowDoesNotSplitSiblings),

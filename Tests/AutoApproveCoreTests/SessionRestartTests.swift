@@ -53,6 +53,44 @@ private final class RestartTerminal: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testRestartSnapshotIncludesOtherJobsOnTheSameTTY() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("aa-restart-tty-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = ["HOME":root.path, "ZDOTDIR":root.path, "PATH":"/usr/bin:/bin"]
+        let terminal = try ManagedPTY(cwd: root.path, command: ["/bin/sh", "-c", "/bin/sleep 30 & echo $! > child; wait"], environment: environment)
+        defer { terminal.close() }
+        let unrelated = try ManagedPTY(cwd: root.path, command: ["/bin/sleep", "30"], environment: environment)
+        defer { unrelated.close() }
+        let source = terminal.descriptor, other = unrelated.descriptor
+        let readyUntil = Date().addingTimeInterval(5)
+        let marker = root.appendingPathComponent("child")
+        var child: Int32?
+        while child == nil {
+            guard Date() < readyUntil else { throw AppError.message("Fixture shell did not start its child") }
+            child = (try? String(contentsOf: marker, encoding: .utf8)).flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            if child == nil { Thread.sleep(forTimeInterval: 0.01) }
+        }
+        let clock = ContinuousClock()
+        var fullTimes = [Duration](), targetTimes = [Duration]()
+        for _ in 0..<7 {
+            let start = clock.now
+            let all = try ProcessDiscovery.read()
+            fullTimes.append(start.duration(to: clock.now))
+            let targetStart = clock.now
+            let scoped = try ProcessDiscovery.terminalRecords(tty: source.tty, including: other.pid)
+            targetTimes.append(targetStart.duration(to: clock.now))
+            let name = String(source.tty.dropFirst("/dev/".count))
+            let occupants = all.filter { $0.tty == name }
+            try expect(occupants.contains { $0.pid == source.pid })
+            try expect(occupants.contains { $0.parent == source.pid && $0.pid == child })
+            try expectEqual(Set(scoped.filter { $0.tty == name }.map(\.key)), Set(occupants.map(\.key)))
+            try expect(scoped.contains { $0.pid == other.pid })
+            try expect(scoped.count < all.count)
+        }
+        print("Restart process snapshot (7 samples), full median \(fullTimes.sorted()[3]), scoped median \(targetTimes.sorted()[3])")
+    }
+
     @MainActor func testExplicitCodexLoginRequestsStopsBeforeWaitingForAnyTurn() async throws {
         let target = CodexAccountTransitionTarget(home: "/fixture", executable: "/fixture/codex")
         var threads = ["a", "b"].map { CodexAccountTransitionThread(id: $0, turnID: "turn-" + $0, active: true) }

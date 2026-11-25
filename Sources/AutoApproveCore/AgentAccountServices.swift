@@ -8,7 +8,11 @@ public struct AgentAccountState:Codable,Sendable {
 public struct AgentAccountServices:Sendable {
     public var home:String
     public var check:@Sendable(String) async throws -> AgentAccountState
-    public var launch:@Sendable(String) throws -> ManagedPTY
+    package typealias PreparedLaunch = @Sendable () throws -> ManagedPTY
+    package var prepareLaunch: (@Sendable (String) throws -> PreparedLaunch)?
+    public var launch:@Sendable(String) throws -> ManagedPTY {
+        didSet { prepareLaunch = nil }
+    }
     public init(home:String,check:@escaping @Sendable(String) async throws -> AgentAccountState,launch:@escaping @Sendable(String) throws -> ManagedPTY) {self.home=home;self.check=check;self.launch=launch}
     public static var live:Self { local(codexHome:nil,executable:nil) }
     public static func codex(_ target:CodexAccountTransitionTarget) throws -> Self {
@@ -36,7 +40,24 @@ public struct AgentAccountServices:Sendable {
             return try CodexOfficialExecutable.resolve(home:selectedHome,userHome:home,
                 executable:executable=="codex" ? nil:executable,records:records,environment:env,verifyExecutable:verifyExecutable)
         }
-        return Self(home:home,check:{agent in
+        let prepare: @Sendable (String) throws -> PreparedLaunch = { agent in
+            let nativeBrowser=browser && agent=="codex"
+            var prefix=nativeBrowser ? ["/usr/bin/env","-u","SSH_CONNECTION","-u","SSH_TTY","-u","SSH_CLIENT","-u","BROWSER","NO_COLOR=1"] : ["/usr/bin/env","BROWSER=true","SSH_CONNECTION=127.0.0.1 0 127.0.0.1 0","NO_COLOR=1"]
+            let command:[String],launchEnvironment:[String:String], verifiedCLI: CodexCLIContext?
+            if agent=="codex" {
+                guard let cli=try resolve() else {throw AppError.message("공식 Codex CLI를 찾지 못했습니다.")}
+                verifiedCLI = cli
+                prefix.insert(contentsOf:["-u","AUTOAPPROVE_NATIVE_RUNTIME_ROOT","-u","AUTOAPPROVE_SELECTED_TRANSITION_SOCKET"],at:1)
+                command=["HOME="+home,"CODEX_HOME="+cli.environment["CODEX_HOME"]!,"PATH="+cli.environment["PATH",default:"/usr/bin:/bin"],cli.executable,"login"]+(nativeBrowser ? []:["--device-auth"])
+                launchEnvironment=cli.environment
+            } else {verifiedCLI = nil; command=["claude","auth","login","--claudeai"];launchEnvironment=env}
+            let arguments = prefix + command
+            return {
+                try verifiedCLI?.verifyUnchanged()
+                return try ManagedPTY(cwd:home,program:"shell",command:arguments,columns:240,rows:40,environment:launchEnvironment)
+            }
+        }
+        var services = Self(home:home,check:{agent in
             try await Task.detached(priority:.utility) {
                 let result:CommandResult
                 if agent=="codex" {
@@ -57,23 +78,9 @@ public struct AgentAccountServices:Sendable {
                 if text.contains("not logged in") || text.contains("not authenticated") {return AgentAccountState(agent:agent,phase:"signedOut")}
                 return AgentAccountState(agent:agent,phase:"unknown")
             }.value
-        },launch:{agent in
-            // A native Mac login uses the CLI's standard browser + loopback
-            // flow. Clear overrides after the login shell has run as well.
-            let nativeBrowser=browser && agent=="codex"
-            var prefix=nativeBrowser ? ["/usr/bin/env","-u","SSH_CONNECTION","-u","SSH_TTY","-u","SSH_CLIENT","-u","BROWSER","NO_COLOR=1"] : ["/usr/bin/env","BROWSER=true","SSH_CONNECTION=127.0.0.1 0 127.0.0.1 0","NO_COLOR=1"]
-            let command:[String],launchEnvironment:[String:String]
-            if agent=="codex" {
-                guard let cli=try resolve() else {throw AppError.message("공식 Codex CLI를 찾지 못했습니다.")}
-                try cli.verifyUnchanged()
-                // The login shell must not reintroduce private fork protocols
-                // or redirect this exact selected home to another account.
-                prefix.insert(contentsOf:["-u","AUTOAPPROVE_NATIVE_RUNTIME_ROOT","-u","AUTOAPPROVE_SELECTED_TRANSITION_SOCKET"],at:1)
-                command=["HOME="+home,"CODEX_HOME="+cli.environment["CODEX_HOME"]!,"PATH="+cli.environment["PATH",default:"/usr/bin:/bin"],cli.executable,"login"]+(nativeBrowser ? []:["--device-auth"])
-                launchEnvironment=cli.environment
-            } else {command=["claude","auth","login","--claudeai"];launchEnvironment=env}
-            return try ManagedPTY(cwd:home,program:"shell",command:prefix+command,columns:240,rows:40,environment:launchEnvironment)
-        })
+        },launch:{ try prepare($0)() })
+        services.prepareLaunch = prepare
+        return services
     }
 }
 
