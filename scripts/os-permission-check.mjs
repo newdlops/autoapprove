@@ -1,4 +1,3 @@
-// Real Core HTTP/browser paths. Permission windows and CLI identities are synthetic.
 import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import {execFileSync,spawn} from 'node:child_process';
@@ -16,7 +15,7 @@ async function inputs(node){try{return JSON.parse(await readFile(node.home+'/os-
 async function state(node){return json(node.url+'/api/state');}
 async function control(node,value){await writeFile(node.home+'/os-control.json',JSON.stringify(value));}
 try{
- const a=await start('Permission A'),b=await start('Permission B'),old=await start('Permission Old',['--web-version=0.2.207:234']);
+ const a=await start('Permission A'),b=await start('Permission B',['--session-launched-app']),old=await start('Permission Old',['--web-version=0.2.207:234']);
  await json(a.url+'/api/peers',{address:b.url});await json(a.url+'/api/peers',{address:old.url});
  const module=await import(process.env.AUTOAPPROVE_PLAYWRIGHT_MODULE||'playwright');browser=await module.chromium.launch({headless:true,channel:'chrome'});
  const page=await browser.newPage({viewport:{width:1440,height:900}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
@@ -36,6 +35,14 @@ try{
  await page.locator('#os-permission-targets').getByRole('button',{name:'등록 해제'}).click();await until(async()=>(await state(a)).sessions.every(v=>!(v.session.osPermissionPolicy?.targets.length)),'Registration was not revoked');
  await json(a.url+'/api/action',{action:'pause',paused:false});await wait(1300);assert.equal((await inputs(a)).length,3);
  await page.getByRole('button',{name:/검증용 Permission B · 웹 관리 구현/}).click();await page.locator('#os-permission-options').evaluate(e=>e.open=true);await page.locator('#os-permission-camera').check();
+ const launched=(await state(b)).snapshot.osPermissions.requests.find(request=>request.needsAppConfirmation);
+ assert.ok(launched?.sessionID);assert.deepEqual(await inputs(b),[]);
+ for(const [name,width,height] of [['mobile',390,844],['tablet',768,1024],['desktop',1440,900]]){
+  await page.setViewportSize({width,height});const row=page.locator('#os-permission-requests article').filter({hasText:'이 세션이 실행한 앱입니다'});
+  await row.scrollIntoViewIfNeeded();assert.ok(await row.getByRole('button',{name:'이 요청만 이 세션에 연결'}).isVisible());
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+  await page.screenshot({path:out+'/launched-'+name+'.png'});
+ }
  await page.locator('#os-permission-requests').getByRole('button',{name:'이 앱을 이 세션에 등록'}).click();await until(async()=>(await inputs(b)).length===1,'Relayed policy/registration did not reach B');assert.equal((await inputs(a)).length,3);
  await control(b,{suffix:'not-enabled',kind:'microphone'});await until(async()=>(await state(b)).snapshot.osPermissions.requests.some(r=>r.windowToken==='not-enabled'),'B pending request missing');
  await page.waitForFunction(()=>document.querySelector('#os-permission-requests')?.textContent.includes('마이크'));

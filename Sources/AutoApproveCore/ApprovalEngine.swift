@@ -134,6 +134,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var osPermissionTask:Task<Void,Never>?
     private var osPermissionScanning=false
     private var osPermissionRequests:[String:OSPermissionRequest]=[:]
+    private var osPermissionLaunches:[String:OSPermissionLaunch]=[:]
     private var osPermissionClaims:[String:(sessionID:String,token:String,source:String)]=[:]
     private var osPermissionPolicySources:[String:String]=[:]
     private var osPermissionReceipts:Set<String>=[]
@@ -11037,15 +11038,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
         cancelCodexProgressCheck(id);codexProgressTrackers.removeValue(forKey:id)
         publish()
     }
+    private func verifiedOSPermissionLaunch(_ request:OSPermissionRequest,session:AgentSession)->Bool {
+        guard let target=request.requester,let observed=osPermissionLaunches[request.immutableToken],
+              observed.matches(session) else {return false}
+        let current=OSPermissionLaunch(target,services:osPermissionServices)
+        return observed.stillEnclosesSameAgent(as:current) && current.matches(session)
+    }
     public func assignOSPermission(_ id:String,requestID:String,token:String,remember:Bool) throws {
         guard let session=sessions[id],session.agent != .shell,session.phase != .ended,
               let request=osPermissionRequests[requestID],request.isPending,request.phase == .waiting,
               request.immutableToken==token,let target=request.requester,let seen=osPermissionSeen[requestID],Date().timeIntervalSince(seen)<6 else {throw RemoteHTTPError(409,"현재 OS 요청과 앱 신원을 다시 확인해주세요.")}
         guard !request.isManagementApp else {throw RemoteHTTPError(409,"AutoApprove 자체의 권한은 CLI 세션 정책에 연결할 수 없습니다. Mac에서 직접 설정해주세요.")}
         guard request.sessionID==nil || request.sessionID==id else {throw RemoteHTTPError(409,"다른 세션에 연결된 요청입니다.")}
+        guard verifiedOSPermissionLaunch(request,session:session) else {throw RemoteHTTPError(409,"요청 앱의 실행 경로가 바뀌었습니다. Mac에서 현재 요청을 확인해주세요.")}
         if remember {
             guard !target.isSharedController else {throw RemoteHTTPError(409,"여러 세션이 공유하는 제어 앱은 현재 요청만 연결할 수 있습니다.")}
-            guard !sessions.values.contains(where:{$0.id != id && $0.phase != .ended && $0.osPermissionPolicy?.targets.contains(where:{$0.matches(target)})==true}) else {throw RemoteHTTPError(409,"이 앱은 다른 실행 세션에 등록되어 있습니다. 그 세션에서 먼저 해제해주세요.")}
+            if case .detached = osPermissionLaunches[token],sessions.values.contains(where:{$0.id != id && $0.phase != .ended && $0.osPermissionPolicy?.targets.contains(where:{$0.matches(target)})==true}) {throw RemoteHTTPError(409,"이 앱은 다른 실행 세션에 등록되어 있습니다. 그 세션에서 먼저 해제해주세요.")}
         }
         guard log(AuditEvent(sessionID:id,summary:"OS 권한 요청 연결 · "+target.name,outcome:remember ? "이 세션의 테스트 앱 등록":"현재 요청만 연결",source:"세션 OS 권한 정책",context:AuditContext(session:session),request:request.content)) else {throw RemoteHTTPError(503,"요청 연결 기록을 저장하지 못했습니다.")}
         if remember {
@@ -11054,6 +11062,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try saveOSPermissionPolicy(session,policy)
         }
         osPermissionClaims[requestID]=(id,token,osPermissionSource(session));osPermissionRequests[requestID]?.sessionID=id
+        osPermissionRequests[requestID]?.needsAppConfirmation=nil
         publishOSPermissions();publish()
     }
     public func removeOSPermissionTarget(_ id:String,targetID:String) throws {
@@ -11088,7 +11097,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   let current=sessions[id],current.phase != .ended,osPermissionSource(current)==source,
                   let currentRequest=osPermissionRequests[requestID],currentRequest.immutableToken==token,currentRequest.sessionID==id,currentRequest.buttons?.contains(choice)==true,
                   let records=try? singleProcessReader(original.pid) else {return false}
-            return records.contains {$0.pid==original.pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent}
+            return verifiedOSPermissionLaunch(request,session:current) && records.contains {$0.pid==original.pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent}
         }
         guard authorized() else {throw RemoteHTTPError(409,"원래 세션 프로세스가 바뀌어 OS 버튼을 누르지 않았습니다.",diagnostics:["delivery":"not_started"])}
         osPermissionActing=requestID;defer {osPermissionActing=nil}
@@ -11140,9 +11149,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
         osPermissionTransitions=osPermissionTransitions.filter {entry in guard let session=sessions[entry.value.sessionID] else {return false};return entry.value.until>Date() && session.phase != .ended && entry.value.source==osPermissionSource(session)}
         let epoch=osPermissionEpoch,service=osPermissionServices,targets=sessions.values.flatMap {$0.osPermissionPolicy?.targets ?? []}+osPermissionTransitions.values.map(\.target)
         do {
-            let scanned=try await Task.detached(priority:.utility) {try service.scan(targets)}.value
+            let (scanned,launches)=try await Task.detached(priority:.utility) {
+                let scan=try service.scan(targets)
+                var launches=[String:OSPermissionLaunch]()
+                for request in scan.requests where !request.isManagementApp {
+                    if let target=request.requester {launches[request.immutableToken]=OSPermissionLaunch(target,services:service)}
+                }
+                return (scan,launches)
+            }.value
             guard !Task.isCancelled,epoch==osPermissionEpoch,!remoteInputStopped else {return}
             let before=snapshot.osPermissions,now=Date(),seen=Set(scanned.requests.map(\.id))
+            let previousLaunches=osPermissionLaunches
+            if scanned.available {osPermissionLaunches=launches}
             for fresh in scanned.requests {
                 var request=fresh
                 request.managementApp=request.isManagementApp ? true:nil
@@ -11155,14 +11173,35 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     request.detail="이 요청에는 이전 조작 기록이 있습니다. 자동으로 다시 누르지 않습니다. 원래 Mac에서 확인해주세요."
                     request.sessionID=decoded.sessionID
                 }
-                if let claim=osPermissionClaims[request.id],claim.token==request.immutableToken,let session=sessions[claim.sessionID],session.phase != .ended,claim.source==osPermissionSource(session) {request.sessionID=claim.sessionID}
-                else if request.action == .enableSetting,let target=request.requester {
-                    let transitions=osPermissionTransitions.values.filter {$0.target==target && $0.kind==request.kind && $0.until>now}
-                    if transitions.count==1 {request.sessionID=transitions[0].sessionID;osPermissionClaims[request.id]=(transitions[0].sessionID,request.immutableToken,transitions[0].source)}
+                let token=request.immutableToken
+                var launch=launches[token] ?? .unknown
+                if let previous=previousLaunches[token],!previous.stillEnclosesSameAgent(as:launch) {
+                    osPermissionLaunches[token]=previous
+                    launch = .unknown
                 }
-                else if let target=request.requester {
-                    let owners=sessions.values.filter {$0.phase != .ended && osPermissionPolicySources[$0.id]==osPermissionSource($0) && $0.osPermissionPolicy?.targets.contains(where:{$0.matches(target)})==true}
-                    if owners.count==1 {request.sessionID=owners[0].id}
+                let claim=osPermissionClaims[request.id]
+                let claimed=claim.flatMap { claim -> AgentSession? in
+                    guard claim.token==token,let owner=sessions[claim.sessionID],owner.phase != .ended,
+                          claim.source==osPermissionSource(owner),launch.matches(owner) else {return nil}
+                    return owner
+                }
+                if let owner=claimed {request.sessionID=owner.id}
+                else if request.action == .enableSetting,let target=request.requester {
+                    let transitions=osPermissionTransitions.values.filter {$0.target==target && $0.kind==request.kind && $0.until>now && sessions[$0.sessionID].map(launch.matches)==true}
+                    if transitions.count==1 {request.sessionID=transitions[0].sessionID;osPermissionClaims[request.id]=(transitions[0].sessionID,token,transitions[0].source)}
+                } else if let target=request.requester {
+                    let owners=sessions.values.filter { session in
+                        guard session.phase != .ended,launch.matches(session) else {return false}
+                        if case .agent = launch {return true}
+                        return osPermissionPolicySources[session.id]==osPermissionSource(session) && session.osPermissionPolicy?.targets.contains(where:{$0.matches(target)})==true
+                    }
+                    if owners.count==1 {
+                        let owner=owners[0]
+                        request.sessionID=owner.id
+                        if case .agent = launch,osPermissionPolicySources[owner.id] != osPermissionSource(owner) || owner.osPermissionPolicy?.targets.contains(where:{$0.matches(target)}) != true {
+                            request.needsAppConfirmation=true
+                        }
+                    }
                 }
                 if request.isManagementApp {
                     request.sessionID=nil;osPermissionClaims.removeValue(forKey:request.id)
@@ -11170,6 +11209,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 } else if request.phase == .waiting {
                     if request.action == .manual {request.detail="Mac 사용자 인증이나 보호된 OS 조작이 필요합니다. 이 창은 Mac에서 직접 처리해주세요."}
                     else if request.requester==nil {request.detail="OS 요청 앱의 서명과 실행 신원을 확인하지 못해 자동 승인하지 않습니다."}
+                    else if launch == .unknown {request.detail="요청 앱의 실행 경로를 확인할 수 없습니다. Mac에서 권한창을 확인해주세요."}
+                    else if request.needsAppConfirmation==true {request.detail="이 세션이 실행한 앱입니다. 이번 요청만 연결하거나 앱을 등록하면 선택한 권한 정책이 적용됩니다."}
                     else if let id=request.sessionID,let session=sessions[id] {
                         request.detail=snapshot.paused ? "전체 일시정지 중입니다.":!session.automatic ? "이 세션의 자동 승인을 켜면 정책을 적용합니다.":session.osPermissionPolicy?.allowed.contains(request.kind)==true ? "이 세션의 허용 정책을 확인하고 있습니다.":"이 세션에서 \(request.kind.title) 권한을 허용하지 않았습니다."
                     } else {request.detail="요청 앱과 내용을 확인한 뒤 처리할 세션에 연결해주세요."}
@@ -11197,6 +11238,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 guard !request.isManagementApp,request.action != .manual,let id=request.sessionID,let original=sessions[id],original.automatic,original.phase != .ended,
                       osPermissionPolicySources[id]==osPermissionSource(original),original.osPermissionPolicy?.allowed.contains(request.kind)==true,request.requester != nil,
                       !userInputHasPriority(id),!automaticInputBusy(id),!osPermissionReceipts.contains(request.id) else {continue}
+                guard original.osPermissionPolicy?.permits(request)==true || osPermissionClaims[request.id].map({$0.sessionID==id && $0.token==request.immutableToken && $0.source==osPermissionSource(original)})==true else {continue}
                 let reader=singleProcessReader,pid=original.pid,automationEpoch=automationRuntime.epoch(id)
                 let records=try await Task.detached(priority:.utility) {try reader(pid)}.value
                 guard epoch==osPermissionEpoch,automationRuntime.epoch(id)==automationEpoch,!remoteInputStopped,!snapshot.paused,
@@ -11213,6 +11255,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                           let current=sessions[id],osPermissionSource(current)==osPermissionSource(original),current.automatic,current.phase != .ended,
                           osPermissionPolicySources[id]==osPermissionSource(current),current.osPermissionPolicy?.allowed.contains(request.kind)==true,osPermissionRequests[request.id]?.immutableToken==request.immutableToken else {return false}
                     guard let live=try? singleProcessReader(original.pid),live.contains(where:{$0.pid==original.pid && $0.started==original.started && "/dev/"+$0.tty==original.tty && $0.agent==original.agent}) else {return false}
+                    guard verifiedOSPermissionLaunch(request,session:current) else {return false}
                     return current.osPermissionPolicy?.permits(request)==true || osPermissionClaims[request.id].map {$0.sessionID==id && $0.token==request.immutableToken && $0.source==osPermissionSource(current)}==true
                 }
                 switch delivery {

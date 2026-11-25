@@ -8,6 +8,13 @@ private final class OSFixture:@unchecked Sendable {
     private var requests:[OSPermissionRequest]=[],values:[String]=[]
     private var held=false,readCount=0,live=true,typing=false
     private var replacement:[ProcessRecord]?
+    var launcher:Int32?
+    func ancestry(_ pid:Int32)->[ProcessRecord] {
+        var app=records[0],root=records[0]
+        root.pid=1;root.parent=0;root.executable="/sbin/launchd"
+        app.pid=pid;app.parent=launcher ?? 1;app.started=target.started;app.executable=target.path
+        return [app]+processes().filter {$0.pid==launcher}+[root]
+    }
     var beforeApproval:(@MainActor ()->Void)?
     var result:OSPermissionDelivery = .sent
     func set(_ requests:[OSPermissionRequest]) {condition.lock();self.requests=requests;condition.unlock()}
@@ -30,7 +37,7 @@ private final class OSFixture:@unchecked Sendable {
     }
 }
 @MainActor private func osEngine(_ fixture:OSFixture,root:URL) async throws -> (ApprovalEngine,[String]) {
-    let service=OSPermissionServices(scan:{_ in fixture.scan()},approve:{request,authorized in
+    let service=OSPermissionServices(ancestry:{fixture.ancestry($0)},scan:{_ in fixture.scan()},approve:{request,authorized in
         fixture.beforeApproval?()
         guard authorized() else {return .unavailable("Synthetic authorization was revoked")};fixture.pressed(request.id);return fixture.result
     },respond:{request,button,authorized in
@@ -141,6 +148,38 @@ extension ApprovalTests {
         try expectEqual(fixture.presses,[request.id,next.id]);try expectEqual(engine.snapshot.osPermissions?.requests.first(where:{$0.id==next.id})?.sessionID,ids[0])
         let other=fixture.request("not-permitted",kind:.microphone);fixture.set([other]);await engine.refreshOSPermissions();try expectEqual(fixture.presses.count,2)
         do {try engine.assignOSPermission(ids[1],requestID:other.id,token:other.immutableToken,remember:true);throw AppError.message("Other session stole a registered app")} catch let error as RemoteHTTPError {try expectEqual(error.status,409)}
+    }
+    func testOSPermissionLaunchedDiskRequestsStayWithOriginalSession() async throws {
+        let fixture=OSFixture(),root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {try? FileManager.default.removeItem(at:root)}
+        let (engine,ids)=try await osEngine(fixture,root:root)
+        defer {engine.stop()}
+        let owners=ids.map {id in engine.snapshot.sessions.first {$0.id==id}!}
+        for owner in owners {try engine.setOSPermissionPolicy(owner.id,allowed:[.files])}
+        fixture.launcher=owners[0].pid
+        let first=fixture.request("folder",kind:.files)
+        fixture.set([first]);await engine.refreshOSPermissions()
+        try expectEqual(engine.snapshot.osPermissions?.requests.first?.sessionID,owners[0].id)
+        try expectEqual(engine.snapshot.osPermissions?.requests.first?.needsAppConfirmation,true)
+        try expectEqual(fixture.presses,[])
+        try engine.assignOSPermission(owners[0].id,requestID:first.id,token:first.immutableToken,remember:true)
+        await engine.refreshOSPermissions();try expectEqual(fixture.presses,[first.id])
+        let next=fixture.request("other-session",kind:.files)
+        fixture.launcher=owners[1].pid;fixture.set([next]);await engine.refreshOSPermissions()
+        let observed=engine.snapshot.osPermissions?.requests.first {$0.id==next.id}
+        try expectEqual(observed?.sessionID,owners[1].id);try expectEqual(observed?.needsAppConfirmation,true)
+        try expectEqual(fixture.presses,[first.id])
+        try engine.assignOSPermission(owners[1].id,requestID:next.id,token:next.immutableToken,remember:true)
+        await engine.refreshOSPermissions();try expectEqual(fixture.presses,[first.id,next.id])
+        let disk=fixture.request("full-disk",kind:.fullDiskAccess);fixture.set([disk])
+        await engine.refreshOSPermissions();try expectEqual(fixture.presses,[first.id,next.id])
+        let race=fixture.request("reparented",kind:.files);fixture.set([race])
+        fixture.beforeApproval={fixture.launcher=nil}
+        await engine.refreshOSPermissions();try expectEqual(fixture.presses,[first.id,next.id])
+        let detached=fixture.request("detached",kind:.files);fixture.set([detached])
+        await engine.refreshOSPermissions()
+        try expectNil(engine.snapshot.osPermissions?.requests.first {$0.id==detached.id}?.sessionID)
+        try expectEqual(fixture.presses,[first.id,next.id])
     }
     func testOSPermissionSharedControllersAreOneRequestOnly() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent("aa-os-shared-"+UUID().uuidString),fixture=OSFixture();defer{try? FileManager.default.removeItem(at:root)}

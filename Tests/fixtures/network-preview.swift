@@ -195,7 +195,13 @@ private final class PreviewScreens: @unchecked Sendable {
         if progressMode {inputAvailable={true}} else if connectionPerformance {inputAvailable={false}} else {inputAvailable=nil}
         let osState=PreviewOSPermissions(directory)
         let osServices:OSPermissionServices?
-        if osMode {osServices=OSPermissionServices(scan:{_ in osState.scan()},approve:{request,authorized in authorized() ? osState.input(request):.unavailable("Synthetic policy revoked")},respond:{request,button,authorized in authorized() ? osState.input(request,button:button):.unavailable("Synthetic source changed")})} else {osServices=nil}
+        if osMode {osServices=OSPermissionServices(ancestry:{pid in
+            var app=records[0],root=records[0]
+            root.pid=1;root.parent=0;root.executable="/sbin/launchd"
+            app.pid=pid;app.parent=1;app.started=osState.target.started;app.executable=osState.target.path
+            if CommandLine.arguments.contains("--session-launched-app") {app.parent=records[0].pid;return [app,records[0],root]}
+            return [app,root]
+        },scan:{_ in osState.scan()},approve:{request,authorized in authorized() ? osState.input(request):.unavailable("Synthetic policy revoked")},respond:{request,button,authorized in authorized() ? osState.input(request,button:button):.unavailable("Synthetic source changed")})} else {osServices=nil}
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport,
             claudeRegistryReader: { _ in [] }, processReader: { records }, screenAdapters: [.terminal: adapter],terminalWindowCapture:capture,
             terminalInputAvailable:inputAvailable,terminalInputIdentity:progressIdentity,codexQueue:goalMode || conversationMode ? goalQueue:.live,osPermissionServices:osServices,codexGoals:goals,codexConversation:conversationMode ? conversation:.live)

@@ -98,6 +98,7 @@ public struct OSPermissionRequest:Codable,Equatable,Identifiable,Sendable {
     /// Optional for compatibility with stored receipts and older hosts.
     public var buttons:[OSPermissionButton]?
     public var sessionID:String?
+    public var needsAppConfirmation:Bool?
     /// Host setup is manual and never belongs to a managed CLI session.
     public var managementApp:Bool?
     public var phase:Phase = .waiting
@@ -136,10 +137,41 @@ public enum OSPermissionPrompt {
     }
 }
 
+enum OSPermissionLaunch:Equatable,Sendable {
+    case detached, unknown
+    case agent(ProcessRecord)
+
+    init(_ target:OSPermissionTarget,services:OSPermissionServices) {
+        if target.isSharedController {self = .detached;return}
+        guard let chain=try? services.ancestry(target.pid),let app=chain.first,
+              app.pid==target.pid,app.started==target.started,chain.last?.pid==1 else {
+            self = .unknown;return
+        }
+        self=chain.dropFirst().first(where:{$0.agent != nil}).map(Self.agent) ?? .detached
+    }
+
+    func stillEnclosesSameAgent(as other:Self)->Bool {
+        guard case .agent(let original)=self else {return true}
+        guard case .agent(let current)=other else {return false}
+        return original.key==current.key && original.tty==current.tty && original.agent==current.agent
+    }
+
+    func matches(_ session:AgentSession)->Bool {
+        switch self {
+        case .unknown:return false
+        case .detached:return true
+        case .agent(let record):
+            return session.phase != .ended && session.pid==record.pid && session.agent==record.agent &&
+                session.started==record.started && session.tty=="/dev/"+record.tty
+        }
+    }
+}
+
 public struct OSPermissionServices:Sendable {
+    public var ancestry:@Sendable (Int32) throws -> [ProcessRecord]
     public var scan:@Sendable ([OSPermissionTarget]) throws -> OSPermissionMonitorStatus
     public var approve:@MainActor @Sendable (OSPermissionRequest,@MainActor ()->Bool)->OSPermissionDelivery
     public var respond:@MainActor @Sendable (OSPermissionRequest,OSPermissionButton,@MainActor ()->Bool)->OSPermissionDelivery
-    public init(scan:@escaping @Sendable ([OSPermissionTarget]) throws -> OSPermissionMonitorStatus,approve:@escaping @MainActor @Sendable (OSPermissionRequest,@MainActor ()->Bool)->OSPermissionDelivery,respond:@escaping @MainActor @Sendable (OSPermissionRequest,OSPermissionButton,@MainActor ()->Bool)->OSPermissionDelivery={_,_,_ in .unavailable("OS 요청 버튼 응답을 지원하지 않는 연결입니다.")}) {self.scan=scan;self.approve=approve;self.respond=respond}
+    public init(ancestry:@escaping @Sendable (Int32) throws -> [ProcessRecord] = {try ProcessDiscovery.readAncestorChain(of:$0,through:1)},scan:@escaping @Sendable ([OSPermissionTarget]) throws -> OSPermissionMonitorStatus,approve:@escaping @MainActor @Sendable (OSPermissionRequest,@MainActor ()->Bool)->OSPermissionDelivery,respond:@escaping @MainActor @Sendable (OSPermissionRequest,OSPermissionButton,@MainActor ()->Bool)->OSPermissionDelivery={_,_,_ in .unavailable("OS 요청 버튼 응답을 지원하지 않는 연결입니다.")}) {self.ancestry=ancestry;self.scan=scan;self.approve=approve;self.respond=respond}
     public static let inactive=Self(scan:{_ in .init(available:false,detail:"격리된 실행 환경입니다.")},approve:{_,_ in .unavailable("OS 입력 연결이 없습니다.")})
 }

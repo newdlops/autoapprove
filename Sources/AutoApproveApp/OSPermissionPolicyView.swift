@@ -32,7 +32,7 @@ struct OSPermissionPolicyView:View {
                         Button("이 세션에서 \(request.kind.title) 허용") {perform {try setAllowed?(policy.allowed+[request.kind])}}
                             .disabled(setAllowed==nil || session.phase == .ended)
                     }
-                    if request.managementApp != true,request.phase == .waiting,request.sessionID==nil,let target=request.requester {
+                    if request.managementApp != true,request.phase == .waiting,request.action != .manual,request.sessionID==nil || request.needsAppConfirmation==true,let target=request.requester {
                         ViewThatFits(in:.horizontal) {
                             HStack {assignmentButtons(request,target:target)}
                             VStack(alignment:.leading,spacing:8) {assignmentButtons(request,target:target)}
