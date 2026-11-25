@@ -16,6 +16,7 @@ import AutoApproveCore
     @State private var loading = false
     @State private var error: String?
     @State private var notice: String?
+    @State private var showTopology = false
     @State private var composeGroup: SessionGroup?
     @Environment(\.openWindow) private var openWindow
     private struct LeaderRepair {
@@ -105,6 +106,13 @@ import AutoApproveCore
                 }.padding(12)
             }
         }
+        .sheet(isPresented: $showTopology) {
+            if let group = selected {
+                SessionTopologySheet(groups: groups, initialGroup: group.id) { next in
+                    persist(next, message: "그룹 관계를 저장했습니다.")
+                }
+            }
+        }
         .sheet(item: $composeGroup) { group in
             SessionGroupMessageSheet(group: group, engine: engine) {
                 notice = "그룹 메시지를 로컬 수신함에 저장했습니다."
@@ -155,6 +163,8 @@ import AutoApproveCore
                         Button("이름 저장") { rename(group) }.disabled(loading || name == group.name)
                     }
                 }
+                Button("관계 그래프…", systemImage: "arrow.triangle.branch") { showTopology = true }
+                    .labelStyle(.iconOnly).disabled(loading).help("그룹과 구성원의 상하 연결을 편집합니다.")
                 Menu {
                     Button("대화 그래프…", systemImage: "point.3.connected.trianglepath.dotted") { openWindow(id: "session-group-graph", value: group.id) }
                         .help("이 그룹의 연결선과 저장된 메시지를 독립 창에서 엽니다.")
@@ -165,7 +175,7 @@ import AutoApproveCore
             }
             Text(group.leaderMemberID == nil
                  ? "구성원의 역할 메뉴에서 그룹장을 한 명 이상 지정할 수 있습니다."
-                 : "그룹장은 직속 구성원에게 작업을 지시하고 질문에 답할 수 있습니다. 그룹장끼리는 역할 메뉴에서 상위 그룹장을 지정하세요. 작업을 받은 구성원은 권한 확인에서 멈추지 않도록 자동 승인이 켜집니다. 작업자가 응답을 마치면 결과 요약이 지시한 세션의 터미널에 입력됩니다.")
+                 : "상위 구성원은 직속 구성원에게 작업을 지시하고 질문에 답할 수 있습니다. 관계 그래프에서 상위 구성원과 상위 그룹을 여러 개 지정할 수 있습니다. 작업을 받은 구성원은 권한 확인에서 멈추지 않도록 자동 승인이 켜집니다. 작업자가 응답을 마치면 결과 요약이 지시한 세션의 터미널에 입력됩니다.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Text("에이전트는 get_session_groups와 get_group_status로 구성원과 작업 상태를 확인합니다. 공유 서버는 자신의 대화 ID를 지정해야 할 수 있습니다. 상태는 새로고침할 때 확인합니다.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -285,39 +295,27 @@ import AutoApproveCore
             } else {
                 Button("그룹장으로 지정") { makeLeader(member, in: group) }
             }
-            let leader = group.isLeader(member.id)
-            if leader ? group.leaderMemberIDs.count > 1 : group.leaderMemberID != nil {
-                Menu(leader ? "상위 그룹장" : "상위 구성원") {
-                    if leader {
-                        Button { setParent(nil, for: member, in: group) } label: {
-                            if member.parentMemberID == nil { Label("없음 (최상위)", systemImage: "checkmark") }
-                            else { Text("없음 (최상위)") }
-                        }
-                    }
-                    ForEach(group.parentCandidates(for: member.id)) { candidate in
-                        let title = candidate.nickname ?? (candidate.title.isEmpty ? candidate.agent.title : candidate.title)
-                        Button { setParent(candidate, for: member, in: group) } label: {
-                            if group.parentID(of: member.id) == candidate.id { Label(title, systemImage: "checkmark") }
-                            else { Text(title) }
-                        }
-                    }
+            Menu("상위 구성원") {
+                ForEach(group.members.filter { $0.id != member.id }) { candidate in
+                    let connected = group.parentIDs(of: member.id).contains(candidate.id)
+                    Toggle(candidate.nickname ?? candidate.title, isOn: Binding(get: { connected }, set: { enabled in
+                        do {
+                            let updated = try group.linkingParent(candidate.id, to: member.id, connected: enabled)
+                            _ = persist(groups.map { $0.id == group.id ? updated : $0 }, message: "상위 구성원을 변경했습니다.")
+                        } catch { self.error = error.localizedDescription }
+                    }))
                 }
-            }
+            }.disabled(group.members.count < 2)
         } label: { Image(systemName: "point.3.connected.trianglepath.dotted") }
             .menuStyle(.borderlessButton).fixedSize().disabled(loading)
             .accessibilityLabel("역할과 상위 구성원").help("그룹장과 상위 구성원을 지정합니다.")
     }
 
     private func roleText(_ member: SessionGroupMember, in group: SessionGroup) -> String {
-        if group.isLeader(member.id) {
-            if let parent = group.members.first(where: { $0.id == member.parentMemberID }) {
-                return "그룹장 · 상위 그룹장 " + (parent.nickname ?? (parent.title.isEmpty ? parent.agent.title : parent.title))
-            }
-            return "그룹장"
-        }
-        guard let parent = group.parentID(of: member.id),
-              let title = group.members.first(where: { $0.id == parent })?.title else { return "그룹장 없음" }
-        return "지시: " + (title.isEmpty ? "구성원" : title)
+        let parents = group.parentIDs(of: member.id).compactMap { id in group.members.first { $0.id == id } }
+        let names = parents.map { $0.nickname ?? ($0.title.isEmpty ? $0.agent.title : $0.title) }
+        if names.isEmpty { return group.isLeader(member.id) ? "그룹장" : "상위 구성원 없음" }
+        return (group.isLeader(member.id) ? "그룹장 · 상위 " : "상위 ") + names.joined(separator: ", ")
     }
 
     private func currentTask(_ member: SessionGroupMember, in group: SessionGroup) -> SessionGroupAssignment? {
@@ -345,10 +343,6 @@ import AutoApproveCore
     private func clearLeader(_ member: SessionGroupMember, in group: SessionGroup) {
         let changed = group.removingLeader(member.id)
         _ = persist(groups.map { $0.id == group.id ? changed : $0 }, message: "선택한 구성원의 그룹장 역할을 해제했습니다.")
-    }
-
-    private func setParent(_ parent: SessionGroupMember?, for member: SessionGroupMember, in group: SessionGroup) {
-        _ = persist(groups.map { $0.id == group.id ? group.settingParent(parent?.id, for: member.id) : $0 }, message: "상위 구성원을 변경했습니다.")
     }
 
     private func refreshIdentity(_ member: SessionGroupMember, in group: SessionGroup) async {
@@ -548,7 +542,12 @@ import AutoApproveCore
     }
     private func deleteSelected() {
         guard let id = selectedID else { return }
-        if persist(groups.filter { $0.id != id }, message: "그룹을 삭제했습니다.") { selectedID = nil }
+        let remaining = groups.filter { $0.id != id }.map { group in
+            var group = group
+            group.parentGroupIDs.removeAll { $0 == id }
+            return group
+        }
+        if persist(remaining, message: "그룹을 삭제했습니다.") { selectedID = nil }
     }
 }
 
@@ -614,5 +613,114 @@ import AutoApproveCore
             onSent()
             dismiss()
         } catch { self.error = error.localizedDescription }
+    }
+}
+
+@MainActor struct SessionTopologySheet: View {
+    struct Node: Identifiable {
+        let id: UUID
+        let name: String
+        let parents: [UUID]
+    }
+
+    let groups: [SessionGroup]
+    let initialGroup: UUID
+    let save: ([SessionGroup]) -> Bool
+    @Environment(\.dismiss) private var dismiss
+    @State private var groupMode = true
+    @State private var focusID: UUID?
+    @State private var editError: String?
+
+    var body: some View {
+        let group = groups.first { $0.id == initialGroup }
+        let nodes: [Node] = groupMode ? groups.map { Node(id: $0.id, name: $0.name, parents: $0.parentGroupIDs) }
+            : group?.members.map { Node(id: $0.id, name: $0.nickname ?? ($0.title.isEmpty ? $0.agent.title : $0.title), parents: group?.parentIDs(of: $0.id) ?? []) } ?? []
+        let focus = nodes.first { $0.id == focusID } ?? nodes.first { $0.id == initialGroup } ?? nodes.first
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("관계 그래프").font(.title2.bold())
+                Spacer()
+                Picker("관계 보기", selection: $groupMode) {
+                    Text("그룹 간").tag(true)
+                    Text("구성원 간").tag(false)
+                }.pickerStyle(.segmented).labelsHidden().frame(width: 180)
+                Button("닫기") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            if let focus {
+                HStack(spacing: 12) {
+                    ScrollViewReader { reader in
+                        ScrollView([.horizontal, .vertical]) { diagram(nodes, selected: focus.id) }
+                            .onAppear { reader.scrollTo(focus.id, anchor: .center) }
+                            .onChange(of: focus.id) { _, id in reader.scrollTo(id, anchor: .center) }
+                    }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    Divider()
+                    VStack(alignment: .leading, spacing: 8) {
+                        Picker("선택한 노드", selection: Binding(get: { focus.id }, set: { focusID = $0 })) {
+                            ForEach(nodes) { node in Text(node.name).tag(node.id) }
+                        }.labelsHidden().help(focus.name)
+                        Text(groupMode ? "상위 그룹" : "상위 구성원").font(.subheadline)
+                        if nodes.count == 1 { Text("연결할 대상이 없습니다.").foregroundStyle(.secondary) }
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(nodes.filter { $0.id != focus.id }) { parent in
+                                    Toggle(parent.name, isOn: Binding(get: { focus.parents.contains(parent.id) }, set: { enabled in
+                                        do {
+                                            let id = groupMode ? focus.id : initialGroup
+                                            guard let index = groups.firstIndex(where: { $0.id == id }) else { return }
+                                            var next = groups
+                                            next[index] = try groupMode ? next[index].linkingGroupParent(parent.id, connected: enabled)
+                                                : next[index].linkingParent(parent.id, to: focus.id, connected: enabled)
+                                            editError = save(next) ? nil : "변경을 저장하지 못했습니다. 최신 그룹 상태를 확인해주세요."
+                                        } catch { editError = error.localizedDescription }
+                                    })).toggleStyle(.checkbox).lineLimit(2).help(parent.name)
+                                }
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }.frame(width: 158)
+                }
+                Text("화살표는 상위에서 하위로 향합니다. 노드를 선택해 상위 연결을 변경하세요.").font(.caption).foregroundStyle(.secondary)
+            } else { ContentUnavailableView("연결할 구성원이 없습니다", systemImage: "person.2") }
+            if let editError { Text(editError).font(.callout).foregroundStyle(.red) }
+        }.padding(16).frame(minWidth: 580, idealWidth: 730, minHeight: 340, idealHeight: 490)
+            .onChange(of: groupMode) { _, _ in focusID = nil; editError = nil }
+    }
+
+    private func diagram(_ nodes: [Node], selected: UUID) -> some View {
+        let radius = nodes.count == 1 ? 0 : max(108, CGFloat(nodes.count) * 118 / (2 * .pi))
+        let width = radius * 2 + 124, height = radius * 2 + 62
+        let points = Dictionary(uniqueKeysWithValues: nodes.enumerated().map { index, node in
+            let angle = Double(index) * 2 * .pi / Double(nodes.count) - .pi / 2
+            return (node.id, CGPoint(x: width / 2 + radius * cos(angle), y: height / 2 + radius * sin(angle)))
+        })
+        return ZStack(alignment: .topLeading) {
+            Canvas { context, _ in
+                for child in nodes {
+                    for parent in child.parents {
+                        guard let a = points[parent], let b = points[child.id] else { continue }
+                        let angle = atan2(b.y - a.y, b.x - a.x)
+                        let dx = cos(angle), dy = sin(angle)
+                        let inset = min(53 / max(abs(dx), 0.001), 15 / max(abs(dy), 0.001)) + 2
+                        let tip = CGPoint(x: b.x - dx * inset - dy * 4, y: b.y - dy * inset + dx * 4)
+                        var path = Path()
+                        path.move(to: CGPoint(x: a.x + dx * inset - dy * 4, y: a.y + dy * inset + dx * 4))
+                        path.addLine(to: tip)
+                        for side: CGFloat in [-1, 1] {
+                            path.move(to: tip)
+                            path.addLine(to: CGPoint(x: tip.x - 8 * dx - side * 4 * dy, y: tip.y - 8 * dy + side * 4 * dx))
+                        }
+                        let active = selected == child.id || selected == parent
+                        context.stroke(path, with: .color(active ? .accentColor : .secondary.opacity(0.6)), lineWidth: active ? 2 : 1)
+                    }
+                }
+            }.accessibilityHidden(true)
+            ForEach(nodes) { node in
+                Button { focusID = node.id } label: {
+                    Text(node.name).lineLimit(1).frame(width: 92, height: 23)
+                }.buttonStyle(.bordered).tint(node.id == selected ? .accentColor : .secondary)
+                    .help(node.name).accessibilityAddTraits(node.id == selected ? .isSelected : [])
+                    .id(node.id).position(points[node.id] ?? .zero)
+            }
+        }.frame(width: width, height: height)
     }
 }

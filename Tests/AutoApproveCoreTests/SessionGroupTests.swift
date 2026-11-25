@@ -1376,6 +1376,45 @@ extension ApprovalTests {
                 "codexCallerConversationID": parentID, "codexCallerHome": home, "groupID": group.id.uuidString, "memberID": worker.id.uuidString]
             args.merge(extra) { _, new in new }; return try await engine.mcpAction(args)
         }
+        let relationStore = SessionGroupStore(directory: directory)
+        let subA = SessionGroupMember(agent: .claude, title: "A", cwd: "/project", conversationID: UUID().uuidString)
+        let subB = SessionGroupMember(agent: .codex, title: "B", cwd: "/project", conversationID: UUID().uuidString)
+        var sub = SessionGroup(name: "Downstream", members: [subA, subB], leaderMemberID: subA.id)
+        sub = try sub.linkingGroupParent(group.id, connected: true)
+        let other = SessionGroup(name: "Independent")
+        try relationStore.save([group, sub, other])
+        let request: JSONObject = ["targetGroupID":sub.id.uuidString, "memberID":subA.id.uuidString, "parentMemberID":subB.id.uuidString, "action":"connect"]
+        let linked = try await call("set_group_relationship", extra:request)
+        try expectEqual(linked["changed"] as? Bool, true)
+        let repeated = try await call("set_group_relationship", extra:request)
+        try expectEqual(repeated["changed"] as? Bool, false)
+        let cycle = try unwrapGroup(try relationStore.load().first { $0.id == sub.id })
+        try expect(cycle.canDirect(subA.id, worker:subB.id) && cycle.canDirect(subB.id, worker:subA.id))
+        try expectEqual(Set(cycle.treeOrder.map(\.id)).count, 2)
+        let diamond = try group.linkingParent(worker.id, to:codex.id, connected:true)
+        try expectEqual(diamond.parentIDs(of:codex.id), [parent.id,worker.id])
+        try expectEqual(try JSONDecoder().decode(SessionGroup.self, from: JSONEncoder().encode(diamond)), diamond)
+        try expectEqual(try diamond.linkingParent(parent.id, to:codex.id, connected:false).parentIDs(of:codex.id), [worker.id])
+        try expectEqual(diamond.removing(worker.id).parentIDs(of:codex.id), [parent.id])
+        let relation: JSONObject = ["groupID":group.id.uuidString, "targetGroupID":group.id.uuidString, "parentGroupID":sub.id.uuidString, "action":"connect"]
+        var groupCall: JSONObject = ["owner":UUID().uuidString, "tool":"set_group_relationship", "agentKind":"codex", "conversationID":parentID, "codexCallerConversationID":parentID, "codexCallerHome":home]
+        groupCall.merge(relation) { _, new in new }
+        _ = try await engine.mcpAction(groupCall)
+        let topology = try await call("get_group_topology")
+        try expectEqual(Set((topology["groups"] as? [JSONObject] ?? []).compactMap { $0["id"] as? String }), [group.id.uuidString,sub.id.uuidString])
+        groupCall["targetGroupID"] = other.id.uuidString
+        do { _ = try await engine.mcpAction(groupCall); throw AppError.message("Unrelated group claimed") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status,403) }
+        var subordinate = request
+        subordinate.merge(["owner":UUID().uuidString, "tool":"set_group_relationship", "groupID":group.id.uuidString, "sessionID":sessions[0].id]) { _,new in new }
+        do { _ = try await engine.mcpAction(subordinate); throw AppError.message("Subordinate claimed cross-group authority") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status,403) }
+        subordinate["targetGroupID"] = group.id.uuidString
+        subordinate["memberID"] = parent.id.uuidString
+        subordinate["parentMemberID"] = worker.id.uuidString
+        do { _ = try await engine.mcpAction(subordinate); throw AppError.message("Subordinate reassigned its superior") }
+        catch let error as RemoteHTTPError { try expectEqual(error.status,403) }
+        try relationStore.save([group])
         for tool in ["get_session_groups", "get_group_status"] {
             let response = try await call(tool)
             let rows = (response["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject] ?? []

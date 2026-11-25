@@ -99,6 +99,10 @@ public enum AutoApproveMCPServer {
                  ["groupID": string, "requestID": string, "conversationID": string], ["groupID", "requestID"], destructive:true),
             tool("clear_group_member", "지정한 구성원만 /clear하고 ID를 갱신합니다. 그룹장이 있으면 그룹장만 가능합니다. 같은 대상의 재시도는 같은 requestID, 다른 요청은 새 ID를 쓰세요. 자신이면 현재 응답을 끝내고 get_group_clear_status로 완료를 확인하세요.",
                  ["groupID": string, "memberID": string, "requestID": string, "conversationID": string], ["groupID", "memberID", "requestID"], destructive:true),
+            tool("get_group_topology", "그룹장이 자신의 groupID로 관리 가능한 산하 그룹과 구성원의 상위 연결을 조회합니다. targetGroupID를 지정하면 그 그룹만 조회합니다.",
+                 ["groupID":string, "targetGroupID":string, "conversationID":string], ["groupID"], readOnly:true),
+            tool("set_group_relationship", "그룹장이 자기 groupID와 변경할 targetGroupID를 지정합니다. action은 connect 또는 disconnect. 구성원 간에는 memberID(하위)와 parentMemberID(상위), 그룹 간에는 parentGroupID를 사용합니다. 다중 상위와 순환을 지원합니다.",
+                 ["groupID":string, "targetGroupID":string, "memberID":string, "parentMemberID":string, "parentGroupID":string, "action":["type":"string","enum":["connect","disconnect"]], "conversationID":string], ["groupID","targetGroupID","action"]),
             tool("set_group_member_title", "원래 Terminal·iTerm2 탭과 구성원 이름(1~80자)을 바꿉니다. role(1~120자)은 선택입니다. 구성원은 자신을 변경할 수 있고, 그룹장은 다른 구성원도 변경할 수 있습니다.",
                  ["groupID": string, "memberID": string, "title": string, "role": string, "conversationID": string], ["groupID", "memberID", "title"]),
             tool("set_group_member_tab_color", "원래 탭 제목에 색상 표식을 적용합니다. default는 표식을 제거합니다. 그룹장이 있으면 그룹장만 가능합니다.",
@@ -208,7 +212,7 @@ public enum AutoApproveMCPServer {
             let handle = {
             if let value = response(message, profile: profile, call: { tool, arguments in
                 var params = arguments; params["tool"] = tool; params["owner"] = owner
-                let groupTool = ["wait_group_dependencies", "update_group_wait", "complete_group_task", "get_session_groups", "get_group_status", "assign_group_task", "assign_group_tasks", "list_group_background_jobs","stop_group_background_job","watch_group_events","explain_group_delivery","get_group_member_goal","manage_group_member_goal","manage_group_task","retry_group_submission","replace_group_task","clear_group_composer","interrupt_group_task", "cancel_group_messages", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "get_group_member_terminal", "ack_group_messages", "clear_session_group", "clear_group_member", "set_group_member_title", "set_group_member_tab_color", "get_group_clear_status"].contains(tool)
+                let groupTool = ["wait_group_dependencies", "update_group_wait", "complete_group_task", "get_session_groups", "get_group_status", "get_group_topology", "set_group_relationship", "assign_group_task", "assign_group_tasks", "list_group_background_jobs","stop_group_background_job","watch_group_events","explain_group_delivery","get_group_member_goal","manage_group_member_goal","manage_group_task","retry_group_submission","replace_group_task","clear_group_composer","interrupt_group_task", "cancel_group_messages", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "get_group_member_terminal", "ack_group_messages", "clear_session_group", "clear_group_member", "set_group_member_title", "set_group_member_tab_color", "get_group_clear_status"].contains(tool)
                 // Only this process may attribute the caller; never trust a supplied session or agent kind.
                 params.removeValue(forKey: "codexCallerRuntimeID")
                 if groupTool {

@@ -2758,6 +2758,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   duplicate.runtimeID == runtime, duplicate.agent == member.agent, duplicate.providerHome == home,
                   UUID(uuidString: duplicate.conversationID) == uuid,
                   !group.isLeader(duplicate.id), group.children(of: duplicate.id).isEmpty,
+                  duplicate.assignedParentIDs == nil || group.parentIDs(of: duplicate.id) == group.parentIDs(of: member.id),
                   duplicate.parentMemberID == nil || duplicate.parentMemberID == member.parentMemberID else {
                 throw AppError.message("확인한 세션 ID가 이미 이 그룹의 다른 구성원에 연결되어 있습니다.")
             }
@@ -6148,6 +6149,55 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         func urls(_ fragment: String) -> [String] { webStatus.directURLs.map { $0 + "/#" + fragment } }
         switch tool {
+        case "get_group_topology", "set_group_relationship":
+            let observed = try await sessionGroupSessions()
+            let (caller, attribution) = try sessionGroupCaller(object, observed: observed)
+            let store = SessionGroupStore(directory: paths.directory), groups = try store.load()
+            guard attribution != "provided_conversation_id", let sourceID = try GroupWaitRequest.uuid(object, "groupID"),
+                  let source = groups.first(where: { $0.id == sourceID }),
+                  let actor = source.members.first(where: { groupMemberIsCaller($0, caller: caller, observed: observed) }),
+                  source.isLeader(actor.id) else { throw RemoteHTTPError(403, "현재 세션이 그룹장인 그룹을 지정해주세요.") }
+            let whole = source.hasGroupAuthority(actor.id)
+            let scope = whole ? SessionGroup.downstream(of: sourceID, in: groups) : [sourceID]
+            let target = try GroupWaitRequest.uuid(object, "targetGroupID")
+            if let target, !scope.contains(target) { throw RemoteHTTPError(403, "관리 가능한 산하 그룹을 선택해주세요.") }
+            func inBranch(_ member: UUID, group: SessionGroup) -> Bool {
+                if group.id != sourceID { return scope.contains(group.id) }
+                if source.reaches(actor.id, member: member) { return true }
+                return whole && !source.isLeader(member) && source.parentIDs(of: member).isEmpty
+            }
+            if tool == "get_group_topology" {
+                let result: [JSONObject] = groups.filter { scope.contains($0.id) && (target == nil || $0.id == target) }.map { group in
+                    let members: [JSONObject] = group.members.map { member in
+                        ["id":member.id.uuidString, "name":member.nickname ?? member.title, "isLeader":group.isLeader(member.id),
+                         "parentMemberIDs":group.parentIDs(of:member.id).map(\.uuidString),
+                         "canEdit":inBranch(member.id, group: group) && (member.id != actor.id || whole || group.id != sourceID)]
+                    }
+                    return ["id":group.id.uuidString, "name":group.name, "parentGroupIDs":group.parentGroupIDs.map(\.uuidString), "members":members]
+                }
+                return ["groups":result, "canEditGroupLinks":whole]
+            }
+            guard let target, let index = groups.firstIndex(where: { $0.id == target }),
+                  let action = object["action"] as? String, ["connect","disconnect"].contains(action) else {
+                throw RemoteHTTPError(400, "targetGroupID와 connect 또는 disconnect를 지정해주세요.")
+            }
+            guard !groupClearActive(target), !groupClearActive(sourceID) else { throw RemoteHTTPError(409, "그룹 초기화가 끝난 뒤 관계를 변경해주세요.") }
+            let member = try GroupWaitRequest.uuid(object, "memberID"), parent = try GroupWaitRequest.uuid(object, "parentMemberID")
+            let parentGroup = try GroupWaitRequest.uuid(object, "parentGroupID"), connect = action == "connect"
+            var next = groups
+            if let member, let parent, parentGroup == nil {
+                guard inBranch(member, group: groups[index]), inBranch(parent, group: groups[index]),
+                      target != sourceID || member != actor.id || whole else {
+                    throw RemoteHTTPError(403, "그룹장 산하에 있는 구성원끼리 연결할 수 있습니다.")
+                }
+                next[index] = try groups[index].linkingParent(parent, to:member, connected:connect)
+            } else if let parentGroup, member == nil, parent == nil {
+                guard whole else { throw RemoteHTTPError(403, "그룹 간 연결을 변경할 권한이 없습니다.") }
+                guard groups.contains(where: { $0.id == parentGroup }) else { throw RemoteHTTPError(404, "상위 그룹을 찾을 수 없습니다.") }
+                next[index] = try groups[index].linkingGroupParent(parentGroup, connected:connect)
+            } else { throw RemoteHTTPError(400, "구성원 연결 또는 그룹 연결 중 하나를 지정해주세요.") }
+            if next != groups { try store.save(next, expected:groups); refreshSessionGroupBadges() }
+            return ["changed":next != groups, "targetGroupID":target.uuidString, "connected":connect]
         case "set_group_member_title", "set_group_member_tab_color":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)) else { throw RemoteHTTPError(400, "groupID와 memberID(UUID)를 지정해주세요.") }
@@ -6341,6 +6391,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "canAskQuestion": member.id != callerMember.id && Self.canAddressGroupMember(member, live: live) && UUID(uuidString: callerMember.conversationID) != nil && groupMemberIsCaller(callerMember, caller: caller, observed: observed),
                             "canReconnect": canReconnectGroupMember(member, group: group, caller: caller, callerMember: callerMember, observed: observed),
                             "isLeader": group.isLeader(member.id),
+                            "parentMemberIDs": group.parentIDs(of: member.id).map(\.uuidString),
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull()]
                 }
                 return ["id": group.id.uuidString, "name": group.name, "members": members,
@@ -6436,6 +6487,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),
                             "modelSettingsRecordedAt": live.flatMap { modelSettings[$0.id]?.recordedAt }.map { ISO8601DateFormatter().string(from: $0) } as Any? ?? NSNull(),
                             "depth": entry.depth, "isLeader": group.isLeader(member.id), "isCaller": member.id == callerMember.id,
+                            "parentMemberIDs": group.parentIDs(of: member.id).map(\.uuidString),
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull(),
                             "connected": live != nil, "phase": phase?.rawValue as Any? ?? NSNull(),
                             "connectionState": live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected",

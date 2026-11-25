@@ -38,8 +38,8 @@ public struct SessionGroupMember: Codable, Equatable, Identifiable, Sendable {
     /// A live process identity helps present an unresolved member, never a replacement for a conversation ID.
     public var runtimeID: String? = nil
     public var tabShell: SessionGroupTabShell?
-    /// The member that directs this one. Nil places a member directly under the leader.
     public var parentMemberID: UUID? = nil
+    public var assignedParentIDs: [UUID]?
     /// One line on what this member works on, set with its nickname through set_group_member_title.
     public var role: String? = nil
     public var nickname: String? = nil
@@ -56,9 +56,9 @@ public struct SessionGroupMember: Codable, Equatable, Identifiable, Sendable {
         self.conversationID = conversationID; self.providerHome = providerHome
     }
 
-    /// Updating a terminal binding never changes the member's place in its group.
     public func updatingConnection(from live: SessionGroupLiveSession) -> SessionGroupMember {
         var result = live.member
+        result.assignedParentIDs = assignedParentIDs
         result.id = id; result.parentMemberID = parentMemberID; result.role = role; result.nickname = nickname
         return result
     }
@@ -74,6 +74,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var name: String
     public var members: [SessionGroupMember]
+    public var parentGroupIDs: [UUID] = []
     public private(set) var leaderMemberIDs: [UUID]
     public var leaderMemberID: UUID? {
         get { leaderMemberIDs.first }
@@ -85,13 +86,14 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
         self.leaderMemberIDs = leaderMemberID.map { [$0] } ?? []
     }
 
-    private enum CodingKeys: String, CodingKey { case id, name, members, leaderMemberID, leaderMemberIDs }
+    private enum CodingKeys: String, CodingKey { case id, name, members, leaderMemberID, leaderMemberIDs, parentGroupIDs }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
         name = try values.decode(String.self, forKey: .name)
         members = try values.decode([SessionGroupMember].self, forKey: .members)
+        parentGroupIDs = try values.decodeIfPresent([UUID].self, forKey: .parentGroupIDs) ?? []
         let legacy = try values.decodeIfPresent(UUID.self, forKey: .leaderMemberID)
         leaderMemberIDs = try values.decodeIfPresent([UUID].self, forKey: .leaderMemberIDs) ?? legacy.map { [$0] } ?? []
         if let legacy, leaderMemberIDs.first != legacy {
@@ -106,6 +108,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
         try values.encode(members, forKey: .members)
         try values.encodeIfPresent(leaderMemberID, forKey: .leaderMemberID)
         try values.encode(leaderMemberIDs, forKey: .leaderMemberIDs)
+        if !parentGroupIDs.isEmpty { try values.encode(parentGroupIDs, forKey: .parentGroupIDs) }
     }
 
     /// Learning an OS shell receipt changes neither group membership nor its permissions.
@@ -120,7 +123,8 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
 
     public func canDirect(_ caller: UUID, worker: UUID) -> Bool {
         guard caller != worker, let parent = parentID(of: worker) else { return false }
-        if caller == parent { return true }
+        if parentIDs(of: worker).contains(caller) { return true }
+        if members.first(where: { $0.id == worker })?.assignedParentIDs != nil { return false }
         return !isLeader(worker) && isLeader(caller) && parentID(of: caller) == nil
             && isLeader(parent) && parentID(of: parent) == nil
     }
@@ -128,24 +132,73 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
     package func canManage(_ caller: UUID, member target: UUID) -> Bool {
         guard isLeader(caller) else { return false }
         if caller == target { return true }
-        if !members.contains(where: { isLeader($0.id) && $0.parentMemberID != nil }) { return true }
+        if !members.contains(where: { $0.assignedParentIDs != nil || (isLeader($0.id) && $0.parentMemberID != nil) }) { return true }
         if canDirect(caller, worker: target) { return true }
-        var current = parentID(of: target)
-        var visited = Set<UUID>()
-        while let parent = current, visited.insert(parent).inserted {
-            if parent == caller { return true }
-            current = parentID(of: parent)
+        return reaches(caller, member: target)
+    }
+
+    public func reaches(_ ancestor: UUID, member: UUID) -> Bool {
+        var pending = [member], visited = Set<UUID>()
+        while let id = pending.popLast() {
+            guard visited.insert(id).inserted else { continue }
+            if id == ancestor { return true }
+            pending.append(contentsOf: parentIDs(of: id).filter { !visited.contains($0) })
         }
         return false
     }
 
-    public func parentID(of memberID: UUID) -> UUID? {
-        guard let member = members.first(where: { $0.id == memberID }) else { return nil }
-        return member.parentMemberID ?? (isLeader(memberID) ? nil : leaderMemberID)
+    public func parentIDs(of memberID: UUID) -> [UUID] {
+        guard let member = members.first(where: { $0.id == memberID }) else { return [] }
+        if let explicit = member.assignedParentIDs { return explicit }
+        return (member.parentMemberID ?? (isLeader(memberID) ? nil : leaderMemberID)).map { [$0] } ?? []
     }
 
+    public func parentID(of memberID: UUID) -> UUID? { parentIDs(of: memberID).first }
+
     public func children(of memberID: UUID) -> [SessionGroupMember] {
-        members.filter { $0.id != memberID && parentID(of: $0.id) == memberID }
+        members.filter { parentIDs(of: $0.id).contains(memberID) }
+    }
+
+    public func linkingParent(_ parent: UUID, to child: UUID, connected: Bool) throws -> Self {
+        guard parent != child, let index = members.firstIndex(where: { $0.id == child }),
+              members.contains(where: { $0.id == parent }) else { throw AppError.message("서로 다른 두 그룹 구성원을 선택해주세요.") }
+        var parents = parentIDs(of: child)
+        guard parents.contains(parent) != connected else { return self }
+        if connected { parents.append(parent) } else { parents.removeAll { $0 == parent } }
+        var result = self
+        result.members[index].parentMemberID = nil
+        result.members[index].assignedParentIDs = parents
+        return result
+    }
+
+    public static func downstream(of source: UUID, in groups: [Self]) -> Set<UUID> {
+        var result = Set<UUID>(), pending = [source]
+        while let current = pending.popLast() {
+            guard result.insert(current).inserted else { continue }
+            pending.append(contentsOf: groups.filter { $0.parentGroupIDs.contains(current) }.map(\.id))
+        }
+        return result
+    }
+
+    public func hasGroupAuthority(_ member: UUID) -> Bool {
+        guard isLeader(member) else { return false }
+        if parentIDs(of: member).isEmpty { return true }
+        var visited = Set<UUID>(), pending = parentIDs(of: member)
+        while let parent = pending.popLast() {
+            guard visited.insert(parent).inserted else { continue }
+            if !reaches(member, member: parent) { return false }
+            pending.append(contentsOf: parentIDs(of: parent))
+        }
+        return true
+    }
+
+    public func linkingGroupParent(_ parent: UUID, connected: Bool) throws -> Self {
+        guard parent != id else { throw AppError.message("서로 다른 두 그룹을 선택해주세요.") }
+        var result = self
+        if connected {
+            if !parentGroupIDs.contains(parent) { result.parentGroupIDs.append(parent) }
+        } else { result.parentGroupIDs.removeAll { $0 == parent } }
+        return result
     }
 
     public var treeOrder: [SessionGroupTreeEntry] {
@@ -160,7 +213,8 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
             for child in children(of: member.id) { visit(child, depth + 1) }
         }
         for id in leaderMemberIDs where parentID(of: id) == nil { if let root = members.first(where: { $0.id == id }) { visit(root, 0) } }
-        for member in members where !visited.contains(member.id) { result.append(SessionGroupTreeEntry(member: member, depth: 1)) }
+        for id in leaderMemberIDs where !visited.contains(id) { if let leader = members.first(where: { $0.id == id }) { visit(leader, 0) } }
+        for member in members where !visited.contains(member.id) { visit(member, 0) }
         return result
     }
 
@@ -208,6 +262,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
             guard parentCandidates(for: memberID).contains(where: { $0.id == parentID }) else { return self }
         } else if !isLeader(memberID) { return self }
         var result = self
+        result.members[index].assignedParentIDs = nil
         result.members[index].parentMemberID = !isLeader(memberID) && parentID == leaderMemberID ? nil : parentID
         return result
     }
@@ -223,6 +278,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
                 result.members[index].parentMemberID = parent
             }
         }
+        for i in result.members.indices { result.members[i].assignedParentIDs?.removeAll { $0 == memberID } }
         result.members.removeAll { $0.id == memberID }
         return result
     }
@@ -257,6 +313,12 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
             }
             result.members[index] = member
         }
+        let memberIDs = Set(members.map(\.id))
+        guard !parentGroupIDs.contains(id), Set(parentGroupIDs).count == parentGroupIDs.count,
+              members.allSatisfy({ member in
+                  guard let parents = member.assignedParentIDs else { return true }
+                  return !parents.contains(member.id) && Set(parents).count == parents.count && memberIDs.isSuperset(of: parents)
+              }) else { throw AppError.message("중복되거나 존재하지 않는 그룹 관계입니다.") }
         try result.validateTree()
         return result
     }
@@ -597,7 +659,8 @@ public struct SessionGroupStore {
         let groups: [SessionGroup]
         do { groups = try JSONDecoder().decode([SessionGroup].self, from: data).map { try $0.validated() } }
         catch { throw AppError.message("세션 그룹 파일을 읽지 못했습니다. 기존 파일을 유지합니다.") }
-        guard groups.count <= 200, Set(groups.map(\.id)).count == groups.count else {
+        let ids = Set(groups.map(\.id))
+        guard groups.count <= 200, ids.count == groups.count, groups.allSatisfy({ ids.isSuperset(of: $0.parentGroupIDs) }) else {
             throw AppError.message("세션 그룹 파일의 그룹 수 또는 ID를 확인해주세요.")
         }
         return groups
@@ -610,7 +673,8 @@ public struct SessionGroupStore {
             throw AppError.message("세션 그룹이 다른 곳에서 변경되었습니다. 새로고침한 뒤 다시 시도해주세요.")
         }
         let values = try groups.map { try $0.validated() }
-        guard values.count <= 200, Set(values.map(\.id)).count == values.count else {
+        let ids = Set(values.map(\.id))
+        guard values.count <= 200, ids.count == values.count, values.allSatisfy({ ids.isSuperset(of: $0.parentGroupIDs) }) else {
             throw AppError.message("세션 그룹의 수 또는 ID를 확인해주세요.")
         }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

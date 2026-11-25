@@ -117,6 +117,7 @@ public enum TerminalProfileGroupRestore {
             let members = original.members.map { saved in
                 var member = saved
                 member.id = ids[saved.id] ?? saved.id
+                member.assignedParentIDs = saved.assignedParentIDs?.map { ids[$0] ?? $0 }
                 member.parentMemberID = saved.parentMemberID.map { ids[$0] ?? $0 }
                 return member
             }
@@ -124,6 +125,7 @@ public enum TerminalProfileGroupRestore {
             var group = SessionGroup(id: original.id, name: original.name, members: members)
             for leader in original.leaderMemberIDs { group = group.addingLeader(ids[leader] ?? leader) }
             group.members = members
+            group.parentGroupIDs = original.parentGroupIDs
             return TerminalProfileGroup(group: try group.validated(), links: snapshot.links.map {
                 .init(entryID: $0.entryID, memberID: ids[$0.memberID] ?? $0.memberID)
             })
@@ -146,6 +148,7 @@ public enum TerminalProfileGroupRestore {
             for saved in snapshot.group.members where !result[gi].members.contains(where:{$0.id==saved.id}) {
                 guard !result[gi].members.contains(where:{$0.agent==saved.agent && !$0.conversationID.isEmpty && $0.conversationID==saved.conversationID && $0.providerHome==saved.providerHome}) else{continue}
                 var member=saved
+                member.assignedParentIDs = nil
                 if result[gi].leaderMemberID==nil || !result[gi].members.contains(where:{$0.id==member.parentMemberID}) {member.parentMemberID=nil}
                 result[gi].members.append(member)
             }
@@ -160,6 +163,12 @@ public enum TerminalProfileGroupRestore {
                     result[gi].members[index].parentMemberID=saved.parentMemberID
                 }
             }
+            let available = Set(result[gi].members.map(\.id))
+            for saved in snapshot.group.members where !existingMemberIDs.contains(saved.id) || !hadLeader {
+                if let index = result[gi].members.firstIndex(where: { $0.id == saved.id }) {
+                    result[gi].members[index].assignedParentIDs = saved.assignedParentIDs?.filter { available.contains($0) }
+                }
+            }
             for link in snapshot.links where restored.contains(link.entryID) {
                 guard let saved=snapshot.group.members.first(where:{$0.id==link.memberID}),
                       let index=result[gi].members.firstIndex(where:{$0.id==link.memberID}) else{continue}
@@ -169,6 +178,8 @@ public enum TerminalProfileGroupRestore {
                 result[gi].members[index]=member
             }
         }
+        let present = Set(result.map(\.id))
+        for index in result.indices { result[index].parentGroupIDs.removeAll { !present.contains($0) } }
         return try result.map {try $0.validated()}
     }
 }
