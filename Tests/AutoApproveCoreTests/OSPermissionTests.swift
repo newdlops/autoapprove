@@ -185,6 +185,41 @@ extension ApprovalTests {
         try expectNil(engine.snapshot.osPermissions?.requests.first {$0.id==detached.id}?.sessionID)
         try expectEqual(fixture.presses,[first.id,next.id])
     }
+    func testGroupPolicyEditsRespectSubmissionOrder() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString), fixture = OSFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gate = ObservationReadGate(blocking: 1)
+        let (engine, _) = try await osEngine(fixture, root: root, readCodex: { _ in _ = try gate.enter([]); return nil })
+        defer { gate.release(0); engine.stop() }
+        let live = ProcessDiscovery.sessions(fixture.records).map { original -> AgentSession in
+            var session = original
+            session.cwd = "/fixture/project"
+            session.terminal = .terminal
+            return session
+        }
+        engine.updateDiscovery(live, records: fixture.records, directories: Dictionary(uniqueKeysWithValues: live.map { ($0.id, $0.cwd) }))
+        let members = live.map { session -> SessionGroupMember in
+            var member = SessionGroupMember(agent: session.agent, title: session.agent.title, cwd: session.cwd, conversationID: "")
+            member.runtimeID = session.id
+            return member
+        }
+        let group = SessionGroup(name: "Concurrent policies", members: members)
+        try SessionGroupStore(directory: root).save([group])
+        let older = Task { try await engine.applyGroupOSPermissions(group, kinds: [.files, .camera], allow: true) }
+        try await gate.waitForReads(1)
+        let latest = try await engine.applyGroupOSPermissions(group, kinds: [.camera], allow: false)
+        try expect(latest.allSatisfy { $0.outcome == .alreadySet })
+        try engine.setOSPermissionPolicy(live[0].id, allowed: [.microphone])
+        gate.release(0)
+        let rows = try await older.value
+        try expectEqual(rows.map(\.outcome), [.skipped, .changed])
+        func allowed(_ id: String) -> [OSPermissionKind]? {
+            engine.snapshot.sessions.first { $0.id == id }?.osPermissionPolicy?.allowed
+        }
+        try expectEqual(allowed(live[0].id), [.microphone])
+        try expectEqual(allowed(live[1].id), [.files])
+    }
+
     func testGroupPolicyHasPriorityDuringDiscovery() async throws {
         let root=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString), fixture=OSFixture()
         defer {try? FileManager.default.removeItem(at:root)}

@@ -146,6 +146,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let sessions: Set<String>
         let agents: Set<AgentKind>
         let kinds: Set<OSPermissionKind>
+        var superseded: [String: Set<OSPermissionKind>] = [:]
     }
     private var groupPolicyEdits: [UUID: GroupPolicyEdit] = [:]
     private func settingSessionPolicy(_ id: String) -> Bool {
@@ -423,12 +424,20 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private struct ScreenConnection {
         var connectID: UUID?
         var enabled = false
-        var polling = false
         var permissionBlocked = false
         var retryAfter = Date.distantPast
         var admissionMisses = 0
         var batchSize = RemoteTerminalPolling.BatchSize()
     }
+    private struct HostScreenRead {
+        let connectionID: UUID?
+        let selectedOnly: Bool
+        let monitoring: Bool
+        let targets: [String: ScreenTarget]
+        let epochs: [String: UInt64]
+        let task: Task<Bool?, Never>
+    }
+    private var hostScreenReads: [ScreenHost: HostScreenRead] = [:]
     private var screenConnections: [ScreenHost: ScreenConnection] = [:]
     private let screenAdapters: [ScreenHost: ScreenHostAdapter]
     private var terminalHistoryStore:TerminalHistoryStore?
@@ -508,7 +517,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var keepAwakeActivity: NSObjectProtocol?
     private let mouseActivity: MouseActivity
     private var mouseActivityTask: Task<Void, Never>?
-    private var discovering = false
+    private var discoveryTask: Task<Void, Never>?
     @Published public private(set) var codexAccountTransitionEnabled = false
     @Published public private(set) var codexAccountTransitionStates: [String: CodexAccountTransitionState] = [:]
     @Published public private(set) var codexAccountTransitionBusy = false
@@ -893,7 +902,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }, disconnected: { [weak self] id in
             Task { @MainActor in self?.disconnect(id) }
         })
-        try socket.start(); server = socket; observationEpoch &+= 1
+        try socket.start(); server = socket; invalidateObservationTasks()
         questionAutomationStopped = false
         keepAwakeStopped = false
         mouseActivity.setEnabled(store.value("mouseActivity") == "true")
@@ -926,15 +935,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             pollTask = Task { [weak self] in
                 while !Task.isCancelled {
                     await self?.refreshDiscovery()
+                    if Task.isCancelled { break }
                     self?.scheduleGoalIntentRecovery()
                     self?.scheduleCohortRecovery()
-                    self?.startObservationPolling()
                     do { try await Task.sleep(for: .seconds(4)) } catch { break }
                 }
             }
-            // The opt-in pulse task sleeps until its one-minute deadline and does not run while disabled.
+            startObservationPolling()
             startMouseActivityPolling()
-            // Screen reads can take many seconds; battery, heat and idle checks keep their own pace.
             let observation = keepAwakeSignal.observe()
             keepAwakeTask = Task { [weak self] in
                 await observation.waitForChange(timeout: 0)
@@ -951,7 +959,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         invalidateHostIPC()
         backgroundJobMonitor?.cancel(); backgroundJobMonitor = nil; jobSnapshots.removeAll(); jobExitObservers.removeAll()
         groupClearTask?.cancel(); groupClearTask = nil
-        groupIdentityObservationTask?.cancel()
         groupConnectionObservation = nil
         groupMCPIdentities.removeAll()
         cohortExecutionTasks.values.forEach{$0.cancel()};cohortExecutionTasks.removeAll()
@@ -998,7 +1005,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         codexProgressTrackers.removeAll();codexProgressHistory.removeAll()
         if let history=terminalHistoryStore {Task {await history.stop()};terminalHistoryStore=nil}
         automationRuntime.stop()
-        observationEpoch &+= 1
+        invalidateObservationTasks()
         for pending in claudeHookWaitTasks.values { pending.task.cancel() }; claudeHookWaitTasks.removeAll()
         claudeHookSignals.values.forEach { $0.notify() }; claudeHookSignals.removeAll()
         for pending in ptyContinuationTasks.values { pending.cancel() }
@@ -2952,12 +2959,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     public func sessionGroupSessions() async throws -> [SessionGroupLiveSession] {
         if let pending = groupIdentityObservationTask { return try await pending.value }
-        let pending = Task { try await readSessionGroupSessions() }
+        let epoch = observationEpoch
+        let pending = Task {
+            defer { if observationEpoch == epoch { groupIdentityObservationTask = nil } }
+            let observed = try await readSessionGroupSessions()
+            try Task.checkCancellation()
+            guard observationEpoch == epoch, !remoteInputStopped else { throw CancellationError() }
+            groupConnectionObservation = (.now, observed)
+            return observed
+        }
         groupIdentityObservationTask = pending
-        defer { groupIdentityObservationTask = nil }
-        let observed = try await pending.value
-        if !Task.isCancelled, !pending.isCancelled { groupConnectionObservation = (.now, observed) }
-        return observed
+        return try await pending.value
     }
 
     private func isBackgroundGroupSession(_ session: AgentSession) -> Bool {
@@ -2965,6 +2977,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func readSessionGroupSessions(runtimeID: String? = nil, reconcile: Bool = true, useStatusCache: Bool = true, priority: TaskPriority = .utility) async throws -> [SessionGroupLiveSession] {
+        let epoch = observationEpoch
         let candidates = runtimeID.map { sessions[$0].map { [$0] } ?? [] } ?? Array(sessions.values)
         let originals = candidates.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 && !isBackgroundGroupSession($0) }
         guard !originals.isEmpty || runtimeID == nil else { return [] }
@@ -2972,13 +2985,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let readAll = processReader, readOne = singleProcessReader, pid = runtimeID == nil ? nil : originals.first?.pid
         let reader: @Sendable () throws -> [ProcessRecord] = { if let pid { return try readOne(pid) }; return try readAll() }
         let registry = claudeRegistryReader, codexReader = codexGroupReader, codexEnvironment = codexGroupEnvironment
-        let records = try await Task.detached(priority: priority) { try reader() }.value
+        let records = try await Task.detached(priority: priority) { ProcessDiscovery.index(try reader()) }.value
         let agyRevisions = agyEvents.mapValues(\.revision)
         var terminalEnvironments: [String: [String: String]] = [:]
         var result: [SessionGroupLiveSession] = []
         for original in originals {
             try Task.checkCancellation()
-            guard let record = records.first(where: { $0.key == original.id && $0.agent == original.agent && "/dev/" + $0.tty == original.tty }) else { continue }
+            guard let record = records[original.pid], record.key == original.id, record.agent == original.agent, "/dev/" + record.tty == original.tty else { continue }
             let environment = await Task.detached(priority: priority) {
                 original.agent == .codex ? codexEnvironment(record) : ProcessEnvironment.read(record)
             }.value
@@ -3031,21 +3044,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
             observation.claudeRegisteredActivity = claudeActivity
             result.append(observation)
         }
-        let latest = try await Task.detached(priority: priority) { try reader() }.value
-        let byPID = Dictionary(latest.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        let byPID = try await Task.detached(priority: priority) { ProcessDiscovery.index(try reader()) }.value
+        try Task.checkCancellation()
+        guard observationEpoch == epoch, !remoteInputStopped else { throw CancellationError() }
         let observed = result.compactMap { observation -> SessionGroupLiveSession? in
             guard let current = sessions[observation.id], current.phase != .ended, !isBackgroundGroupSession(current),
                   current.pid == observation.session.pid, current.started == observation.session.started,
                   current.tty == observation.session.tty, current.cwd == observation.session.cwd,
                   current.agent == observation.session.agent,
                   current.codexApprovalBinding?.threadID == observation.session.codexApprovalBinding?.threadID,
-                  latest.contains(where: { $0.key == observation.id && $0.agent == current.agent && "/dev/" + $0.tty == current.tty }) else { return nil }
+                  let process = byPID[current.pid], process.key == observation.id, process.agent == current.agent, "/dev/" + process.tty == current.tty else { return nil }
             var result = observation
             result.session = current
             if current.agent == .agy, agyRevisions[current.id] != agyEvents[current.id]?.revision {
                 result.conversationID = agyEvents[current.id]?.conversationId
             }
-            if let process = byPID[current.pid] { result.tabShell = SessionGroupTabShell.observe(current, process: process, records: byPID, environment: terminalEnvironments[current.id]) }
+            result.tabShell = SessionGroupTabShell.observe(current, process: process, records: byPID, environment: terminalEnvironments[current.id])
             let mcp = current.agent == .codex ? groupMCPIdentity(for: current, home: result.providerHome) : nil
             if let mcp, let id = mcp.conversationID {
                 groupStatusIdentities.removeValue(forKey: current.id)
@@ -7828,7 +7842,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     public func refresh() async {
+        let epoch = observationEpoch
         await refreshDiscovery()
+        guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
         async let questions = refreshCodexHistory()
         await refreshScreens()
         _ = await questions
@@ -7839,32 +7855,54 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let selected = sessionIDs.compactMap { sessions[$0] }.filter { $0.phase != .ended }
         guard !selected.isEmpty else { return }
         async let questions = refreshCodexHistory(sessionIDs: sessionIDs)
-        for host in ScreenHost.allCases {
-            let targets = selected.filter { $0.terminal == host.kind }
-            if !targets.isEmpty {
-                await refreshScreenHost(host, reportConnecting: false, targets: targets, hostTargets: pollingTargets(host), selectedOnly: true)
+        await withTaskGroup(of: Void.self) { reads in
+            for (host, targets) in Dictionary(grouping: selected, by: { ScreenHost(kind: $0.terminal) }) {
+                guard let host else { continue }
+                reads.addTask { @MainActor in
+                    await self.refreshScreenHost(host, reportConnecting: false, targets: targets,
+                                                 hostTargets: self.pollingTargets(host), selectedOnly: true)
+                }
             }
         }
         _ = await questions
         publish()
     }
 
+    private func invalidateObservationTasks() {
+        observationEpoch &+= 1
+        discoveryTask?.cancel(); discoveryTask = nil
+        groupIdentityObservationTask?.cancel(); groupIdentityObservationTask = nil
+        for read in hostScreenReads.values { read.task.cancel() }
+        hostScreenReads.removeAll()
+    }
+
     private func refreshDiscovery() async {
-        guard !discovering else { return }
-        discovering = true
-        var publishedDiscovery = false
+        guard !Task.isCancelled, !remoteInputStopped else { return }
+        if let discoveryTask { return await discoveryTask.value }
         let epoch = observationEpoch
-        defer {
-            discovering = false
-            if !initialDiscoveryComplete { initialDiscoveryComplete = true }
+        let task = Task {
+            await performDiscovery(epoch: epoch)
+            if observationEpoch == epoch {
+                discoveryTask = nil
+                if !initialDiscoveryComplete { initialDiscoveryComplete = true }
+            }
         }
+        discoveryTask = task
+        await task.value
+    }
+
+    private func performDiscovery(epoch: UInt64) async {
+        var publishedDiscovery = false
         do {
-            let reader = discoveryReader
-            let discovered = try await Task.detached(priority: .utility) { try reader() }.value
+            let reader = discoveryReader, registry = claudeRegistryReader
+            let (discovered, found) = try await Task.detached(priority: .utility) {
+                let records = try reader()
+                return (records, ProcessDiscovery.sessions(records))
+            }.value
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
-            let found = ProcessDiscovery.sessions(discovered)
             let agyRevisions = agyEvents.mapValues(\.revision)
-            let agyIDs = await Task.detached(priority: .utility) {
+            async let registrations = Task.detached(priority: .utility) { registry(discovered) }.value
+            async let agyRead = Task.detached(priority: .utility) {
                 var ids: [String: String] = [:]
                 for target in found where target.agent == .agy {
                     ids[target.id] = ProcessOpenFiles.agyConversation(pid: target.pid, started: target.started)
@@ -7883,6 +7921,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     return Dictionary(directoryTargets.compactMap { session in paths[session.pid].map { (session.id, $0) } }, uniquingKeysWith: { a, _ in a })
                 }.value
             }
+            let (agyIDs, claudeRegistrations) = await (agyRead, registrations)
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
             let readAt = ProcessInfo.processInfo.systemUptime
             let liveIDs = Set(identities)
@@ -7898,7 +7937,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     sessions[target.id]?.channel = ApprovalChannel.none
                 }
             }
-            updateDiscovery(found, records: discovered, directories: workingDirectoriesBySession, agyIDs: agyIDs)
+            updateDiscovery(found, records: discovered, directories: workingDirectoriesBySession, claudeRegistrations: claudeRegistrations, agyIDs: agyIDs)
             publishedDiscovery = true
         } catch {
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return }
@@ -8028,10 +8067,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let started = ProcessInfo.processInfo.systemUptime
                     let state = await self.refreshCodexHistory()
                     if let state, state.targetCount == 0 {
-                        // The empty collection closes retained SQLite handles.
-                        // With no Codex session, discovery signals the next
-                        // useful read; an eight-second timer only repeats the
-                        // same empty query and reopens no useful work.
                         await observation.waitForChange()
                         continue
                     }
@@ -8094,7 +8129,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     if !due.isEmpty {
                         let batch = Set(due)
                         let read = await self.refreshScreenHost(host, reportConnecting:false,
-                            targets: targets.filter { batch.contains($0.id) }, hostTargets: targets)
+                            targets: targets.filter { batch.contains($0.id) }, hostTargets: targets, monitoring: true)
                         if read != nil { refreshPending.subtract(batch) }
                         let finished = ProcessInfo.processInfo.systemUptime
                         for id in due where (self.screenReadAt[id] ?? 0) >= started && finished - started >= (intervals[id] ?? 0) {
@@ -8976,11 +9011,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     try await Task.detached { try HostAutomationPermission.request(host) }.value
                 }
             } catch {
-                guard screenConnections[host]?.connectID == connectID else { return }
+                guard screenConnections[host]?.connectID == connectID, !remoteInputStopped else { return }
                 screenConnections[host]?.permissionBlocked = error is TerminalAdapterError
                 screenConnections[host]?.retryAfter = Date().addingTimeInterval(5)
                 screenPollSignals[host]?.notify()
-                updateHealth(host) { $0.requested = true; $0.connected = false; $0.status = error.localizedDescription }
+                updateHealth(host) { $0.requested = true; $0.connected = false; $0.connecting = false; $0.status = error.localizedDescription }
                 return
             }
             guard screenConnections[host]?.connectID == connectID, !remoteInputStopped else { return }
@@ -9003,7 +9038,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             remoteScreenReads.removeValue(forKey: id)?.task.cancel(); remoteFrames.removeValue(forKey: id)
             remoteMonitorFrames.removeValue(forKey: id)
         }
-        updateHealth(host) { $0.status = "연결 해제됨"; $0.requested = false; $0.connected = false }
+        updateHealth(host) { $0.status = "연결 해제됨"; $0.requested = false; $0.connected = false; $0.connecting = false }
         do { try store.set(Self.enabledKey(host), "false") }
         catch { updateHealth(host) { $0.status = "연결은 해제했지만 설정을 저장하지 못했습니다: \(error.localizedDescription)" } }
         for id in Array(sessions.keys) where sessions[id]?.channel == host.channel {
@@ -9016,25 +9051,57 @@ private struct ScreenAnalysisStorageKey: Hashable {
         _ = await refreshScreenHost(host, reportConnecting:reportConnecting, targets:nil)
     }
 
-    /// `targets` are read now; `hostTargets` are all of the host's monitored
-    /// sessions, so the health line still counts tabs read on an earlier pass.
     @discardableResult
     private func refreshScreenHost(_ host: ScreenHost, reportConnecting: Bool, targets suppliedTargets: [AgentSession]?,
-                                   hostTargets: [AgentSession]? = nil, selectedOnly: Bool = false) async -> Bool? {
-        guard !remoteInputStopped, let connection = screenConnections[host], connection.enabled, !connection.polling, !connection.permissionBlocked,
-              Date() >= connection.retryAfter, let adapter = screenAdapters[host] else { return nil }
-        screenConnections[host]?.polling = true
-        let epoch = observationEpoch
+                                   hostTargets: [AgentSession]? = nil, selectedOnly: Bool = false, monitoring: Bool = false) async -> Bool? {
+        let epoch = observationEpoch, connectionID = screenConnections[host]?.connectID
+        while !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch,
+              let connection = screenConnections[host], connection.enabled, connection.connectID == connectionID,
+              !connection.permissionBlocked, (Date() >= connection.retryAfter || (!monitoring && connection.admissionMisses > 0)),
+              let adapter = screenAdapters[host] {
+            let targets = suppliedTargets?.compactMap { original -> AgentSession? in
+                guard let live = sessions[original.id], live.phase != .ended, live.terminal == host.kind,
+                      live.tty == original.tty, live.screenHandle == original.screenHandle else { return nil }
+                return live
+            } ?? pollingTargets(host)
+            if suppliedTargets?.isEmpty == false && targets.isEmpty { return nil }
+            let requests = Dictionary(uniqueKeysWithValues: targets.map { ($0.id, ScreenTarget(tty: $0.tty, handle: $0.screenHandle)) })
+            let epochs = Dictionary(uniqueKeysWithValues: targets.map { ($0.id, automationRuntime.epoch($0.id)) })
+            if let active = hostScreenReads[host] {
+                let covered = active.connectionID == connectionID && active.selectedOnly == selectedOnly &&
+                    requests.allSatisfy { active.targets[$0.key] == $0.value && active.epochs[$0.key] == epochs[$0.key] } &&
+                    (!targets.isEmpty || active.targets.isEmpty)
+                let result = await active.task.value
+                if covered && !(active.monitoring && !monitoring && result == nil) { return result }
+                continue
+            }
+            let task = Task {
+                defer { if observationEpoch == epoch { hostScreenReads[host] = nil } }
+                return await performScreenRead(host, connection: connection, adapter: adapter, epoch: epoch,
+                                               targets: targets, hostTargets: hostTargets, selectedOnly: selectedOnly,
+                                               reportConnecting: reportConnecting, monitoring: monitoring)
+            }
+            hostScreenReads[host] = HostScreenRead(connectionID: connectionID, selectedOnly: selectedOnly, monitoring: monitoring,
+                                                  targets: requests, epochs: epochs, task: task)
+            return await task.value
+        }
+        return nil
+    }
+
+    private func performScreenRead(_ host: ScreenHost, connection: ScreenConnection, adapter: ScreenHostAdapter,
+                                   epoch: UInt64, targets: [AgentSession], hostTargets: [AgentSession]?,
+                                   selectedOnly: Bool, reportConnecting: Bool, monitoring: Bool) async -> Bool? {
+        guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch,
+              screenConnections[host]?.enabled == true, screenConnections[host]?.connectID == connection.connectID else { return nil }
         let automationEpochs = automationRuntime.epochs
         let automationDefaultEpoch = automationRuntime.defaultEpoch
         let announceConnection = reportConnecting || !snapshot.health.screen(host).connected
         if announceConnection { updateHealth(host) { $0.connecting = true } }
         defer {
-            screenConnections[host]?.polling = false
-            if observationEpoch != epoch { screenPollSignals[host]?.notify() }
-            else if announceConnection { updateHealth(host) { $0.connecting = false } }
+            if announceConnection, observationEpoch == epoch, screenConnections[host]?.connectID == connection.connectID {
+                updateHealth(host) { $0.connecting = false }
+            }
         }
-        let targets = suppliedTargets ?? sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
         let title = host.title
         if !targets.isEmpty { nativeKeyboardActivity.prepare(host.kind) }
         do {
@@ -9073,14 +9140,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             let requests = targets.filter { sharedDates[$0.id] == nil }.map { ScreenTarget(tty: $0.tty, handle: $0.screenHandle) }
             let reusedScreens = sharedScreens, reusedDates = sharedDates
-            // The worker needs only this host's active sessions. Retaining the
-            // entire cross-host cache pins unrelated terminal scrollback for
-            // the duration of a potentially slow Apple Event read.
             var cached: [String: (analysis: ScreenAnalysis?, raw: String, observedAt: Date?)] = [:]
             cached.reserveCapacity(targets.count)
             for target in targets {
-                // Prefer the detector's last observed frame. The remote monitor
-                // may advance while hook-owned input intentionally skips analysis.
                 if let previous = remoteObservedScreens[target.id] {
                     cached[target.id] = (screenAnalyses[target.id], previous.raw, previous.observedAt)
                 } else if let previous = remoteMonitorFrames[target.id] {
@@ -9088,9 +9150,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
             let analysisTargets = targets.map { (id: $0.id, tty: $0.tty, agent: $0.agent) }
-            // A large scrollback in many tabs must not monopolize the UI actor.
-            // One bounded worker per host reads and parses; no policy or input is run here.
-            let waitForSlot = connection.admissionMisses >= 2
+            let waitForSlot = !monitoring || connection.admissionMisses >= 2
             let worker = Task.detached(priority: .utility) {
                 let result = requests.isEmpty ? TerminalSnapshot() : try await adapter.isolatedRead(host,waitForSlot:waitForSlot) { try reader(requests) }
                 var screensByTTY = reusedScreens
@@ -9132,12 +9192,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return (result.failures, screensByTTY, analyses, changedIDs, unchangedObservedAt)
             }
             let (failures, screensByTTY, analyses, changedIDs, unchangedObservedAt) = try await withTaskCancellationHandler(operation: { try await worker.value }, onCancel: { worker.cancel() })
-            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch, screenConnections[host]?.enabled == true else { return nil }
+            guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch, screenConnections[host]?.enabled == true,
+                  screenConnections[host]?.connectID == connection.connectID else { return nil }
+            let hadTargets = !targets.isEmpty
             let targets = targets.filter { target in
                 guard (automationEpochs[target.id] ?? automationDefaultEpoch) == automationRuntime.epoch(target.id),
                       let current = sessions[target.id], current.phase != .ended,
                       current.pid == target.pid, current.started == target.started,
-                      current.tty == target.tty, current.terminal == host.kind else { return false }
+                      current.tty == target.tty, current.terminal == host.kind, current.screenHandle == target.screenHandle else { return false }
                 if let at = reusedDates[target.id] {
                     guard !userInputHasPriority(target.id),
                           remoteFrames[target.id]?.frame.observedAt == at,
@@ -9150,6 +9212,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 return true
             }
+            if hadTargets && targets.isEmpty { return nil }
             screenConnections[host]?.admissionMisses = 0
             if hostTargets != nil, adapter.usesHostIPC {
                 screenConnections[host]?.batchSize.completed(count: requests.count, elapsed: ProcessInfo.processInfo.systemUptime - readStartedUptime)
@@ -9211,9 +9274,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         }
                         continue
                     }
-                    // Preserve the last known display label when an optional
-                    // title Apple Event is unavailable; the fresh screen below
-                    // remains authoritative for detection and approval.
                     if let title = screen.title, sessions[target.id]?.terminalTitle != title {
                         sessions[target.id]?.terminalTitle = title
                         sessionProjectionChanged = true
@@ -9234,9 +9294,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             sessions[target.id]?.detail = detail
                             sessionProjectionChanged = true
                         }
-                        // Another actor task may have observed a newer frame while
-                        // this host read was suspended; only trust the skip if the
-                        // captured observation timestamp still owns the current one.
                         let contentsUnchanged = unchangedObservedAt[target.id].map { $0 == remoteObservedScreens[target.id]?.observedAt } ?? false
                         receiveScreen(sessionID: target.id, raw: screen.contents, generation: "\(host.rawValue):\(target.id)", source: host.channel, at: reusedDates[target.id] ?? readStartedAt, appearance: screen.appearance, cursor: screen.cursor, display: screen.display, precomputed: analyses[target.id], screenContentsUnchanged: contentsUnchanged)
                     }
@@ -9296,7 +9353,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             publish()
             unchangedScreenReads[host] = 0
-            // After a failed host read, the next successful pass reads every tab.
             for target in targets { screenReadSucceeded.remove(target.id); unchangedSessionReads[target.id] = 0 }
             screenPollSignals[host]?.notify()
             return nil
@@ -11041,7 +11097,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !kinds.isEmpty, kinds.isSubset(of: Set(OSPermissionKind.automaticCases)) else {
             throw AppError.message("일괄 변경할 권한을 선택해주세요.")
         }
-        let editID = UUID()
+        let editID = UUID(), olderEdits = Array(groupPolicyEdits.keys), epoch = observationEpoch
         let cached = groupConnectionObservation?.sessions ?? []
         let targets = Set(expected.members.compactMap(\.runtimeID) + expected.members.compactMap { SessionGroupMatching.match($0, in: cached)?.id })
         groupPolicyEdits[editID] = GroupPolicyEdit(sessions: targets, agents: Set(expected.members.map(\.agent)), kinds: kinds)
@@ -11053,6 +11109,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let observed = try await readSessionGroupSessions(reconcile: false, priority: .userInitiated)
         try Task.checkCancellation()
+        guard observationEpoch == epoch, !remoteInputStopped else { throw CancellationError() }
         let groups = try SessionGroupStore(directory: paths.directory).load()
         guard !groupClearActive(expected.id), let group = groups.first(where: { $0.id == expected.id }),
               group.sameMembership(as: expected) else {
@@ -11072,11 +11129,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     continue
                 }
                 let existing = Set(osPermissionPolicySources[session.id] == osPermissionSource(session) ? session.osPermissionPolicy?.allowed ?? [] : [])
-                let updated = allow ? existing.union(kinds) : existing.subtracting(kinds)
-                guard updated != existing else { record(.alreadySet, "이미 설정됨"); continue }
+                let applicable = kinds.subtracting(groupPolicyEdits[editID]?.superseded[session.id] ?? [])
+                guard !applicable.isEmpty else { record(.skipped, "더 최근에 요청한 설정이 적용됐습니다."); continue }
+                let updated = allow ? existing.union(applicable) : existing.subtracting(applicable)
                 do {
-                    try setOSPermissionPolicy(session.id, allowed: Array(updated))
-                    record(.changed, allow ? "허용 적용" : "허용 해제")
+                    if updated != existing { try persistOSPermissionPolicy(session.id, allowed: Array(updated)) }
+                    supersedeGroupPolicyEdits(olderEdits, sessionID: session.id, kinds: applicable)
+                    if updated == existing { record(.alreadySet, "이미 설정됨") }
+                    else { record(.changed, allow ? "허용 적용" : "허용 해제") }
                 } catch {
                     record(.skipped, error.localizedDescription)
                 }
@@ -11085,7 +11145,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return results
     }
 
+    private func supersedeGroupPolicyEdits(_ edits: [UUID], sessionID: String, kinds: Set<OSPermissionKind>) {
+        for edit in edits {
+            guard let overlap = groupPolicyEdits[edit]?.kinds.intersection(kinds), !overlap.isEmpty else { continue }
+            groupPolicyEdits[edit]?.superseded[sessionID, default: []].formUnion(overlap)
+        }
+    }
+
     public func setOSPermissionPolicy(_ id:String,allowed:[OSPermissionKind]) throws {
+        try persistOSPermissionPolicy(id, allowed: allowed)
+        supersedeGroupPolicyEdits(Array(groupPolicyEdits.keys), sessionID: id, kinds: Set(OSPermissionKind.automaticCases))
+    }
+
+    private func persistOSPermissionPolicy(_ id:String,allowed:[OSPermissionKind]) throws {
         guard !allowed.contains(.authentication) else {throw RemoteHTTPError(400,"Mac 사용자 인증은 자동 승인 정책으로 허용할 수 없습니다.")}
         guard let session=sessions[id],session.agent != .shell,session.pid>0,session.phase != .ended else {throw RemoteHTTPError(404,"실행 중인 Codex·Claude 세션을 선택해주세요.")}
         var policy=osPermissionPolicySources[id]==osPermissionSource(session) ? session.osPermissionPolicy ?? .init():.init();policy.allowed=Array(Set(allowed)).sorted {$0.rawValue<$1.rawValue}
