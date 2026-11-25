@@ -268,6 +268,10 @@ package final class AutomationIPC: @unchecked Sendable {
         }
     }
 
+    func readRetryDelay(_ host: String) -> TimeInterval {
+        lock.withLock { max(0.25, (reopen[host] ?? 0) - now) }
+    }
+
     func blocksWrites(_ host:String) -> Bool {
         lock.withLock {
             if let flight = active[host], now >= flight.deadline { expire(host,flight,.timeout) }

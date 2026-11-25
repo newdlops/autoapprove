@@ -4731,14 +4731,40 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard let before, UUID(uuidString: member.conversationID) != nil, remoteCanRead(before.session) else {
             throw RemoteHTTPError(409, "구성원의 대화 ID와 원본 터미널 화면 연결을 확인해주세요.")
         }
-        let frame = try await remoteTerminal(sessionID: before.id, realtime: true, textOnly: true)
-        if let reason = frame.outputReason { throw RemoteHTTPError(409, reason) }
-        let (_, latest, after) = try await groupEvidenceTarget(object, groupID: groupID, memberID: memberID)
-        guard let after, after.id == before.id, after.session.tty == before.session.tty,
-              after.conversationID == before.conversationID, latest.conversationID == member.conversationID,
-              after.providerHome == before.providerHome else {
-            throw RemoteHTTPError(409, "조회 중 구성원의 연결이 바뀌었습니다. 다시 조회해주세요.")
+        func confirmedTarget() async throws -> (SessionGroupMember, SessionGroupLiveSession) {
+            try Task.checkCancellation()
+            let (_, latest, after) = try await groupEvidenceTarget(object, groupID: groupID, memberID: memberID)
+            guard let after, after.id == before.id, after.session.pid == before.session.pid,
+                  after.session.started == before.session.started, after.session.tty == before.session.tty,
+                  after.session.terminal == before.session.terminal, after.session.screenHandle == before.session.screenHandle,
+                  after.conversationID == before.conversationID, latest.conversationID == member.conversationID,
+                  after.providerHome == before.providerHome, remoteCanRead(after.session), !remoteInputStopped else {
+                throw RemoteHTTPError(409, "조회 중 구성원의 연결이 바뀌었습니다. 다시 조회해주세요.")
+            }
+            return (latest, after)
         }
+        let frame: RemoteTerminalFrame
+        var retried = false
+        while true {
+            do {
+                frame = try await remoteTerminal(sessionID: before.id, realtime: true, textOnly: true)
+                break
+            } catch {
+                try Task.checkCancellation()
+                guard let host = ScreenHost(kind: before.session.terminal), [.terminal, .iterm].contains(host),
+                      (error as? AutomationIPC.Failure) == .busy || TerminalAppleEvents.isTransientReadFailure(error) else { throw error }
+                let delay = AutomationIPC.shared.readRetryDelay(host.title)
+                guard !retried else {
+                    throw RemoteHTTPError(503, "\(host.title) 응답이 지연되어 구성원의 현재 화면을 읽지 못했습니다. 잠시 후 get_group_member_terminal로 다시 조회해주세요.",
+                                          diagnostics: ["retryable": "true", "retryAfterSeconds": String(Int(ceil(delay)))])
+                }
+                retried = true
+                try await Task.sleep(for: .seconds(delay))
+                _ = try await confirmedTarget()
+            }
+        }
+        if let reason = frame.outputReason { throw RemoteHTTPError(409, reason) }
+        let (latest, after) = try await confirmedTarget()
         let tail = frame.screen.utf8.suffix(12000).drop(while: { $0 & 0xc0 == 0x80 })
         return ["groupID": groupID.uuidString, "memberID": memberID.uuidString, "conversationID": latest.conversationID,
                 "title": latest.nickname ?? latest.title, "phase": groupDisplayPhase(after.session, observation: after).rawValue,
