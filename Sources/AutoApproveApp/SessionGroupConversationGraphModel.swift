@@ -45,8 +45,6 @@ struct GraphNode: Equatable, Identifiable {
     func size(_ scope: SessionGroupGraph.Scope) -> SessionGroupGraph.NodeSize { SessionGroupGraph.nodeSize(forMessages: messages(scope)) }
 }
 
-/// Reads the group file and the mailbox on its own connection, never on the main thread.
-/// It reads again only when the mailbox's data version or the group file's time or size changed.
 actor ConversationGraphReader {
     struct Read: @unchecked Sendable {
         let group: SessionGroup?
@@ -57,33 +55,35 @@ actor ConversationGraphReader {
         let storageChanged: Bool
     }
 
-    private struct FileStamp: Equatable { let modified: timespec; let size: off_t
+    private struct FileStamp: Equatable { let modified: timespec; let size: off_t; let inode: ino_t
         static func == (lhs: Self, rhs: Self) -> Bool {
-            lhs.modified.tv_sec == rhs.modified.tv_sec && lhs.modified.tv_nsec == rhs.modified.tv_nsec && lhs.size == rhs.size
+            lhs.modified.tv_sec == rhs.modified.tv_sec && lhs.modified.tv_nsec == rhs.modified.tv_nsec && lhs.size == rhs.size && lhs.inode == rhs.inode
         }
     }
 
     private let directory: URL
     private var mailbox: SessionGroupMailbox?
+    private var groupID: UUID?
     private var version: Int?
     private var stamp: FileStamp??
     private var cached: (group: SessionGroup?, page: SessionGroupConversationPage?, inboxes: [UUID: SessionGroupMailbox.InboxOperation])?
 
     init(directory: URL) { self.directory = directory }
 
-    /// Nil when storage is unchanged and the lines need no new time reference.
     func read(groupID: UUID, force: Bool, now: Date, recomputeLines: Bool) throws -> Read? {
         if mailbox == nil { mailbox = try SessionGroupMailbox(directory: directory) }
         guard let mailbox else { return nil }
-        let version = try mailbox.dataVersion
+        let version = try mailbox.conversationRevision
         let stamp = fileStamp()
-        let changed = force || cached == nil || version != self.version || self.stamp != .some(stamp)
+        let groupChanged = force || cached == nil || self.groupID != groupID || self.stamp != .some(stamp)
+        let changed = groupChanged || version != self.version
         guard changed || recomputeLines else { return nil }
         if changed {
-            let group = try SessionGroupStore(directory: directory).load().first { $0.id == groupID }
+            let group = groupChanged ? try SessionGroupStore(directory: directory).load().first { $0.id == groupID } : cached?.group
             let page = group == nil ? nil : try mailbox.conversations(groupID: groupID)
             let inboxes = group == nil ? [:] : try mailbox.inboxOperations(groupID: groupID)
             cached = (group, page, inboxes)
+            self.groupID = groupID
             self.version = version
             self.stamp = .some(stamp)
         }
@@ -99,7 +99,7 @@ actor ConversationGraphReader {
     private func fileStamp() -> FileStamp? {
         var info = stat()
         guard lstat(directory.appendingPathComponent("session-groups.json").path, &info) == 0 else { return nil }
-        return FileStamp(modified: info.st_mtimespec, size: info.st_size)
+        return FileStamp(modified: info.st_mtimespec, size: info.st_size, inode: info.st_ino)
     }
 }
 

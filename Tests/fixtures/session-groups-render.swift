@@ -609,20 +609,17 @@ final class GraphReadProbe: @unchecked Sendable {
     print("PASS graph scenes: \(written.count) PNG\n" + written.joined(separator: "\n"))
 }
 
-/// Another connection writes, and the window must follow within two seconds without
-/// recomputing when nothing changed, reading off the main thread and stopping while hidden.
 @MainActor func verifyGraphRefresh(root: URL) async throws {
-    // The window reads the real clock here, so the messages are placed relative to now and the
-    // recent view shows the same counts and size steps as the rendered scenes.
     let fixture = try GraphFixture.make(root: root, name: "refresh-state", now: Date())
     defer { fixture.engine.stop() }
+    try fixture.engine.setPaused(true)
     let size = CGSize(width: 1040, height: 680)
     func require(_ ok: Bool, _ message: String) throws { if !ok { throw AppError.message(message) } }
     // "최근" and "전체" draw some circles at different sizes but place every node at the same point.
     var scopePlaces: [SessionGroupGraph.Scope: [String: CGPoint]] = [:], scopeSizes: [SessionGroupGraph.Scope: [String: CGFloat]] = [:]
     for scope in [SessionGroupGraph.Scope.recent, .all] {
         GraphProbe.places = [:]; GraphProbe.rects = [:]
-        let (scopeWindow, scopeHost) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine, initialScope: scope)
+        let (scopeWindow, scopeHost) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine, initialScope: scope, layout: .tree)
             .frame(width: size.width, height: size.height), size: size)
         try await Task.sleep(for: .seconds(2))
         scopeHost.layoutSubtreeIfNeeded()
@@ -637,7 +634,7 @@ final class GraphReadProbe: @unchecked Sendable {
     let resizedBySwitch = (scopeSizes[.recent] ?? [:]).filter { name, ratio in abs((scopeSizes[.all]?[name] ?? ratio) - ratio) > 0.01 }.count
     try require(resizedBySwitch > 0, "No circle differs between the views, so the switch check proves nothing")
     GraphProbe.places = [:]; GraphProbe.rects = [:]
-    let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine)
+    let (window, host) = hiddenHarnessWindow(SessionGroupConversationGraph(groupID: fixture.group.id, engine: fixture.engine, layout: .tree)
         .frame(width: size.width, height: size.height), size: size)
     defer { window.close() }
     func waitForMessages(_ count: Int, within seconds: Double) async throws -> Double? {
@@ -741,15 +738,15 @@ final class GraphReadProbe: @unchecked Sendable {
     host.layoutSubtreeIfNeeded()
     let viewAfterMember = GraphProbe.view
     try require(same(zoomed, viewAfterMember), "A new member changed the zoom or pan: \(String(describing: zoomed)) -> \(String(describing: viewAfterMember))")
-    // 20 messages from "화면 점검" to the leader move both from a smaller size step to the largest.
-    // The layout makes room for the larger circles, no two nodes overlap, and the zoom and pan stay.
     let widthsBefore = GraphProbe.rects.mapValues { $0.height / $0.width }
     let placesBeforeBurst = GraphProbe.places
     for i in 0..<20 {
         _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["ui"]!, recipientID: fixture.id["lead"]!,
                                kind: .message, text: "화면 점검 결과 \(i + 1)을 정리했습니다")
     }
-    guard try await waitForMessages(initial + 22, within: 3) != nil else { throw AppError.message("Message burst did not appear within 3 s") }
+    let afterBurst = try writer.conversations(groupID: fixture.group.id).messages.count
+    try require(afterBurst >= initial + 22, "The fixture is missing burst messages")
+    guard try await waitForMessages(afterBurst, within: 3) != nil else { throw AppError.message("Message burst did not appear within 3 s") }
     try await Task.sleep(for: .milliseconds(400))
     host.layoutSubtreeIfNeeded()
     let grew = ["결제 총괄", "화면 점검"].filter { name in (GraphProbe.rects[name].map { $0.height / $0.width } ?? 0) > (widthsBefore[name] ?? 0) + 0.01 }
@@ -770,7 +767,7 @@ final class GraphReadProbe: @unchecked Sendable {
     _ = try writer.enqueue(groupID: fixture.group.id, senderID: fixture.id["api"]!, recipientID: fixture.id["test"]!,
                            kind: .message, text: "숨긴 동안 보낸 메시지입니다")
     window.orderFrontRegardless()
-    guard let reopen = try await waitForMessages(initial + 23, within: 3) else { throw AppError.message("Shown window did not read again") }
+    guard let reopen = try await waitForMessages(afterBurst + 1, within: 3) else { throw AppError.message("Shown window did not read again") }
     let result: [String: Any] = ["newMessageLatencyMs": latency * 1000, "rootBodiesWhileUnchanged3s": unchangedRoots,
                                  "storageChecksWhileUnchanged3s": unchangedChecks, "mainThreadReads": probe.value.onMain,
                                  "totalReads": probe.value.checks, "nodesMovedAfterMessage": moved.count, "sizeStepsChangedByOneMessage": resized.count,

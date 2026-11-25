@@ -253,8 +253,11 @@ public final class SessionGroupMailbox {
                 CREATE INDEX IF NOT EXISTS wait_notification_member ON group_waits(group_id,\(Self.waitMember),state) WHERE \(Self.compoundWait);
                 CREATE INDEX IF NOT EXISTS message_notification_candidates ON messages(group_id,recipient_id,sequence) WHERE \(Self.notificationCandidate);
                 CREATE INDEX IF NOT EXISTS message_receipt_due ON messages(next_attempt) WHERE \(Self.awaitingReceipt);
+                CREATE INDEX IF NOT EXISTS message_group_sequence ON messages(group_id,sequence);
+                CREATE INDEX IF NOT EXISTS message_graph_questions ON messages(group_id,kind,sequence,id) WHERE kind='question' AND last_result IS NOT 'superseded';
                 CREATE INDEX IF NOT EXISTS message_open_questions ON messages(sequence) WHERE kind='question' AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired';
                 """)
+            try installConversationRevision()
             try execute("""
                 UPDATE messages AS q SET last_result='answered',last_error=NULL
                 WHERE kind='question' AND \(Self.pendingFilter)
@@ -268,6 +271,34 @@ public final class SessionGroupMailbox {
         } catch { sqlite3_close(db); db = nil; throw error }
     }
     deinit { sqlite3_close(db) }
+
+    private func installConversationRevision() throws {
+        guard try scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversation_revision'") == 0 else { return }
+        try transaction {
+            try execute("""
+                CREATE TABLE IF NOT EXISTS conversation_revision(id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
+                INSERT OR IGNORE INTO conversation_revision VALUES(1,0);
+                """)
+            let tables = [
+                ("messages", ["acknowledged", "last_result", "last_error", "requested_priority", "priority_override", "category",
+                              "id", "group_id", "sender_id", "recipient_id", "kind", "source_key", "sequence", "created", "body"]),
+                ("group_waits", ["state", "group_id", "request"]),
+                ("group_original_reports", ["message_id"])
+            ]
+            for (table, columns) in tables {
+                let changes = columns.map { "OLD.\($0) IS NOT NEW.\($0)" }.joined(separator: " OR ")
+                for (name, event, condition) in [("insert", "INSERT", ""), ("delete", "DELETE", ""),
+                                                  ("update", "UPDATE OF " + columns.joined(separator: ","), "WHEN " + changes)] {
+                    try execute("""
+                        CREATE TRIGGER IF NOT EXISTS graph_\(table)_\(name) AFTER \(event) ON \(table) \(condition)
+                        BEGIN UPDATE conversation_revision SET revision=revision+1 WHERE id=1; END;
+                        """)
+                }
+            }
+        }
+    }
+
+    public var conversationRevision: Int { get throws { try scalar("SELECT revision FROM conversation_revision WHERE id=1") } }
 
     /// Changes whenever another connection commits. A reader polls it to reload only after a real write.
     public var dataVersion: Int { get throws { try scalar("PRAGMA data_version") } }
@@ -395,8 +426,30 @@ public final class SessionGroupMailbox {
 
     var hasPendingReceipts: Bool { get throws { try scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE " + Self.awaitingReceipt + ")") != 0 } }
 
-    func overdueReceipts(at date: Date = Date()) throws -> [SessionGroupMessage] {
-        try rows("WHERE " + Self.awaitingReceipt + " AND next_attempt<=? ORDER BY sequence", [String(date.timeIntervalSince1970)])
+    struct DueReceipt {
+        let id: UUID
+        let groupID: UUID
+        let recipientID: UUID
+        let lastResult: String
+        let scheduledAt: Double
+    }
+
+    func overdueReceipts(at date: Date = Date()) throws -> [DueReceipt] {
+        let query = try statement("""
+            SELECT id,group_id,recipient_id,last_result,next_attempt FROM messages
+            WHERE \(Self.awaitingReceipt) AND next_attempt<=? ORDER BY sequence
+            """, [String(date.timeIntervalSince1970)])
+        defer { sqlite3_finalize(query) }
+        func uuid(_ index: Int32) -> UUID? { sqlite3_column_text(query, index).flatMap { UUID(uuidString: String(cString: $0)) } }
+        var receipts: [DueReceipt] = []
+        while true {
+            let status = sqlite3_step(query)
+            if status == SQLITE_DONE { return receipts }
+            guard status == SQLITE_ROW, let id = uuid(0), let group = uuid(1), let recipient = uuid(2),
+                  let result = sqlite3_column_text(query, 3) else { throw AppError.message("그룹 메시지 수신 확인 일정을 읽지 못했습니다.") }
+            receipts.append(.init(id: id, groupID: group, recipientID: recipient, lastResult: String(cString: result),
+                                  scheduledAt: sqlite3_column_double(query, 4)))
+        }
     }
 
     /// Proof of loss: queue the same message (same ID) for one more typing, or park it.
@@ -446,9 +499,23 @@ public final class SessionGroupMailbox {
         return Date(timeIntervalSince1970: sqlite3_column_double(query, 0))
     }
 
-    /// No proof either way yet (the recipient is busy or its composer has text): look again later.
-    func deferReceipt(_ id: UUID, until date: Date) throws {
-        try update("UPDATE messages SET next_attempt=? WHERE id=? AND " + Self.awaitingReceipt, [String(date.timeIntervalSince1970), id.uuidString])
+    func deferReceipts(_ receipts: [(DueReceipt, Date)]) throws {
+        guard !receipts.isEmpty else { return }
+        try transaction {
+            let query = try statement("""
+                UPDATE messages SET next_attempt=? WHERE id=? AND last_result=? AND next_attempt=? AND acknowledged IS NULL
+                """)
+            defer { sqlite3_finalize(query) }
+            for (receipt, date) in receipts {
+                sqlite3_reset(query)
+                let copy = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                guard sqlite3_bind_double(query, 1, date.timeIntervalSince1970) == SQLITE_OK,
+                      sqlite3_bind_text(query, 2, receipt.id.uuidString, -1, copy) == SQLITE_OK,
+                      sqlite3_bind_text(query, 3, receipt.lastResult, -1, copy) == SQLITE_OK,
+                      sqlite3_bind_double(query, 4, receipt.scheduledAt) == SQLITE_OK,
+                      sqlite3_step(query) == SQLITE_DONE else { throw AppError.message("그룹 메시지 수신 확인 일정을 저장하지 못했습니다.") }
+            }
+        }
     }
 
     func enqueueNicknameRequest(group: UUID, recipient: UUID, scope: String, text: String, replacesAll: Bool) throws {
@@ -627,20 +694,19 @@ public final class SessionGroupMailbox {
                  [groupID.uuidString, memberID.uuidString, String(after)] + [priority?.rawValue, category?.rawValue].compactMap { $0 } + [String(max(1, min(limit, 101)))])
     }
 
-    /// Questions retain their identity after delivery, so an observed prompt
-    /// or an ACK cannot by itself remove an unanswered edge from the graph.
     public func conversations(groupID: UUID) throws -> SessionGroupConversationPage {
-        let questions = """
-            SELECT id FROM messages q WHERE q.group_id=? AND q.kind='question'
-              AND q.last_result IS NOT 'superseded'
-            ORDER BY EXISTS(SELECT 1 FROM messages a WHERE a.source_key='answer:' || q.id),
-                     q.sequence DESC LIMIT 301
-            """
         let rows = try rows("""
-            WHERE group_id=? AND (id IN (\(questions)) OR source_key IN
-                (SELECT 'answer:' || id FROM (\(questions))))
-            ORDER BY sequence DESC
-            """, Array(repeating: groupID.uuidString, count: 3))
+            WHERE sequence IN (
+                WITH questions AS MATERIALIZED (
+                    SELECT q.sequence,q.id FROM messages q WHERE q.group_id=? AND q.kind='question'
+                      AND q.last_result IS NOT 'superseded'
+                    ORDER BY EXISTS(SELECT 1 FROM messages a WHERE a.source_key='answer:' || q.id),
+                             q.sequence DESC LIMIT 301
+                )
+                SELECT sequence FROM questions UNION ALL
+                SELECT a.sequence FROM questions q JOIN messages a ON a.source_key='answer:' || q.id WHERE a.group_id=?
+            ) ORDER BY sequence DESC
+            """, [groupID.uuidString, groupID.uuidString])
         let answers = Dictionary(uniqueKeysWithValues: rows.filter { $0.kind == .reply }.compactMap { row in
             row.sourceKey.map { ($0, row) }
         })

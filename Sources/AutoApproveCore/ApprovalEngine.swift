@@ -4874,16 +4874,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try groupMailbox().recordHeldEvents()
             notifyStalledSenders()
         }
-        let overdue = try groupMailbox().overdueReceipts()
-        var heads = try groupMailbox().heads()
+        let box = try groupMailbox()
+        let overdue = try box.overdueReceipts()
         let idle = groupMailboxIdleSessions
         groupMailboxIdleSessions.removeAll()
-        let now = Date()
-        guard !overdue.isEmpty || heads.contains(where: { $0.nextAttemptAt <= now || (!idle.isEmpty && $0.lastResult == "not_started") }) else { return }
-        let observed = try await sessionGroupSessions()
-        if !overdue.isEmpty {
+        let observed: [SessionGroupLiveSession]
+        let heads: [SessionGroupMessage]
+        if overdue.isEmpty {
+            heads = try box.heads()
+            let now = Date()
+            guard heads.contains(where: { $0.nextAttemptAt <= now || (!idle.isEmpty && $0.lastResult == "not_started") }) else { return }
+            observed = try await sessionGroupSessions()
+        } else {
+            observed = try await sessionGroupSessions()
             await verifyGroupReceipts(overdue, observed: observed)
-            heads = try groupMailbox().heads()
+            heads = try box.heads()
         }
         var eligible: [UUID: Set<UUID>] = [:]
         if !idle.isEmpty {
@@ -5017,12 +5022,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private enum GroupReceiptEvidence { case received, lost, unknown }
 
-    /// Commit or redeliver typed messages whose receipt is overdue. Only proof of loss
-    /// (an idle recipient, an empty composer and no trace of the prompt) types a message
-    /// again, so a message that reached the model never costs a second turn.
-    private func verifyGroupReceipts(_ messages: [SessionGroupMessage], observed: [SessionGroupLiveSession]) async {
+    private func verifyGroupReceipts(_ messages: [SessionGroupMailbox.DueReceipt], observed: [SessionGroupLiveSession]) async {
         guard let box = try? groupMailbox() else { return }
         let groups = (try? SessionGroupStore(directory: paths.directory).load()) ?? []
+        let recipients = Dictionary(grouping: messages, by: \.groupID).mapValues { Set($0.map(\.recipientID)) }
+        var matches: [UUID: [UUID: SessionGroupLiveSession]] = [:]
+        for group in groups {
+            guard let due = recipients[group.id] else { continue }
+            for member in group.members where due.contains(member.id) {
+                matches[group.id, default: [:]][member.id] = SessionGroupMatching.match(member, in: observed)
+            }
+        }
+        var deferred: [(SessionGroupMailbox.DueReceipt, Date)] = []
+        defer { try? box.deferReceipts(deferred) }
         for message in messages {
             guard !Task.isCancelled, !remoteInputStopped else { return }
             if activeGroupMailboxMessages.contains(message.id) { continue }
@@ -5035,14 +5047,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 } catch { continue }
             }
             let later = Date().addingTimeInterval(groupMailboxReceiptGrace)
-            guard let recipient = groups.first(where: { $0.id == message.groupID })?.members.first(where: { $0.id == message.recipientID }),
-                  let live = SessionGroupMatching.match(recipient, in: observed), let session = sessions[live.id] else {
-                // An offline recipient proves nothing; keep the message and look again later.
-                try? box.deferReceipt(message.id, until: later); continue
+            guard let live = matches[message.groupID]?[message.recipientID], let session = sessions[live.id] else {
+                deferred.append((message, later))
+                continue
             }
-            switch await groupReceiptEvidence(message, live: live, session: session) {
+            switch await groupReceiptEvidence(message.id, live: live, session: session) {
             case .received: break
-            case .unknown: try? box.deferReceipt(message.id, until: later)
+            case .unknown: deferred.append((message, later))
             case .lost:
                 if (try? box.requeueLostSubmission(message.id, attemptLimit: groupMailboxDirectAttemptLimit)) == false,
                    let parked = try? box.message(message.id), parked.lastResult == "undelivered" {
@@ -5055,29 +5066,29 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func groupReceiptEvidence(_ message: SessionGroupMessage, live: SessionGroupLiveSession, session: AgentSession) async -> GroupReceiptEvidence {
+    private func groupReceiptEvidence(_ messageID: UUID, live: SessionGroupLiveSession, session: AgentSession) async -> GroupReceiptEvidence {
         if session.agent == .agy {
             guard let conversation = live.conversationID,
                   let turn = await Task.detached(priority: .utility, operation: {
-                      AgyTranscript.finalTurn(conversation: conversation, messageID: message.id)
-                  }).value, SessionGroupMessage.terminalMessageID(turn.prompt) == message.id,
+                      AgyTranscript.finalTurn(conversation: conversation, messageID: messageID)
+                  }).value, SessionGroupMessage.terminalMessageID(turn.prompt) == messageID,
                   let box = try? groupMailbox() else { return .unknown }
             do {
-                if try box.confirmedPrompt(message.id, conversation: live.id, prompt: turn.prompt) {
-                    try box.recordSubmission(message.id, conversation: conversation, prompt: turn.prompt)
+                if try box.confirmedPrompt(messageID, conversation: live.id, prompt: turn.prompt) {
+                    try box.recordSubmission(messageID, conversation: conversation, prompt: turn.prompt)
                 }
-                guard try box.confirmedPrompt(message.id, conversation: conversation, prompt: turn.prompt) else { return .unknown }
+                guard try box.confirmedPrompt(messageID, conversation: conversation, prompt: turn.prompt) else { return .unknown }
                 receiveGroupTurn(conversation: conversation, turn: conversation + ":" + String(turn.step), prompt: turn.prompt, response: turn.answer)
-                return try box.message(message.id)?.acknowledgedAt != nil ? .received : .unknown
+                return try box.message(messageID)?.acknowledgedAt != nil ? .received : .unknown
             } catch { return .unknown }
         }
         if session.agent == .claude, let conversation = live.conversationID {
             let reader = groupTranscriptReader
-            if let turn = await Task.detached(priority: .utility, operation: { reader.groupTurns(live)[message.id] }).value,
-               let box = try? groupMailbox(), (try? box.confirmedPrompt(message.id, conversation: conversation, prompt: turn.prompt)) == true,
-               let id = try? box.recoveryTurn(message.id, promptAt: turn.date, fallback: turn.response.id) {
+            if let turn = await Task.detached(priority: .utility, operation: { reader.groupTurns(live)[messageID] }).value,
+               let box = try? groupMailbox(), (try? box.confirmedPrompt(messageID, conversation: conversation, prompt: turn.prompt)) == true,
+               let id = try? box.recoveryTurn(messageID, promptAt: turn.date, fallback: turn.response.id) {
                 receiveGroupTurn(conversation: conversation, turn: id, prompt: turn.prompt, response: turn.response.originalResponse)
-                if (try? box.message(message.id))?.acknowledgedAt != nil { return .received }
+                if (try? box.message(messageID))?.acknowledgedAt != nil { return .received }
             }
         }
         if session.agent == .claude, let conversation = live.conversationID,
@@ -5085,14 +5096,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
            !snapshot.paused, !remoteInputStopped, !automaticInputBusy(session.id),
            let host = ScreenHost(kind: session.terminal), screenConnections[host]?.enabled == true,
            let adapter = screenAdapters[host], adapter.checkedTypeLine != nil,
-           let text = try? groupMailbox().pendingEnterPrompt(message.id, conversation: conversation),
-           SessionGroupMessage.terminalMessageID(text) == message.id, sendingMessages.insert(session.id).inserted {
+           let text = try? groupMailbox().pendingEnterPrompt(messageID, conversation: conversation),
+           SessionGroupMessage.terminalMessageID(text) == messageID, sendingMessages.insert(session.id).inserted {
             defer { sendingMessages.remove(session.id) }
             let reader = singleProcessReader
             if let records = try? await Task.detached(operation: { try reader(session.pid) }).value,
                records.contains(where: { $0.key == session.id && $0.agent == .claude && "/dev/" + $0.tty == session.tty && $0.isForeground }) {
                 let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: [session.pid], sourcePID: session.pid, sourceStarted: session.started)
-                if await submitRemainingClaudeDraft(text, session: session, live: live, target: target, adapter: adapter, messageID: message.id) != nil { return .unknown }
+                if await submitRemainingClaudeDraft(text, session: session, live: live, target: target, adapter: adapter, messageID: messageID) != nil { return .unknown }
             }
         }
         guard ![.working, .approval, .input, .ended].contains(session.phase), !session.pendingInTerminal,
@@ -5100,15 +5111,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
               let frame = try? await remoteTerminal(sessionID: session.id, realtime: true, textOnly: true),
               frame.inputReason == nil,
               session.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen) : ClaudeComposerReadiness.isEmpty(frame.screen) else { return .unknown }
-        guard let box = try? groupMailbox(), let current = try? box.message(message.id) else { return .unknown }
+        guard let box = try? groupMailbox(), let current = try? box.message(messageID) else { return .unknown }
         if current.acknowledgedAt != nil { return .received }
         switch session.agent {
         case .claude:
             return .lost
         case .codex:
-            guard let entry = codexTurns[session.id], let submitted = try? box.submittedAt(message.id),
+            guard let entry = codexTurns[session.id], let submitted = try? box.submittedAt(messageID),
                   entry.1 > submitted.addingTimeInterval(groupMailboxPollInterval) else { return .unknown }
-            if entry.0.userPrompt.flatMap(SessionGroupMessage.terminalMessageID) == message.id { return .unknown }
+            if entry.0.userPrompt.flatMap(SessionGroupMessage.terminalMessageID) == messageID { return .unknown }
             return .lost
         default: return .unknown
         }

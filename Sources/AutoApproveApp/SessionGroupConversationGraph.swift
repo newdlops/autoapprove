@@ -1540,84 +1540,94 @@ private extension AgentKind {
     }
 }
 
-/// One line: pickers on the left and, in the room left over, the hints on the right.
 private struct ControlRowLayout: Layout {
     let spacing: CGFloat
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let pickers = subviews[0].sizeThatFits(.unspecified), hints = subviews[1].sizeThatFits(.unspecified)
-        return CGSize(width: proposal.width ?? pickers.width + spacing + hints.width, height: max(pickers.height, hints.height))
+    struct Cache {
+        let pickers: CGSize
+        let hints: CGSize
     }
 
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let pickers = subviews[0].sizeThatFits(.unspecified)
-        subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(pickers))
-        let room = max(0, bounds.width - pickers.width - spacing)
+    func makeCache(subviews: Subviews) -> Cache {
+        Cache(pickers: subviews[0].sizeThatFits(.unspecified), hints: subviews[1].sizeThatFits(.unspecified))
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
+        CGSize(width: proposal.width ?? cache.pickers.width + spacing + cache.hints.width,
+               height: max(cache.pickers.height, cache.hints.height))
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
+        subviews[0].place(at: CGPoint(x: bounds.minX, y: bounds.midY), anchor: .leading, proposal: ProposedViewSize(cache.pickers))
+        let room = max(0, bounds.width - cache.pickers.width - spacing)
         subviews[1].place(at: CGPoint(x: bounds.maxX, y: bounds.midY), anchor: .trailing, proposal: ProposedViewSize(width: room, height: nil))
     }
 }
 
-/// Marks the first legend item of a group (agents, states, line kinds, widths).
 private struct LegendGroupStart: LayoutValueKey {
     static let defaultValue = false
 }
 
-/// Places legend items left to right and wraps them onto the next line when the row is full.
-/// A group's first item keeps `groupSpacing` before it, other items `itemSpacing`.
 private struct LegendFlow: Layout {
     let groupSpacing: CGFloat
     let itemSpacing: CGFloat
     let lineSpacing: CGFloat
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let rows = arrange(width: proposal.width ?? .infinity, subviews: subviews)
+    struct Item {
+        let size: CGSize
+        let startsGroup: Bool
+    }
+
+    struct Row {
+        var items: Range<Int>
+        var width: CGFloat
+        var height: CGFloat
+    }
+
+    func makeCache(subviews: Subviews) -> [Item] {
+        subviews.map { Item(size: $0.sizeThatFits(.unspecified), startsGroup: $0[LegendGroupStart.self]) }
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout [Item]) -> CGSize {
+        let rows = arrange(width: proposal.width ?? .infinity, items: cache)
         return CGSize(width: rows.map(\.width).max() ?? 0, height: rows.reduce(0) { $0 + $1.height } + lineSpacing * CGFloat(max(0, rows.count - 1)))
     }
 
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout [Item]) {
         var y = bounds.minY
-        for row in arrange(width: bounds.width, subviews: subviews) {
+        for row in arrange(width: bounds.width, items: cache) {
             var x = bounds.minX
-            for (position, index) in row.items.enumerated() {
-                if position > 0 { x += spacing(before: index, subviews: subviews) }
-                let size = subviews[index].sizeThatFits(.unspecified)
-                subviews[index].place(at: CGPoint(x: x, y: y + (row.height - size.height) / 2), proposal: ProposedViewSize(size))
-                x += size.width
+            for index in row.items {
+                let item = cache[index]
+                if index != row.items.lowerBound { x += item.startsGroup ? groupSpacing : itemSpacing }
+                subviews[index].place(at: CGPoint(x: x, y: y + (row.height - item.size.height) / 2), proposal: ProposedViewSize(item.size))
+                x += item.size.width
             }
             y += row.height + lineSpacing
         }
     }
 
-    private func spacing(before index: Int, subviews: Subviews) -> CGFloat {
-        subviews[index][LegendGroupStart.self] ? groupSpacing : itemSpacing
-    }
-
-    private func arrange(width: CGFloat, subviews: Subviews) -> [(items: [Int], width: CGFloat, height: CGFloat)] {
-        var rows: [(items: [Int], width: CGFloat, height: CGFloat)] = []
-        // A group moves to the next line as a whole when it fits there but not in the rest of
-        // this line; only a group wider than a whole line wraps between its own items.
+    private func arrange(width: CGFloat, items: [Item]) -> [Row] {
+        var rows: [Row] = []
         func groupWidth(from start: Int) -> CGFloat {
-            var total = subviews[start].sizeThatFits(.unspecified).width, index = start + 1
-            while index < subviews.count, !subviews[index][LegendGroupStart.self] {
-                total += itemSpacing + subviews[index].sizeThatFits(.unspecified).width; index += 1
+            var total = items[start].size.width
+            for item in items[(start + 1)...] {
+                if item.startsGroup { break }
+                total += itemSpacing + item.size.width
             }
             return total
         }
-        for index in subviews.indices {
-            let size = subviews[index].sizeThatFits(.unspecified)
-            let gap = spacing(before: index, subviews: subviews)
-            if let last = rows.last, subviews[index][LegendGroupStart.self] {
-                let group = groupWidth(from: index)
-                if last.width + gap + group > width, group <= width {
-                    rows.append(([index], size.width, size.height)); continue
+        for (index, item) in items.enumerated() {
+            let gap = item.startsGroup ? groupSpacing : itemSpacing
+            if let last = rows.last, last.width + gap + item.size.width <= width {
+                let group = item.startsGroup ? groupWidth(from: index) : item.size.width
+                if group > width || last.width + gap + group <= width {
+                    rows[rows.count - 1] = Row(items: last.items.lowerBound..<(index + 1),
+                                               width: last.width + gap + item.size.width, height: max(last.height, item.size.height))
+                    continue
                 }
             }
-            if var last = rows.last, last.width + gap + size.width <= width {
-                last.items.append(index); last.width += gap + size.width; last.height = max(last.height, size.height)
-                rows[rows.count - 1] = last
-            } else {
-                rows.append(([index], size.width, size.height))
-            }
+            rows.append(Row(items: index..<(index + 1), width: item.size.width, height: item.size.height))
         }
         return rows
     }

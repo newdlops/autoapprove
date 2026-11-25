@@ -115,8 +115,20 @@ extension ApprovalTests {
         let writer = try SessionGroupMailbox(directory: directory), reader = try SessionGroupMailbox(directory: directory)
         let initial = try reader.dataVersion
         try expectEqual(try reader.dataVersion, initial, "Reading alone does not change the version")
-        _ = try writer.enqueue(groupID: UUID(), senderID: UUID(), recipientID: UUID(), kind: .message, text: "fixture")
+        let empty = try reader.conversationRevision
+        let message = try writer.enqueue(groupID: UUID(), senderID: UUID(), recipientID: UUID(), kind: .message, text: "fixture")
         try expect(try reader.dataVersion != initial, "A commit on another connection changes the version")
+        let added = try reader.conversationRevision
+        try expect(added > empty)
+        try writer.noteAttempt(message.id, result: "direct_submitted", retryAt: .distantPast)
+        let submitted = try reader.conversationRevision
+        try expect(submitted > added)
+        let beforeRetry = try reader.dataVersion
+        try writer.noteAttempt(message.id, result: "direct_submitted", retryAt: .distantFuture)
+        try expect(try reader.dataVersion != beforeRetry)
+        try expectEqual(try reader.conversationRevision, submitted, "A new retry deadline leaves graph content unchanged")
+        try writer.acknowledge([message.id], groupID: message.groupID, recipientID: message.recipientID)
+        try expect(try reader.conversationRevision > submitted, "The graph follows acknowledgements from other connections")
     }
 
     // MARK: Conversation graph presentation

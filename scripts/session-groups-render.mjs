@@ -68,7 +68,7 @@ if(verifyOpen||verifyDrag||verifyGraphRefresh) {
   graph=out+'/SessionGroupConversationGraph.swift';
   await writeFile(graph,text);
   if(verifyGraphRefresh) {
-    const original=await readFile(model,'utf8'),marker='        let version = try mailbox.dataVersion';
+    const original=await readFile(model,'utf8'),marker='        let version = try mailbox.conversationRevision';
     if(!original.includes(marker))throw Error('Missing graph reader instrumentation point');
     model=out+'/SessionGroupConversationGraphModel.swift';
     await writeFile(model,original.replace(marker,'        GraphReadProbe.shared.check()\n'+marker));
