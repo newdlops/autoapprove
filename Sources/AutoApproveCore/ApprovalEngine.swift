@@ -414,6 +414,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var permissionBlocked = false
         var retryAfter = Date.distantPast
         var admissionMisses = 0
+        var batchSize = RemoteTerminalPolling.BatchSize()
     }
     private var screenConnections: [ScreenHost: ScreenConnection] = [:]
     private let screenAdapters: [ScreenHost: ScreenHostAdapter]
@@ -8076,7 +8077,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let started = ProcessInfo.processInfo.systemUptime
                     let intervals = self.screenReadIntervals(host, targets: targets)
                     let due = RemoteTerminalPolling.monitorBatch(ids, pending: refreshPending, intervals: intervals,
-                        lastRead: self.screenReadAt, now: started, limit: self.screenAdapters[host]?.usesHostIPC == true ? 8 : ids.count)
+                        lastRead: self.screenReadAt, now: started, limit: self.screenAdapters[host]?.usesHostIPC == true ? (self.screenConnections[host]?.batchSize.limit ?? 2) : ids.count)
                     if !due.isEmpty {
                         let batch = Set(due)
                         let read = await self.refreshScreenHost(host, reportConnecting:false,
@@ -8954,6 +8955,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         screenConnections[host,default:ScreenConnection()].connectID = connectID
         screenConnections[host]?.enabled = true
         screenConnections[host]?.admissionMisses = 0
+        screenConnections[host]?.batchSize = RemoteTerminalPolling.BatchSize()
         if screenAdapters[host]?.usesHostIPC == true {
             do {
                 if try await !HostAutomationPermission.check(host) {
@@ -9136,6 +9138,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return true
             }
             screenConnections[host]?.admissionMisses = 0
+            if hostTargets != nil, adapter.usesHostIPC {
+                screenConnections[host]?.batchSize.completed(count: requests.count, elapsed: ProcessInfo.processInfo.systemUptime - readStartedUptime)
+            }
             let unchanged = !targets.isEmpty && targets.allSatisfy { screensByTTY[$0.tty] != nil && !changedIDs.contains($0.id) }
             let hasLiveViewer = targets.contains { remoteTerminalChanges[$0.id]?.hasObservers == true }
             unchangedScreenReads[host] = unchanged && !hasLiveViewer
@@ -9235,6 +9240,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return nil
             }
             if TerminalAppleEvents.isTransientReadFailure(error) {
+                if hostTargets != nil, adapter.usesHostIPC { screenConnections[host]?.batchSize.timedOut(count: targets.count) }
                 let now = ProcessInfo.processInfo.systemUptime
                 screenConnections[host]?.retryAfter = Date().addingTimeInterval(1)
                 func recentlyConfirmed(_ id: String) -> Bool {

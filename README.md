@@ -1,5 +1,7 @@
 # AutoApprove
 
+**Terminal 응답 시간에 따른 감시 탭 수 조정 · 0.2.411 빌드 438** [변경 사항](docs/releases/v0.2.411.md)
+
 **그룹장 긴급 권한 요청과 메시지 우선순위 · 0.2.410 빌드 437** [변경 사항](docs/releases/v0.2.410.md)
 
 **차단된 Goal의 원래 탭에서 Enter 복구 · 0.2.409 빌드 436** [변경 사항](docs/releases/v0.2.409.md)

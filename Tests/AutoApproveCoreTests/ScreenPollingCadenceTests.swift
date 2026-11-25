@@ -50,5 +50,17 @@ extension ApprovalTests {
             for id in batch { readAt[id] = Double(pass) }
         }
         try expect(pending.isEmpty)
+        var size = RemoteTerminalPolling.BatchSize()
+        try expectEqual(size.limit, 2)
+        for _ in 0..<6 { size.completed(count:size.limit, elapsed:0.3) }
+        try expectEqual(size.limit, 8)
+        size.completed(count:8, elapsed:4)
+        try expectEqual(size.limit, 3)
+        size.timedOut(count:3)
+        try expectEqual(size.limit, 1)
+        for _ in 0..<3 { size.completed(count:0, elapsed:0) }
+        try expectEqual(size.limit, 1)
+        for _ in 0..<3 { size.completed(count:1, elapsed:0.3) }
+        try expectEqual(size.limit, 2)
     }
 }

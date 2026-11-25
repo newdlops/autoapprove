@@ -132,6 +132,34 @@ public enum RemoteTerminalPolling {
         }
     }
 
+    package struct BatchSize {
+        package private(set) var limit = 2
+        private var fastReads = 0
+
+        package init() {}
+
+        package mutating func completed(count: Int, elapsed: TimeInterval) {
+            guard count > 0 else { return }
+            if elapsed > 2 {
+                limit = min(limit, max(1, Int(Double(count) * 1.5 / elapsed)))
+                fastReads = 0
+            } else if elapsed <= 0.75 && count >= limit {
+                fastReads += 1
+                if fastReads >= 3 {
+                    limit = min(8, limit * 2)
+                    fastReads = 0
+                }
+            } else {
+                fastReads = 0
+            }
+        }
+
+        package mutating func timedOut(count: Int) {
+            limit = max(1, min(limit, count) / 2)
+            fastReads = 0
+        }
+    }
+
     package static func monitorBatch(_ ids: [String], pending: Set<String>, intervals: [String: TimeInterval],
                                      lastRead: [String: TimeInterval], now: TimeInterval, limit: Int) -> [String] {
         let due = pending.union(dueTargets(ids, intervals: intervals, lastRead: lastRead, now: now))
