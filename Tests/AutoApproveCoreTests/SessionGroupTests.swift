@@ -1110,6 +1110,33 @@ extension ApprovalTests {
         try expect(engine.snapshot.paused)
     }
 
+    func testMailboxPriorityRoutingAndInterruptReservation() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let box = try SessionGroupMailbox(directory:root)
+        let group = UUID(), worker = UUID(), leader = UUID()
+        let normal = try box.enqueue(groupID:group, senderID:worker, recipientID:leader, kind:.message, text:"normal")
+        let urgent = try box.enqueue(groupID:group, senderID:worker, recipientID:leader, kind:.message, text:"urgent", priority:.urgent)
+        let request = try box.enqueue(groupID:group, senderID:worker, recipientID:leader, kind:.choiceQuestion, text:"permission",
+                                      sourceKey:"question:fixture:approval", priority:.urgent, category:.permissionRequest)
+        try expectEqual(try box.heads().map(\.id), [request.id])
+        try expectEqual(try box.list(groupID:group, memberID:leader, priority:.urgent, category:.message).map(\.id), [urgent.id])
+        try expectFalse(try box.reservePermissionInterrupt(urgent.id))
+        try expect(try box.reservePermissionInterrupt(request.id))
+        let reopened = try SessionGroupMailbox(directory:root)
+        try expectFalse(try reopened.reservePermissionInterrupt(request.id))
+        try reopened.releaseUnsentPermissionInterrupt(request.id)
+        try expect(try box.reservePermissionInterrupt(request.id))
+        _ = try box.setPriority(.normal, id:request.id, group:group, recipient:leader)
+        try expectEqual(try box.heads().first?.id, urgent.id)
+        try expectEqual(try box.list(groupID:group, memberID:leader, priority:.normal, category:.permissionRequest).first?.id, request.id)
+        _ = try box.setPriority(.urgent, id:normal.id, group:group, recipient:leader)
+        try expectEqual(try box.heads().first?.id, normal.id)
+        let retried = try box.enqueue(id:normal.id, groupID:group, senderID:worker, recipientID:leader, kind:.message, text:"normal")
+        try expectEqual(retried.priority,.urgent)
+        try expectFalse(try reopened.reservePermissionInterrupt(normal.id))
+    }
+
     @MainActor func testGroupWorkerChoiceQuestionReachesParentAndIsAnswered() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("group-question-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1128,7 +1155,7 @@ extension ApprovalTests {
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in writer.send(target, input) })
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.iterm: adapter])
         defer { engine.stop() }
-        engine.groupQuestionGrace = 0.2; engine.groupDeliveryInterval = 0.2
+        engine.groupQuestionGrace = 0.2; engine.groupDeliveryInterval = 0.2; engine.groupMailboxPollInterval = 0.2
         engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
         let observed = try await engine.sessionGroupSessions()
         let leader = try unwrapGroup(observed.first { $0.id == records[0].key })
@@ -1157,7 +1184,9 @@ extension ApprovalTests {
         writer.show("결과 정리\n\n❯ Try “다음 작업”\n? for shortcuts", on: leaderTTY)
         try expect(try await waitForGroup(10) { await engine.refreshScreens(); return phase(leader.id) == .idle }, "The parent must be idle to receive reports")
 
-        // Any other permission prompt is delegated: the parent's choice counts as the user's approval.
+        let workingScreen = "Working… (esc to interrupt)\n────────────\n❯ \n────────────\n ? for shortcuts"
+        writer.show(workingScreen.replacingOccurrences(of:"❯ ", with:"❯ my draft"), on:leaderTTY)
+        await engine.refreshScreens()
         let approvalScope = "Yes, and don't ask again for commands that start with `python3 -B /tmp/" +
             String(repeating: "fixture-directory/", count: 12) + "verify.py`"
         let approvalOptions = ["Yes", approvalScope, "No"]
@@ -1176,6 +1205,23 @@ extension ApprovalTests {
         }
         try expect(delegated, "The worker's permission prompt must reach the parent")
         let permissionMessage = try unwrapGroup(messages().first { $0.text.contains("[AutoApprove 그룹 승인 요청") })
+        try expectEqual(permissionMessage.category, .permissionRequest)
+        try expectEqual(permissionMessage.priority, .urgent)
+        try await Task.sleep(for:.milliseconds(650))
+        try expectFalse(writer.writes(to:leaderTTY).contains("\u{1b}"))
+        writer.show(workingScreen, on:leaderTTY)
+        let interrupted = try await waitForGroup(10) {
+            await engine.refreshScreens()
+            return writer.writes(to:leaderTTY).contains("\u{1b}")
+        }
+        if !interrupted {
+            let current = try mailbox.message(permissionMessage.id)
+            let phases = engine.snapshot.sessions.map { $0.phase.rawValue + ":pending=" + String($0.pendingInTerminal) }
+            throw AppError.message("Expected one parent Escape, phases=\(phases), empty=\(ClaudeComposerReadiness.isEmpty(writer.screen(leaderTTY))), result=\(current?.lastResult ?? "-"), detail=\(current?.lastError ?? "-"), claimAvailable=\(try mailbox.reservePermissionInterrupt(permissionMessage.id))")
+        }
+        try expectEqual(writer.writes(to:leaderTTY).filter { $0 == "\u{1b}" }.count,1)
+        writer.show("Finished\n❯ \n ? for shortcuts", on:leaderTTY)
+        await engine.refreshScreens()
         let request = permissionMessage.text
         _ = try await call("ack_group_messages", from: leader.id, ["messageIDs": [permissionMessage.id.uuidString]])
         try expect(request.contains("echo fixture") && request.contains("1) Yes") && request.contains("사용자 승인으로 처리"))

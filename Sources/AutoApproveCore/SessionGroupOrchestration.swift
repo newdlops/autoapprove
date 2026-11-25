@@ -30,6 +30,7 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
     public var deliveryError: String?
     /// A choice question the worker is waiting on during this task. Only its parent may answer it.
     public var question: GroupWorkerQuestion?
+    public var permissionPriority: SessionGroupMessage.Priority?
     /// True from the moment the task is recorded until it has been typed into the worker's terminal.
     /// A record that still says so when the app starts never reached the worker and is dropped.
     public var pendingDelivery: Bool?

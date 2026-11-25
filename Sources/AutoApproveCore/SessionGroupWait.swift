@@ -258,7 +258,7 @@ extension SessionGroupMailbox {
         return returnsToSource ? edges : []
     }
 
-    func answer(_ question: UUID, id: UUID?, group: UUID, sender: UUID, recipient: UUID, text: String) throws -> SessionGroupMessage {
+    func answer(_ question: UUID, id: UUID?, group: UUID, sender: UUID, recipient: UUID, text: String, priority: SessionGroupMessage.Priority = .normal) throws -> SessionGroupMessage {
         guard let q = try message(question), q.kind == .question, q.groupID == group, q.senderID == recipient, q.recipientID == sender else {
             throw RemoteHTTPError(403, "원래 질문의 지정 수신자만 같은 그룹에서 답할 수 있습니다.")
         }
@@ -271,7 +271,7 @@ extension SessionGroupMailbox {
         }
         try update("UPDATE messages SET last_result='answered',last_error=NULL WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'expired' AND last_result IS NOT 'superseded'", [question.uuidString])
         try update("UPDATE messages SET last_result='superseded',last_error=NULL WHERE source_key=? AND acknowledged IS NULL", ["followup:" + question.uuidString])
-        let answer = try insertMessage(id: id, groupID: group, senderID: sender, recipientID: recipient, kind: .reply, text: text, sourceKey: key)
+        let answer = try insertMessage(id: id, groupID: group, senderID: sender, recipientID: recipient, kind: .reply, text: text, sourceKey: key, priority: priority)
         try suppressLateAnswerDelivery(question, answer: answer)
         return answer
     }

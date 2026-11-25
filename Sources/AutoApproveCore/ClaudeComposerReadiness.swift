@@ -71,6 +71,13 @@ public enum ClaudeComposerReadiness {
         return body
     }
 
+    static func emptyInterruptComposer(_ screen: String) -> Bool {
+        let rows = ActivityDetector.nonemptyTail(screen)
+        guard let index = rows.lastIndex(where: { $0.hasPrefix("❯") }), rows[index] == "❯",
+              index > 0, index + 1 < rows.count else { return false }
+        return border(rows[index - 1]) && border(rows[index + 1])
+    }
+
     public static func isEmpty(_ screen: String) -> Bool {
         let rows = ActivityDetector.nonemptyTail(screen)
         let tail = rows.joined(separator: "\n")

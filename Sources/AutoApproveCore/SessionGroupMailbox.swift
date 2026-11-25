@@ -5,6 +5,12 @@ import Darwin
 public struct SessionGroupMessage: Equatable {
     /// `notice` is AutoApprove's own one-off request to a member (for example, naming the members).
     public enum Kind: String { case question, reply, message, report, choiceQuestion, waitNotice, notice }
+    public enum Priority: String, Codable { case normal, urgent }
+    public enum Category: String { case message, permissionRequest }
+    public var requestedPriority: Priority = .normal
+    public var priorityOverride: Priority?
+    public var category: Category = .message
+    public var priority: Priority { priorityOverride ?? requestedPriority }
     public var sequence: Int64
     public var id: UUID
     public var groupID: UUID
@@ -20,6 +26,8 @@ public struct SessionGroupMessage: Equatable {
     public var lastError: String?
     public var sourceKey: String?
     var containsOriginalReport = false
+
+    var urgentPermission: Bool { category == .permissionRequest && priority == .urgent && kind == .choiceQuestion }
 
     public var isExpired: Bool { lastResult == "expired" }
 
@@ -49,7 +57,9 @@ public struct SessionGroupMessage: Equatable {
             let lead = String(text.prefix(while: { $0 != "." }).prefix(120))
             return lead + ". 요청 전문을 읽고 처리해 줘. " + referenceText + Self.userButtonMarker + id.uuidString + ")"
         }
-        let heading = Self.promptPrefix + id.uuidString + "] "
+        let label = category == .permissionRequest ? (priority == .urgent ? "[긴급 권한 요청] " : "[일반 권한 요청] ")
+            : priority == .urgent ? "[긴급 메시지] " : ""
+        let heading = Self.promptPrefix + id.uuidString + "] " + label
         let context: String
         if kind == .notice {
             context = heading + "AutoApprove 알림 · notice · groupID " + groupID.uuidString +
@@ -106,7 +116,7 @@ public struct SessionGroupMessage: Equatable {
         var result: JSONObject = ["messageID": id.uuidString, "sequence": sequence, "kind": kind.rawValue,
             "textBytes": text.utf8.count, "preview": snippet, "truncated": bytes < line.utf8.count,
             outbox ? "memberID" : "senderMemberID": (outbox ? recipientID : senderID).uuidString]
-        for key in ["state", "inReplyTo", "blocksProgress"] { result[key] = full[key] }
+        for key in ["state", "inReplyTo", "blocksProgress", "priority", "category"] { result[key] = full[key] }
         if lastError != nil { result["hasDeliveryError"] = true }
         return result
     }
@@ -115,7 +125,7 @@ public struct SessionGroupMessage: Equatable {
         let date = ISO8601DateFormatter()
         var value: JSONObject = ["messageID": id.uuidString, "sequence": sequence, "groupID": groupID.uuidString,
                 "senderMemberID": senderID.uuidString, "memberID": recipientID.uuidString, "kind": kind.rawValue,
-                "text": text, "createdAt": date.string(from: createdAt),
+                "priority": priority.rawValue, "category": category.rawValue, "text": text, "createdAt": date.string(from: createdAt),
                 "state": acknowledgedAt == nil ? "pending" : "acknowledged",
                 "acknowledged": acknowledgedAt != nil,
                 "acknowledgedAt": acknowledgedAt.map(date.string(from:)) as Any? ?? NSNull(),
@@ -153,7 +163,7 @@ public struct SessionGroupConversationPage: Equatable {
 public final class SessionGroupMailbox {
     private var db: OpaquePointer?
     private let maximumPending: Int
-    private let columns = "sequence,id,group_id,sender_id,recipient_id,kind,body,created,acknowledged,attempts,next_attempt,last_result,last_error,source_key,EXISTS(SELECT 1 FROM group_original_reports o WHERE o.message_id=messages.id)"
+    private let columns = "sequence,id,group_id,sender_id,recipient_id,kind,body,created,acknowledged,attempts,next_attempt,last_result,last_error,source_key,EXISTS(SELECT 1 FROM group_original_reports o WHERE o.message_id=messages.id),requested_priority,priority_override,category"
 
     public init(directory: URL, maximumPending: Int = 1000) throws {
         self.maximumPending = maximumPending
@@ -179,6 +189,18 @@ public final class SessionGroupMailbox {
         do {
             sqlite3_busy_timeout(db, 1000)
             try execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; CREATE TABLE IF NOT EXISTS messages (sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,group_id TEXT NOT NULL,sender_id TEXT NOT NULL,recipient_id TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,created REAL NOT NULL,acknowledged REAL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,last_result TEXT,last_error TEXT,source_key TEXT UNIQUE); CREATE INDEX IF NOT EXISTS message_inbox ON messages(group_id,recipient_id,acknowledged,sequence); CREATE INDEX IF NOT EXISTS message_outbox ON messages(group_id,sender_id,sequence);")
+            if try scalar("SELECT count(*) FROM pragma_table_info('messages') WHERE name='requested_priority'") == 0 {
+                try transaction {
+                    guard try scalar("SELECT count(*) FROM pragma_table_info('messages') WHERE name='requested_priority'") == 0 else { return }
+                    try execute("""
+                        ALTER TABLE messages ADD COLUMN requested_priority TEXT NOT NULL DEFAULT 'normal';
+                        ALTER TABLE messages ADD COLUMN priority_override TEXT;
+                        ALTER TABLE messages ADD COLUMN category TEXT NOT NULL DEFAULT 'message';
+                        UPDATE messages SET category='permissionRequest',requested_priority='urgent'
+                        WHERE kind='choiceQuestion' AND source_key LIKE 'question:%' AND body LIKE '[AutoApprove 그룹 승인 요청 %';
+                        """)
+                }
+            }
             try execute("""
                 CREATE INDEX IF NOT EXISTS message_pending_age ON messages(created) WHERE \(Self.pendingFilter);
                 CREATE TABLE IF NOT EXISTS background_jobs(id TEXT PRIMARY KEY,gid TEXT NOT NULL,member TEXT NOT NULL,session TEXT NOT NULL,conversation TEXT NOT NULL,body TEXT NOT NULL,finished REAL);
@@ -207,6 +229,7 @@ public final class SessionGroupMailbox {
                     message_id TEXT PRIMARY KEY, conversation TEXT NOT NULL, prompt TEXT NOT NULL, submitted REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS group_submit_enters (message_id TEXT PRIMARY KEY, submitted REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS group_permission_interrupts (message_id TEXT PRIMARY KEY, at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS group_manual_enters (message_id TEXT PRIMARY KEY, submitted REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS group_observed_turns (
                     message_id TEXT PRIMARY KEY, turn TEXT NOT NULL
@@ -277,7 +300,9 @@ public final class SessionGroupMailbox {
                   let group = text(2).flatMap(UUID.init(uuidString:)), let sender = text(3).flatMap(UUID.init(uuidString:)),
                   let recipient = text(4).flatMap(UUID.init(uuidString:)), let kind = text(5).flatMap(SessionGroupMessage.Kind.init(rawValue:)),
                   let body = text(6) else { throw AppError.message("그룹 수신함 기록을 해석하지 못했습니다. 기존 데이터를 유지합니다.") }
-            result.append(.init(sequence: sqlite3_column_int64(s, 0), id: id, groupID: group, senderID: sender, recipientID: recipient,
+            result.append(.init(requestedPriority: text(15).flatMap(SessionGroupMessage.Priority.init(rawValue:)) ?? .normal,
+                priorityOverride: text(16).flatMap(SessionGroupMessage.Priority.init(rawValue:)),
+                category: text(17).flatMap(SessionGroupMessage.Category.init(rawValue:)) ?? .message, sequence: sqlite3_column_int64(s, 0), id: id, groupID: group, senderID: sender, recipientID: recipient,
                 kind: kind, text: body, createdAt: Date(timeIntervalSince1970: sqlite3_column_double(s, 7)),
                 acknowledgedAt: sqlite3_column_type(s, 8) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(s, 8)),
                 attempts: Int(sqlite3_column_int64(s, 9)), nextAttemptAt: Date(timeIntervalSince1970: sqlite3_column_double(s, 10)),
@@ -418,10 +443,11 @@ public final class SessionGroupMailbox {
     }
 
     public func enqueue(id: UUID? = nil, groupID: UUID, senderID: UUID, recipientID: UUID, kind: SessionGroupMessage.Kind,
-                        text: String, sourceKey: String? = nil, at date: Date = Date(), originalReport: Bool = false) throws -> SessionGroupMessage {
+                        text: String, sourceKey: String? = nil, at date: Date = Date(), originalReport: Bool = false,
+                        priority: SessionGroupMessage.Priority = .normal, category: SessionGroupMessage.Category = .message) throws -> SessionGroupMessage {
         try transaction {
             let message = try insertMessage(id: id, groupID: groupID, senderID: senderID, recipientID: recipientID,
-                                            kind: kind, text: text, sourceKey: sourceKey, at: date, originalReport: originalReport)
+                                            kind: kind, text: text, sourceKey: sourceKey, at: date, originalReport: originalReport, priority: priority, category: category)
             if originalReport, kind == .report, message.text == text {
                 try update("INSERT OR IGNORE INTO group_original_reports(message_id) VALUES(?)", [message.id.uuidString])
                 return try self.message(message.id) ?? message
@@ -431,26 +457,26 @@ public final class SessionGroupMailbox {
     }
 
     func insertMessage(id: UUID? = nil, groupID: UUID, senderID: UUID, recipientID: UUID, kind: SessionGroupMessage.Kind,
-                       text: String, sourceKey: String? = nil, at date: Date = Date(), originalReport: Bool = false) throws -> SessionGroupMessage {
+                       text: String, sourceKey: String? = nil, at date: Date = Date(), originalReport: Bool = false,
+                        priority: SessionGroupMessage.Priority = .normal, category: SessionGroupMessage.Category = .message) throws -> SessionGroupMessage {
         guard !text.isEmpty, text.count <= ((originalReport || [.reply, .waitNotice].contains(kind)) ? Int.max : kind == .report || kind == .choiceQuestion ? 16000 : SessionGroupOrchestration.maximumTaskLength), !text.contains("\0"), (senderID != recipientID || kind == .waitNotice || kind == .notice) else {
             throw RemoteHTTPError(400, "그룹 메시지 내용과 대상을 확인해주세요.")
         }
         if let sourceKey, let previous = try message(sourceKey: sourceKey) {
-            guard previous.groupID == groupID, previous.senderID == senderID, previous.recipientID == recipientID, previous.kind == kind else { throw RemoteHTTPError(409, "그룹 보고의 원래 대상을 확인해주세요.") }
+            guard previous.groupID == groupID, previous.senderID == senderID, previous.recipientID == recipientID, previous.kind == kind, previous.requestedPriority == priority, previous.category == category else { throw RemoteHTTPError(409, "그룹 보고의 원래 대상을 확인해주세요.") }
             return previous
         }
         if let id, let previous = try message(id) {
             guard previous.groupID == groupID, previous.senderID == senderID, previous.recipientID == recipientID,
-                  previous.kind == kind, previous.text == text, previous.sourceKey == sourceKey else { throw RemoteHTTPError(409, "같은 messageID의 내용이나 대상이 다릅니다. 새 메시지에만 새 ID를 사용하세요.") }
+                  previous.kind == kind, previous.text == text, previous.sourceKey == sourceKey, previous.requestedPriority == priority, previous.category == category else { throw RemoteHTTPError(409, "같은 messageID의 내용이나 대상이 다릅니다. 새 메시지에만 새 ID를 사용하세요.") }
             return previous
         }
-        // Older clients omit messageID. Collapse only identical, still-unacknowledged messages.
-        if id == nil, sourceKey == nil, let previous = try rows("WHERE group_id=? AND sender_id=? AND recipient_id=? AND kind=? AND body=? AND source_key IS NULL AND \(Self.pendingFilter) ORDER BY sequence LIMIT 1",
-            [groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text]).first { return previous }
+        if id == nil, sourceKey == nil, let previous = try rows("WHERE group_id=? AND sender_id=? AND recipient_id=? AND kind=? AND body=? AND requested_priority=? AND category=? AND source_key IS NULL AND \(Self.pendingFilter) ORDER BY sequence LIMIT 1",
+            [groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text, priority.rawValue, category.rawValue]).first { return previous }
         guard try kind == .waitNotice || kind == .notice || pendingCount < maximumPending else { throw RemoteHTTPError(409, "미확인 그룹 메시지가 너무 많아 새 메시지를 접수하지 않았습니다. 기존 메시지를 수신 확인한 뒤 다시 보내세요.") }
         let key = id ?? UUID()
-        try update("INSERT INTO messages(id,group_id,sender_id,recipient_id,kind,body,created,source_key) VALUES(?,?,?,?,?,?,?,NULLIF(?,''))",
-                   [key.uuidString, groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text, String(date.timeIntervalSince1970), sourceKey ?? ""])
+        try update("INSERT INTO messages(id,group_id,sender_id,recipient_id,kind,body,created,source_key,requested_priority,category) VALUES(?,?,?,?,?,?,?,NULLIF(?,''),?,?)",
+                   [key.uuidString, groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text, String(date.timeIntervalSince1970), sourceKey ?? "", priority.rawValue, category.rawValue])
         guard let result = try message(key) else { throw AppError.message("저장된 그룹 메시지를 확인하지 못했습니다.") }
         return result
     }
@@ -538,11 +564,45 @@ public final class SessionGroupMailbox {
         }
     }
 
+    func hasUrgentPermission(group: UUID, recipient: UUID) throws -> Bool {
+        try scalar("SELECT EXISTS(SELECT 1 FROM messages m WHERE m.group_id=? AND m.recipient_id=? AND m.category='permissionRequest' AND COALESCE(m.priority_override,m.requested_priority)='urgent' AND " + Self.notificationFilter + ")", [group.uuidString,recipient.uuidString]) != 0
+    }
+
+    package func reservePermissionInterrupt(_ id: UUID) throws -> Bool {
+        try update("""
+            INSERT OR IGNORE INTO group_permission_interrupts(message_id,at)
+            SELECT m.id,strftime('%s','now') FROM messages m WHERE m.id=? AND m.kind='choiceQuestion'
+            AND m.category='permissionRequest' AND COALESCE(m.priority_override,m.requested_priority)='urgent'
+            AND \(Self.notificationFilter)
+            """,[id.uuidString])
+        return sqlite3_changes(db) == 1
+    }
+
+    package func releaseUnsentPermissionInterrupt(_ id: UUID) throws {
+        try update("DELETE FROM group_permission_interrupts WHERE message_id=?", [id.uuidString])
+    }
+
+    package func setPriority(_ priority: SessionGroupMessage.Priority, id: UUID, group: UUID, recipient: UUID) throws -> SessionGroupMessage {
+        try transaction {
+            guard let item = try message(id), item.groupID == group, item.recipientID == recipient else {
+                throw RemoteHTTPError(404, "그룹장 수신함에서 메시지를 찾지 못했습니다.")
+            }
+            guard item.acknowledgedAt == nil, [nil, "not_started", "redeliver"].contains(item.lastResult),
+                  try submittedAt(id) == nil else { throw RemoteHTTPError(409, "전달이 시작되거나 종료된 메시지입니다.") }
+            try update("UPDATE messages SET priority_override=?,next_attempt=0 WHERE id=?", [priority.rawValue, id.uuidString])
+            guard let saved = try message(id) else { throw RemoteHTTPError(404, "메시지를 찾지 못했습니다.") }
+            return saved
+        }
+    }
+
     public func list(groupID: UUID, memberID: UUID, outbox: Bool = false, includeAcknowledged: Bool = false,
-                     after: Int64 = 0, limit: Int = 50) throws -> [SessionGroupMessage] {
+                     after: Int64 = 0, limit: Int = 50, priority: SessionGroupMessage.Priority? = nil,
+                     category: SessionGroupMessage.Category? = nil) throws -> [SessionGroupMessage] {
         try rows("WHERE group_id=? AND " + (outbox ? "sender_id" : "recipient_id") + "=? AND sequence>?" +
-                 (includeAcknowledged ? "" : " AND " + Self.pendingFilter) + " ORDER BY sequence LIMIT ?",
-                 [groupID.uuidString, memberID.uuidString, String(after), String(max(1, min(limit, 101)))])
+                 (includeAcknowledged ? "" : " AND " + Self.pendingFilter) +
+                 (priority == nil ? "" : " AND COALESCE(priority_override,requested_priority)=?") +
+                 (category == nil ? "" : " AND category=?") + " ORDER BY sequence LIMIT ?",
+                 [groupID.uuidString, memberID.uuidString, String(after)] + [priority?.rawValue, category?.rawValue].compactMap { $0 } + [String(max(1, min(limit, 101)))])
     }
 
     /// Questions retain their identity after delivery, so an observed prompt
@@ -597,7 +657,7 @@ public final class SessionGroupMailbox {
         )
         """
 
-    private static let notificationOrder = "CASE WHEN m.source_key LIKE 'userButton:rename:%' THEN -3 WHEN m.source_key LIKE 'userButton:questionPriority:%' THEN -2 WHEN (m.kind='notice' AND m.body LIKE '[AutoApprove 닉네임 요청]%') THEN -1 WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 0 ELSE 1 END,CASE WHEN m.source_key LIKE 'userButton:rename:%' THEN -m.sequence ELSE m.sequence END"
+    private static let notificationOrder = "CASE WHEN m.category='permissionRequest' AND COALESCE(m.priority_override,m.requested_priority)='urgent' THEN -4 WHEN m.source_key LIKE 'userButton:rename:%' THEN -3 WHEN m.source_key LIKE 'userButton:questionPriority:%' THEN -2 WHEN (m.kind='notice' AND m.body LIKE '[AutoApprove 닉네임 요청]%') THEN -1 WHEN COALESCE(m.priority_override,m.requested_priority)='urgent' THEN 0 WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 1 ELSE 2 END,CASE WHEN m.source_key LIKE 'userButton:rename:%' THEN -m.sequence ELSE m.sequence END"
 
     public struct InboxOperation: Equatable, Sendable {
         public let unacknowledgedCount: Int
@@ -662,7 +722,7 @@ public final class SessionGroupMailbox {
                         ORDER BY \(Self.notificationOrder)) AS position
                     FROM messages m WHERE \(Self.notificationFilter)
                 ) WHERE position=1
-            ) ORDER BY CASE WHEN source_key LIKE 'userButton:rename:%' THEN -sequence ELSE sequence END
+            ) ORDER BY CASE WHEN category='permissionRequest' AND COALESCE(priority_override,requested_priority)='urgent' THEN -2 WHEN source_key LIKE 'userButton:rename:%' THEN -1 WHEN COALESCE(priority_override,requested_priority)='urgent' THEN 0 ELSE 1 END, CASE WHEN source_key LIKE 'userButton:rename:%' THEN -sequence ELSE sequence END
             """)
     }
 
@@ -767,8 +827,10 @@ public final class SessionGroupMailbox {
             """)
     }
 
-    package func pendingReplies(group: UUID, member: UUID, senders: [UUID], after: Int64 = 0, limit: Int = 51) throws -> [SessionGroupMessage] {
-        try rows("""
+    package func pendingReplies(group: UUID, member: UUID, senders: [UUID], after: Int64 = 0, limit: Int = 51,
+                               priority: SessionGroupMessage.Priority? = nil, category: SessionGroupMessage.Category? = nil) throws -> [SessionGroupMessage] {
+        if category == .permissionRequest { return [] }
+        return try rows("""
             WHERE group_id=? AND recipient_id=? AND sequence>? AND kind='question' AND sender_id IN (SELECT value FROM json_each(?))
               AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'
               AND NOT EXISTS(SELECT 1 FROM messages a WHERE a.source_key='answer:' || messages.id)
@@ -778,8 +840,9 @@ public final class SessionGroupMailbox {
                        WHERE w.group_id=messages.group_id AND w.state='expired' AND q.value=messages.id)
                    OR EXISTS(SELECT 1 FROM group_waits w,json_each(w.request,'$.questions') q
                        WHERE w.group_id=messages.group_id AND w.state='waiting' AND q.value=messages.id))
+              \(priority == nil ? "" : "AND COALESCE(priority_override,requested_priority)=?")
             ORDER BY sequence LIMIT ?
-            """, [group.uuidString, member.uuidString, String(after), String(decoding: try JSONEncoder().encode(senders), as: UTF8.self), String(limit)])
+            """, [group.uuidString, member.uuidString, String(after), String(decoding: try JSONEncoder().encode(senders), as: UTF8.self)] + [priority?.rawValue].compactMap { $0 } + [String(limit)])
     }
 
     static let priorityPrefix = "userButton:questionPriority:"

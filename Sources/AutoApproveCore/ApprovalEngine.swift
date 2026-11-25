@@ -3456,10 +3456,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func recordSessionGroupAnswer(_ box: SessionGroupMailbox, questionID: UUID, messageID: UUID?,
-                                          groupID: UUID, senderID: UUID, recipientID: UUID, body: String, fromRecipient: Bool = false) throws -> SessionGroupMessage {
+                                          groupID: UUID, senderID: UUID, recipientID: UUID, body: String, fromRecipient: Bool = false, priority: SessionGroupMessage.Priority = .normal) throws -> SessionGroupMessage {
         let state = try groupOrchestration()
         let answer = try box.transaction {
-            let message = try box.answer(questionID, id: messageID, group: groupID, sender: senderID, recipient: recipientID, text: body)
+            let message = try box.answer(questionID, id: messageID, group: groupID, sender: senderID, recipient: recipientID, text: body, priority: priority)
             if fromRecipient, let original = try box.message(questionID) { try box.confirmDelivery(original) }
             try box.reconcileWaits(assignments: state.assignments, group: groupID)
             return message
@@ -3468,7 +3468,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return answer
     }
 
+    private static func mailboxPriority(_ object: JSONObject, key: String = "priority") throws -> SessionGroupMessage.Priority? {
+        guard let raw = object[key] else { return nil }
+        guard let name = raw as? String, let priority = SessionGroupMessage.Priority(rawValue: name) else {
+            throw RemoteHTTPError(400, key + "는 urgent 또는 normal로 지정해주세요.")
+        }
+        return priority
+    }
+
     private func enqueueGroupMessage(_ object: JSONObject, groupID: UUID, memberID: UUID, text: String, kind: SessionGroupMessage.Kind) async throws -> JSONObject {
+        let priority = try Self.mailboxPriority(object) ?? .normal
         let includeReceiptText = try object["includeReceiptText"] == nil || GroupWaitRequest.flag(object, "includeReceiptText")
         let line = SessionGroupOrchestration.oneLine(text)
         guard !line.isEmpty, text.count <= SessionGroupOrchestration.maximumTaskLength, !text.contains("\0"),
@@ -3501,7 +3510,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let key = "replacement:" + id.uuidString + ":" + ids.map(\.uuidString).sorted().joined(separator: ",")
             message = try box.transaction {
                 try box.retireQueued(ids, group: groupID, sender: sender.id, recipient: memberID, replacement: id)
-                let next = try box.insertMessage(id: id, groupID: groupID, senderID: sender.id, recipientID: memberID, kind: kind, text: body, sourceKey: key)
+                let next = try box.insertMessage(id: id, groupID: groupID, senderID: sender.id, recipientID: memberID, kind: kind, text: body, sourceKey: key, priority: priority)
                 guard next.text == body, next.id == id else { throw RemoteHTTPError(409, "같은 대체 요청의 본문이 바뀌었습니다.") }
                 return next
             }
@@ -3509,7 +3518,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let state = try groupOrchestration()
             let request = try waitRequest(object, id: id, group: groupID, member: sender.id, question: id, box: box, state: state)
             message = try box.transaction {
-                let m = try box.insertMessage(id: id, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: .question, text: body, sourceKey: "decision:" + id.uuidString)
+                let m = try box.insertMessage(id: id, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: .question, text: body, sourceKey: "decision:" + id.uuidString, priority: priority)
                 guard m.text == body else { throw RemoteHTTPError(409, "같은 ID의 질문 내용이 다릅니다.") }
                 wait = try box.registerWait(request, assignments: state.assignments)
                 return m
@@ -3517,9 +3526,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             refreshGroupWaits()
         } else if let reply {
             message = try recordSessionGroupAnswer(box, questionID: reply, messageID: requestedID, groupID: groupID,
-                                                   senderID: sender.id, recipientID: recipient.id, body: body, fromRecipient: true)
+                                                   senderID: sender.id, recipientID: recipient.id, body: body, fromRecipient: true, priority: priority)
         } else {
-            message = try box.enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: body)
+            message = try box.enqueue(id: requestedID, groupID: groupID, senderID: sender.id, recipientID: recipient.id, kind: kind, text: body, priority: priority)
         }
         scheduleGroupMailboxDelivery()
         let messageAtReturn = try box.message(message.id) ?? message
@@ -4597,6 +4606,48 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
+    private func interruptForUrgentPermission(_ message: SessionGroupMessage, observed: [SessionGroupLiveSession]) async throws {
+        guard message.urgentPermission,
+              let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == message.groupID }),
+              let recipient = group.members.first(where: { $0.id == message.recipientID }),
+              let live = SessionGroupMatching.match(recipient, in: observed), let conversation = UUID(uuidString: recipient.conversationID),
+              live.conversationID.flatMap(UUID.init(uuidString:)) == conversation,
+              let session = sessions[live.id], session.phase == .working || live.claudeRegisteredStatus == "busy" else { return }
+        let box = try groupMailbox()
+        func valid() throws -> Bool {
+            guard !snapshot.paused, !remoteInputStopped, !groupClearActive(group.id),
+                  !codexAccountInputHeld(live.id), !changingGoals.contains(live.id), !sendingMessages.contains(live.id),
+                  let now = sessions[live.id], now.started == session.started, now.tty == session.tty, now.phase == .working,
+                  !now.pendingInTerminal, !nativeUserInputHasPriority(live.id),
+                  let current = try box.message(message.id), current.urgentPermission, current.acknowledgedAt == nil,
+                  let currentGroup = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == group.id }),
+                  currentGroup.members.contains(recipient), currentGroup.canDirect(recipient.id, worker: message.senderID),
+                  let assignment = try groupOrchestration().current(groupID:group.id, workerMemberID:message.senderID),
+                  assignment.parentMemberID == recipient.id, assignment.status == .working,
+                  let question = assignment.question, question.isPermission,
+                  message.sourceKey == "question:" + assignment.id.uuidString + ":" + question.id,
+                  let worker = sessions[assignment.workerSessionID], worker.phase == .approval,
+                  let pending = delegablePermission(worker), question.matches(pending) else { return false }
+            return true
+        }
+        guard try valid(), !(await userInputHasPriority(live.id, backgroundOnly:true)) else { return }
+        let frame = try await remoteTerminal(sessionID:live.id, realtime:true, textOnly:true)
+        guard frame.inputReason == nil, frame.outputReason == nil,
+              !RemoteMessageReadiness.hasMenu(frame.screen, agent:session.agent),
+              (session.agent == .claude ? ClaudeComposerReadiness.emptyInterruptComposer(frame.screen) : Self.emptyGroupComposer(frame.screen, agent:session.agent)),
+              ActivityDetector.nonemptyTail(frame.screen).suffix(8).joined(separator:" ").range(of:#"(?i)esc(?:ape)? to (?:interrupt|stop|cancel)"#,options:.regularExpression) != nil,
+              try valid(), try box.reservePermissionInterrupt(message.id) else { return }
+        do {
+            _ = try await remoteInput(["sessionID":live.id, "revision":frame.revision, "kind":"escape"], automaticAuthorization: {
+                guard try valid() else { throw RemoteHTTPError(409, "권한 요청이나 그룹장 상태가 바뀌었습니다.") }
+            }, authorizationSource:"긴급 그룹 권한 요청", backgroundOnly:true)
+        } catch {
+            if (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started" {
+                try box.releaseUnsentPermissionInterrupt(message.id)
+            }
+        }
+    }
+
     private func deliverGroupMailboxNotifications() async throws {
         guard !snapshot.paused, !remoteInputStopped else { return }
         // Both checks read the group store and scan held messages; their thresholds are minutes long,
@@ -4634,8 +4685,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   current.attempts == message.attempts, current.lastResult == message.lastResult,
                   activeGroupMailboxMessages.insert(message.id).inserted else { continue }
             defer { activeGroupMailboxMessages.remove(message.id) }
-            // A typed message is never repeated on a timer. After the grace period the
-            // receipt check either finds it in the conversation or proves it was lost.
+            if current.urgentPermission { try? await interruptForUrgentPermission(current, observed: observed) }
             let receiptDue = Date().addingTimeInterval(groupMailboxReceiptGrace)
             try groupMailbox().noteAttempt(message.id, result: "direct_attempting", retryAt: receiptDue, increment: true)
             do {
@@ -4647,7 +4697,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let backoff = recipientWakesLoop(message, observed: observed) ? groupMailboxHeldFallback
                         : min(groupMailboxReminderInterval, max(groupMailboxPollInterval, Double(message.attempts + 1) * 5))
                     let retryable = (error as? RemoteHTTPError)?.diagnostics?["retryable"] == "true"
-                    let retryDelay = (retryable || message.sourceKey?.hasPrefix(SessionGroupMailbox.priorityPrefix) == true || message.sourceKey?.hasPrefix("userButton:rename:") == true) ? min(backoff, groupMailboxPollInterval) : backoff
+                    let retryDelay = (retryable || message.urgentPermission || message.sourceKey?.hasPrefix(SessionGroupMailbox.priorityPrefix) == true || message.sourceKey?.hasPrefix("userButton:rename:") == true) ? min(backoff, groupMailboxPollInterval) : backoff
                     try groupMailbox().noteAttempt(message.id, result: result, error: error.localizedDescription, retryAt: Date().addingTimeInterval(retryDelay), increment: -1)
                 } else {
                     try groupMailbox().noteAttempt(message.id, result: "direct_unknown", error: error.localizedDescription, retryAt: receiptDue)
@@ -4937,6 +4987,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   latest.acknowledgedAt != nil || Date().timeIntervalSince(latest.createdAt) < TimeInterval(self.groupMessageTTLMinutes * 60),
                   latest.lastResult == (message.deliversBody ? "direct_attempting" : "attempting") else {
                 throw RemoteHTTPError(409, "메시지가 이미 처리되었습니다.", diagnostics: ["delivery": "not_started"])
+            }
+            if !manualQuestion, !latest.urgentPermission, try box.hasUrgentPermission(group:message.groupID, recipient:message.recipientID) {
+                throw RemoteHTTPError(409, "긴급 권한 요청을 먼저 전달합니다.", diagnostics:["delivery":"not_started", "retryable":"true"])
             }
             if message.deliversBody {
                 let conversation = live.conversationID ?? live.id
@@ -5661,7 +5714,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let body = (isQuestion ? nil : item.originalResponse) ?? SessionGroupOrchestration.report(for: isQuestion ? [] : [item], questions: isQuestion ? [item] : [], titles: Dictionary(group.members.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first }))
                 let message = try groupMailbox().enqueue(groupID: group.id, senderID: item.workerMemberID, recipientID: item.parentMemberID,
                     kind: isQuestion ? .choiceQuestion : .report, text: body, sourceKey: source,
-                    originalReport: !isQuestion && item.originalResponse != nil)
+                    originalReport: !isQuestion && item.originalResponse != nil,
+                    priority: isQuestion && item.question?.isPermission == true ? (item.permissionPriority ?? .urgent) : .normal,
+                    category: isQuestion && item.question?.isPermission == true ? .permissionRequest : .message)
                 let box = try groupMailbox()
                 if try box.acknowledgedBatchContains(message) { try box.confirmDelivery(message) }
                 if try box.message(message.id)?.acknowledgedAt != nil { try applyGroupMessageAcknowledgements([message.id]) }
@@ -6332,6 +6387,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if tool == "reconnect_group_member" { return try await reconnectGroupMember(object, groupID: groupID, memberID: memberID) }
             guard let text = object["text"] as? String else { throw RemoteHTTPError(400, "메시지 내용을 지정해주세요.") }
             if tool == "send_group_message", try GroupWaitRequest.flag(object,"asTask") {
+                guard object["priority"] == nil else { throw RemoteHTTPError(400, "priority는 일반 메시지 전달에 지정해주세요.") }
                 let (group, leader) = try await groupMailboxCaller(object, groupID:groupID, verified:true)
                 guard group.isLeader(leader.id), object["supersedes"] == nil else { throw RemoteHTTPError(403,"지시는 그룹장이 직속 구성원에게 보내세요. 메시지 대체와 함께 사용할 수 없습니다.") }
                 var assignment = object
@@ -6376,15 +6432,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard (1...50).contains(limit), ["inbox", "outbox"].contains(direction),
                   object["direction"] == nil || object["direction"] is String,
                   object["includeAcknowledged"] == nil || (object["includeAcknowledged"] as? NSNumber).map({ CFGetTypeID($0) == CFBooleanGetTypeID() }) == true else { throw RemoteHTTPError(400, "조회 방향·페이지 범위를 확인해주세요.") }
+            let priority = try Self.mailboxPriority(object)
+            let category = (object["category"] as? String).flatMap(SessionGroupMessage.Category.init(rawValue:))
+            guard category != nil || object["category"] == nil else { throw RemoteHTTPError(400, "category는 message 또는 permissionRequest로 지정해주세요.") }
             if let id = try GroupWaitRequest.uuid(object, "messageID") {
                 guard let message = try groupMailbox().message(id), message.groupID == groupID,
-                      (direction == "outbox" ? message.senderID : message.recipientID) == mailbox.id else { throw RemoteHTTPError(404, "지정한 수신함·발신함에 해당 메시지가 없습니다.") }
+                      (direction == "outbox" ? message.senderID : message.recipientID) == mailbox.id,
+                      priority == nil || priority == message.priority, category == nil || category == message.category else { throw RemoteHTTPError(404, "지정한 수신함·발신함에 해당 메시지가 없습니다.") }
                 return ["memberID": mailbox.id.uuidString, "messages": [message.json], "hasMore": false, "direction": direction, "groupID": groupID.uuidString]
             }
             let unanswered = try GroupWaitRequest.flag(object, "unansweredOnly")
             guard !unanswered || direction == "inbox" else { throw RemoteHTTPError(400, "미응답 질문은 수신함에서 조회해주세요.") }
-            let messages = try unanswered ? groupMailbox().pendingReplies(group: groupID, member: mailbox.id, senders: group.members.map(\.id), after: after, limit: limit + 1) : groupMailbox().list(groupID: groupID, memberID: mailbox.id, outbox: direction == "outbox",
-                includeAcknowledged: object["includeAcknowledged"] as? Bool == true, after: after, limit: limit + 1)
+            let messages = try unanswered ? groupMailbox().pendingReplies(group: groupID, member: mailbox.id, senders: group.members.map(\.id), after: after, limit: limit + 1, priority: priority, category: category) : groupMailbox().list(groupID: groupID, memberID: mailbox.id, outbox: direction == "outbox",
+                includeAcknowledged: object["includeAcknowledged"] as? Bool == true, after: after, limit: limit + 1, priority: priority, category: category)
             let page = Array(messages.prefix(limit))
             return ["groupID": groupID.uuidString, "memberID": mailbox.id.uuidString, "messages": page.map(\.json),
                     "hasMore": messages.count > limit, "nextAfterSequence": page.last?.sequence as Any? ?? NSNull(),
@@ -6547,6 +6607,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             return ["groups": output, "agent": caller.session.agent.rawValue, "attribution": attribution,
                     "message": "그룹 상태를 조회했습니다."]
+        case "set_group_message_priority":
+            guard let groupID = try GroupWaitRequest.uuid(object,"groupID"), let id = try GroupWaitRequest.uuid(object,"messageID"),
+                  let priority = try Self.mailboxPriority(object) else { throw RemoteHTTPError(400, "groupID, messageID, priority를 지정해주세요.") }
+            let (group, leader) = try await groupMailboxCaller(object, groupID: groupID, verified: true)
+            guard group.isLeader(leader.id) else { throw RemoteHTTPError(403, "그룹장만 수신함 우선순위를 변경할 수 있습니다.") }
+            let item = try groupMailbox().setPriority(priority, id: id, group: groupID, recipient: leader.id)
+            scheduleGroupMailboxDelivery()
+            return item.json
         case "cancel_group_messages":
             guard let group = try GroupWaitRequest.uuid(object, "groupID"), let member = try GroupWaitRequest.uuid(object, "memberID") else {
                 throw RemoteHTTPError(400, "그룹과 수신자 ID를 지정해주세요.")
@@ -6579,6 +6647,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 var params = object
                 params["tool"] = "assign_group_task"; params["groupID"] = group.uuidString
                 params["task"] = item["task"] ?? object["task"]; params["memberID"] = item["memberID"]
+                params["permissionPriority"] = item["permissionPriority"] ?? object["permissionPriority"]
                 params["workScope"] = item["workScope"]
                 params["allowScopeConflict"] = item["allowScopeConflict"]
                 params["requestID"] = item["requestID"]
@@ -6601,6 +6670,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)),
                   let raw = object["task"] as? String else { throw RemoteHTTPError(400, "그룹 ID, 구성원 ID와 작업 내용을 지정해주세요.") }
             guard !groupClearActive(groupID) else { throw RemoteHTTPError(409, "그룹 초기화가 끝난 뒤 새 작업을 지시해주세요.") }
+            let permissionPriority = try Self.mailboxPriority(object, key: "permissionPriority") ?? .urgent
             let task = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !task.isEmpty, task.count <= SessionGroupOrchestration.maximumTaskLength, !task.contains("\0") else {
                 throw RemoteHTTPError(400, "작업 내용은 1~\(SessionGroupOrchestration.maximumTaskLength)자로 지정해주세요.")
@@ -6618,7 +6688,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if let requestID, let prior = try groupOrchestration().assignments.first(where: { $0.id == requestID }) {
                 guard prior.groupID == groupID, prior.workerMemberID == memberID, prior.parentMemberID == callerMember.id,
                       prior.replacesTaskID == (tool == "replace_group_task" ? try GroupWaitRequest.uuid(object, "taskID") : nil),
-                      prior.task == task, (tool == "replace_group_task" || prior.workScope == (object["workScope"] as? String)?.trimmingCharacters(in: .whitespaces)) else {
+                      prior.task == task, (prior.permissionPriority ?? .urgent) == permissionPriority, (tool == "replace_group_task" || prior.workScope == (object["workScope"] as? String)?.trimmingCharacters(in: .whitespaces)) else {
                     throw RemoteHTTPError(409, "같은 requestID의 배정 내용이 다릅니다.")
                 }
                 return ["taskID": requestID.uuidString, "workerMemberID": memberID.uuidString, "alreadyRecorded": true,
@@ -6633,13 +6703,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 var state = try groupOrchestration()
                 var queue = state.queue ?? []
                 if let prior = queue.first(where:{ $0.assignment.id == requestID }) {
-                    guard prior.after == after, prior.assignment.task == task, prior.assignment.parentMemberID == callerMember.id,
+                    guard prior.after == after, prior.assignment.task == task, (prior.assignment.permissionPriority ?? .urgent) == permissionPriority, prior.assignment.parentMemberID == callerMember.id,
                           prior.assignment.groupID == groupID, prior.assignment.workerMemberID == memberID else { throw RemoteHTTPError(409,"같은 requestID의 예약이 다릅니다.") }
                 } else {
                     guard queue.count < 300, !state.assignments.contains(where:{ $0.id == requestID }),
                           state.assignments.contains(where:{ $0.id == after && $0.groupID == groupID && $0.status != .superseded }) ||
                           queue.contains(where:{ $0.assignment.id == after && $0.assignment.groupID == groupID }) else { throw RemoteHTTPError(409,"같은 그룹의 선행 작업을 확인해주세요.") }
                     var next = SessionGroupAssignment(id:requestID,groupID:groupID,workerMemberID:memberID,parentMemberID:callerMember.id,workerSessionID:worker.id,parentSessionID:caller.id,task:task)
+                    next.permissionPriority = permissionPriority
                     next.workerConversationID = workerConversation
                     queue.append(.init(assignment:next,parentConversation:parentConversation,after:after))
                     state.queue = queue
@@ -6695,6 +6766,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 assignment.workScope = scope.trimmingCharacters(in: .whitespaces)
                 guard assignment.workScope != "" else { throw RemoteHTTPError(400, "작업 소유 범위가 비었습니다.") }
             }
+            assignment.permissionPriority = permissionPriority
             assignment.workerConversationID = worker.conversationID
             assignment.replacesTaskID = original?.id
             if let original { assignment.workScope = original.workScope }
