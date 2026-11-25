@@ -1599,7 +1599,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
               let encoded = object["data"] as? String, let data = Data(base64Encoded: encoded) else { throw RemoteHTTPError(400, "PTY 연결과 입력 바이트를 지정해주세요.") }
         let terminal = try managedPTY.terminal(id)
         let members = sessions.values.filter { $0.tty == terminal.descriptor.tty && $0.phase != .ended }.map(\.id)
-        guard !remotePTYInput.contains(id), !members.contains(where: { remoteInputSessions.contains($0) }) else { throw RemoteHTTPError(409, "다른 PTY 입력이 진행 중입니다. 화면을 확인해주세요.") }
+        guard restartTerminalOwners[terminal.descriptor.tty] == nil, !remotePTYInput.contains(id), !members.contains(where: { remoteInputSessions.contains($0) }) else { throw RemoteHTTPError(409, "다른 PTY 입력이 진행 중입니다. 화면을 확인해주세요.") }
         remotePTYInput.insert(id)
         for member in members { remoteInputSessions.insert(member); screens[member]?.scheduledID = nil }
         defer {
@@ -2292,7 +2292,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         if let reason = remoteInputReason(session) { throw RemoteHTTPError(409, reason) }
-        guard !remoteInputSessions.contains(id), (kind == .eraseLine ? automaticAuthorization != nil && backgroundOnly && observed.frame.keys.contains("backspace") : observed.frame.keys.contains(kind.rawValue)) else { throw RemoteHTTPError(409, "다른 입력이 진행 중이거나 지원하지 않는 키입니다. 화면을 확인해주세요.") }
+        guard !restartingTerminal(id), !remoteInputSessions.contains(id), (kind == .eraseLine ? automaticAuthorization != nil && backgroundOnly && observed.frame.keys.contains("backspace") : observed.frame.keys.contains(kind.rawValue)) else { throw RemoteHTTPError(409, "다른 입력이 진행 중이거나 지원하지 않는 키입니다. 화면을 확인해주세요.") }
         if !relay && automaticInputBusy(id) { throw RemoteHTTPError(409, "Mac에서 승인 또는 이어서 진행 입력을 전달하고 있습니다. 잠시 뒤 화면을 확인해주세요.") }
         let input = RemoteTerminalInput(kind: kind, text: object["text"] as? String ?? "", relay: relay); try input.validate()
         // This capability is private; callers cannot enable it through JSON. It
@@ -2458,7 +2458,23 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
+    private func restartingTerminal(_ id: String) -> Bool {
+        sessions[id].map { restartTerminalOwners[$0.tty] != nil } ?? false
+    }
+
     private func automaticInputBusy(_ id: String) -> Bool {
+        restartingTerminal(id) || activeAutomaticInput(id)
+    }
+
+    private func restartInputInFlight(on tty: String) -> Bool {
+        sessions.values.contains { session in
+            let id = session.id
+            return session.tty == tty && (sendingMessages.contains(id) || remoteInputSessions.contains(id) ||
+                groupStatusQueries.contains(id) || changingGoals.contains(id) || activeAutomaticInput(id))
+        }
+    }
+
+    private func activeAutomaticInput(_ id: String) -> Bool {
         automaticInputSessions.contains(id) || osPermissionActing != nil || systemSafetyTasks[id] != nil || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
     }
 
@@ -2482,6 +2498,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   let suppliedRevision = object["revision"] as? String, !suppliedRevision.isEmpty else {
                 throw RemoteHTTPError(400, "메시지와 원본 터미널 연결을 확인해주세요.")
             }
+            guard !restartingTerminal(original.id) else { throw RemoteHTTPError(409,"선택한 탭을 다시 시작하고 있습니다.",diagnostics:["delivery":"not_started","retryable":"true"]) }
             guard !sendingMessages.contains(original.id), !remoteInputStopped else { throw RemoteHTTPError(409, "메시지를 전달하고 있습니다. 잠시 후 다시 확인해주세요.") }
             sendingMessages.insert(original.id); defer { sendingMessages.remove(original.id) }
             for attempt in 0..<3 {
@@ -2578,12 +2595,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return await Task.detached(priority:.userInitiated) {keyboard.hasPriority(terminal:session.terminal,tty:session.tty)}.value
     }
     private func userInputHasPriority(_ id:String) -> Bool {
-        settingSessionPolicy(id) || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)
+        restartingTerminal(id) || settingSessionPolicy(id) || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) || nativeUserInputHasPriority(id)
     }
     private func userInputHasPriority(_ id:String,backgroundOnly:Bool) async -> Bool {
-        if settingSessionPolicy(id) || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) {return true}
+        if restartingTerminal(id) || settingSessionPolicy(id) || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id) {return true}
         let native=await nativeUserInputHasPriority(id,backgroundOnly:backgroundOnly)
-        return native || settingSessionPolicy(id) || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id)
+        return native || restartingTerminal(id) || settingSessionPolicy(id) || codexAccountInputHeld(id) || changingGoals.contains(id) || remoteUserInputHasPriority(id)
     }
     func remoteTerminalObservation(sessionID: String) -> RemoteTerminalObservation {
         if remoteTerminalChanges[sessionID] == nil { remoteTerminalChanges[sessionID] = RemoteTerminalChangeSignal() }
@@ -5436,10 +5453,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
               let process = records.first(where: { $0.key == id && $0.agent == original.agent }) else {
             return fail("CLI 프로세스를 확인하지 못했습니다.")
         }
-        // npm launchers put a node process between the shell and the CLI, so use the nearest shell on the same terminal.
-        // A CLI that replaced its shell with exec has nothing to return to: a finished Terminal tab cannot run anything
-        // again, and a new tab always lands at the end of the tab bar. Such a session is left untouched so its tab and
-        // position stay as they are.
         let chain = ProcessDiscovery.ancestors(of: process.parent, records: records)
         guard let index = chain.firstIndex(where: { $0.tty == process.tty && SessionExitRecovery.isShell($0) }),
               chain[..<index].allSatisfy({ $0.tty == process.tty }) else {
@@ -5468,14 +5481,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
         guard !Task.isCancelled, !remoteInputStopped else { return }
         guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
-        // Codex can show /status during a turn if its composer is empty.
-        if conversation == nil, current.agent == .codex, !sendingMessages.contains(id), !automaticInputBusy(id) {
+        if conversation == nil, current.agent == .codex {
             updateRestart(id, .waiting, "터미널의 /status 화면에서 대화 ID를 확인하고 있습니다.")
-            conversation = valid(try? await statusConversationID(current, waitForInput: false))
+            conversation = valid(try? await statusConversationID(current))
             if let conversation { groupStatusIdentities[id] = GroupStatusIdentity(session: current, conversationID: conversation, home: nil) }
         }
-        // Last resort: the conversation the CLI was launched with. A later /clear may have started another one,
-        // so the result says which ID was used.
         var launchedConversation = false
         if !recovery, conversation == nil, current.phase == .idle {
             let tokens = Array(argv.dropFirst())
@@ -5521,15 +5531,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if !plan.arguments.contains(ClaudePromptBridge.plugin.path) { plan.arguments += ["--plugin-dir", ClaudePromptBridge.plugin.path] }
             environment[ClaudePromptBridge.key] = ClaudePromptBridge.channel(paths).path
         }
-        let settleUntil = Date().addingTimeInterval(5)
-        while sendingMessages.contains(id) || automaticInputBusy(id) {
+        let slot = original.tty
+        let settleUntil = Date().addingTimeInterval(12)
+        while restartTerminalOwners[slot] != nil || restartInputInFlight(on:slot) {
             guard !Task.isCancelled, !remoteInputStopped else { return }
-            guard Date() < settleUntil else { return fail("전달 중인 입력이 끝나지 않아 CLI를 종료하지 않았습니다.") }
-            updateRestart(id, .waiting, "전달 중인 입력이 끝나면 CLI를 종료합니다.")
-            try? await Task.sleep(for: .milliseconds(150))
+            guard Date() < settleUntil else { return fail("선택한 탭의 입력이 끝나지 않아 CLI를 종료하지 않았습니다.") }
+            updateRestart(id, .waiting, "선택한 탭에서 전달 중인 입력이 끝나기를 기다립니다.")
+            try? await Task.sleep(for: .milliseconds(80))
         }
-        guard !Task.isCancelled,!remoteInputStopped else {return}
-        guard let current = sessions[id], current.phase != .ended else { return fail("다시 시작하기 전에 세션이 종료되었습니다.") }
+        guard !Task.isCancelled, !remoteInputStopped else {return}
+        guard let current = sessions[id], current.phase != .ended, current.tty == slot,
+              current.pid == original.pid, current.started == original.started else { return fail("다시 시작하기 전에 세션이 바뀌었습니다.") }
+        restartTerminalOwners[slot] = id
         let wasAutomatic = current.automatic
         let command:String
         do {command=try codexContext.map{try $0.terminalInvocation(Array(plan.arguments.dropFirst())).map(HookInstaller.quote).joined(separator:" ")}
@@ -5539,21 +5552,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let job = records.filter { $0.tty == process.tty && $0.processGroup == process.processGroup }.map(\.pid)
             let target = ScreenTarget(tty: original.tty, handle: original.screenHandle, jobPIDs: job, sourcePID: process.pid, sourceStarted: process.started)
             updateRestart(id, .waiting, "원래 CLI에 Esc로 중단을 요청하고 같은 대화로 다시 시작합니다.")
-            _ = try? await Task.detached {
-                if host == .terminal {
-                    return try TerminalDeviceInput.restartEscape(target: target, agent: original.agent)
+            do {
+                _ = try await adapter.restartInput(host) {
+                    guard try reader().contains(where: { $0.key == id && $0.tty == process.tty && $0.isForeground }) else { return .agentMissing }
+                    if host == .terminal && adapter.usesHostIPC {
+                        return try TerminalDeviceInput.restartEscape(target: target, agent: original.agent)
+                    }
+                    guard let frame = try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty }) else { return .agentMissing }
+                    return try adapter.input(target, frame.contents, original.agent, .init(kind: .escape))
                 }
-                guard let frame = try adapter.readForValidation([target]).screens.first(where: { $0.tty == target.tty }),
-                      try reader().contains(where: { $0.key == id && $0.tty == process.tty && $0.isForeground }) else { return TerminalDelivery.agentMissing }
-                return try adapter.input(target, frame.contents, original.agent, .init(kind: .escape))
-            }.value
+            } catch is CancellationError {return}
+            catch let error as AutomationIPC.InputNotStarted {return fail(error.localizedDescription + " 기존 CLI는 실행 중입니다.")}
+            catch let error as AutomationIPC.Failure {return fail(error.localizedDescription + " 기존 CLI는 실행 중입니다.")}
+            catch {
+                guard !Task.isCancelled, !remoteInputStopped else {return}
+            }
         }
-        let slot = host == .terminal ? "Terminal.app" : current.tty
-        while restartTerminalOwners[slot] != nil || restartTerminalOwners.count >= 2 {
-            guard !Task.isCancelled, !remoteInputStopped else { return }
-            try? await Task.sleep(for: .milliseconds(80))
-        }
-        restartTerminalOwners[slot] = id
         let terminate = processTerminator
         guard let fresh = try? await Task.detached(operation: { try reader() }).value,
               fresh.contains(where: { $0.pid == process.pid && $0.started == process.started && $0.agent == original.agent && $0.tty == process.tty }),
@@ -5563,7 +5577,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !Task.isCancelled, !remoteInputStopped else { return }
         guard fresh.contains(where: { $0.key == process.key && ProcessDiscovery.ancestors(of: $0.parent, records: fresh)
             .contains(where: { $0.key == shell.key }) }),
-              !sendingMessages.contains(id), !automaticInputBusy(id) else {
+              restartTerminalOwners[slot] == id, !restartInputInFlight(on:slot) else {
             return fail("CLI와 셸의 연결 또는 입력 상태가 바뀌어 종료하지 않았습니다.")
         }
         let recoveryStarted = Date()
@@ -5607,13 +5621,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard !Task.isCancelled, !remoteInputStopped else { return }
             updateRestart(id, .launching, "같은 터미널에서 같은 대화를 다시 열고 있습니다.")
             do {
-                let delivery:TerminalDelivery=try await Task.detached {
-                    try adapter.dispatchInput(host) {
-                        try codexContext?.verifyUnchanged()
-                        guard try context.verifiedShell(in: reader()) != nil else { return .agentMissing }
-                        return try restart(target,prompt,command)
-                    }
-                }.value
+                let delivery = try await adapter.restartInput(host) {
+                    try codexContext?.verifyUnchanged()
+                    guard try context.verifiedShell(in: reader()) != nil else { return .agentMissing }
+                    return try restart(target,prompt,command)
+                }
                 sent = delivery == .sent
                 if !sent {
                     reason = delivery == .screenChanged ? "입력 직전에 셸 화면이 바뀌었습니다." : "터미널이 원래 셸 입력 대상을 확인하지 못했습니다."

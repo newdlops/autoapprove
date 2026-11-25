@@ -67,9 +67,14 @@ public struct ScreenHostAdapter: Sendable {
         if usesHostIPC { return try await AutomationIPC.shared.read(host:host.title,waitForSlot:waitForSlot,body:read) }
         return try await Task.detached(priority:.userInitiated,operation:read).value
     }
-    func dispatchInput<T>(_ host:ScreenHost,budget:TimeInterval = 30,_ body:@escaping @Sendable () throws -> T) throws -> T {
-        if usesHostIPC { return try AutomationIPC.shared.runInput(host:host.title,budget:budget,body:body) }
+    func dispatchInput<T>(_ host:ScreenHost,budget:TimeInterval = 30,admissionWait:TimeInterval = 0.8,_ body:@escaping @Sendable () throws -> T) throws -> T {
+        if usesHostIPC { return try AutomationIPC.shared.runInput(host:host.title,budget:budget,admissionWait:admissionWait,body:body) }
         return try body()
+    }
+
+    func restartInput(_ host: ScreenHost, _ write: @escaping @Sendable () throws -> TerminalDelivery) async throws -> TerminalDelivery {
+        let work = Task.detached(priority: .userInitiated) { try self.dispatchInput(host, admissionWait: 5, write) }
+        return try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
     }
 
     public var screens: @Sendable ([ScreenTarget]) throws -> TerminalSnapshot

@@ -279,6 +279,14 @@ extension ApprovalTests {
     }
 
     @MainActor func testMultipleRestartsLaunchIndependentShells() async throws {
+        try await verifyIndependentRestarts(host:.iterm)
+    }
+
+    @MainActor func testTerminalRestartsDoNotHoldOtherShells() async throws {
+        try await verifyIndependentRestarts(host:.terminal)
+    }
+
+    @MainActor private func verifyIndependentRestarts(host:ScreenHost) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let terminals = [0, 1].map { index -> RestartTerminal in
@@ -293,7 +301,7 @@ extension ApprovalTests {
         let sessions = ProcessDiscovery.sessions(records).filter { $0.agent == .claude }.map { value in
             var session = value
             session.providerID = UUID().uuidString
-            session.terminal = .iterm
+            session.terminal = host == .terminal ? .terminal : .iterm
             return session
         }
         let adapter = ScreenHostAdapter(screens: { targets in
@@ -302,9 +310,10 @@ extension ApprovalTests {
                 return TerminalScreen(tty: target.tty, contents: t.screen(target.tty))
             })
         }, approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, restart: { target, expected, command in
-            terminals[target.tty.hasSuffix("0") ? 0 : 1].restart(target, expected: expected, command: command)
+            guard terminals.allSatisfy({ $0.terminated == 1 }) else { return .agentMissing }
+            return terminals[target.tty.hasSuffix("0") ? 0 : 1].restart(target, expected: expected, command: command)
         }, input: { target,_,_,input in terminals[target.tty.hasSuffix("0") ? 0 : 1].send(target, input) })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { terminals.flatMap(\.records) }, screenAdapters: [.iterm: adapter])
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { terminals.flatMap(\.records) }, screenAdapters: [host: adapter])
         defer { engine.stop() }
         engine.processArgumentsReader = { _ in ["/fixture/claude"] }
         engine.processTerminator = { record in
@@ -313,9 +322,15 @@ extension ApprovalTests {
             return terminals[i].terminate(record)
         }
         engine.updateDiscovery(sessions, records: records)
-        await engine.connectScreenHost(.iterm)
+        await engine.connectScreenHost(host)
         engine.restartSessions(sessions.map(\.id), resume: false)
         try expect(try await waitForRestart(12) { terminals.allSatisfy { $0.launched.count == 1 } })
+        for (i, terminal) in terminals.enumerated() {
+            let session = sessions.first { $0.tty.hasSuffix(String(i)) }!
+            try expectEqual(terminal.typed, ["\u{1b}"])
+            try expectEqual(terminal.terminated, 1)
+            try expect(terminal.launched[0].lowercased().contains(session.providerID!.lowercased()))
+        }
     }
 
     @MainActor func testSessionRestartLeavesShelllessCLIUntouched() async throws {

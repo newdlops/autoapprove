@@ -181,6 +181,11 @@ package final class AutomationIPC: @unchecked Sendable {
     }
     package func runInput<T>(host:String,budget:TimeInterval,admissionWait:TimeInterval = 0,body:@escaping () throws -> T) throws -> T {
         try Task.checkCancellation()
+        if let parent = Thread.current.threadDictionary[threadKey] as? Flight {
+            guard lock.withLock({ active[host] === parent && !parent.readOnly }) else {throw InputNotStarted(.busy)}
+            return try run(host:host,readOnly:false,budget:budget,body:body)
+        }
+        guard !Thread.isMainThread || Bundle.main.bundleIdentifier != "local.autoapprove.mac" else {throw InputNotStarted(.busy)}
         let flight: ResultFlight<T>
         do {
             flight = try acquire(host,readOnly:false,budget:budget,admissionWait:admissionWait,body:body)

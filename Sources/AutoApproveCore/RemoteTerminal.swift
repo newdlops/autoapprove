@@ -18,6 +18,7 @@ public enum TerminalKeyboard {
     }
 
     public struct Environment: Sendable {
+        fileprivate var usesHostIPC = false
         public var trusted: @Sendable () -> Bool
         public var postingAllowed: @Sendable () -> Bool
         public var run: @Sendable (String) throws -> String
@@ -56,7 +57,7 @@ public enum TerminalKeyboard {
             self.prepareLive = prepareLive
         }
         public static var live: Self {
-            Self(trusted: { TerminalKeyboard.isAvailable }, postingAllowed: { CGPreflightPostEventAccess() },
+            var environment = Self(trusted: { TerminalKeyboard.isAvailable }, postingAllowed: { CGPreflightPostEventAccess() },
                 run: { script in try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
                     try AutomationScript.run(script, app: "Terminal", denied: .permissionDenied, timeout: 3)
                 } },
@@ -80,6 +81,8 @@ public enum TerminalKeyboard {
                 } }, prepareLive: {tty in try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
                     try TerminalAppleEvents.prepareLiveInput(tty:tty)
                 } })
+            environment.usesHostIPC = true
+            return environment
         }
         public static func live(sourcePID: Int32) throws -> Self {
             let chain = try RemoteTerminalPerformance.shared.measure(.inputProcessCheck) {
@@ -201,6 +204,19 @@ public enum TerminalKeyboard {
                                environment: Environment = .live, timeout: TimeInterval = 8, goalWorkingComparison: Bool = false, allowActivation: Bool = true) throws -> TerminalDelivery {
         try input.validate()
         guard agent != .shell, timeout.isFinite, timeout > 0 else { throw RemoteHTTPError(400, "이 직접 입력 방식은 지원하지 않습니다.") }
+        let write = {
+            try deliverSequence(target:target, expected:expected, agent:agent, input:input, environment:environment,
+                                timeout:timeout, goalWorkingComparison:goalWorkingComparison, allowActivation:allowActivation)
+        }
+        if environment.usesHostIPC {
+            return try AutomationIPC.shared.runInput(host:"Terminal",budget:min(timeout,8)+2,admissionWait:2,body:write)
+        }
+        return try write()
+    }
+
+    private static func deliverSequence(target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput,
+                                        environment: Environment, timeout: TimeInterval, goalWorkingComparison: Bool,
+                                        allowActivation: Bool) throws -> TerminalDelivery {
         let deadline = environment.clock() + min(timeout, 8)
         guard deliveryLock.lock(before: Date().addingTimeInterval(min(timeout, 8))) else {
             throw RemoteHTTPError(409, "다른 Terminal 입력이 끝나지 않아 입력하지 않았습니다. 화면을 확인해주세요.")

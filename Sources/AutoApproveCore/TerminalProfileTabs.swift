@@ -166,71 +166,26 @@ public enum TerminalProfileTopology {
             let windows=CGWindowListCopyWindowInfo([.optionAll,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]] ?? []
             let frames=TerminalProfileWindowPlacement.frames(windows,owner:owner.pid)
             for index in rows.indices {rows[index].bounds=frames[rows[index].windowID]}
-            return (rows,try reader.groups())
+            return (rows,try reader.layoutWindows())
         }
-        return try TerminalProfileNativeCapture.capture(rows,original:original) {row in
-            try gate.run(host:"Terminal",readOnly:false,budget:12,admissionWait:3) {
-                let before=try reader.currentSelections(original)
-                let tty=row.selectedTTY ?? row.tty
-                guard before.count==original.count,before.allSatisfy({group in original.contains {$0.id==group.id && $0.tabs==group.tabs}}),
-                      TerminalProcessLookup.identity(pid:owner.pid)==owner,
-                      TerminalProfileLauncher.validTTY(tty) else {
-                    throw AppError.message("Terminal 탭 구성이 바뀌었습니다. 다시 불러와주세요.")
-                }
-                let keyboard=TerminalKeyboard.Environment.live
-                let wanted=try AutomationScript.literal(tty)
-                let selected=try AutomationScript.literal(row.selectedTTY as Any? ?? NSNull())
-                let selectedTTY="function selectedTTY(){const tab=window.selectedTab();return tab ? tab.tty():null;}"
-
-                let script="""
-                (()=>{
-                  const app=Application('com.apple.Terminal'),window=app.windows.byId(\(row.windowID));
-                  \(selectedTTY)
-                  if(!window.exists()||Number(window.id())!==\(row.windowID)||selectedTTY()!==\(selected)||
-                     window.tabs.whose({tty:\(wanted)})().length!==1)
-                    throw Error('확인할 Terminal 창이나 선택 탭이 바뀌었습니다.');
-                  const wasMinimized=window.miniaturized();
-                  if(wasMinimized)window.miniaturized=false;
-                  window.index=1;app.activate();
-                  return JSON.stringify({tty:\(wanted),windowID:Number(window.id()),selected:selectedTTY()===\(selected),
-                    minimized:window.miniaturized(),wasMinimized});
-                })();
-                """
-                let text=try keyboard.run(script)
-                struct Selection:Decodable {let wasMinimized:Bool}
-                let selection=try JSONDecoder().decode(Selection.self,from:Data(text.utf8))
-                guard let metadata=try TerminalAdapter.windowMetadata(output:text,tty:tty),metadata.ownerPID==owner.pid,
-                      metadata.windowID==row.windowID,metadata.selected,!metadata.minimized else {
-                    throw AppError.message("선택한 Terminal 탭을 확인하지 못했습니다.")
-                }
-                try TerminalProfileReadiness.wait(message:"선택한 Terminal 탭의 화면 반영을 확인하지 못했습니다.") {
-                    TerminalKeyboard.isFocused(metadata,requiresTextArea:false) ? true:nil
-                }
-                let state:TerminalNativeTabGroup?
-                do {state=try reader.focusedGroup()}
-                catch {
-                    if TerminalKeyboard.isFocused(metadata,requiresTextArea:false) {try? reader.restore(before)}
-                    throw error
-                }
-                guard TerminalKeyboard.isFocused(metadata,requiresTextArea:false) else {throw AppError.message("확인 중 Terminal 선택이 바뀌었습니다.")}
-                if let state {
-                    guard let previous=before.first(where:{$0.id==state.id && $0.tabs==state.tabs}) else {
-                        throw AppError.message("Terminal 탭 순서가 바뀌었습니다. 다시 불러와주세요.")
-                    }
-                    if state != previous {try reader.select(previous,expected:state)}
-                }
-                if selection.wasMinimized {
-                    _ = try keyboard.run("""
-                    const app=Application('com.apple.Terminal'),window=app.windows.byId(\(row.windowID));
-                    \(selectedTTY)
-                    if(!app.frontmost()||!window.exists()||selectedTTY()!==\(selected))throw Error('복원할 Terminal 창이 바뀌었습니다.');
-                    window.miniaturized=true;'restored';
-                    """)
-                }
-                try reader.restore([])
-                return state
+        guard !original.groups.isEmpty || rows.allSatisfy({ original.standalone.contains($0.windowID) }) else {
+            throw AppError.message("Terminal의 현재 창과 탭을 확인하지 못했습니다. 배치를 다시 읽어주세요.")
+        }
+        let captured = try TerminalProfileNativeCapture.capture(rows,original:Array(original.groups.values)) {row in
+            if original.standalone.contains(row.windowID) {return nil}
+            if let visible = original.groups[row.windowID] {return visible}
+            return try gate.run(host:"Terminal",readOnly:false,budget:8,admissionWait:5) {
+                try reader.inspectWindow(row,original:original)
             }
         }
+        let final = try gate.run(host:"Terminal",readOnly:true,budget:timeout+3,admissionWait:5) {
+            (try readRows(ttys,timeout:timeout),try reader.layoutWindows())
+        }
+        let verified = Dictionary(uniqueKeysWithValues:final.0.map { ($0.tty,$0) })
+        guard original.sameTabs(as:final.1),rows.allSatisfy({ row in
+            verified[row.tty]?.windowID == row.windowID && verified[row.tty]?.tabOrder == row.tabOrder
+        }) else {throw AppError.message("읽는 동안 Terminal 창·탭 배치가 바뀌었습니다. 배치를 다시 읽어주세요.")}
+        return captured
     }
 
     static func readForProfile(ttys:[String]) async throws -> [TerminalProfileTabSnapshot] {
@@ -387,6 +342,19 @@ public enum TerminalProfileTabOpener {
     public static func open(anchorTTY:String,settingsName:String? = nil,environment suppliedEnvironment:TerminalKeyboard.Environment? = nil,
                             nativeGroupReader:(() throws -> TerminalNativeTabGroup?)? = nil,
                             nativeTabSelector:((TerminalNativeTabGroup,TerminalNativeTabGroup) throws -> Void)? = nil) throws -> String {
+        let open = {
+            try openVerified(anchorTTY:anchorTTY,settingsName:settingsName,environment:suppliedEnvironment,
+                             nativeGroupReader:nativeGroupReader,nativeTabSelector:nativeTabSelector)
+        }
+        if suppliedEnvironment == nil {
+            return try AutomationIPC.shared.runInput(host:"Terminal",budget:12,admissionWait:3,body:open)
+        }
+        return try open()
+    }
+
+    private static func openVerified(anchorTTY:String,settingsName:String?,environment suppliedEnvironment:TerminalKeyboard.Environment?,
+                                     nativeGroupReader:(() throws -> TerminalNativeTabGroup?)?,
+                                     nativeTabSelector:((TerminalNativeTabGroup,TerminalNativeTabGroup) throws -> Void)?) throws -> String {
         var environment=suppliedEnvironment ?? .live
         if suppliedEnvironment == nil {
             environment.run={try AutomationScript.run($0,app:"Terminal",denied:.permissionDenied,timeout:8)}

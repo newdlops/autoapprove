@@ -100,6 +100,34 @@ extension ApprovalTests {
         } catch AutomationIPC.Failure.busy {}
     }
 
+    func testLayoutAndKeyboardTakeTurns() async throws {
+        let gate = AutomationIPC()
+        let entered = DispatchSemaphore(value:0), finish = DispatchSemaphore(value:0)
+        defer { finish.signal() }
+        let layout = Task.detached {
+            try gate.run(host:"Terminal",readOnly:false,budget:3) {
+                entered.signal()
+                return finish.wait(timeout:.now()+2) == .success
+            }
+        }
+        while entered.wait(timeout:.now()) != .success {try await Task.sleep(for:.milliseconds(1))}
+        let keyboard = Task.detached {
+            try gate.runInput(host:"Terminal",budget:1,admissionWait:2) {
+                try gate.runInput(host:"Terminal",budget:1) { 42 }
+            }
+        }
+        try expectEqual(try await gate.read(host:"iTerm2") { 7 },7)
+        finish.signal()
+        try expect(try await layout.value)
+        try expectEqual(try await keyboard.value,42)
+        try expectEqual(try await gate.read(host:"Terminal") {
+            do {
+                _ = try gate.runInput(host:"Terminal",budget:1) { throw AppError.message("Unexpected keyboard dispatch") }
+                return false
+            } catch is AutomationIPC.InputNotStarted {return true}
+        },true)
+    }
+
     @MainActor func testMonitorRecoversVerifiedConnectionAfterTimeout() async throws {
         final class Probe: @unchecked Sendable {
             let lock = NSLock()
