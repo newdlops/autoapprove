@@ -187,9 +187,19 @@ public enum CodexResumeCheck {
         guard !blocked(current), !running(current), let composer = current.lastIndex(where: isComposer),
               stop.agent != .codex || !goalHeld(current), let footer = stop.composerFooter else { return false }
         if !stop.identity.isEmpty {
-            let transcript = current[..<composer].joined(separator: "\n")
-            let compact = PromptDetector.fingerprint(transcript.components(separatedBy: .whitespacesAndNewlines).joined())
-            guard PromptDetector.fingerprint(transcript) == stop.identity || compact == stop.continuationIdentity else { return false }
+            let history = current[..<composer]
+            func matchesReceipt(_ rows: ArraySlice<String>) -> Bool {
+                let transcript = rows.joined(separator: "\n")
+                if PromptDetector.fingerprint(transcript) == stop.identity { return true }
+                let compact = transcript.components(separatedBy: .whitespacesAndNewlines).joined()
+                return PromptDetector.fingerprint(compact) == stop.continuationIdentity
+            }
+            if !matchesReceipt(history) {
+                guard stop.continuationText == CodexCapacityStop.goalResumeText, stop.agent == .codex,
+                      goalStalled(current), let last = history.lastIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }),
+                      history[last].trimmingCharacters(in: .whitespaces) == "› resume",
+                      matchesReceipt(history[..<last]) else { return false }
+            }
         }
         let tail = current[current.index(after: composer)..<current.endIndex].indices
             .filter { !current[$0].trimmingCharacters(in: .whitespaces).isEmpty }
@@ -406,7 +416,13 @@ enum CodexResumeScript {
       delay(0.75);
       const stable = resumeRows(read());
       if (!draftReady(stable, region, text, footer)) return typedState(before, stable, region, text) === 'submitted' ? 'sent' : 'typed';
-      if (transcript(stable).replace(/\\s/g, '') !== transcript(before).replace(/\\s/g, '')) return 'typed';
+      const compact = value => value.replace(/\\s/g, '');
+      const previous = compact(transcript(before)), current = transcript(stable);
+      if (compact(current) !== previous) {
+        const history = resumeRows(current);
+        if (text !== '/goal resume' || !goalStalled(stable) || history.pop()?.trim() !== '› resume'
+            || compact(history.join('\\n')) !== previous) return 'typed';
+      }
       if (!enter()) return 'agentMissing';
       if (awaitSubmitted(read, stable, region, text)) return 'sent';
       return draftReady(resumeRows(read()), region, text, footer) ? 'draft' : 'typed';

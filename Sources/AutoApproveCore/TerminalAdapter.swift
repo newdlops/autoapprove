@@ -257,14 +257,19 @@ public enum TerminalAdapter {
         let agent = CodexResumeCheck.agent(in: region)
         return try VerifiedResumeInput.deliver(region: region, text: text, read: { try resumeRead(bound) }, write: { expected,input in
             guard try resumeRead(bound) == expected else { return .screenChanged }
+            if agent == .codex, text == CodexCapacityStop.goalResumeText, input.kind == .enter {
+                return try TerminalDeviceInput.submitGoalDraft(target: bound, screen: expected)
+            }
             return try TerminalDeviceInput.deliver(target: bound, agent: agent, input: input, screen: expected)
         })
     }
     public static func completeResume(target: ScreenTarget, stop: CodexCapacityStop) throws -> ResumeDelivery {
-        guard TerminalInputClient.shared.isAvailable else { throw AppError.message(TerminalDeviceInput.unavailableBeforeInputMessage) }
+        let goal = stop.agent == .codex && stop.continuationText == CodexCapacityStop.goalResumeText
+        guard goal || TerminalInputClient.shared.isAvailable else { throw AppError.message(TerminalDeviceInput.unavailableBeforeInputMessage) }
         guard let bound = boundResumeTarget(target) else { return .agentMissing }
         return try VerifiedResumeInput.complete(stop: stop, read: { try resumeRead(bound) }, write: { expected,input in
             guard try resumeRead(bound) == expected else { return .screenChanged }
+            if goal { return try TerminalDeviceInput.submitGoalDraft(target: bound, screen: expected) }
             return try TerminalDeviceInput.deliver(target: bound, agent: stop.agent, input: input, screen: expected)
         })
     }

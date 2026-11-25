@@ -20,15 +20,29 @@ public enum TerminalDeviceInput {
         let claudeClear = agent == .claude && input.text == "/clear" &&
             ClaudeComposerReadiness.isEmpty(screen) && ActivityDetector.detect(screen,agent:agent).phase != .working
         guard [.message, .submit].contains(input.kind), codexReady || claudeClear || (agent == .agy && AgyComposerReadiness.isEmpty(screen)),
-              !RemoteMessageReadiness.hasMenu(screen, agent: agent),
-              let pid = target.sourcePID, target.jobPIDs.contains(pid), let original = target.sourceIdentity,
+              !RemoteMessageReadiness.hasMenu(screen, agent: agent) else { return .agentMissing }
+        let text = claudeClear ? "/clear" : "\u{1b}[200~" + input.text + "\u{1b}[201~"
+        return try writeToTab(target: target, screen: screen, agent: agent, text: text, captureIdentity: captureIdentity, run: run)
+    }
+
+    static func submitGoalDraft(target: ScreenTarget, screen: String) throws -> TerminalDelivery {
+        guard CodexResumeCheck.draftVisible(screen, text: CodexCapacityStop.goalResumeText),
+              CodexResumeCheck.goalStalled(CodexResumeCheck.rows(screen)) else { return .screenChanged }
+        return try writeToTab(target: target, screen: screen, agent: .codex, text: "",
+                              captureIdentity: { try TTYInputIdentity.capture(pid: $0) }, run: nil)
+    }
+
+    private static func writeToTab(target: ScreenTarget, screen: String, agent: AgentKind, text: String,
+                                   captureIdentity: @Sendable (Int32) throws -> TTYInputIdentity,
+                                   run: (@Sendable (String) throws -> String)?) throws -> TerminalDelivery {
+        guard let pid = target.sourcePID, target.jobPIDs.contains(pid), let original = target.sourceIdentity,
               original.pid == pid, original.processStart == target.sourceStarted,
               let current = try? captureIdentity(pid), current.sameProcess(as: original),
               current.uid == getuid(), current.effectiveUID == geteuid(), current.processGroup == current.foregroundGroup else {
             return .agentMissing
         }
         let data = try AutomationScript.literal(["tty": target.tty, "screen": screen,
-            "text": claudeClear ? "/clear" : "\u{1b}[200~" + input.text + "\u{1b}[201~", "agent": agent.rawValue] as JSONObject)
+            "text": text, "agent": agent.rawValue] as JSONObject)
         let script = """
         (() => {
           const app = Application('com.apple.Terminal'), target = \(data);

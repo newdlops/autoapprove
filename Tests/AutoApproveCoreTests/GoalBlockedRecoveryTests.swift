@@ -58,10 +58,14 @@ extension ApprovalTests {
         let waiting = draft.replacingOccurrences(of: "? for shortcuts · ", with: changedFooter + "\n")
         let owned = CodexCapacityStop.detect(initial, agent: .codex)!
         try expect(CodexResumeCheck.draftReady(waiting, stop: owned))
+        let withEcho = waiting.replacingOccurrences(of: "› /goal resume", with: "› resume\n\n› /goal resume")
+        try expect(CodexResumeCheck.draftReady(withEcho, stop: owned))
         for edited in [waiting.replacingOccurrences(of: "weekly", with: "monthly"),
                        waiting.replacingOccurrences(of: "project", with: "another"),
                        waiting.replacingOccurrences(of: "› /goal resume", with: "› /goal resume\nuser note"),
-                       waiting.replacingOccurrences(of: "› /goal resume", with: "› resume\n\n› /goal resume"),
+                       withEcho.replacingOccurrences(of: "› resume", with: "› resume another task"),
+                       withEcho.replacingOccurrences(of: "› resume", with: "› resume\n• New output"),
+                       withEcho.replacingOccurrences(of: "› resume", with: "› resume\n› resume"),
                        waiting.replacingOccurrences(of: "Goal stalled", with: "Goal paused")] {
             try expectFalse(CodexResumeCheck.draftReady(edited, stop: owned))
         }
@@ -70,6 +74,8 @@ extension ApprovalTests {
                                              ([before, draft, pursuing.replacingOccurrences(of: "Pursuing goal", with: "Pursuing\ngoal")], "sent", 2),
                                              ([before, draft, before], "typed", 2),
                                              ([initial, waiting, pursuing], "sent", 2),
+                                             ([initial, withEcho, pursuing], "sent", 2),
+                                             ([initial, withEcho.replacingOccurrences(of: "› resume", with: "› resume another task")], "typed", 1),
                                              ([initial, waiting.replacingOccurrences(of: "project", with: "another")], "typed", 1),
                                              ([before.replacingOccurrences(of: "Goal stalled", with: "Goal paused")], "screenChanged", 0),
                                              ([before.replacingOccurrences(of: "› Ask Codex to do anything", with: "› user draft")], "screenChanged", 0)] {
