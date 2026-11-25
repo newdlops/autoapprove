@@ -126,7 +126,6 @@ import AutoApproveCore
         try expect(records.first(where: { $0.pid == 11 })?.isForeground == false)
     }
     func testPaddedBareProcessNamesAndNestedPTYs() throws {
-        // ps aligns comm with several spaces. Production Claude changes comm to a bare name.
         let records = ProcessDiscovery.parse("""
             1     0 ??           1     0 Sat Sep 19 16:00:00 2026     /sbin/launchd
            10     1 ??          10     0 Sat Sep 19 16:00:01 2026     /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
@@ -148,7 +147,6 @@ import AutoApproveCore
     }
     func testTerminalScriptingContractAndPartialFailure() throws {
         let context = JSContext()!
-        // JavaScriptCore is a sandboxed in-memory mock here; Application never sends an Apple event.
         context.evaluateScript("""
         function Application(identifier) {
           return {
@@ -177,7 +175,6 @@ import AutoApproveCore
         try expectNil(context.exception)
         let rawMetadata = try JSONSerialization.jsonObject(with: Data(rawValue.toString().utf8)) as! JSONObject
         try expect((rawMetadata["screens"] as! [JSONObject])[0]["cursorWindow"] is NSNull, "Background approval reads must skip native window/cursor metadata")
-        // No mock tab exposes name(), matching Terminal.sdef. Calling it loses the healthy tab.
     }
     func testOrdinaryTerminalsAreExcluded() throws {
         let records = ProcessDiscovery.parse("""
@@ -627,6 +624,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session profiles: unresolved conversations require an explicit new CLI choice",tests.testTerminalProfileSavingRequiresExplicitNewCLISelection),
             ("Session profiles: validated explicit binding and preserved identity failures",tests.testTerminalProfileCaptureUsesValidatedExplicitBindingAndPreservesFailures),
             ("Session profiles: malformed, future, duplicate and unsafe files",tests.testTerminalProfilesRejectMalformedUnsafeAndDuplicateFiles),
+            ("Session profiles: restore geometry once and invalidate reused TTYs after a Terminal restart",tests.testProfileRestoresGeometryOnceAndDiscardsPreviousTerminalReceipts),
             ("Session profiles: fixed resume grammar and native host contracts",tests.testTerminalProfileFixedCommandsAndNativeHostContracts),
             ("Session profiles: optional conversation starts CLI and saves separate entries",tests.testTerminalProfileFreshCLICommandsAndPrivateFiles),
             ("Session profiles: fresh CLI tabs and bounded duplicate launch receipts",tests.testTerminalProfileFreshCLIRestoreKeepsTabsAndReceipts),

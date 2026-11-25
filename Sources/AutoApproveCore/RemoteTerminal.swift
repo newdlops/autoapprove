@@ -17,8 +17,6 @@ public enum TerminalKeyboard {
         return AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
     }
 
-    /// The injectable boundary keeps permission, exact-window preparation and
-    /// paired event submission in one process. Tests never post actual events.
     public struct Environment: Sendable {
         public var trusted: @Sendable () -> Bool
         public var postingAllowed: @Sendable () -> Bool
@@ -115,8 +113,6 @@ public enum TerminalKeyboard {
         }
     }
 
-    /// Accessibility activation works from the authorized sender even when
-    /// ordinary cooperative app activation declines a background request.
     public static func activateApplication(owner:TerminalProcessIdentity,
         identity:(Int32)->TerminalProcessIdentity? = {TerminalProcessLookup.identity(pid:$0)},
         setAttribute:(Int32,String,Bool)->AXError = {pid,name,value in
@@ -156,14 +152,12 @@ public enum TerminalKeyboard {
     }
 
     private static let deliveryLock = NSLock()
-    private static func isFocused(_ metadata: TerminalWindowMetadata) -> Bool {
+    static func isFocused(_ metadata: TerminalWindowMetadata, requiresTextArea: Bool = true) -> Bool {
         guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]],
               let first = windows.first(where: {
                   ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == metadata.ownerPID
                     && ($0[kCGWindowLayer as String] as? NSNumber)?.intValue == 0
               }) else { return false }
-        // CGWindow.h defines this list's order as front to back. Only the
-        // prepared owner's exact first window can receive terminal keys.
         guard (first[kCGWindowNumber as String] as? NSNumber)?.uint32Value == metadata.windowID else { return false }
         let app = AXUIElementCreateApplication(metadata.ownerPID)
         AXUIElementSetMessagingTimeout(app, 0.2)
@@ -172,10 +166,13 @@ public enum TerminalKeyboard {
             return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
         }
         guard (attribute(app,kAXFrontmostAttribute) as? NSNumber)?.boolValue==true,
-              let focused = attribute(app, kAXFocusedUIElementAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID(),
-              attribute(focused as! AXUIElement, kAXRoleAttribute) as? String == kAXTextAreaRole,
-              let inputWindow = attribute(focused as! AXUIElement, kAXWindowAttribute), CFGetTypeID(inputWindow) == AXUIElementGetTypeID(),
-              let focusedWindow = attribute(app, kAXFocusedWindowAttribute), CFGetTypeID(focusedWindow) == AXUIElementGetTypeID(), CFEqual(inputWindow, focusedWindow) else { return false }
+              let focusedWindow=attribute(app,kAXFocusedWindowAttribute),
+              CFGetTypeID(focusedWindow)==AXUIElementGetTypeID() else {return false}
+        if !requiresTextArea {return true}
+        guard let focused = attribute(app,kAXFocusedUIElementAttribute), CFGetTypeID(focused) == AXUIElementGetTypeID(),
+              attribute(focused as! AXUIElement,kAXRoleAttribute) as? String == kAXTextAreaRole,
+              let inputWindow=attribute(focused as! AXUIElement,kAXWindowAttribute),
+              CFGetTypeID(inputWindow)==AXUIElementGetTypeID(),CFEqual(inputWindow,focusedWindow) else {return false}
         return true
     }
     private static func source(_ target: ScreenTarget, agent: AgentKind, records: [ProcessRecord]) -> ProcessRecord? {
@@ -251,8 +248,6 @@ public enum TerminalKeyboard {
                     RemoteTerminalPerformance.shared.increment(.scriptedInputPreparations)
                 }
                 window=current
-                // App activation/tab selection is asynchronous. Wait only for
-                // readiness; never retry activation or an input event.
                 let focusDeadline=min(deadline,environment.clock()+0.5)
                 var ready=false
                 for attempt in 0..<26 {
@@ -312,8 +307,6 @@ public enum TerminalKeyboard {
                 }
                 try checkPermissionAndTime()
                 if packet.paste, pasteboard?.isCurrent() != true { throw RemoteHTTPError(409,"클립보드가 바뀌어 입력하지 않았습니다.") }
-                // Once submission begins, even a throwing callback is an uncertain
-                // outcome. Both events already exist and the pair is never retried.
                 attemptedPairs += 1
                 try environment.postPair(owner.pid, down, up)
                 if packet.paste {
@@ -384,8 +377,6 @@ public struct RemoteTerminalInput: Codable, Equatable, Sendable {
 }
 
 enum RemoteMessageReadiness {
-    /// A message must not act as Enter on a CLI's current setup or choice menu.
-    /// Historical menus above a newer composer do not block new messages.
     static func hasMenu(_ screen: String, agent: AgentKind) -> Bool {
         if agent == .codex, TerminalChoiceQuestion.hasCodexOverlay(screen) { return true }
         if PromptDetector.detect(screen, agent: agent) != nil || QuestionDetector.detect(screen, agent: agent) != nil { return true }
@@ -394,7 +385,6 @@ enum RemoteMessageReadiness {
         guard let last = rows.lastIndex(where: { $0.range(of: option, options: .regularExpression) != nil }),
               rows[...last].filter({ $0.range(of: option, options: .regularExpression) != nil }).count >= 2,
               rows[...last].contains(where: { $0.range(of: #"^[›❯»>]\s*[1-9][0-9]?\.\s+"#, options: .regularExpression) != nil }) else {
-            // Claude's initial workspace trust menu has unnumbered choices.
             return agent == .claude && rows.contains("Accessing workspace:") && rows.contains(where: { $0.hasPrefix("❯ No, exit") || $0.hasPrefix("❯ Yes, I trust this folder") }) && rows.contains(where: { $0.contains("Enter to confirm") })
         }
         return rows.dropFirst(last + 1).allSatisfy { row in

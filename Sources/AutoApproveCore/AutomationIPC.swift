@@ -81,7 +81,7 @@ package final class AutomationIPC: @unchecked Sendable {
     private let threadKey = UUID().uuidString
     private let lock = NSLock()
     private var active: [String:Flight] = [:]
-    private var waitingReaders: [String:[UUID]] = [:]
+    private var waiters: [String:[UUID]] = [:]
     private var reopen: [String:TimeInterval] = [:]
     private var metrics = Metrics()
     private var durations: [Double] = []
@@ -101,7 +101,7 @@ package final class AutomationIPC: @unchecked Sendable {
         if let current = active[host], now >= current.deadline { expire(host,current,.timeout) }
         if let time = reopen[host], !readOnly || now < time || active[host] != nil { metrics.rejected += 1; throw Failure.open }
         guard active.count < 2, active[host] == nil,
-              !readOnly || waitingReaders[host]?.first == nil || waitingReaders[host]?.first == ticket else { metrics.rejected += 1; throw Failure.busy }
+              waiters[host]?.first == nil || waiters[host]?.first == ticket else { metrics.rejected += 1; throw Failure.busy }
         let flight = ResultFlight<T>(budget:budget)
         flight.readOnly = readOnly
         active[host] = flight
@@ -158,7 +158,7 @@ package final class AutomationIPC: @unchecked Sendable {
             _ = flight.finished.wait(timeout:.now() + min(0.025,max(0,flight.deadline-now)))
         }
     }
-    package func run<T>(host:String,readOnly:Bool,budget:TimeInterval,body:@escaping () throws -> T) throws -> T {
+    package func run<T>(host:String,readOnly:Bool,budget:TimeInterval,admissionWait:TimeInterval = 0,body:@escaping () throws -> T) throws -> T {
         try Task.checkCancellation()
         if let parent = Thread.current.threadDictionary[threadKey] as? Flight {
             try lock.withLock {
@@ -176,49 +176,71 @@ package final class AutomationIPC: @unchecked Sendable {
             return try result.get()
         }
         guard !Thread.isMainThread || Bundle.main.bundleIdentifier != "local.autoapprove.mac" else { throw Failure.busy }
-        let flight = try lock.withLock { try reserve(host,readOnly:readOnly,budget:budget,body:body) }
+        let flight = try acquire(host,readOnly:readOnly,budget:budget,admissionWait:admissionWait,body:body)
         return try wait(flight,host:host)
     }
-    package func runInput<T>(host:String,budget:TimeInterval,body:@escaping () throws -> T) throws -> T {
+    package func runInput<T>(host:String,budget:TimeInterval,admissionWait:TimeInterval = 0,body:@escaping () throws -> T) throws -> T {
         try Task.checkCancellation()
         let flight: ResultFlight<T>
         do {
-            flight = try lock.withLock { try reserve(host,readOnly:false,budget:budget,body:body) }
+            flight = try acquire(host,readOnly:false,budget:budget,admissionWait:admissionWait,body:body)
         } catch let reason as Failure {
             throw InputNotStarted(reason)
         }
         return try wait(flight,host:host)
     }
 
-    private func reserveRead<T>(host:String,budget:TimeInterval,waitForSlot:Bool,body:@escaping () throws -> T) async throws -> ResultFlight<T> {
-        let deadline = now + budget
-        let admissionDeadline = min(deadline, now + 0.8)
+    private struct Admission {
         let ticket = UUID()
+        let until: TimeInterval
         var queued = false
-        defer {
-            if queued {
-                lock.withLock {
-                    waitingReaders[host]?.removeAll { $0 == ticket }
-                    if waitingReaders[host]?.isEmpty == true { waitingReaders.removeValue(forKey:host) }
+    }
+
+    private func attempt<T>(_ host:String, readOnly:Bool, budget:TimeInterval, admission:inout Admission,
+                            body:@escaping () throws -> T) throws -> ResultFlight<T>? {
+        try lock.withLock {
+            if admission.queued {
+                guard waiters[host]?.contains(admission.ticket) == true else { throw Failure.invalidated }
+                guard now < admission.until else { throw Failure.busy }
+            }
+            do { return try reserve(host,readOnly:readOnly,budget:budget,ticket:admission.ticket,body:body) }
+            catch Failure.busy where now < admission.until {
+                if !admission.queued {
+                    guard (waiters[host]?.count ?? 0) < 16 else { throw Failure.busy }
+                    waiters[host,default:[]].append(admission.ticket)
+                    admission.queued = true
                 }
+                return nil
             }
         }
+    }
+
+    private func release(_ admission:Admission, host:String) {
+        guard admission.queued else { return }
+        lock.withLock {
+            waiters[host]?.removeAll { $0 == admission.ticket }
+            if waiters[host]?.isEmpty == true { waiters.removeValue(forKey:host) }
+        }
+    }
+
+    private func acquire<T>(_ host:String, readOnly:Bool, budget:TimeInterval, admissionWait:TimeInterval,
+                            body:@escaping () throws -> T) throws -> ResultFlight<T> {
+        var admission = Admission(until:now + admissionWait)
+        defer { release(admission,host:host) }
         while true {
             try Task.checkCancellation()
-            let flight: ResultFlight<T>? = try lock.withLock {
-                if queued && waitingReaders[host]?.contains(ticket) != true { throw Failure.invalidated }
-                if queued && now >= admissionDeadline { throw Failure.busy }
-                do { return try reserve(host,readOnly:true,budget:deadline-now,ticket:ticket,body:body) }
-                catch Failure.busy where waitForSlot && now < admissionDeadline {
-                    if !queued {
-                        guard (waitingReaders[host]?.count ?? 0) < 4 else { throw Failure.busy }
-                        waitingReaders[host,default:[]].append(ticket)
-                        queued = true
-                    }
-                    return nil
-                }
-            }
-            if let flight { return flight }
+            if let flight = try attempt(host,readOnly:readOnly,budget:budget,admission:&admission,body:body) { return flight }
+            Thread.sleep(forTimeInterval:0.02)
+        }
+    }
+
+    private func reserveRead<T>(host:String,budget:TimeInterval,waitForSlot:Bool,body:@escaping () throws -> T) async throws -> ResultFlight<T> {
+        let deadline = now + budget
+        var admission = Admission(until:waitForSlot ? min(deadline,now + 0.8) : now)
+        defer { release(admission,host:host) }
+        while true {
+            try Task.checkCancellation()
+            if let flight = try attempt(host,readOnly:true,budget:deadline-now,admission:&admission,body:body) { return flight }
             try await Task.sleep(for:.milliseconds(20))
         }
     }
@@ -283,7 +305,7 @@ package final class AutomationIPC: @unchecked Sendable {
     package func invalidate(_ host:String) {
         lock.withLock {
             permissions.removeValue(forKey:host)
-            waitingReaders.removeValue(forKey:host)
+            waiters.removeValue(forKey:host)
             if let flight = active[host] { expire(host,flight,.invalidated) }
         }
     }

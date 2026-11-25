@@ -12,8 +12,6 @@ enum BundledRuntimeProbe {
                 guard args.count==3,args[1].hasPrefix("/private/tmp/aa-managed2-daemon-") else {
                     throw AppError.message("Owned daemon fixture home and official CLI required")
                 }
-                // A valid on-disk binary must not attest a different process
-                // answering at the selected home's socket.
                 try CodexOfficialExecutable.verify(args[2])
                 let peer=try CodexOfficialExecutable.verifyServer(CodexQueueConnection(home:args[1]))
                 let userHome=URL(fileURLWithPath:args[1]).deletingLastPathComponent().path
@@ -70,7 +68,6 @@ private final class BundledRuntimeFixture {
     var bytes=Data([0xcf,0xfa,0xed,0xfe])
     init()throws {
         try FileManager.default.createDirectory(at:root.appendingPathComponent("bin"),withIntermediateDirectories:true,attributes:[.posixPermissions:0o700])
-        // The fixture has no AutoApprove-specific code or capability markers.
         bytes.append(Data(repeating:0,count:1_048_600))
         #if arch(arm64)
         let architecture="arm64",target="aarch64-apple-darwin"
@@ -102,8 +99,6 @@ private final class BundledRuntimeFixture {
     func record(_ home:String){homes.append(home)}
 }
 extension ApprovalTests {
-    // Synthetic shell fixtures exercise selection and races; they cannot pass
-    // the production OpenAI signature check, which has separate negative tests.
     nonisolated private static func verifyFixtureCLI(_ cli:CodexCLIContext,_ version:String)throws {
         let reply=try cli.run(["--version"])
         guard reply.status==0,reply.output.trimmingCharacters(in:.whitespacesAndNewlines)=="codex-cli "+version,
@@ -299,9 +294,16 @@ extension ApprovalTests {
         let runtime=try CodexBundledRuntime.inspect(root:f.root.path,release:trusted)
         try expectEqual(runtime.executable,f.binary.path);try runtime.verifyUnchanged()
         try expectEqual(runtime.version,"0.167.1")
+        _ = try CodexBundledRuntime.inspect(root:f.root.path,release:trusted)
+        let original=try FileManager.default.attributesOfItem(atPath:f.binary.path)
+        let handle=try FileHandle(forWritingTo:f.binary)
+        try handle.seek(toOffset:128)
+        try handle.write(contentsOf:Data([13]))
+        try handle.close()
+        try FileManager.default.setAttributes([.modificationDate:original[.modificationDate]!],ofItemAtPath:f.binary.path)
+        try expectThrows(CodexBundledRuntime.inspect(root:f.root.path,release:trusted))
         f.bytes.append(1);try f.saveBinary();try f.saveManifest()
         try expectThrows(runtime.verifyUnchanged())
-        // Updating a runtime's self-published manifest never authorizes new code.
         try expectThrows(CodexBundledRuntime.inspect(root:f.root.path,release:trusted))
         try expectThrows(CodexBundledRuntime.inspect(root:f.root.path))
     }

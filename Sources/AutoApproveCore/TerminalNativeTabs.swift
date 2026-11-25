@@ -12,8 +12,6 @@ public enum TerminalProfileAccessError:LocalizedError,Equatable {
     }
 }
 
-/// Wait for the result of an action that was submitted once. Reads can settle
-/// on a later AppKit/AX turn; actions and resume commands are never retried.
 public enum TerminalProfileReadiness {
     @discardableResult public static func wait<Value>(timeout:TimeInterval = 1.5,message:String,
         clock:() -> TimeInterval = {ProcessInfo.processInfo.systemUptime},
@@ -30,7 +28,6 @@ public enum TerminalProfileReadiness {
     }
 }
 
-/// Operation-local accessibility identities. Never written to a saved profile.
 public struct TerminalNativeTabGroup:Equatable,Sendable {
     public var id:Int
     public var tabs:[Int]
@@ -42,11 +39,7 @@ public struct TerminalNativeTabGroup:Equatable,Sendable {
     }
 }
 
-/// AppKit moves the same native tab bar between its individual NSWindows.
-/// Compare AX elements, never tab titles, window bounds or scripting IDs.
 public final class TerminalNativeTabReader:@unchecked Sendable {
-    /// Actual AX replies are authoritative. A cached trust preflight must not
-    /// prevent an already permitted process from even trying a read.
     public struct Services {
         public var ownsProcess:(Int32,String)->Bool
         public var read:(AXUIElement,String)->(AXError,CFTypeRef?)
@@ -73,7 +66,8 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
     private let bundleID:String
     private var elements:[AXUIElement]=[]
     private var originalWindow:AXUIElement?
-    private let originalApplication:NSRunningApplication?
+    private var originalApplication:NSRunningApplication?
+    private let observesForeground:Bool
     private let services:Services
     private let terminalIdentity:TerminalProcessIdentity?
     public init(ownerPID:Int32,bundleID:String,services:Services?=nil) {
@@ -81,8 +75,7 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
         application=AXUIElementCreateApplication(ownerPID)
         self.services=services ?? .live
         terminalIdentity=services==nil && bundleID==TerminalProcessLookup.bundleID ? TerminalProcessLookup.identity(pid:ownerPID):nil
-        // Injected adapters cannot acquire a path to real focus-changing UI.
-        originalApplication=services == nil ? NSWorkspace.shared.frontmostApplication:nil
+        observesForeground=services == nil
     }
     public static func terminal(owner suppliedOwner:TerminalProcessIdentity? = nil) throws -> TerminalNativeTabReader {
         let owner=try suppliedOwner ?? TerminalProcessLookup.running()
@@ -113,8 +106,6 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
         elements.append(element);return elements.count
     }
     private func group(_ window:AXUIElement,deadline:TimeInterval) throws -> TerminalNativeTabGroup? {
-        // The native tab bar is a direct window child. Never descend into a
-        // terminal text area, scrollback or an application-rendered TUI.
         let children=try attribute(window,kAXChildrenAttribute,deadline:deadline) as? [AXUIElement] ?? []
         guard children.count<=256 else {throw AppError.message("Terminal 창의 탭 표시를 확인하지 못했습니다.")}
         var groups:[TerminalNativeTabGroup]=[]
@@ -141,9 +132,32 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
         guard groups.count<=1 else {throw AppError.message("Terminal의 탭 묶음을 구분하지 못했습니다.")}
         return groups.first
     }
+    private func rememberFocus(deadline:TimeInterval) throws {
+        originalWindow=nil
+        if observesForeground {originalApplication=NSWorkspace.shared.frontmostApplication}
+        if let window=try attribute(application,kAXFocusedWindowAttribute,deadline:deadline),CFGetTypeID(window)==AXUIElementGetTypeID() {
+            originalWindow=(window as! AXUIElement)
+        }
+    }
+
+    func currentSelections(_ original:[TerminalNativeTabGroup]) throws -> [TerminalNativeTabGroup] {
+        try check()
+        let deadline=ProcessInfo.processInfo.systemUptime+3
+        try rememberFocus(deadline:deadline)
+        var result:[TerminalNativeTabGroup]=[]
+        for var state in original {
+            let bar=elements[state.id-1]
+            guard let value=try attribute(bar,kAXValueAttribute,deadline:deadline), CFGetTypeID(value)==AXUIElementGetTypeID(),
+                  let selected=state.tabs.first(where:{CFEqual(elements[$0-1],value)}) else {return try groups()}
+            state.selected=selected
+            result.append(state)
+        }
+        return result
+    }
+
     public func groups() throws -> [TerminalNativeTabGroup] {
         try check();let deadline=ProcessInfo.processInfo.systemUptime+3
-        if let window=try attribute(application,kAXFocusedWindowAttribute,deadline:deadline),CFGetTypeID(window)==AXUIElementGetTypeID() {originalWindow=(window as! AXUIElement)}
+        try rememberFocus(deadline:deadline)
         guard let windows=try attribute(application,kAXWindowsAttribute,deadline:deadline) as? [AXUIElement] else {throw AppError.message("Terminal의 접근성 창 목록을 확인하지 못했습니다. 현재 창을 다시 불러와주세요.")}
         guard windows.count<=512 else {throw AppError.message("확인할 Terminal 창이 너무 많습니다.")}
         var result:[TerminalNativeTabGroup]=[]
@@ -157,8 +171,6 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
         guard let window=try attribute(application,kAXFocusedWindowAttribute,deadline:deadline),CFGetTypeID(window)==AXUIElementGetTypeID() else {throw AppError.message("선택한 Terminal 창을 확인하지 못했습니다.")}
         return try group(window as! AXUIElement,deadline:deadline)
     }
-    /// Select an already identified tab in the current operation. When supplied,
-    /// expected must still be the focused group before the single AX action.
     public func select(_ state:TerminalNativeTabGroup,expected:TerminalNativeTabGroup? = nil) throws {
         try check()
         guard services.foreground(ownerPID) else {throw AppError.message("확인 중 앱 초점이 바뀌었습니다. Terminal의 선택 탭을 확인한 뒤 다시 불러와주세요.")}
@@ -195,7 +207,6 @@ public final class TerminalNativeTabReader:@unchecked Sendable {
         }
     }
     public func restore(_ original:[TerminalNativeTabGroup]) throws {
-        // Every AX read/action remains subject to macOS authorization.
         try check()
         guard services.foreground(ownerPID) else {throw AppError.message("확인 중 앱 초점이 바뀌었습니다. Terminal의 선택 탭을 확인한 뒤 다시 불러와주세요.")}
         for state in original {try select(state)}
@@ -217,32 +228,43 @@ public enum TerminalProfileNativeCapture {
     }
     public static func capture(_ rows:[TerminalProfileTabSnapshot],environment:Environment) throws -> [TerminalProfileTabSnapshot] {
         let original=try environment.groups()
+        return try capture(rows,original:original) {row in
+            let state:TerminalNativeTabGroup?
+            do {
+                guard try environment.focus(row.tty)==row.windowID else {throw AppError.message("Terminal 창이 바뀌었습니다. 다시 불러와주세요.")}
+                state=try environment.focusedGroup()
+            }
+            catch {try? environment.restore(original);throw error}
+            try environment.restore(original)
+            return state
+        }
+    }
+
+    static func capture(_ rows:[TerminalProfileTabSnapshot],original:[TerminalNativeTabGroup],
+                        visit:(TerminalProfileTabSnapshot) throws -> TerminalNativeTabGroup?) throws -> [TerminalProfileTabSnapshot] {
         guard original.allSatisfy(\.isValid),Set(original.map(\.id)).count==original.count else {throw AppError.message("Terminal 탭 묶음이 바뀌었습니다. 다시 불러와주세요.")}
         guard !original.isEmpty else {return rows}
-        var states:[String:TerminalNativeTabGroup]=[:]
-        do {
-            for row in rows {
-                try Task.checkCancellation()
-                guard try environment.focus(row.tty)==row.windowID else {throw AppError.message("Terminal 창이 바뀌었습니다. 다시 불러와주세요.")}
-                if let state=try environment.focusedGroup() {
-                    guard state.isValid,let baseline=original.first(where:{$0.id==state.id}),baseline.tabs==state.tabs else {throw AppError.message("Terminal 탭 순서가 바뀌었습니다. 다시 불러와주세요.")}
-                    states[row.tty]=state
-                }
+        var windows=Set<UInt32>(),states:[String:TerminalNativeTabGroup]=[:]
+        let byWindow=Dictionary(grouping:rows,by:\.windowID)
+        for row in rows where windows.insert(row.windowID).inserted {
+            try Task.checkCancellation()
+            if let state=try visit(row) {
+                guard state.isValid,let baseline=original.first(where:{$0.id==state.id}),baseline.tabs==state.tabs else {throw AppError.message("Terminal 탭 순서가 바뀌었습니다. 다시 불러와주세요.")}
+                for member in byWindow[row.windowID] ?? [] {states[member.tty]=state}
             }
-        } catch {try? environment.restore(original);throw error}
-        try environment.restore(original)
+        }
         var result=rows
-        // Preserve unrelated independent windows and flatten any legacy tabs
-        // within the native group in their original order.
         let grouped=Dictionary(grouping:rows.filter {states[$0.tty] != nil},by:{states[$0.tty]!.id})
         for (id,members) in grouped {
             guard let baseline=original.first(where:{$0.id==id}),let representative=members.min(by:{$0.windowOrder<$1.windowOrder}) else {continue}
+            let bounds=members.first(where: {states[$0.tty]?.selected==baseline.selected && $0.bounds != nil})?.bounds ?? members.compactMap(\.bounds).first
             let ordered=members.sorted {a,b in
                 let left=states[a.tty]!,right=states[b.tty]!
                 return (baseline.tabs.firstIndex(of:left.selected)!,a.tabOrder)<(baseline.tabs.firstIndex(of:right.selected)!,b.tabOrder)
             }
             for (order,row) in ordered.enumerated() {
                 guard let index=result.firstIndex(where:{$0.tty==row.tty}) else {continue}
+                result[index].bounds=bounds
                 result[index].windowID=representative.windowID;result[index].windowOrder=representative.windowOrder
                 result[index].tabOrder=order;result[index].selected=row.selected && states[row.tty]!.selected==baseline.selected
             }

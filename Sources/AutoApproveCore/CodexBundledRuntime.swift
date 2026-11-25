@@ -2,8 +2,6 @@ import Foundation
 import Darwin
 import CryptoKit
 
-/// Launch only bytes from the official release pinned in the signed app's
-/// resources. A runtime's own manifest cannot attest or select its executable.
 enum CodexBundledRuntime {
     struct Release:Decodable,Sendable {
         let format:Int
@@ -13,9 +11,6 @@ enum CodexBundledRuntime {
         let target:String
         let files:[String:String]
         static func bundled()throws->Self {
-            // The packaged app keeps the resource bundle in Contents/Resources.
-            // SPM's Bundle.module traps when it cannot find the bundle there, so
-            // check the packaged location first, as RemoteWebVersion does.
             let packaged=Bundle.main.resourceURL?.appendingPathComponent("AutoApprove_AutoApproveCore.bundle/CodexOfficialRelease.json")
             let url:URL
             if let packaged, FileManager.default.fileExists(atPath:packaged.path) {
@@ -29,9 +24,16 @@ enum CodexBundledRuntime {
     }
     private struct Package:Decodable {let version:String,target:String,entrypoint:String}
     fileprivate struct Identity:Equatable,Sendable {
-        let device:dev_t,inode:ino_t,size:off_t,seconds:Int,nanos:Int
-        init(_ info:stat){device=info.st_dev;inode=info.st_ino;size=info.st_size;seconds=info.st_mtimespec.tv_sec;nanos=info.st_mtimespec.tv_nsec}
+        let device:dev_t,inode:ino_t,size:off_t,seconds:Int,nanos:Int,changeSeconds:Int,changeNanos:Int
+        init(_ info:stat){device=info.st_dev;inode=info.st_ino;size=info.st_size;seconds=info.st_mtimespec.tv_sec;nanos=info.st_mtimespec.tv_nsec;changeSeconds=info.st_ctimespec.tv_sec;changeNanos=info.st_ctimespec.tv_nsec}
     }
+    private struct VerifiedFile: Equatable {
+        let identity: Identity
+        let digest: String
+    }
+    private static let digestLock = NSLock()
+    private static var verifiedLargeFiles: [String: VerifiedFile] = [:]
+
     struct Installation:Sendable {
         let executable:String
         let version:String
@@ -63,8 +65,6 @@ enum CodexBundledRuntime {
         guard fstat(fd,&info)==0,info.st_mode&S_IFMT==S_IFREG,[getuid(),0].contains(info.st_uid),info.st_mode&0o022==0 else{close(fd);throw failure}
         return fd
     }
-    /// The injected catalog is an internal fixture seam. Production always uses
-    /// the catalog packaged with AutoApprove, never data from the runtime tree.
     static func inspect(root:String,release supplied:Release?=nil)throws->Installation {
         let release=try supplied ?? Release.bundled()
         #if arch(arm64)
@@ -90,6 +90,13 @@ enum CodexBundledRuntime {
             var before=stat(),after=stat()
             guard fstat(fd,&before)==0,(0...1_073_741_824).contains(before.st_size),
                   relative != "bin/codex" || before.st_mode&0o111 != 0 else{throw failure}
+            try Task.checkCancellation()
+            let cacheable = before.st_size > 1_048_576 && relative != "codex-package.json"
+            let verified = VerifiedFile(identity: Identity(before), digest: expected)
+            if cacheable, digestLock.withLock({ verifiedLargeFiles[path] == verified }) {
+                identities[path] = verified.identity
+                continue
+            }
             let handle=FileHandle(fileDescriptor:fd,closeOnDealloc:false)
             var hash=SHA256(),count=0,metadata=Data()
             while let chunk=try handle.read(upToCount:1_048_576),!chunk.isEmpty {
@@ -100,6 +107,12 @@ enum CodexBundledRuntime {
             }
             guard count==before.st_size,fstat(fd,&after)==0,Identity(before)==Identity(after),
                   hash.finalize().map({String(format:"%02x",$0)}).joined()==expected else{throw failure}
+            if cacheable {
+                digestLock.withLock {
+                    if verifiedLargeFiles.count >= 64 { verifiedLargeFiles.removeAll(keepingCapacity: true) }
+                    verifiedLargeFiles[path] = verified
+                }
+            }
             identities[path]=Identity(before)
             if relative=="codex-package.json" {packageData=metadata}
         }

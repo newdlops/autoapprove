@@ -39,6 +39,39 @@ private final class ProfileReadFixture: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testProfileRestoresGeometryOnceAndDiscardsPreviousTerminalReceipts() async throws {
+        actor Owner {
+            var pid:Int32=31
+            func read()->TerminalProcessIdentity {.init(pid:pid,startedSeconds:1,startedMicroseconds:0)}
+            func restart(){pid+=1}
+        }
+        let owner=Owner(),restorer=TerminalProfileRestorer(terminalProcess:{await owner.read()})
+        let log=FreshProfileLaunchRecorder(),effects=ProfileLaunchEffects()
+        let frame=try JSONDecoder().decode(TerminalWindowBounds.self,from:Data(#"{"x":-1200,"y":40,"width":1100,"height":720}"#.utf8))
+        let group=UUID()
+        var a=profileEntry(),b=profileEntry()
+        a.terminalTab = .init(window:group,windowOrder:0,tabOrder:0,bounds:frame)
+        b.terminalTab = .init(window:group,windowOrder:0,tabOrder:1,bounds:frame)
+        let saved=try TerminalProfileStore.encode(.init(name:"배치",entries:[a,b]))
+        let profile=try TerminalProfileStore.decode(saved)
+        try expectEqual(profile.entries.map(\.terminalTab?.bounds),[frame,frame])
+        func restore() async throws -> [TerminalProfileRestoreResult.Phase] {
+            try await restorer.restore(profile,selected:Set(profile.entries.map(\.id)),active:[],
+                directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await log.launch($0,$1)},placeWindow:{tty,bounds in
+                    try expectEqual(bounds,frame);effects.record(tty)
+                }).map(\.phase)
+        }
+        try expectEqual(try await restore(),[.opened,.opened])
+        try expectEqual(try await restore(),[.alreadyOpen,.alreadyOpen])
+        await owner.restart()
+        try expectEqual(try await restore(),[.opened,.opened])
+        try expectEqual(effects.calls,["/dev/ttys980","/dev/ttys982"])
+        try expectEqual(await log.anchors,[nil,"/dev/ttys980",nil,"/dev/ttys982"])
+        var invalid=a
+        invalid.terminalTab?.bounds=try JSONDecoder().decode(TerminalWindowBounds.self,from:Data(#"{"x":0,"y":0,"width":-1,"height":500}"#.utf8))
+        try expectThrows(invalid.validated())
+    }
+
     func testTerminalProfilesMultiplePrivateFilesAndRestart() throws {
         let directory=FileManager.default.temporaryDirectory.appendingPathComponent("aa-profiles-"+UUID().uuidString)
         defer {try? FileManager.default.removeItem(at:directory)}
@@ -60,7 +93,6 @@ extension ApprovalTests {
         try expectEqual(try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(second.id))).entries,second.entries)
         let json=String(decoding:try TerminalProfileStore.encode(first),as:UTF8.self)
         for key in ["pid","tty","token","password","prompt","command","transcript"] {try expect(!json.contains("\""+key+"\""),"Profiles contain resumable metadata only")}
-        // An app that currently discovers no processes never writes over snapshots.
         try expectEqual(try TerminalProfileStore(directory:directory).list().profiles.count,3)
     }
 
@@ -205,7 +237,6 @@ extension ApprovalTests {
         try expectEqual(failed.first?.phase,.needsReview)
         let retry=try await restorer.restore(uncertainProfile,selected:[uncertain.id],active:[],directoryExists:{_ in true},launch:{entry,_ in await opened.add(entry.key);return "/dev/fixture-profile"})
         try expectEqual(retry.first?.phase,.needsReview);try expect(retry.first?.detail.contains("lost acknowledgement") == true,"Keep the original failure visible after retrying");try expectEqual(await opened.keys.count,1)
-        // A failed entry must not move its siblings into a different window.
         for knownNotSent in [true,false] {
             let batchRestorer=TerminalProfileRestorer(),recorder=FreshProfileLaunchRecorder(),window=UUID()
             var batch=(0..<3).map {_ in profileEntry()}
@@ -270,8 +301,6 @@ extension ApprovalTests {
         let again=try await restorer.restore(profile,selected:selected,active:[],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await recorder.launch($0,$1)})
         try expectEqual(again.map(\.phase),[.needsReview,.needsReview,.alreadyOpen,.alreadyOpen])
         try expectEqual(await recorder.anchors.count,2,"Retry cannot multiply an unconfirmed first window")
-        // A fresh exact live binding resolves the unknown first window without
-        // relaunching its conversation; only its remaining tab is added there.
         let connected=try await restorer.restore(profile,selected:selected,active:[first],activeTerminalTTYs:[first.key:"/dev/ttys979"],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await recorder.launch($0,$1)})
         try expectEqual(connected.map(\.phase),[.alreadyOpen,.opened,.alreadyOpen,.alreadyOpen])
         anchors=await recorder.anchors;try expectEqual(anchors.last!,"/dev/ttys979")
@@ -289,7 +318,6 @@ extension ApprovalTests {
         })
         try expectEqual(results.map(\.phase),[.opened,.failed,.needsReview,.opened])
         try expectEqual(await recorder.anchors.count,2,"An unknown tab must not create more tabs or windows in that saved window")
-        // Once the user explicitly retries, retain the known window anchor.
         let retry=try await restorer.restore(profile,selected:Set(entries.map(\.id)),active:[],directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await recorder.launch($0,$1)})
         try expectEqual(retry.map(\.phase),[.alreadyOpen,.opened,.opened,.alreadyOpen])
         let anchors=await recorder.anchors
@@ -468,8 +496,6 @@ extension ApprovalTests {
         _ = try await TerminalProfileRestorer().restore(profile,selected:Set(profile.entries.map(\.id)),active:[],directoryExists:{_ in true},launch:{try await log.launch($0,$1)})
         for id in ids {try expect(await log.commands.contains {$0.contains("'resume' '"+id+"'")})}
         for index in sessions.indices {sessions[index].terminalTitle=titles[index]}
-        // Discovery preserves existing presentation titles; a fresh engine
-        // seeds the equivalent current titles supplied by screen observation.
         let activeEngine=try ApprovalEngine(paths:AppPaths(directory:directory.appendingPathComponent("active")),questionTransport:transport,processReader:{records},codexQueue:queue)
         defer {activeEngine.stop()};activeEngine.updateDiscovery(sessions,records:records)
         let active=try await activeEngine.terminalProfileCandidates(includeLayout:false)

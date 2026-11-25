@@ -1,4 +1,3 @@
-// Count scripting API requests using production-generated scripts. No Terminal access.
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
 import {mkdir,readFile,writeFile} from 'node:fs/promises';
@@ -67,6 +66,37 @@ function check(scenario,{placeholder=false}={}){
   assert.equal(activations,3);assert.equal(sleeps,0);
   return {existing:scenario.existing,stages,requests:Object.values(stages).reduce((total,stage)=>total+Object.values(stage).reduce((a,b)=>a+b,0),0),commands};
 }
+function capture(scenario,{placeholder=false,changed=false}={}) {
+  const ids=scenario.previous.map((_,i)=>i+77);
+  const rows=scenario.previous.map(tty=>[tty]);
+  ids.push(10000);
+  rows.push([]);
+  let ttyReads=0,individual=0;
+  const windows={
+    id:()=>placeholder ? [null,...ids] : ids,
+    tabs:{tty:()=>{ttyReads++;return changed && ttyReads>1 ? rows.slice().reverse():rows;},
+      currentSettings:{name:()=>rows.map(tabs=>tabs.map(()=>'Pro'))},
+      customTitle:()=>rows.map(tabs=>tabs.map(()=>null))},
+    selectedTab:{tty:()=>rows.map(tabs=>tabs[0]??null)},
+    byId:id=>{
+      const i=ids.indexOf(id),tabs=rows[i];
+      return {tabs:{tty:()=>{individual++;return tabs;},currentSettings:{name:()=>tabs.map(()=>'Pro')},customTitle:()=>tabs.map(()=>null)},
+        selectedTab:()=>tabs.length ? {tty:()=>tabs[0]}:null};
+    }
+  };
+  const app={running:()=>true,windows};
+  return {result:JSON.parse(vm.runInNewContext(scenario.capture,{Application:()=>app},{timeout:2000})),ttyReads,individual};
+}
+
+for(const scenario of scripts.filter(value=>value.capture)){
+  const fast=capture(scenario);
+  assert.deepEqual(fast.result.map(row=>row.tty),scenario.previous);
+  assert.equal(fast.ttyReads,2);
+  assert.equal(fast.individual,0);
+  assert.deepEqual(capture(scenario,{placeholder:true}).result,fast.result);
+  assert.throws(()=>capture(scenario,{changed:true}));
+}
+
 const cases=scripts.map(check),recordOnly=process.argv.includes('--record-only');
 if(!recordOnly){
   for(const result of cases){
@@ -80,7 +110,6 @@ if(!recordOnly){
     assert.equal(result.requests,cases[0].requests,'Client request count must stay fixed through 128 tabs');
   }
 }
-// Terminal can emit a null scripting window and omit it from bulk TTYs.
 const placeholder = check(scripts[1], {placeholder:true});
 for (const name of ['prepare','confirm','select']) {
   assert.equal(placeholder.stages[name].bulkTTY || 0, 0);

@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CoreGraphics
 
 public struct TerminalProfileTabLayout: Codable, Equatable, Sendable {
     public var window:UUID
@@ -8,11 +9,12 @@ public struct TerminalProfileTabLayout: Codable, Equatable, Sendable {
     public var selected:Bool
     public var settingsName:String?
     public var customTitle:String?
-    public init(window:UUID,windowOrder:Int,tabOrder:Int,selected:Bool=false,settingsName:String?=nil,customTitle:String?=nil) {
-        self.window=window;self.windowOrder=windowOrder;self.tabOrder=tabOrder;self.selected=selected;self.settingsName=settingsName;self.customTitle=customTitle
+    public var bounds:TerminalWindowBounds?
+    public init(window:UUID,windowOrder:Int,tabOrder:Int,selected:Bool=false,settingsName:String?=nil,customTitle:String?=nil,bounds:TerminalWindowBounds?=nil) {
+        self.window=window;self.windowOrder=windowOrder;self.tabOrder=tabOrder;self.selected=selected;self.settingsName=settingsName;self.customTitle=customTitle;self.bounds=bounds
     }
     public func validated() throws -> Self {
-        guard (0..<512).contains(windowOrder),(0..<4096).contains(tabOrder),
+        guard bounds.map({ $0.profileRect != nil }) ?? true, (0..<512).contains(windowOrder),(0..<4096).contains(tabOrder),
               [settingsName,customTitle].allSatisfy({value in value.map {$0.count<=256 && !$0.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)} ?? true}),
               settingsName.map({!$0.isEmpty}) ?? true else {throw AppError.message("Terminal의 창·탭 순서와 설정 프로필을 확인해주세요.")}
         return self
@@ -20,7 +22,6 @@ public struct TerminalProfileTabLayout: Codable, Equatable, Sendable {
     public var label:String {"창 \(windowOrder+1) · 탭 \(tabOrder+1)"+(selected ? " · 선택 탭":"")}
 }
 
-/// A workspace CLI or a specific conversation, never a saved shell command.
 public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
     public enum Host: String, Codable, Sendable, CaseIterable { case terminal, iterm }
     public var id: UUID
@@ -62,7 +63,6 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
     private static func path(_ value: String) -> Bool {
         value.hasPrefix("/") && value.utf8.count <= 4096 && !value.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)
     }
-    /// Fixed CLI grammar, with every user value quoted. No prompt or approval flag is replayed.
     public func resumeCommand(nativeRuntimeRoot:String?=nil) throws -> String {
         try resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:nil)
     }
@@ -107,8 +107,6 @@ public struct TerminalSessionProfile: Codable, Equatable, Identifiable, Sendable
     public init(id: UUID = UUID(), name: String, savedAt: Date = Date(), entries: [TerminalProfileEntry], groups:[TerminalProfileGroup]?=nil) {
         self.id=id;self.name=name;self.savedAt=savedAt;self.entries=entries;self.groups=groups
     }
-    /// Editing/capture requires an explicit choice before an unresolved
-    /// conversation becomes a new CLI. Legacy files remain readable unchanged.
     public func validatedForSaving(newCLIIDs:Set<UUID>) throws -> Self {
         guard newCLIIDs.isSubset(of:Set(entries.map(\.id))) else {throw AppError.message("새 CLI로 저장할 항목을 다시 확인해주세요.")}
         var profile=self
@@ -160,7 +158,6 @@ public struct TerminalProfileListing {
     public var warnings: [String]
 }
 
-/// Named snapshots change only on explicit save/import. Opening an empty app cannot erase them.
 public struct TerminalProfileStore: Sendable {
     public let directory: URL
     public static let maximumBytes=512*1024
@@ -252,9 +249,6 @@ public struct CodexProfileConversation: Identifiable, Sendable {
     public init(id:String,title:String) {self.id=id;self.title=title}
 }
 
-/// The daemon can own many threads while the TUI owns no rollout descriptor.
-/// Bind only a unique full server name rendered by this terminal in this folder.
-/// A single folder candidate, preview or newest conversation is insufficient.
 public enum CodexProfileConversationBinding {
     public static func terminalName(_ title:String?,cwd:String)->String? {
         guard var title=title?.precomposedStringWithCanonicalMapping.trimmingCharacters(in:.whitespacesAndNewlines),
@@ -285,17 +279,23 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
     public var id: UUID
     public var phase: Phase
     public var detail: String
-    /// This restore attempt's tab receipt, never part of the saved profile.
     public var tty: String?
     public init(id:UUID,phase:Phase,detail:String,tty:String?=nil) {self.id=id;self.phase=phase;self.detail=detail;self.tty=tty}
 }
 
 @MainActor public final class TerminalProfileRestorer {
     public private(set) var busy=false
-    // nil TTY means an ambiguous write: it cannot be replayed automatically.
-    private struct Receipt {var tty:String?;var failure:String? = nil}
+    private struct Receipt {
+        var tty:String?
+        var failure:String?
+        var terminal:TerminalProcessIdentity?
+    }
     private var dispatched:[String:Receipt]=[:]
-    public init() {}
+    private let terminalProcess: @Sendable () async -> TerminalProcessIdentity?
+    public init(terminalProcess: @escaping @Sendable () async -> TerminalProcessIdentity? = {
+        await Task.detached(priority:.userInitiated) { try? TerminalProcessLookup.running() }.value
+    }) { self.terminalProcess = terminalProcess }
+
     public func restore(_ profile: TerminalSessionProfile,selected: Set<UUID>,active: [TerminalProfileEntry],
                         activeTerminalTTYs:[String:String]=[:],
                         directoryExists: @Sendable (String)->Bool = {var directory:ObjCBool=false;return FileManager.default.fileExists(atPath:$0,isDirectory:&directory)&&directory.boolValue},
@@ -304,6 +304,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                             try await Task.detached(priority:.userInitiated) { Set(try ProcessDiscovery.read().map { "/dev/" + $0.tty }) }.value
                         },
                         launch: @Sendable (TerminalProfileEntry,String?) async throws -> String,
+                        placeWindow: @Sendable (String, TerminalWindowBounds) async throws -> Void = { try await TerminalProfileLauncher.placeWindow(tty:$0,bounds:$1) },
                         selectTab:@Sendable (String) async throws -> Void = {_ in},
                         progress: @MainActor (TerminalProfileRestoreResult)->Void = {_ in}) async throws -> [TerminalProfileRestoreResult] {
         guard !busy else {throw AppError.message("이미 프로필을 복원하고 있습니다.")}
@@ -315,7 +316,10 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
             let right=(b.element.host == .terminal ? 0:1,b.element.terminalTab?.windowOrder ?? 512,b.element.terminalTab?.tabOrder ?? b.offset)
             return left==right ? a.offset<b.offset:left<right
         }.map(\.element)
+        var terminal = entries.contains(where: { $0.host == .terminal }) ? await terminalProcess() : nil
         let activeKeys=Set(active.map(\.key))
+        let activeByTTY = Dictionary(grouping:active.filter { $0.host == .terminal && $0.resumesConversation && activeTerminalTTYs[$0.key] != nil },
+                                     by:{ activeTerminalTTYs[$0.key]! })
         var anchors:[String:String]=[:],knownTTYs:[String:String]=[:],openedGroups=Set<String>()
         var unresolvedGroups=Set<String>(),unconfirmedTabs=Set<String>()
         var checkedTTYs: Set<String>?
@@ -329,6 +333,11 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
             if activeKeys.contains(entry.key),let key=group(entry) {unresolvedGroups.insert(key)}
             if let receipt=dispatched[entry.key] {
                 if let tty=receipt.tty {
+                    if entry.host == .terminal {
+                        let restarted = receipt.terminal.map { old in terminal.map { $0 != old } ?? false } ?? false
+                        let reused = entry.resumesConversation && activeByTTY[tty]?.contains(where: { $0.key != entry.key }) == true
+                        if restarted || reused {dispatched.removeValue(forKey:entry.key);continue}
+                    }
                     let open: Bool?
                     if let terminalIsOpen { open = try? await terminalIsOpen(tty) }
                     else {
@@ -374,10 +383,19 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
             } else {
                 dispatched[entry.key]=Receipt(tty:nil)
                 do {
-                    let tty=try await launch(entry,key.flatMap {anchors[$0]});dispatched[entry.key]=Receipt(tty:tty);knownTTYs[entry.key]=tty
+                    let anchor = key.flatMap {anchors[$0]}
+                    let tty=try await launch(entry,anchor)
+                    if entry.host == .terminal, terminal == nil {terminal = await terminalProcess()}
+                    dispatched[entry.key]=Receipt(tty:tty,terminal:entry.host == .terminal ? terminal:nil)
+                    knownTTYs[entry.key]=tty
                     if let key {anchors[key]=tty;openedGroups.insert(key)}
                     let detail=entry.resumesConversation ? (entry.host == .terminal ? "Terminal에 대화 이어하기 명령을 전달했습니다.":"새 터미널에 저장한 대화의 이어하기 명령을 전달했습니다."):"저장한 폴더에서 새 CLI 실행 명령을 전달했습니다."
-                    result = .init(id:entry.id,phase:.opened,detail:detail,tty:tty)
+                    var placementDetail = ""
+                    if anchor == nil, entry.host == .terminal, let bounds = entry.terminalTab?.bounds {
+                        do { try await placeWindow(tty,bounds) }
+                        catch { placementDetail = " 창 위치 복원 실패 · " + error.localizedDescription }
+                    }
+                    result = .init(id:entry.id,phase:.opened,detail:detail+placementDetail,tty:tty)
                 }
                 catch {
                     let diagnostics=(error as? RemoteHTTPError)?.diagnostics
@@ -461,34 +479,69 @@ public enum TerminalProfileLauncher {
             } catch {
                 throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["delivery":"not_started"])
             }
-            var targetTTY:String?
-            if entry.host == .terminal,let anchorTTY {
-                // Failure to confirm a tab is never permission to change the
-                // saved window layout. Preserve the opener's delivery diagnostics.
-                targetTTY=try openTab(anchorTTY,entry.terminalTab?.settingsName)
+            func deliver() throws -> String {
+                var targetTTY:String?
+                if entry.host == .terminal,let anchorTTY {
+                    targetTTY=try openTab(anchorTTY,entry.terminalTab?.settingsName)
+                }
+                try launchRuntime?.verifyUnchanged()
+                let body=try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nil,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed,standalone:launchRuntime?.standalone ?? false)
+                let text:String
+                do {
+                    if let execute {text=try execute(body,entry.host)}
+                    else {text=try AutomationScript.run(body,app:entry.host == .iterm ? "iTerm2":"Terminal",denied:entry.host == .iterm ? .automationDenied("iTerm2"):.permissionDenied)}
+                }
+                catch let error as TerminalAdapterError {
+                    throw RemoteHTTPError(403,error.localizedDescription,diagnostics:targetTTY==nil ? ["delivery":"not_started"]:nil)
+                }
+                guard let object=try JSONSerialization.jsonObject(with:Data(text.utf8)) as? JSONObject else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
+                if let failure=object["error"] as? String {
+                    throw RemoteHTTPError(409,failure,diagnostics:object["commandAttempted"] as? Bool == false ? ["command_delivery":"not_started"]:nil)
+                }
+                guard let tty=object["tty"] as? String,validTTY(tty) else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
+                return tty
             }
-            try launchRuntime?.verifyUnchanged()
-            let body=try script(entry,targetTTY:targetTTY,nativeRuntimeRoot:nil,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed,standalone:launchRuntime?.standalone ?? false)
-            let text:String
+            guard execute == nil, entry.host == .terminal else { return try deliver() }
             do {
-                if let execute {text=try execute(body,entry.host)}
-                else {text=try AutomationScript.run(body,app:entry.host == .iterm ? "iTerm2":"Terminal",denied:entry.host == .iterm ? .automationDenied("iTerm2"):.permissionDenied)}
+                return try AutomationIPC.shared.runInput(host:"Terminal",budget:24,admissionWait:3,body:deliver)
+            } catch let error as AutomationIPC.InputNotStarted {
+                throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["delivery":"not_started"])
             }
-            catch let error as TerminalAdapterError {
-                throw RemoteHTTPError(403,error.localizedDescription,diagnostics:targetTTY==nil ? ["delivery":"not_started"]:nil)
-            }
-            guard let object=try JSONSerialization.jsonObject(with:Data(text.utf8)) as? JSONObject else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
-            if let failure=object["error"] as? String {
-                throw RemoteHTTPError(409,failure,diagnostics:object["commandAttempted"] as? Bool == false ? ["command_delivery":"not_started"]:nil)
-            }
-            guard let tty=object["tty"] as? String,validTTY(tty) else {throw AppError.message("복원한 터미널을 확인하지 못했습니다.")}
-            return tty
         }.value
     }
+    public static func placeWindow(tty:String,bounds:TerminalWindowBounds) async throws {
+        guard validTTY(tty) else {throw AppError.message("창 위치를 적용할 탭을 확인하지 못했습니다.")}
+        try await Task.detached(priority:.userInitiated) {
+            guard let frame=TerminalProfileWindowPlacement.fit(bounds,displays:TerminalProfileWindowPlacement.displays()) else {
+                throw AppError.message("창을 배치할 화면을 확인하지 못했습니다.")
+            }
+            let target=try AutomationScript.literal(tty)
+            let placement=try AutomationScript.literal(["x":frame.minX,"y":frame.minY,"width":frame.width,"height":frame.height])
+            let script="""
+            (()=>{
+              const app=Application('com.apple.Terminal');
+              if(!app.running())throw Error('Terminal 창이 닫혔습니다.');
+              \(TerminalProfileScriptQueries.inventory)
+              const row=inventory().find(item=>item.tty===\(target));
+              if(!row)throw Error('복원한 Terminal 탭이 닫혔습니다.');
+              const {window}=exactTab(row);
+              if(window.selectedTab().tty()!==row.tty)throw Error('복원한 Terminal 창의 선택이 바뀌었습니다.');
+              window.bounds=\(placement);
+              return 'placed';
+            })();
+            """
+            _ = try AutomationIPC.shared.run(host:"Terminal",readOnly:false,budget:5,admissionWait:3) {
+                try AutomationScript.run(script,app:"Terminal",denied:.permissionDenied,timeout:5)
+            }
+        }.value
+    }
+
     public static func selectTab(_ tty:String) async throws {
         guard validTTY(tty) else {throw AppError.message("선택할 Terminal 탭을 확인하지 못했습니다.")}
         _ = try await Task.detached(priority:.utility) {
-            try AutomationScript.run(selectionScript(tty),app:"Terminal",denied:.permissionDenied)
+            try AutomationIPC.shared.run(host:"Terminal",readOnly:false,budget:6,admissionWait:3) {
+                try AutomationScript.run(selectionScript(tty),app:"Terminal",denied:.permissionDenied,timeout:6)
+            }
         }.value
     }
     public static func selectionScript(_ tty:String) throws -> String {

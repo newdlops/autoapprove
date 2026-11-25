@@ -1,8 +1,6 @@
 import Foundation
 import CoreGraphics
 
-/// Read the current scripting topology in a fixed number of Apple events.
-/// Window IDs bracket the bulk TTY reply; exact predicates bind any later action.
 enum TerminalProfileScriptQueries {
     static let windowIDs = """
     function realWindowIDs(ids){
@@ -17,8 +15,6 @@ enum TerminalProfileScriptQueries {
 
     function inventory(){
       const ids=app.windows.id(),real=realWindowIDs(ids);
-      // Terminal can return a null window ID and omit that slot in the
-      // bulk TTY result. Resolve real windows by ID when alignment is lost.
       const groups=real.length===ids.length
         ? app.windows.tabs.tty()
         : real.map(id=>app.windows.byId(id).tabs.tty());
@@ -52,7 +48,6 @@ enum TerminalProfileScriptQueries {
     """
 }
 
-/// Native IDs are used only during capture. Saved files contain relative groups.
 public struct TerminalProfileTabSnapshot:Codable,Equatable,Sendable {
     public var tty:String
     public var windowID:UInt32
@@ -61,6 +56,7 @@ public struct TerminalProfileTabSnapshot:Codable,Equatable,Sendable {
     public var selected:Bool
     public var settingsName:String?
     public var customTitle:String?
+    public var bounds:TerminalWindowBounds?
     public var selectedTTY:String?
     public init(tty:String,windowID:UInt32,windowOrder:Int,tabOrder:Int,selected:Bool=false,settingsName:String?=nil,customTitle:String?=nil,selectedTTY:String?=nil) {
         self.tty=tty;self.windowID=windowID;self.windowOrder=windowOrder;self.tabOrder=tabOrder;self.selected=selected;self.settingsName=settingsName;self.customTitle=customTitle
@@ -69,16 +65,12 @@ public struct TerminalProfileTabSnapshot:Codable,Equatable,Sendable {
 }
 
 public enum TerminalProfileTopology {
-    /// Verify the preceding selection and select the next exact TTY in one
-    /// scripting process. Capture never needs the opener's all-TTY inventory.
     public static func focusScript(tty:String,windowID:UInt32? = nil,previous:TerminalWindowMetadata? = nil) throws -> String {
         guard TerminalProfileLauncher.validTTY(tty),windowID.map({$0>0}) ?? true else {throw AppError.message("선택할 Terminal 탭을 확인하지 못했습니다.")}
         let target=try AutomationScript.literal(tty)
         let preceding=try AutomationScript.literal(previous.map {["tty":$0.tty,"windowID":$0.windowID] as JSONObject} as Any? ?? NSNull())
         let lookup:String
         if let windowID {
-            // The initial inventory already bound this TTY to this scripting
-            // window. Query only that exact window, never its changing index.
             lookup="""
             const wantedWindow=app.windows.byId(\(windowID));
             if(!wantedWindow.exists()||Number(wantedWindow.id())!==\(windowID))throw Error('선택할 Terminal 창이 닫혔거나 바뀌었습니다.');
@@ -116,87 +108,129 @@ public enum TerminalProfileTopology {
           const app=Application('com.apple.Terminal'),wanted=new Set(\(targets)),result=[];
           if(!app.running())throw Error('Terminal이 실행 중이 아닙니다.');
           \(TerminalProfileScriptQueries.windowIDs)
-          const ids=app.windows.id();
-          realWindowIDs(ids).forEach((windowID,windowOrder)=>{
-            const window=app.windows.byId(windowID),matches=[];
-            window.tabs().forEach((tab,tabOrder)=>{
-              const tty=tab.tty();if(wanted.has(tty))matches.push({tab,tty,tabOrder});
-            });
-            if(!matches.length)return;
-            const selectedTab=window.selectedTab(),selected=selectedTab ? selectedTab.tty():null;
-            matches.forEach(({tab,tty,tabOrder})=>{
-              const settingsName=String(tab.currentSettings().name()),customTitle=String(tab.customTitle());
-              result.push({tty,windowID,windowOrder,tabOrder,selected:tty===selected,selectedTTY:selected,settingsName,customTitle:customTitle||null});
+          const windows=app.windows,ids=windows.id(),real=realWindowIDs(ids);
+          const readTTYs=()=>real.length===ids.length ? windows.tabs.tty() : real.map(id=>windows.byId(id).tabs.tty());
+          const ttys=readTTYs();
+          if(!Array.isArray(ttys)||ttys.length!==real.length||ttys.some(tabs=>!Array.isArray(tabs)))
+            throw Error('Terminal 창·탭 구성을 확인하지 못했습니다.');
+          function bulk(query){
+            if(real.length!==ids.length)return null;
+            try {const values=query(windows);return Array.isArray(values)&&values.length===real.length ? values:null;}
+            catch(error){if(error.errorNumber!==-1728)throw error;return null;}
+          }
+          const selected=bulk(w=>w.selectedTab.tty()),settings=bulk(w=>w.tabs.currentSettings.name()),titles=bulk(w=>w.tabs.customTitle());
+          real.forEach((windowID,w)=>{
+            const tabs=ttys[w];
+            if(!tabs.some(tty=>wanted.has(tty)))return;
+            const window=windows.byId(windowID);
+            let active;
+            if(selected)active=selected[w];
+            else {const tab=window.selectedTab();active=tab ? tab.tty():null;}
+            const names=settings ? settings[w]:window.tabs.currentSettings.name();
+            const labels=titles ? titles[w]:window.tabs.customTitle();
+            if(![names,labels].every(c=>Array.isArray(c)&&c.length===tabs.length)||(active!=null&&!tabs.includes(active)))
+              throw Error('Terminal 탭 순서가 바뀌었습니다.');
+            tabs.forEach((tty,t)=>{
+              if(wanted.has(tty))result.push({tty,windowID,windowOrder:w,tabOrder:t,selected:tty===active,
+                selectedTTY:active,settingsName:names[t],customTitle:labels[t]||null});
             });
           });
-          if(JSON.stringify(ids)!==JSON.stringify(app.windows.id()))throw Error('Terminal 창·탭 구성이 바뀌었습니다.');
+          if(JSON.stringify(ids)!==JSON.stringify(windows.id())||JSON.stringify(ttys)!==JSON.stringify(readTTYs()))
+            throw Error('Terminal 창·탭 구성이 바뀌었습니다.');
           return JSON.stringify(result);
         })();
         """
     }
+
     private static func readRows(_ ttys:[String], timeout:TimeInterval) throws -> [TerminalProfileTabSnapshot] {
         let text=try AutomationScript.run(script(ttys:ttys),app:"Terminal",denied:.permissionDenied,timeout:timeout,readOnly:true)
-        return try JSONDecoder().decode([TerminalProfileTabSnapshot].self,from:Data(text.utf8))
+        let rows=try JSONDecoder().decode([TerminalProfileTabSnapshot].self,from:Data(text.utf8))
+        guard rows.count==ttys.count,Set(rows.map(\.tty))==Set(ttys),Set(ttys).count==ttys.count else {
+            throw AppError.message("Terminal 창·탭 구성이 바뀌었습니다. 다시 불러와주세요.")
+        }
+        return rows
     }
 
     public static func read(ttys:[String]) throws -> [TerminalProfileTabSnapshot] {
         guard !ttys.isEmpty else {return []}
-        return try nativeLayout(readRows(ttys,timeout:min(45,max(8,Double(ttys.count)*1.5))))
+        let gate=AutomationIPC.shared,owner=try TerminalProcessLookup.running()
+        let reader=try TerminalNativeTabReader.terminal(owner:owner)
+        let timeout=min(45,max(8,Double(ttys.count)*1.5))
+        let (rows,original)=try gate.run(host:"Terminal",readOnly:true,budget:timeout+3,admissionWait:3) {
+            var rows=try readRows(ttys,timeout:timeout)
+            let windows=CGWindowListCopyWindowInfo([.optionAll,.excludeDesktopElements],kCGNullWindowID) as? [[String:Any]] ?? []
+            let frames=TerminalProfileWindowPlacement.frames(windows,owner:owner.pid)
+            for index in rows.indices {rows[index].bounds=frames[rows[index].windowID]}
+            return (rows,try reader.groups())
+        }
+        return try TerminalProfileNativeCapture.capture(rows,original:original) {row in
+            try gate.run(host:"Terminal",readOnly:false,budget:12,admissionWait:3) {
+                let before=try reader.currentSelections(original)
+                let tty=row.selectedTTY ?? row.tty
+                guard before.count==original.count,before.allSatisfy({group in original.contains {$0.id==group.id && $0.tabs==group.tabs}}),
+                      TerminalProcessLookup.identity(pid:owner.pid)==owner,
+                      TerminalProfileLauncher.validTTY(tty) else {
+                    throw AppError.message("Terminal 탭 구성이 바뀌었습니다. 다시 불러와주세요.")
+                }
+                let keyboard=TerminalKeyboard.Environment.live
+                let wanted=try AutomationScript.literal(tty)
+                let selected=try AutomationScript.literal(row.selectedTTY as Any? ?? NSNull())
+                let selectedTTY="function selectedTTY(){const tab=window.selectedTab();return tab ? tab.tty():null;}"
+
+                let script="""
+                (()=>{
+                  const app=Application('com.apple.Terminal'),window=app.windows.byId(\(row.windowID));
+                  \(selectedTTY)
+                  if(!window.exists()||Number(window.id())!==\(row.windowID)||selectedTTY()!==\(selected)||
+                     window.tabs.whose({tty:\(wanted)})().length!==1)
+                    throw Error('확인할 Terminal 창이나 선택 탭이 바뀌었습니다.');
+                  const wasMinimized=window.miniaturized();
+                  if(wasMinimized)window.miniaturized=false;
+                  window.index=1;app.activate();
+                  return JSON.stringify({tty:\(wanted),windowID:Number(window.id()),selected:selectedTTY()===\(selected),
+                    minimized:window.miniaturized(),wasMinimized});
+                })();
+                """
+                let text=try keyboard.run(script)
+                struct Selection:Decodable {let wasMinimized:Bool}
+                let selection=try JSONDecoder().decode(Selection.self,from:Data(text.utf8))
+                guard let metadata=try TerminalAdapter.windowMetadata(output:text,tty:tty),metadata.ownerPID==owner.pid,
+                      metadata.windowID==row.windowID,metadata.selected,!metadata.minimized else {
+                    throw AppError.message("선택한 Terminal 탭을 확인하지 못했습니다.")
+                }
+                try TerminalProfileReadiness.wait(message:"선택한 Terminal 탭의 화면 반영을 확인하지 못했습니다.") {
+                    TerminalKeyboard.isFocused(metadata,requiresTextArea:false) ? true:nil
+                }
+                let state:TerminalNativeTabGroup?
+                do {state=try reader.focusedGroup()}
+                catch {
+                    if TerminalKeyboard.isFocused(metadata,requiresTextArea:false) {try? reader.restore(before)}
+                    throw error
+                }
+                guard TerminalKeyboard.isFocused(metadata,requiresTextArea:false) else {throw AppError.message("확인 중 Terminal 선택이 바뀌었습니다.")}
+                if let state {
+                    guard let previous=before.first(where:{$0.id==state.id && $0.tabs==state.tabs}) else {
+                        throw AppError.message("Terminal 탭 순서가 바뀌었습니다. 다시 불러와주세요.")
+                    }
+                    if state != previous {try reader.select(previous,expected:state)}
+                }
+                if selection.wasMinimized {
+                    _ = try keyboard.run("""
+                    const app=Application('com.apple.Terminal'),window=app.windows.byId(\(row.windowID));
+                    \(selectedTTY)
+                    if(!app.frontmost()||!window.exists()||selectedTTY()!==\(selected))throw Error('복원할 Terminal 창이 바뀌었습니다.');
+                    window.miniaturized=true;'restored';
+                    """)
+                }
+                try reader.restore([])
+                return state
+            }
+        }
     }
 
     static func readForProfile(ttys:[String]) async throws -> [TerminalProfileTabSnapshot] {
-        guard !ttys.isEmpty else {return []}
-        let timeout=min(45,max(8,Double(ttys.count)*1.5))
-        let rows=try await AutomationIPC.shared.read(host:"Terminal",budget:timeout,waitForSlot:true) {
-            try readRows(ttys,timeout:timeout)
-        }
-        try Task.checkCancellation()
-        return try await Task.detached(priority:.userInitiated) {try nativeLayout(rows)}.value
-    }
-
-    private static func nativeLayout(_ rows:[TerminalProfileTabSnapshot]) throws -> [TerminalProfileTabSnapshot] {
-        let owner=try TerminalProcessLookup.running(),reader=try TerminalNativeTabReader.terminal(owner:owner)
-        var keyboard=TerminalKeyboard.Environment.live
-        keyboard.metadata={try TerminalAppleEvents.profileWindowMetadata(tty:$0,owner:owner)}
-        let windowIDs=Dictionary(rows.map {($0.tty,$0.windowID)},uniquingKeysWith:{_,_ in 0})
-        guard windowIDs.count==rows.count,windowIDs.values.allSatisfy({$0>0}) else {throw AppError.message("Terminal 창·탭 구성이 바뀌었습니다. 다시 불러와주세요.")}
-        var previous:TerminalWindowMetadata?
-        func confirmFocus() throws {
-            guard let previous else {return}
-            guard let current=try keyboard.metadata(previous.tty),current.windowID==previous.windowID,current.ownerPID==previous.ownerPID,
-                  current.selected,!current.minimized,keyboard.focused(current) else {throw AppError.message("확인 중 Terminal 선택이 바뀌었습니다. 현재 탭을 확인한 뒤 다시 불러와주세요.")}
-        }
-        return try TerminalProfileNativeCapture.capture(rows,environment:.init(groups:{try reader.groups()},focus:{tty in
-            guard TerminalProcessLookup.identity(pid:owner.pid)==owner,let windowID=windowIDs[tty] else {throw AppError.message("탭을 확인하는 동안 Terminal 프로세스가 바뀌었습니다.")}
-            if let previous,!keyboard.focused(previous) {throw AppError.message("확인 중 Terminal 선택이 바뀌었습니다. 현재 탭을 확인한 뒤 다시 불러와주세요.")}
-            let text=try keyboard.run(focusScript(tty:tty,windowID:windowID,previous:previous))
-            guard let metadata=try TerminalAdapter.windowMetadata(output:text,tty:tty),metadata.ownerBundleID=="com.apple.Terminal",
-                  metadata.ownerPID==owner.pid,metadata.windowID==windowID,metadata.tty==tty,metadata.selected,!metadata.minimized else {
-                throw AppError.message("선택한 Terminal 탭을 확인하지 못했습니다. 다시 불러와주세요.")
-            }
-            try TerminalProfileReadiness.wait(message:"선택한 Terminal 탭의 화면 반영을 확인하지 못했습니다.") {keyboard.focused(metadata) ? true:nil}
-            previous=metadata
-            return metadata.windowID
-        },focusedGroup:{try reader.focusedGroup()},restore:{groups in
-            // Restore legacy selections as well as the native selected window.
-            // Never type or run a command while collecting a profile.
-            try confirmFocus()
-            let selections=Array(Set(rows.compactMap(\.selectedTTY)))
-            let target=try AutomationScript.literal(selections)
-            var failure:Error?
-            do {_ = try keyboard.run("""
-                const app=Application('com.apple.Terminal'),wanted=new Set(\(target));
-                \(TerminalProfileScriptQueries.windowIDs)
-                if(app.frontmost())for(const id of realWindowIDs(app.windows.id())){
-                  const window=app.windows.byId(id);
-                  for(const tab of window.tabs())if(wanted.has(tab.tty()))window.selectedTab=tab;
-                }
-                'restored';
-                """)}
-            catch {failure=error}
-            try reader.restore(groups)
-            if let failure {throw failure}
-        }))
+        let work=Task.detached(priority:.userInitiated) {try read(ttys:ttys)}
+        return try await withTaskCancellationHandler(operation:{try await work.value},onCancel:{work.cancel()})
     }
     public static func apply(_ snapshots:[TerminalProfileTabSnapshot],to candidates:[TerminalProfileCandidate]) throws -> [TerminalProfileCandidate] {
         let terminal=candidates.filter {$0.entry.host == .terminal && $0.tty != nil}
@@ -215,7 +249,7 @@ public enum TerminalProfileTopology {
         var result=candidates
         for index in result.indices {
             guard result[index].entry.host == .terminal,let tty=result[index].tty,let row=rows.first(where:{$0.tty==tty}),let group=groups[row.windowID] else {continue}
-            result[index].entry.terminalTab=try TerminalProfileTabLayout(window:group.0,windowOrder:group.1,tabOrder:row.tabOrder,selected:row.selected,settingsName:row.settingsName,customTitle:row.customTitle).validated()
+            result[index].entry.terminalTab=try TerminalProfileTabLayout(window:group.0,windowOrder:group.1,tabOrder:row.tabOrder,selected:row.selected,settingsName:row.settingsName,customTitle:row.customTitle,bounds:row.bounds).validated()
         }
         return result.enumerated().sorted {left,right in
             let a=left.element.entry.terminalTab,b=right.element.entry.terminalTab
@@ -224,8 +258,6 @@ public enum TerminalProfileTopology {
     }
 }
 
-/// Cmd-T is sent only to the verified Terminal process and exact prepared window.
-/// The new TTY is confirmed before any resume command can reach it.
 public enum TerminalProfileTabOpener {
     private struct Prepared:Codable {var tty:String;var windowID:UInt32;var ttys:[String]}
     private static let lock=NSLock()
@@ -284,8 +316,6 @@ public enum TerminalProfileTabOpener {
         let deadline=environment.clock()+8
         func check() throws {
             guard !environment.cancelled(),environment.clock()<deadline else {throw AppError.message("탭 복원 준비가 중단되었습니다.")}
-            // Posting has its own current authorization check. Native AX
-            // reads below prove access and focus before any key is submitted.
             guard environment.postingAllowed() else {throw AppError.message("macOS가 AutoApprove의 새 탭 키 전달을 허용하지 않았습니다. 손쉬운 사용에서 이미 허용했다면 앱을 완전히 종료한 뒤 다시 열어주세요.")}
         }
         do {
@@ -339,10 +369,6 @@ public enum TerminalProfileTabOpener {
                 throw AppError.message("새 탭을 선택한 원래 Terminal 프로세스에서 확인하지 못했습니다.")
             }
             try TerminalProfileReadiness.wait(message:"새 Terminal 탭의 화면 반영을 확인하지 못했습니다.") {environment.focused(newMetadata) ? true:nil}
-            // Adding ANY tab can rebuild the AX bar and its tab objects.
-            // Compare insertion positions and any surviving identities, then
-            // bind the current bar through both exact TTYs below. Old AX
-            // identities are never a prerequisite for the Nth addition.
             stage="새 탭의 창 묶음 확인"
             let anchorIndex=before.flatMap {$0.tabs.firstIndex(of:$0.selected)} ?? 0
             func matchesAddition(_ value:TerminalNativeTabGroup)->Bool {
@@ -361,10 +387,12 @@ public enum TerminalProfileTabOpener {
                 if value==nil,before==nil,newMetadata.windowID==initial.windowID {return .some(nil)}
                 return nil
             }
+            if let added, let before, added.addingOneTab(to:before),
+               try nativeGroup()==added, environment.focused(newMetadata) {
+                return tty
+            }
             if let added {
                 guard matchesAddition(added) else {throw AppError.message("새 탭의 묶음과 순서를 확인하지 못했습니다.")}
-                // A native tab is a different scripting window. Select the
-                // exact anchor to prove both TTYs share the same native bar.
                 var anchorGroup=added;anchorGroup.selected=added.tabs[anchorIndex]
                 try selectNative(anchorGroup,from:added,tty:anchorTTY)
                 guard let anchor=try environment.metadata(anchorTTY),anchor.windowID==initial.windowID,anchor.ownerPID==metadata.ownerPID,
@@ -388,8 +416,6 @@ public enum TerminalProfileTabOpener {
             }
             return tty
         }catch {
-            // This routine can create a tab, but never submits a CLI command.
-            // Preserve the separate uncertainty about the tab itself.
             var diagnostics=["command_delivery":"not_started"]
             if !posted {diagnostics["delivery"]="not_started"}
             else {diagnostics["tab_creation"]="unknown"}
