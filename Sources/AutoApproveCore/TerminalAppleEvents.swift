@@ -279,15 +279,10 @@ public struct TerminalAppleEventReader {
                               selected.allSatisfy({ seen.contains($0) }) else { return [:] }
                         return Dictionary(uniqueKeysWithValues: zip(selected, contents))
                     }
-                    // A structurally invalid or partial batch must not be
-                    // retried on every monitor pass. Empty terminal contents
-                    // still have a TTY key, so an empty/partial map means the
-                    // batch identity check failed; exact-TTY reads below stay
-                    // authoritative for this pass.
-                    if values.count == targets.count && Set(values.keys) == Set(targets) {
+                    if !values.isEmpty {
                         contentsByTTY = values
                     } else {
-                        contentsBatchUnavailable()
+                        slowContentsBatch()
                     }
                 } catch {
                     let status = (error as NSError).code
@@ -511,8 +506,13 @@ enum TerminalAppleEvents {
         return metadata
     }
 
-    /// nil uses the existing script's initial consent/compatibility path. A
-    /// revoked permission or timeout never starts a second read or launches Terminal.
+    static func isTransientReadFailure(_ error: Error) -> Bool {
+        if case AutomationIPC.Failure.timeout = error { return true }
+        if case AutomationIPC.Failure.open = error { return true }
+        if case TerminalReadEventError.timedOut = error { return true }
+        return (error as NSError).code == -1712
+    }
+
     static func screens(ttys: [String], includeTitles: Bool = true, includeCursor: Bool = false,
                         purpose: RemoteTerminalPerformance.NativePurpose = .other, freshTitles: Bool = false) throws -> TerminalSnapshot? {
         guard let application = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first else {

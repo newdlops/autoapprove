@@ -222,7 +222,12 @@ extension ApprovalTests {
         for session in sessions { writer.show(custom, on: session.tty) }
         var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: writer.screen($0.tty)) }) },
             approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { _,_,_,_ in .missingTarget })
-        adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
+        let firstAdmission = DispatchSemaphore(value:0)
+        firstAdmission.signal()
+        adapter.typeLine = { target, text in
+            if firstAdmission.wait(timeout:.now()) == .success { throw AutomationIPC.InputNotStarted(.busy) }
+            return terminal.type(target, text, pid: target.sourcePID ?? 0)
+        }
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.iterm: adapter], isolateByDefault: true)
         defer { engine.stop() }
         engine.groupMailboxPollInterval = 0.05; engine.groupMailboxHeldFallback = 300

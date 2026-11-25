@@ -27,6 +27,33 @@ extension ApprovalTests {
         } catch AutomationIPC.Failure.busy {}
     }
 
+    @MainActor func testMonitorRecoversVerifiedConnectionAfterTimeout() async throws {
+        final class Probe: @unchecked Sendable {
+            let lock = NSLock()
+            var calls = 0
+            func read(_ targets: [ScreenTarget]) throws -> TerminalSnapshot {
+                let count = lock.withLock { calls += 1; return calls }
+                if count == 2 { throw AutomationIPC.Failure.timeout }
+                return TerminalSnapshot(screens:targets.map { TerminalScreen(tty:$0.tty, contents:"Working\nesc to interrupt") })
+            }
+        }
+        let probe = Probe(), root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:root) }
+        let adapter = ScreenHostAdapter(screens:{ try probe.read($0) }, approve:{ _,_,_ in .missingTarget }, reveal:{ _ in nil })
+        let engine = try ApprovalEngine(paths:AppPaths(directory:root), screenAdapters:[.terminal:adapter], nativeKeyboardActivity:.inactive)
+        defer { engine.stop() }
+        let session = AgentSession(id:"fixture",agent:.codex,pid:42,started:"fixture",tty:"/dev/ttys621",cwd:root.path,terminal:.terminal)
+        engine.updateDiscovery([session],records:[])
+        await engine.connectScreenHost(.terminal)
+        await engine.refreshScreenHost(.terminal)
+        try expect(engine.snapshot.health.terminalConnected && engine.snapshot.health.terminal.contains("재확인"))
+        try expectEqual(engine.snapshot.sessions.first?.channel, .terminalScreen)
+        try await Task.sleep(for:.milliseconds(1100))
+        await engine.refreshScreenHost(.terminal)
+        try expect(engine.snapshot.health.terminalConnected && engine.snapshot.health.terminal.contains("연결됨"))
+        try expectEqual(probe.lock.withLock { probe.calls },3)
+    }
+
     func testBlockedAutomationIsolation() async throws {
         let gate = AutomationIPC(cooldown:0.04)
         let release = DispatchSemaphore(value:0), entered = DispatchSemaphore(value:0)

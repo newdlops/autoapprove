@@ -132,6 +132,16 @@ public enum RemoteTerminalPolling {
         }
     }
 
+    package static func monitorBatch(_ ids: [String], pending: Set<String>, intervals: [String: TimeInterval],
+                                     lastRead: [String: TimeInterval], now: TimeInterval, limit: Int) -> [String] {
+        let due = pending.union(dueTargets(ids, intervals: intervals, lastRead: lastRead, now: now))
+        let candidates = ids.filter { due.contains($0) }
+        guard candidates.count > limit else { return candidates }
+        return Array(candidates.sorted {
+            (lastRead[$0] ?? -.infinity, $0) < (lastRead[$1] ?? -.infinity, $1)
+        }.prefix(limit))
+    }
+
     /// Time until the next session becomes due, kept between 0.1 and 8 s.
     public static func nextReadDelay(_ ids: [String], intervals: [String: TimeInterval],
                                      lastRead: [String: TimeInterval], now: TimeInterval) -> TimeInterval {

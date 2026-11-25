@@ -21,10 +21,12 @@ if(process.argv.includes('--offline')) {
  }
 }
 
+let dropNextReply=false;
 const server=createServer(socket=>{
  let buffer='';socket.setEncoding('utf8');socket.on('data',chunk=>{
   buffer+=chunk;const end=buffer.indexOf('\n');if(end<0)return;
   const message=JSON.parse(buffer.slice(0,end));calls.push(message.params);
+  if(dropNextReply) { dropNextReply=false;socket.destroy();return; }
   socket.end(JSON.stringify({result:{ok:true}})+'\n');
  });
 });
@@ -54,15 +56,18 @@ try {
   await request(index+2,tool,{groupID:'fixture',memberID:'fixture',text:'fixture',task:'fixture',choice:1,
    sessionID:'spoofed-session',agentKind:'spoofed-agent',codexCallerHome:'/spoofed',codexCallerConversationID:'spoofed',codexCallerSource:'spoofed',codexCallerRuntimeID:'spoofed-runtime'});
  }
- // The stdio connection remains usable after the GUI's Unix listener restarts.
  await new Promise(resolve=>server.close(resolve));
+ const pendingReconnect=request(20,'get_session_groups',{});
+ await new Promise(resolve=>setTimeout(resolve,2300));
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(path.join(home,'bridge.sock'),resolve);});
- await request(20,'get_session_groups',{});
+ await pendingReconnect;
+ dropNextReply=true;
+ await request(22,'send_group_message',{groupID:'fixture',memberID:'fixture',text:'lost response fixture'},true);
  if(process.env.AA_EXPECT_AGENT==='1' && process.env.CODEX_THREAD_ID) {
   await request(21,'get_session_groups',{conversationID:'00000000-0000-4000-8000-000000000000'},true);
  }
  child.stdin.end();const [code]=await closed;assert.equal(code,0);child=null;reader.close();
- assert.deepEqual(calls.map(value=>value.tool),['ask_user',...groupTools,'get_session_groups','disconnect']);
+ assert.deepEqual(calls.map(value=>value.tool),['ask_user',...groupTools,'get_session_groups','send_group_message','disconnect']);
  if(calls[1].codexCallerConversationID) {
   assert.equal(calls[1].sessionID,undefined,'Conversation proof must not fall back to a shared process ID');
   assert.equal(calls[1].agentKind,'codex');

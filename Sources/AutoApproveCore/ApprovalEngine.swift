@@ -380,6 +380,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var screenReadAt: [String: TimeInterval] = [:]
     private var unchangedSessionReads: [String: Int] = [:]
     private var screenReadSucceeded: Set<String> = []
+    private var lastConfirmedScreenRead: [String:TimeInterval] = [:]
     private var observationEpoch: UInt64 = 0
     private let historyPollSignal = RemoteTerminalChangeSignal()
     private let screenPollSignals = Dictionary(uniqueKeysWithValues: ScreenHost.allCases.map { ($0, RemoteTerminalChangeSignal()) })
@@ -412,6 +413,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var polling = false
         var permissionBlocked = false
         var retryAfter = Date.distantPast
+        var admissionMisses = 0
     }
     private var screenConnections: [ScreenHost: ScreenConnection] = [:]
     private let screenAdapters: [ScreenHost: ScreenHostAdapter]
@@ -2283,6 +2285,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         automaticInputSessions.contains(id) || osPermissionActing != nil || systemSafetyTasks[id] != nil || capacityStates[id]?.phase == .sending || pendingActions.values.contains { $0.sessionID == id }
     }
 
+    private static func beforeTerminalWrite(_ error: Error) -> RemoteHTTPError {
+        let http = error as? RemoteHTTPError
+        var diagnostics = http?.diagnostics ?? [:]
+        diagnostics["delivery"] = "not_started"
+        if TerminalAppleEvents.isTransientReadFailure(error) || error is AutomationIPC.Failure || http?.status == 503 {
+            diagnostics["retryable"] = "true"
+        }
+        return RemoteHTTPError(http?.status ?? 409, error.localizedDescription, diagnostics:diagnostics)
+    }
+
     private func sendOriginalTerminalMessage(_ original: AgentSession, object: JSONObject,
                                             codexStatusQuery: Bool = false, textOnly: Bool = false, backgroundOnly: Bool = false,
                                             preflight: ((RemoteTerminalFrame) async throws -> Void)? = nil) async throws -> JSONObject {
@@ -2299,7 +2311,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if attempt > 0, codexStatusQuery {
                     try await waitForGroupStatusInput(original, backgroundOnly: backgroundOnly)
                 }
-                let frame = try await remoteTerminal(sessionID: original.id, realtime: true, textOnly: textOnly)
+                let frame: RemoteTerminalFrame
+                do { frame = try await remoteTerminal(sessionID: original.id, realtime:true, textOnly:textOnly) }
+                catch { throw Self.beforeTerminalWrite(error) }
                 guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
                       current.tty == original.tty, current.terminal == original.terminal,
                       current.bridgeID == original.bridgeID, current.terminalID == original.terminalID,
@@ -2325,7 +2339,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 else { throw RemoteHTTPError(409, "이 원본의 메시지 전송 연결을 확인해주세요. 작성한 내용은 보관합니다.") }
                 var textWasSent = false
                 do {
-                    try await preflight?(frame)
+                    do { try await preflight?(frame) }
+                    catch { throw Self.beforeTerminalWrite(error) }
                     if codexStatusQuery, !submitSeparately {
                         _ = try await remoteInput(input, automaticAuthorization: nil, codexStatusQuery: true, backgroundOnly: backgroundOnly)
                     } else if backgroundOnly {
@@ -4631,7 +4646,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if result == "not_started" {
                     let backoff = recipientWakesLoop(message, observed: observed) ? groupMailboxHeldFallback
                         : min(groupMailboxReminderInterval, max(groupMailboxPollInterval, Double(message.attempts + 1) * 5))
-                    let retryDelay = (message.sourceKey?.hasPrefix(SessionGroupMailbox.priorityPrefix) == true || message.sourceKey?.hasPrefix("userButton:rename:") == true) ? min(backoff, groupMailboxPollInterval) : backoff
+                    let retryable = (error as? RemoteHTTPError)?.diagnostics?["retryable"] == "true"
+                    let retryDelay = (retryable || message.sourceKey?.hasPrefix(SessionGroupMailbox.priorityPrefix) == true || message.sourceKey?.hasPrefix("userButton:rename:") == true) ? min(backoff, groupMailboxPollInterval) : backoff
                     try groupMailbox().noteAttempt(message.id, result: result, error: error.localizedDescription, retryAt: Date().addingTimeInterval(retryDelay), increment: -1)
                 } else {
                     try groupMailbox().noteAttempt(message.id, result: "direct_unknown", error: error.localizedDescription, retryAt: receiptDue)
@@ -5876,7 +5892,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return
         }
         if session.agent == .claude, let host = ScreenHost(kind: session.terminal), screenConnections[host]?.enabled == true,
-           let type = screenAdapters[host]?.typeLine, let before = await claudeStatuses([session])[session.id] {
+           let adapter = screenAdapters[host], let type = adapter.typeLine, let before = await claudeStatuses([session])[session.id] {
             guard ClaudeSessionRegistration.acceptsPrompt(before) else {
                 throw RemoteHTTPError(409, "대상 Claude가 대기 상태가 아니어서 입력하지 않았습니다. (상태: \(before))", diagnostics: ["delivery": "not_started"])
             }
@@ -5888,12 +5904,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             defer { sendingMessages.remove(session.id) }
             let target = ScreenTarget(tty: session.tty, handle: session.screenHandle, jobPIDs: [process.pid], sourcePID: process.pid, sourceStarted: process.started)
-            let expected = try await preflight?()
-            let checked = screenAdapters[host]?.checkedTypeLine
-            guard try await Task.detached(operation: { () throws -> TerminalDelivery in
-                if let expected, let checked { return try checked(target, text, expected) }
-                return try type(target, text)
-            }).value == .sent else {
+            let expected: String?
+            do { expected = try await preflight?() }
+            catch { throw Self.beforeTerminalWrite(error) }
+            let delivered: TerminalDelivery
+            do {
+                delivered = try await Task.detached {
+                    try adapter.dispatchInput(host) {
+                        if let expected, let checked = adapter.checkedTypeLine { return try checked(target, text, expected) }
+                        return try type(target, text)
+                    }
+                }.value
+            } catch let error as AutomationIPC.InputNotStarted {
+                throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["delivery":"not_started","retryable":"true"])
+            }
+            guard delivered == .sent else {
                 throw RemoteHTTPError(409, "대상 터미널 탭을 찾지 못해 입력하지 않았습니다.", diagnostics: ["delivery": "not_started"])
             }
             func submitted(within seconds: Double) async -> Bool {
@@ -7936,6 +7961,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             screenPollTasks[host] = Task { [weak self] in
                 await observation.waitForChange(timeout: 0)
                 var seenRevision: UInt64?
+                var refreshPending = Set<String>()
                 while !Task.isCancelled, let self, !self.remoteInputStopped {
                     guard self.screenConnections[host]?.enabled == true else {
                         await observation.waitForChange()
@@ -7967,24 +7993,23 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         await observation.waitForChange()
                         continue
                     }
-                    // A poll signal (session list, automation, permission or
-                    // viewer change) reads every tab once, as before. Timer
-                    // passes read only the sessions whose own cadence is due.
                     let revision = self.screenPollSignals[host]?.revision
-                    let signalled = revision != seenRevision
+                    let ids = targets.map(\.id)
+                    refreshPending.formIntersection(ids)
+                    if revision != seenRevision {
+                        refreshPending = Set(ids)
+                        for id in ids { self.unchangedSessionReads[id] = 0 }
+                    }
                     seenRevision = revision
-                    if signalled { for target in targets { self.unchangedSessionReads[target.id] = 0 } }
                     let started = ProcessInfo.processInfo.systemUptime
                     let intervals = self.screenReadIntervals(host, targets: targets)
-                    let due = signalled ? targets.map(\.id) : RemoteTerminalPolling.dueTargets(targets.map(\.id),
-                        intervals: intervals, lastRead: self.screenReadAt, now: started)
+                    let due = RemoteTerminalPolling.monitorBatch(ids, pending: refreshPending, intervals: intervals,
+                        lastRead: self.screenReadAt, now: started, limit: self.screenAdapters[host]?.usesHostIPC == true ? 8 : ids.count)
                     if !due.isEmpty {
-                        let ids = Set(due)
-                        await self.refreshScreenHost(host, reportConnecting:false,
-                            targets: targets.filter { ids.contains($0.id) }, hostTargets: targets)
-                        // A read slower than a session's cadence waits one
-                        // full interval after completion instead of starting
-                        // the next expensive native read at once.
+                        let batch = Set(due)
+                        let read = await self.refreshScreenHost(host, reportConnecting:false,
+                            targets: targets.filter { batch.contains($0.id) }, hostTargets: targets)
+                        if read != nil { refreshPending.subtract(batch) }
                         let finished = ProcessInfo.processInfo.systemUptime
                         for id in due where (self.screenReadAt[id] ?? 0) >= started && finished - started >= (intervals[id] ?? 0) {
                             self.screenReadAt[id] = finished
@@ -7994,7 +8019,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let delay = RemoteTerminalPolling.nextReadDelay(currentTargets.map(\.id),
                         intervals: self.screenReadIntervals(host, targets: currentTargets), lastRead: self.screenReadAt,
                         now: ProcessInfo.processInfo.systemUptime)
-                    await observation.waitForChange(timeout: delay)
+                    await observation.waitForChange(timeout: refreshPending.isEmpty ? delay : min(0.1, delay))
                 }
             }
         }
@@ -8630,6 +8655,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             screenReadAt = screenReadAt.filter { monitored.contains($0.key) }
             unchangedSessionReads = unchangedSessionReads.filter { monitored.contains($0.key) }
             screenReadSucceeded.formIntersection(monitored)
+            lastConfirmedScreenRead = lastConfirmedScreenRead.filter { monitored.contains($0.key) }
         }
         if previousCodex != liveCodex {
             readableQuestionSessions.formIntersection(liveCodex)
@@ -8855,6 +8881,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let connectID = UUID()
         screenConnections[host,default:ScreenConnection()].connectID = connectID
         screenConnections[host]?.enabled = true
+        screenConnections[host]?.admissionMisses = 0
         if screenAdapters[host]?.usesHostIPC == true {
             do {
                 if try await !HostAutomationPermission.check(host) {
@@ -8976,8 +9003,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let analysisTargets = targets.map { (id: $0.id, tty: $0.tty, agent: $0.agent) }
             // A large scrollback in many tabs must not monopolize the UI actor.
             // One bounded worker per host reads and parses; no policy or input is run here.
+            let waitForSlot = connection.admissionMisses >= 2
             let worker = Task.detached(priority: .utility) {
-                let result = requests.isEmpty ? TerminalSnapshot() : try await adapter.isolatedRead(host,waitForSlot:false) { try reader(requests) }
+                let result = requests.isEmpty ? TerminalSnapshot() : try await adapter.isolatedRead(host,waitForSlot:waitForSlot) { try reader(requests) }
                 var screensByTTY = reusedScreens
                 screensByTTY.reserveCapacity(result.screens.count)
                 for screen in result.screens where screensByTTY[screen.tty] == nil {
@@ -9035,6 +9063,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 return true
             }
+            screenConnections[host]?.admissionMisses = 0
             let unchanged = !targets.isEmpty && targets.allSatisfy { screensByTTY[$0.tty] != nil && !changedIDs.contains($0.id) }
             let hasLiveViewer = targets.contains { remoteTerminalChanges[$0.id]?.hasObservers == true }
             unchangedScreenReads[host] = unchanged && !hasLiveViewer
@@ -9042,7 +9071,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
             for target in targets {
                 screenReadAt[target.id] = readStartedUptime
                 let read = screensByTTY[target.tty] != nil
-                if read { screenReadSucceeded.insert(target.id) } else { screenReadSucceeded.remove(target.id) }
+                if read {
+                    screenReadSucceeded.insert(target.id)
+                    lastConfirmedScreenRead[target.id] = readStartedUptime
+                } else {
+                    screenReadSucceeded.remove(target.id)
+                    lastConfirmedScreenRead.removeValue(forKey:target.id)
+                }
                 let stable = read && !changedIDs.contains(target.id) && remoteTerminalChanges[target.id]?.hasObservers != true
                 unchangedSessionReads[target.id] = stable ? min((unchangedSessionReads[target.id] ?? 0) + 1, 16) : 0
             }
@@ -9121,9 +9156,42 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return unchanged
         } catch {
             guard !Task.isCancelled, !remoteInputStopped, observationEpoch == epoch else { return nil }
+            guard screenConnections[host]?.enabled == true, screenConnections[host]?.connectID == connection.connectID else { return nil }
             if case AutomationIPC.Failure.busy = error {
+                screenConnections[host]?.admissionMisses = min(connection.admissionMisses + 1, 2)
                 screenConnections[host]?.retryAfter = Date().addingTimeInterval(0.25)
                 return nil
+            }
+            if TerminalAppleEvents.isTransientReadFailure(error) {
+                let now = ProcessInfo.processInfo.systemUptime
+                screenConnections[host]?.retryAfter = Date().addingTimeInterval(1)
+                func recentlyConfirmed(_ id: String) -> Bool {
+                    screenReadSucceeded.contains(id) && lastConfirmedScreenRead[id].map { now - $0 < 20 } == true
+                }
+                let relevant = targets.filter { target in
+                    guard let live = sessions[target.id], live.pid == target.pid, live.started == target.started,
+                          live.tty == target.tty, live.terminal == host.kind, live.phase != .ended,
+                          (automationEpochs[target.id] ?? automationDefaultEpoch) == automationRuntime.epoch(target.id) else { return false }
+                    return true
+                }
+                let stillConnected = snapshot.health.screen(host).connected &&
+                    (hostTargets ?? targets).contains { recentlyConfirmed($0.id) }
+                updateHealth(host) {
+                    $0.connected = stillConnected
+                    $0.status = stillConnected ? "화면 조회 지연 · 자동 재확인 중" : "화면 응답 대기 · 자동 재연결 중"
+                }
+                for target in relevant {
+                    screenReadAt[target.id] = now
+                    guard sessions[target.id]?.channel == host.channel else { continue }
+                    automationNeedsFreshScreen.insert(target.id)
+                    if !recentlyConfirmed(target.id) {
+                        sessions[target.id]?.channel = .none
+                        screenReadSucceeded.remove(target.id)
+                    }
+                    clearScreen(target.id, preserveSummary:true)
+                }
+                publish()
+                return false
             }
             let blocked = error is TerminalAdapterError
             screenConnections[host]?.permissionBlocked = blocked
