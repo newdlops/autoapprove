@@ -134,10 +134,27 @@ public enum TerminalProfileTopology {
         })();
         """
     }
+    private static func readRows(_ ttys:[String], timeout:TimeInterval) throws -> [TerminalProfileTabSnapshot] {
+        let text=try AutomationScript.run(script(ttys:ttys),app:"Terminal",denied:.permissionDenied,timeout:timeout,readOnly:true)
+        return try JSONDecoder().decode([TerminalProfileTabSnapshot].self,from:Data(text.utf8))
+    }
+
     public static func read(ttys:[String]) throws -> [TerminalProfileTabSnapshot] {
         guard !ttys.isEmpty else {return []}
-        let text=try AutomationScript.run(script(ttys:ttys),app:"Terminal",denied:.permissionDenied,timeout:min(45,max(8,Double(ttys.count)*1.5)))
-        let rows=try JSONDecoder().decode([TerminalProfileTabSnapshot].self,from:Data(text.utf8))
+        return try nativeLayout(readRows(ttys,timeout:min(45,max(8,Double(ttys.count)*1.5))))
+    }
+
+    static func readForProfile(ttys:[String]) async throws -> [TerminalProfileTabSnapshot] {
+        guard !ttys.isEmpty else {return []}
+        let timeout=min(45,max(8,Double(ttys.count)*1.5))
+        let rows=try await AutomationIPC.shared.read(host:"Terminal",budget:timeout,waitForSlot:true) {
+            try readRows(ttys,timeout:timeout)
+        }
+        try Task.checkCancellation()
+        return try await Task.detached(priority:.userInitiated) {try nativeLayout(rows)}.value
+    }
+
+    private static func nativeLayout(_ rows:[TerminalProfileTabSnapshot]) throws -> [TerminalProfileTabSnapshot] {
         let owner=try TerminalProcessLookup.running(),reader=try TerminalNativeTabReader.terminal(owner:owner)
         var keyboard=TerminalKeyboard.Environment.live
         keyboard.metadata={try TerminalAppleEvents.profileWindowMetadata(tty:$0,owner:owner)}

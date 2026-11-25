@@ -442,7 +442,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var screenConnections: [ScreenHost: ScreenConnection] = [:]
     private let screenAdapters: [ScreenHost: ScreenHostAdapter]
     private var terminalHistoryStore:TerminalHistoryStore?
-    private let terminalProfileLayoutReader:@Sendable ([String]) throws -> [TerminalProfileTabSnapshot]
+    private let terminalProfileLayoutReader:@Sendable ([String]) async throws -> [TerminalProfileTabSnapshot]
     /// A brief cancellation window for supported yes/no confirmations. Ordinary
     /// permission screens are handled immediately; unsafe system changes deny.
     public var automaticConfirmationDelay: TimeInterval = 0.5
@@ -687,9 +687,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.osPermissionServices=osPermissionServices ?? (processReader == nil ? OSPermissionAutomation.live:.inactive)
         self.osPermissionMonitoringEnabled=processReader==nil || osPermissionServices != nil
         self.publishedUpdateServices=publishedUpdateServices
-        // Injected inventories never inspect the user's real Terminal implicitly.
-        if let terminalProfileLayoutReader {self.terminalProfileLayoutReader=terminalProfileLayoutReader}
-        else if processReader == nil {self.terminalProfileLayoutReader={try TerminalProfileTopology.read(ttys:$0)}}
+        if let terminalProfileLayoutReader {
+            self.terminalProfileLayoutReader={ ttys in
+                try await Task.detached(priority:.utility) {try terminalProfileLayoutReader(ttys)}.value
+            }
+        }
+        else if processReader == nil {self.terminalProfileLayoutReader={try await TerminalProfileTopology.readForProfile(ttys:$0)}}
         else {self.terminalProfileLayoutReader={_ in []}}
         // Synthetic/injected process inventories have no implicit association
         // with the user's desktop. Tests can supply explicit keyboard activity.
@@ -1190,7 +1193,26 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let keep = Set(inventory.map { "pty:" + $0.ptyID })
         for id in Array(sessions.keys) where id.hasPrefix("pty:") && !keep.contains(id) { sessions.removeValue(forKey: id) }
     }
+    private enum ProfileObservation {
+        case restore, captureSessions, captureLayout, validateSessions, validateWithScreen
+    }
+
     public func terminalProfileCandidates(includeLayout:Bool = true, refreshForSaving:Bool = false, sessionIDs:Set<String>? = nil) async throws -> [TerminalProfileCandidate] {
+        let mode:ProfileObservation = includeLayout ? .captureLayout : (refreshForSaving ? .validateWithScreen : .restore)
+        return try await terminalProfileCandidates(mode,sessionIDs:sessionIDs)
+    }
+
+    public func terminalProfileSaveCandidates(readWindowLayout:Bool, sessionIDs:Set<String>? = nil) async throws -> [TerminalProfileCandidate] {
+        let mode:ProfileObservation
+        if sessionIDs == nil {mode = readWindowLayout ? .captureLayout : .captureSessions}
+        else {mode = readWindowLayout ? .validateWithScreen : .validateSessions}
+        return try await terminalProfileCandidates(mode,sessionIDs:sessionIDs)
+    }
+
+    private func terminalProfileCandidates(_ mode:ProfileObservation, sessionIDs:Set<String>?) async throws -> [TerminalProfileCandidate] {
+        let collectChoices = mode == .captureSessions || mode == .captureLayout
+        let allowScreenIdentity = mode == .captureLayout || mode == .validateWithScreen
+        let allowObservedTitle = allowScreenIdentity || mode == .restore
         guard !remoteInputStopped else {throw AppError.message("앱이 종료 중입니다.")}
         let epoch = observationEpoch
         let targets = snapshot.sessions.filter {
@@ -1229,15 +1251,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                 explicitCodexBindings[session.id]=thread
                             } catch {detail="현재 대화를 확인하지 못했습니다: "+error.localizedDescription}
                         }
-                        if entry.conversationID.isEmpty || includeLayout {
+                        if collectChoices || (entry.conversationID.isEmpty && allowObservedTitle) {
                             let conversations:[CodexQueueConversation]
                             if let cached=conversationLists[target.home]?[session.cwd] {conversations=cached}
                             else {
                                 conversations=try await codexQueue.conversations(target,session.cwd)
                                 conversationLists[target.home,default:[:]][session.cwd]=conversations
                             }
-                            if includeLayout {choices=conversations.map {CodexProfileConversation(id:$0.id,title:$0.title)}}
-                            if entry.conversationID.isEmpty,let bound=CodexProfileConversationBinding.match(title:session.terminalTitle,cwd:session.cwd,conversations:conversations),let name=bound.name {
+                            if collectChoices {choices=conversations.map {CodexProfileConversation(id:$0.id,title:$0.title)}}
+                            if allowObservedTitle,entry.conversationID.isEmpty,let bound=CodexProfileConversationBinding.match(title:session.terminalTitle,cwd:session.cwd,conversations:conversations),let name=bound.name {
                                 entry.conversationID=bound.id
                                 namedCodexBindings[session.id]=name.precomposedStringWithCanonicalMapping
                             }
@@ -1246,7 +1268,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         else if detail==nil {detail="현재 대화를 확인하지 못했습니다. 이어갈 대화를 선택하거나 새 CLI 실행을 명시적으로 선택해주세요."}
                     } catch {if detail==nil {detail="현재 대화를 확인하지 못했습니다: "+error.localizedDescription}}
                 }
-                if includeLayout || refreshForSaving, entry.conversationID.isEmpty, let named=await groupNamedConversation(session) {
+                if allowScreenIdentity, entry.conversationID.isEmpty, let named=await groupNamedConversation(session) {
                     entry.conversationID=named.id;entry.providerHome=named.home;detail=nil
                 }
             } else if entry.conversationID.isEmpty {
@@ -1259,9 +1281,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             result.append(.init(id:session.id,entry:entry,conversations:choices,detail:detail,tty:session.terminal == .terminal ? session.tty:nil))
         }
-        let terminalTTYs=result.filter {$0.entry.host == .terminal}.compactMap(\.tty),layoutReader=terminalProfileLayoutReader
-        if includeLayout && !terminalTTYs.isEmpty {
-            let layout=try await Task.detached(priority:.utility) {try layoutReader(terminalTTYs)}.value
+        let terminalTTYs=result.filter {$0.entry.host == .terminal}.compactMap(\.tty)
+        if mode == .captureLayout && !terminalTTYs.isEmpty {
+            let layout=try await terminalProfileLayoutReader(terminalTTYs)
             result=try TerminalProfileTopology.apply(layout,to:result)
             for index in result.indices where result[index].entry.agent == "codex" {
                 let candidate=result[index]
@@ -1282,7 +1304,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
         }
-        if includeLayout || refreshForSaving {
+        if mode != .restore {
             let settingsReader = profileExecutionSettingsReader
             let inputs = result.enumerated().compactMap { index, candidate -> (Int, SessionGroupLiveSession)? in
                 let entry = candidate.entry
@@ -2631,12 +2653,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let target = ScreenTarget(tty: original.tty, handle: original.screenHandle,
                                   sourcePID: original.pid, sourceStarted: original.started)
         func readFrame() async -> TerminalScreen? {
-            try? await Task.detached(priority: .utility) {
+            try? await adapter.isolatedRead(host) {
                 let snapshot = try (adapter.identityScreens ?? adapter.screens)([target])
                 guard snapshot.failures.isEmpty, snapshot.screens.count == 1,
                       snapshot.screens[0].tty == target.tty else { return nil as TerminalScreen? }
                 return snapshot.screens[0]
-            }.value
+            }
         }
         guard let first = await readFrame(), let title = CodexGroupNamedConversation.title(in: first, cwd: original.cwd),
               let name = CodexProfileConversationBinding.terminalName(title, cwd: original.cwd),

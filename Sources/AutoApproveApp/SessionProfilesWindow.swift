@@ -1,10 +1,9 @@
-// THESIS: Save each CLI conversation once, then reopen the chosen workspace after a restart.
-// FORM: The existing native split list, system controls and restrained semantic feedback.
 import SwiftUI
 import AutoApproveCore
 
 struct SessionProfilesWindow: View {
     @ObservedObject var controller:SessionProfilesController
+    @State private var readWindowLayout=false
     var body:some View {
         VStack(spacing:0) {
             if let error=controller.error {
@@ -23,6 +22,9 @@ struct SessionProfilesWindow: View {
                         if controller.loading {ProgressView().controlSize(.small).accessibilityLabel("프로필 불러오는 중")}
                     }.padding(.horizontal,16).padding(.top,20)
                     Text("작업 폴더와 CLI, 이어갈 대화를 파일로 저장합니다.").font(.callout).foregroundStyle(.secondary).padding(.horizontal,16)
+                    Toggle("저장할 때 현재 창·탭 배치 읽기",isOn:$readWindowLayout)
+                        .toggleStyle(.checkbox).padding(.horizontal,16).disabled(controller.busy)
+                        .help("Terminal 탭을 차례로 선택해 창 묶음과 순서를 확인합니다. 기본 저장으로 갱신하면 일치하는 대화의 기존 배치를 사용합니다.")
                     if controller.profiles.isEmpty {
                         VStack(alignment:.leading,spacing:8) {
                             Text(controller.loading ? "프로필을 불러오고 있습니다…":"저장한 프로필이 없습니다").font(.headline)
@@ -49,7 +51,7 @@ struct SessionProfilesWindow: View {
                         } description: {
                             Text("현재 세션을 프로필로 저장하면 재부팅 뒤 같은 폴더에서 CLI를 열 수 있습니다. 대화 ID를 저장하면 해당 대화를 이어갑니다.")
                         } actions: {
-                            Button("현재 세션으로 새 프로필") {Task {await controller.captureCurrent()}}.disabled(controller.busy)
+                            Button("현재 세션으로 새 프로필") {Task {await controller.captureCurrent(readWindowLayout:readWindowLayout)}}.disabled(controller.busy)
                         }
                     }
                 }.frame(minWidth:400,maxWidth:.infinity,maxHeight:.infinity)
@@ -65,7 +67,7 @@ struct SessionProfilesWindow: View {
         }.frame(minWidth:700,minHeight:480)
         .toolbar {
             ToolbarItemGroup(placement:.primaryAction) {
-                Button {Task {await controller.captureCurrent()}} label: {Label("새 프로필",systemImage:"plus")}
+                Button {Task {await controller.captureCurrent(readWindowLayout:readWindowLayout)}} label: {Label("새 프로필",systemImage:"plus")}
                     .keyboardShortcut("n").disabled(controller.busy).help("현재 Mac의 에이전트 창을 새 프로필 파일로 저장합니다.")
                 Button("가져오기",systemImage:"square.and.arrow.down") {controller.importProfile()}.disabled(controller.busy)
                     .help("저장한 세션 프로필 JSON 파일을 가져옵니다. 실행 전에 내용을 확인합니다.")
@@ -92,7 +94,7 @@ struct SessionProfilesWindow: View {
                 Spacer(minLength:8)
                 Menu {
                     Button("프로필 편집") {controller.edit(profile)}
-                    Button("현재 창으로 갱신…") {Task {await controller.captureCurrent(replacing:profile)}}
+                    Button("현재 창으로 갱신…") {Task {await controller.captureCurrent(replacing:profile,readWindowLayout:readWindowLayout)}}
                     Button("파일 내보내기…") {controller.export(profile)}
                     Button("Finder에서 파일 보기") {controller.reveal(profile)}
                     Divider()

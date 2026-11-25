@@ -156,6 +156,36 @@ private actor LaunchLog {
         engine.updateDiscovery([session],records:records)
         let candidates=try await engine.terminalProfileCandidates()
         try check(candidates.first?.entry.conversationID==conversation,"Profile capture uses the verified conversation from group discovery")
+        var pinned=entry(21,"codex",plain,"Stored")
+        pinned.terminalTab = .init(window:UUID(),windowOrder:2,tabOrder:3,selected:true)
+        let oldProfile=try store.save(.init(name:"Pinned",entries:[pinned]))
+        var liveEntry=pinned
+        liveEntry.id=UUID()
+        liveEntry.terminalTab=nil
+        var requests:[(Bool, Set<String>?)]=[]
+        let captures=SessionProfilesController(store:store,capture:{throw AppError.message("Unexpected restoration")},
+            captureForSaving:{layout,selected in
+                requests.append((layout,selected))
+                if layout {throw AppError.message("Layout unavailable")}
+                return [.init(id:"live",entry:liveEntry)]
+            })
+        await captures.captureCurrent(replacing:oldProfile)
+        let quick=captures.draft!
+        try check(quick.candidates[0].entry.terminalTab==pinned.terminalTab,"Matching conversation previews its saved arrangement")
+        try await captures.save(.init(id:quick.profileID,name:quick.name,entries:quick.candidates.map(\.entry)))
+        let retained=try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(quick.profileID)))
+        try check(retained.entries[0].terminalTab==pinned.terminalTab,"Quick save retains only a matching arrangement")
+        try check(requests.count==2 && !requests[0].0 && requests[0].1==nil && !requests[1].0 && requests[1].1==["live"],"Draft and selected commit both skip terminal automation")
+        await captures.captureCurrent(replacing:retained)
+        let changing=captures.draft!
+        liveEntry.conversationID=UUID().uuidString.lowercased()
+        try await captures.save(.init(id:changing.profileID,name:changing.name,entries:changing.candidates.map(\.entry)))
+        let changed=try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(changing.profileID)))
+        try check(changed.entries[0].terminalTab==nil && changed.entries[0].conversationID==liveEntry.conversationID,"A switched conversation cannot inherit the previous layout")
+        let bytes=try TerminalProfileStore.read(store.file(changed.id))
+        await captures.captureCurrent(replacing:changed,readWindowLayout:true)
+        try check(requests.last?.0==true && captures.error=="Layout unavailable" && captures.draft==nil,"Exact layout errors stay visible")
+        try check(try TerminalProfileStore.read(store.file(changed.id))==bytes,"Failed exact capture leaves the existing profile intact")
         print("PASS \(checks) profile selection checks; production controller/restorer, exact repo roots, hidden-row exclusion, draft-free filter state, no real Terminal launch")
     }
 }

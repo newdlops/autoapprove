@@ -2,6 +2,60 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testProfileSaveCompletesWhileTerminalIsOccupied() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:root) }
+        let gate = AutomationIPC(), entered = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0)
+        let occupied = Task.detached {
+            try gate.runInput(host:"Terminal",budget:8) {
+                entered.signal()
+                return release.wait(timeout:.now()+7) == .success
+            }
+        }
+        defer { release.signal() }
+        while entered.wait(timeout:.now()) != .success { try await Task.sleep(for:.milliseconds(1)) }
+        let records = ProcessDiscovery.parse("""
+        991111 1 ttys930 991111 991111 Wed Oct 28 12:00:00 2026 /fixture/codex
+        991112 1 ttys931 991112 991112 Wed Oct 28 12:00:00 2026 /fixture/codex
+        """)
+        let thread = UUID().uuidString.lowercased(), other = UUID().uuidString.lowercased()
+        let transport = CodexReplyTransport(prepare:{_,_ in throw AppError.message("Unexpected input")},send:{_,_ in throw AppError.message("Unexpected input")},
+            queueHome:{_ in .init(executable:"",home:root.path,threadID:"")})
+        let queue = CodexQueueTransport(list:{_ in []},delete:{_,_ in .init(removed:[])},
+            conversations:{_,_ in [.init(id:other,title:"Other",name:"Other")]})
+        let adapter = ScreenHostAdapter(screens:{_ in .init()},approve:{_,_,_ in .missingTarget},reveal:{_ in nil})
+        let engine = try ApprovalEngine(paths:.init(directory:root),questionTransport:transport,processReader:{records},screenAdapters:[.terminal:adapter],codexQueue:queue,
+            codexGroupReader:{ record in record.pid == records[0].pid ? .init(threadID:thread,database:root.appendingPathComponent("state_5.sqlite").path) : nil },
+            profileExecutionSettingsReader:{ _ in .init(model:"model",reasoningEffort:"high") },isolateByDefault:true,terminalProfileLayoutReader:{ _ in
+                try gate.run(host:"Terminal",readOnly:true,budget:1) { throw AppError.message("Unexpected layout read") }
+            })
+        defer { engine.stop() }
+        let sessions = records.map { record in
+            var session = AgentSession(id:record.key,agent:.codex,pid:record.pid,started:record.started,tty:"/dev/"+record.tty,cwd:root.path,terminal:.terminal)
+            session.terminalTitle="Other | "+root.lastPathComponent
+            return session
+        }
+        engine.updateDiscovery(sessions,records:records)
+        do {
+            _ = try await engine.terminalProfileSaveCandidates(readWindowLayout:true)
+            throw AppError.message("Expected live layout to require the occupied host")
+        } catch AutomationIPC.Failure.busy {}
+        let candidates = try await engine.terminalProfileSaveCandidates(readWindowLayout:false)
+        guard let unknown = candidates.first(where: { $0.id == records[1].key }) else { throw AppError.message("Missing unresolved session") }
+        try expectEqual(unknown.conversations.map(\.id),[other])
+        try expectEqual(unknown.entry.conversationID,"")
+        let selected = try await engine.terminalProfileSaveCandidates(readWindowLayout:false,sessionIDs:[records[0].key])
+        let store = TerminalProfileStore(directory:root.appendingPathComponent("profiles"))
+        let saved = try store.save(.init(name:"Concurrent",entries:selected.map(\.entry)))
+        let persisted = try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(saved.id)))
+        try expectEqual(persisted.entries.map(\.conversationID),[thread])
+        try expectEqual(persisted.entries.first?.executionSettings?.reasoningEffort,"high")
+        try expectNil(persisted.entries.first?.terminalTab)
+        try expectEqual(gate.snapshot().inFlight,1)
+        release.signal()
+        try expect(try await occupied.value)
+    }
+
     func testInteractiveReadAndInputAdmissionRecover() async throws {
         let gate = AutomationIPC(cooldown:0.02)
         let entered = DispatchSemaphore(value:0), release = DispatchSemaphore(value:0)
