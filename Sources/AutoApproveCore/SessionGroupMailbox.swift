@@ -853,8 +853,17 @@ public final class SessionGroupMailbox {
         get throws { try scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE " + Self.outstandingQuestionFilter + ")") != 0 }
     }
 
-    func outstandingQuestions() throws -> [SessionGroupMessage] {
-        try rows("WHERE " + Self.outstandingQuestionFilter + " ORDER BY sequence")
+    func outstandingQuestions(in groups: [SessionGroup]) throws -> [SessionGroupMessage] {
+        let members = groups.flatMap { group in group.members.map { [group.id.uuidString, $0.id.uuidString] } }
+        guard !members.isEmpty else { return [] }
+        let encoded = String(decoding: try JSONEncoder().encode(members), as: UTF8.self)
+        let membership = "SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?1)"
+        return try rows("""
+            WHERE \(Self.outstandingQuestionFilter)
+                AND (group_id COLLATE NOCASE, sender_id COLLATE NOCASE) IN (\(membership))
+                AND (group_id COLLATE NOCASE, recipient_id COLLATE NOCASE) IN (\(membership))
+            ORDER BY sequence
+            """, [encoded])
     }
 
     package func pendingReplies(group: UUID, member: UUID, senders: [UUID], after: Int64 = 0, limit: Int = 51,

@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import AppKit
 import AutoApproveCore
 
@@ -155,7 +156,10 @@ import AutoApproveCore
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let error { Label(error, systemImage: "exclamationmark.circle").font(.callout).foregroundStyle(.red) }
         }.frame(maxWidth: .infinity, alignment: .leading)
-            .windowUpdates(viewUpdates, sources: [engine.objectWillChange])
+            .windowUpdates(viewUpdates, sources: [
+                engine.$webStatus.windowChanges, engine.$lanUpdate.windowChanges,
+                engine.$networkIsolated.windowChanges
+            ])
             .onChange(of: viewUpdates.isVisible) { _, visible in if visible { localAddressStatus = LocalDashboardAddress.status() } }
             .onReceive(NotificationCenter.default.publisher(for:NSApplication.didBecomeActiveNotification)) {_ in if viewUpdates.isVisible { localAddressStatus = LocalDashboardAddress.status() } }
     }

@@ -49,8 +49,12 @@ struct CodexAccountRuntime:Sendable {
         try context.verifyUnchanged()
     }
     func connectedServerIdentity(home:String) throws ->[String] {
-        guard official else{return []} // Internal synthetic transport fixtures only.
-        let peer=try CodexOfficialExecutable.verifyServer(CodexQueueConnection(home:home))
+        guard official else { return [] }
+        return try connectedServerIdentity(CodexQueueConnection(home: home))
+    }
+    func connectedServerIdentity(_ connection: CodexQueueConnection) throws -> [String] {
+        guard official else { return [] }
+        let peer = try CodexOfficialExecutable.verifyServer(connection)
         return [String(peer.pid),String(peer.auditPidVersion)]
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import TerminalInputSupport
 
 /// The app that owns an agent's PTY. Identifying a host never grants control;
 /// only a connected screen host can read the screen or answer a request.
@@ -168,16 +169,8 @@ public enum ProcessEnvironment {
         guard sysctl(&mib, 3, &bytes, &count, nil, 0) == 0 else { return nil }
         return Array(bytes.prefix(count))
     }
-    private static let formatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.timeZone = .current
-        formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
-        return formatter
-    }()
-    private static let formatterLock = NSLock()
     static func startDate(_ started: String) -> Date? {
-        formatterLock.lock(); defer { formatterLock.unlock() }
-        return formatter.date(from: started)
+        ProcessStartTime.date(started)
     }
 }
 

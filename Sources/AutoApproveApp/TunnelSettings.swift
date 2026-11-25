@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import AppKit
 import AutoApproveCore
 
@@ -151,7 +152,11 @@ import AutoApproveCore
                 }.padding(.top,4)
             }.font(.callout)
         }.frame(maxWidth:.infinity,alignment:.leading)
-            .windowUpdates(updates,sources:[engine.objectWillChange])
+            .windowUpdates(updates, sources: [
+                engine.$tunnelStatus.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                engine.$cloudflareStatus.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                engine.$tunnelPINConfigured.windowChanges, engine.tunnelToolChanges.eraseToAnyPublisher()
+            ])
             .onAppear {
                 do{try engine.loadTunnelPIN()}catch{self.error=error.localizedDescription}
                 configuration=engine.tunnelConfiguration

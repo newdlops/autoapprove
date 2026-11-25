@@ -64,6 +64,7 @@ public struct CodexAccountTransitionObservation: Sendable {
 }
 @MainActor public struct CodexAccountTransitionServices {
     public var observe: (CodexAccountTransitionTarget) async throws -> CodexAccountTransitionObservation
+    package var observeForIdleCheck: ((CodexAccountTransitionTarget) async throws -> CodexAccountTransitionObservation)?
     public var interrupt: (CodexAccountTransitionTarget, String, String, String) async throws -> Void
     public var restart: (CodexAccountTransitionTarget, CodexAccountTransitionObservation) async throws -> Void
     public var verify: (CodexAccountTransitionTarget, [CodexAccountTransitionWitness], [CodexAccountTransitionThread]) async throws -> Int
@@ -125,7 +126,9 @@ public struct CodexAccountTransitionState: Codable, Equatable, Sendable {
         guard !checking else { return }
         checking = true; defer { checking = false }
         do {
-            let observed = try await services.observe(target)
+            let idleCheck = !state.held && loginRequestID == nil && preStoppedGoals.isEmpty
+            let observe = idleCheck ? (services.observeForIdleCheck ?? services.observe) : services.observe
+            let observed = try await observe(target)
             try Task.checkCancellation()
             if state.phase == .review,!state.restartReserved,state.resumeServerID==nil {
                 // A missing acknowledgement is not proof that the interrupt

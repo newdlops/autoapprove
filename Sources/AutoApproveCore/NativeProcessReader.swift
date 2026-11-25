@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import TerminalInputSupport
 
 /// Read-only, fresh kernel metadata. No process, environment or executable-path
 /// cache crosses reads; callers still verify the original before sending input.
@@ -65,7 +66,6 @@ enum NativeProcessReader {
         // Only periodic session discovery may omit unrelated process details.
         var arguments = [UInt8](repeating: 0, count: try argumentLimit())
         var path = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
-        var formatter: DateFormatter?
         var dates: [Int64: String] = [:], devices: [dev_t: String] = [:]
         return try entries.compactMap { entry -> ProcessRecord? in
             try Task.checkCancellation()
@@ -94,15 +94,7 @@ enum NativeProcessReader {
             let started: String
             if let value = dates[seconds] { started = value }
             else {
-                let dateFormatter: DateFormatter
-                if let formatter { dateFormatter = formatter }
-                else {
-                    let value = DateFormatter()
-                    value.locale = Locale(identifier: "en_US_POSIX"); value.timeZone = .current
-                    value.dateFormat = "EEE MMM d HH:mm:ss yyyy"
-                    formatter = value; dateFormatter = value
-                }
-                let value = dateFormatter.string(from: Date(timeIntervalSince1970: Double(seconds)))
+                let value = ProcessStartTime.string(seconds: seconds)
                 dates[seconds] = value
                 started = value
             }

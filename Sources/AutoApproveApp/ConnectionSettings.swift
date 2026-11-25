@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import AppKit
 import AutoApproveCore
 
@@ -195,7 +196,16 @@ import AutoApproveCore
                 }.padding(24)
             }
         }.frame(width: 600, height: 660)
-            .windowUpdates(viewUpdates, sources: [engine.objectWillChange, notifications.objectWillChange])
+            .windowUpdates(viewUpdates, sources: [
+                engine.$snapshot.map(\.health).windowChanges,
+                engine.$snapshot.map(\.keepAwake).windowChanges,
+                engine.$snapshot.map(\.mouseActivity).windowChanges,
+                engine.$snapshot.map(\.questionNotificationDelay).windowChanges,
+                engine.$snapshot.map(\.codexProgressRecoveryEnabled).windowChanges,
+                engine.$networkIsolated.windowChanges,
+                engine.groupMessageTTLChanges.eraseToAnyPublisher(),
+                notifications.objectWillChange.eraseToAnyPublisher()
+            ])
             .onAppear {
                 questionDelayText = String(engine.snapshot.questionNotificationDelay)
                 groupTTLText = String(engine.groupMessageTTLMinutes)

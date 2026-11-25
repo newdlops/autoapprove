@@ -16,6 +16,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     @Published public private(set) var initialDiscoveryComplete = false
     @Published public private(set) var webStatus = RemoteNetworkStatus()
     @Published public internal(set) var tunnelStatus = RemoteTunnelStatus()
+    public let tunnelToolChanges = PassthroughSubject<Void, Never>()
     var tunnelController: RemoteTunnelController?
     var relayController:CloudflareRelayController?
     var tunnelRestoreAttempted = false
@@ -284,6 +285,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var claudeGroupPrompts: [String: (prompt: String, turn: String)] = [:]
     private var groupMailboxDelegations: [UUID: (sessionID: String, prompt: String, at: Date, context: String)] = [:]
     public var groupMailboxPollInterval: TimeInterval = 5
+    public let groupMessageTTLChanges = PassthroughSubject<Void, Never>()
     public static let groupMessageTTLMinutesRange = 1...10_080
     public var groupMessageTTLMinutes: Int {
         guard let raw = store.value("groupMessageTTLMinutes"), let minutes = Int(raw),
@@ -295,6 +297,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw AppError.message("그룹 메시지 만료 시간은 1~10,080분으로 지정해주세요.")
         }
         try store.set("groupMessageTTLMinutes", String(minutes))
+        groupMessageTTLChanges.send()
         scheduleGroupMailboxDelivery()
     }
     public var groupMailboxReminderInterval: TimeInterval = 120
@@ -4768,8 +4771,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     if !hasDelivery, let expiration { delay = max(0.1, expiration.timeIntervalSinceNow) }
                     if !self.snapshot.paused, Date().timeIntervalSince(self.groupRecoveryAt) >= 5 {
                         self.groupRecoveryAt = Date()
-                        let questions = try box.outstandingQuestions()
-                        if !questions.isEmpty { await self.recoverGroupQuestions(questions) }
+                        if try box.hasOutstandingQuestions { await self.recoverGroupQuestions(box) }
                     }
                     if hasDelivery { try await self.deliverGroupMailboxNotifications() }
                     if let expiration { delay = min(delay, max(0.1, expiration.timeIntervalSinceNow)) }
@@ -4779,9 +4781,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func recoverGroupQuestions(_ questions: [SessionGroupMessage]) async {
+    private func recoverGroupQuestions(_ box: SessionGroupMailbox) async {
         guard !remoteInputStopped, let groups = try? SessionGroupStore(directory: paths.directory).load(),
-              let live = try? await sessionGroupSessions(), let box = try? groupMailbox() else { return }
+              let questions = try? box.outstandingQuestions(in: groups), !questions.isEmpty,
+              let live = try? await sessionGroupSessions() else { return }
         let reader = groupTranscriptReader
         let destinations = Dictionary(grouping: questions, by: \.recipientID)
         for group in groups {

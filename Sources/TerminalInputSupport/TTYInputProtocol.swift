@@ -2,15 +2,52 @@ import Foundation
 import Darwin
 private import CTTYInput
 
-public struct TTYInputIdentity: Codable, Equatable, Sendable {
-    private static let processStartFormatterLock = NSLock()
-    private static let processStartFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = .current
-        formatter.dateFormat = "EEE MMM d HH:mm:ss yyyy"
-        return formatter
+package enum ProcessStartTime {
+    private static let lock = NSLock()
+    private static let formatter: DateFormatter = {
+        let value = DateFormatter()
+        value.locale = Locale(identifier: "en_US_POSIX")
+        value.dateFormat = "EEE MMM d HH:mm:ss yyyy"
+        return value
     }()
+    private static var zone: TimeZone?
+    private static var strings: [Int64: String] = [:]
+    private static var dates: [String: Date] = [:]
+
+    private static func updateTimeZone() {
+        let current = TimeZone.current
+        if current != zone {
+            zone = current
+            formatter.timeZone = current
+            strings.removeAll(keepingCapacity: true)
+            dates.removeAll(keepingCapacity: true)
+        }
+    }
+
+    package static func string(seconds: Int64) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        updateTimeZone()
+        if let value = strings[seconds] { return value }
+        let value = formatter.string(from: Date(timeIntervalSince1970: Double(seconds)))
+        if strings.count >= 512 { strings.removeAll(keepingCapacity: true) }
+        strings[seconds] = value
+        return value
+    }
+
+    package static func date(_ text: String) -> Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        updateTimeZone()
+        if let value = dates[text] { return value }
+        guard let value = formatter.date(from: text) else { return nil }
+        if dates.count >= 512 { dates.removeAll(keepingCapacity: true) }
+        dates[text] = value
+        return value
+    }
+}
+
+public struct TTYInputIdentity: Codable, Equatable, Sendable {
     public var pid: Int32
     public var processGroup: Int32
     public var foregroundGroup: Int32
@@ -34,13 +71,7 @@ public struct TTYInputIdentity: Codable, Equatable, Sendable {
             foregroundGroup: value.foreground_group)
     }
     public var processStart: String {
-        Self.processStartFormatterLock.lock()
-        defer { Self.processStartFormatterLock.unlock() }
-        // Keep an already-running app correct if the user changes time zone.
-        if Self.processStartFormatter.timeZone.identifier != TimeZone.current.identifier {
-            Self.processStartFormatter.timeZone = .current
-        }
-        return Self.processStartFormatter.string(from: Date(timeIntervalSince1970: Double(startSeconds)))
+        ProcessStartTime.string(seconds: Int64(clamping: startSeconds))
     }
     /// Foreground jobs can change while the original CLI still exists. Bind
     /// its precise lifetime/device, then check foreground ownership at delivery.

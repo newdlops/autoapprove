@@ -137,3 +137,9 @@ extension View {
             .onDisappear { updates.stop() }
     }
 }
+
+extension Publisher where Failure == Never, Output: Equatable {
+    var windowChanges: AnyPublisher<Void, Never> {
+        removeDuplicates().dropFirst().map { _ in () }.eraseToAnyPublisher()
+    }
+}

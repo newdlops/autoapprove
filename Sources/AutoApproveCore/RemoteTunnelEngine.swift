@@ -86,7 +86,7 @@ extension ApprovalEngine {
             if configuration.provider.usesCloudflared, configuration.executable.isEmpty, tunnelToolPath == nil {
                 progress("installing","Cloudflare 연결 도구를 내려받고 확인하고 있습니다…")
                 _ = try await RemoteTunnelTool.install(directory:paths.directory)
-                try current();objectWillChange.send()
+                try current();tunnelToolChanges.send();objectWillChange.send()
             }
             if !webStatus.ready {
                 progress("preparing","이 Mac의 웹 접속을 준비하고 있습니다…")
@@ -108,6 +108,7 @@ extension ApprovalEngine {
     public func installTunnelTool() async throws {
         guard !tunnelStatus.active else { throw AppError.message("터널 연결을 종료한 뒤 도구를 설치해주세요.") }
         _ = try await RemoteTunnelTool.install(directory:paths.directory)
+        tunnelToolChanges.send()
         objectWillChange.send()
     }
     public func startTunnel(_ supplied: RemoteTunnelConfiguration, token: String = "") async throws {

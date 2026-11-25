@@ -27,7 +27,7 @@ extension CodexAccountTransitionTarget {
 extension CodexAccountTransitionServices {
     public static var live: Self {local()}
     static func local(verifyExecutable:(@Sendable (String)throws->Void)?=nil) ->Self {
-        Self(observe: { target in
+        var services = Self(observe: { target in
             try await CodexAccountBackground.run {
                 let runtime=try CodexAccountRuntime(target,verifyExecutable:verifyExecutable)
                 return try CodexAccountTransitionLocal.observe(target,runtime:runtime)
@@ -96,6 +96,13 @@ extension CodexAccountTransitionServices {
                 return try await CodexAccountContinuationLocal.resume(target,runtime:runtime,expected:expected,original:original,receipt:receipt)
             }
         })
+        services.observeForIdleCheck = { target in
+            try await CodexAccountBackground.run {
+                let runtime = try CodexAccountRuntime(target, verifyExecutable: verifyExecutable)
+                return try CodexAccountTransitionLocal.observe(target, runtime: runtime, idleCheck: true)
+            }
+        }
+        return services
     }
 }
 
@@ -180,14 +187,20 @@ enum CodexAccountTransitionLocal {
         }
         return digest([user, workspace])
     }
-    static func observe(_ target: CodexAccountTransitionTarget,runtime:CodexAccountRuntime) throws -> CodexAccountTransitionObservation {
+    static func observe(_ target: CodexAccountTransitionTarget, runtime: CodexAccountRuntime,
+                        idleCheck: Bool = false) throws -> CodexAccountTransitionObservation {
         let before = try identity(target,runtime:runtime)
         let saved = try CodexAccountMetadataProcess.read(target,runtime:runtime)
         let connection = try CodexQueueConnection(home: target.home)
-        // A validated empty session list is a signed-out server, not a failed
-        // observation. It must be recoverable using the saved login. Malformed
-        // metadata still throws, and restart revalidates this exact nil state.
         let current = try account(connection.request("accountSession/list", ["refreshWorkspaceMetadata": false]))
+        if idleCheck && (saved == nil || saved == current) {
+            try runtime.validate(target)
+            let peer = try runtime.connectedServerIdentity(connection)
+            guard try runtime.connectedServerIdentity(home: target.home) == peer else {
+                throw AppError.message("계정 확인 중 공통 서버가 바뀌었습니다.")
+            }
+            return .init(savedAccount: saved, serverAccount: current, serverID: before, threads: [])
+        }
         var cursor: String?, seen = Set<String>(), ids = Set<String>(), threads: [CodexAccountTransitionThread] = []
         repeat {
             var params: JSONObject = ["limit": 100]

@@ -58,7 +58,7 @@ extension ApprovalTests {
         var threads = ["a", "b"].map { CodexAccountTransitionThread(id: $0, turnID: "turn-" + $0, active: true) }
         var stopped: [String] = []
         var restarts = 0
-        let services = CodexAccountTransitionServices(
+        var services = CodexAccountTransitionServices(
             observe: { _ in .init(savedAccount: "new", serverAccount: "old", serverID: "server", threads: threads) },
             interrupt: { _, _, id, _ in
                 stopped.append(id)
@@ -72,8 +72,16 @@ extension ApprovalTests {
             },
             restart: { _, _ in restarts += 1 },
             verify: { _, _, _ in 0 })
+        var idleChecks = 0
+        services.observeForIdleCheck = { _ in
+            idleChecks += 1
+            return .init(savedAccount: "old", serverAccount: "old", serverID: "server", threads: [])
+        }
         let coordinator = CodexAccountTransitionCoordinator(target: target, services: services, save: { _ in })
         let start = Date()
+        await coordinator.check(now: start)
+        try expectEqual(coordinator.state.phase, .ready)
+        try expectEqual(idleChecks, 1)
         await coordinator.check(now: start, loginRequestID: UUID().uuidString)
         try expect(stopped.isEmpty, "The first check must publish the input hold")
         await coordinator.check(now: start.addingTimeInterval(1))
@@ -85,6 +93,7 @@ extension ApprovalTests {
         threads[1].active = false
         await coordinator.check(now: start.addingTimeInterval(3))
         try expectEqual(restarts, 1)
+        try expectEqual(idleChecks, 1)
     }
 
     func testSessionRestartCommandKeepsKnownOptionsOnly() throws {
