@@ -107,7 +107,7 @@ struct SessionProfileEntryFilter:Equatable {
     @Published private(set) var results:[UUID:TerminalProfileRestoreResult]=[:]
     private let capture:@MainActor () async throws -> [TerminalProfileCandidate]
     private let activeSessions:@MainActor () async throws -> [TerminalProfileCandidate]
-    private let refreshForSaving:@MainActor () async throws -> [TerminalProfileCandidate]
+    private let refreshForSaving:@MainActor (Set<String>) async throws -> [TerminalProfileCandidate]
     private let captureGroups:@MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup]
     private let restoreGroups:@MainActor (TerminalSessionProfile,[TerminalProfileRestoreResult],[TerminalProfileCandidate]) async throws -> Void
     private let launch:@Sendable (TerminalProfileEntry,String?) async throws -> String
@@ -117,13 +117,13 @@ struct SessionProfileEntryFilter:Equatable {
     private var repositoryGeneration=UUID()
     init(store:TerminalProfileStore,capture:@escaping @MainActor () async throws -> [TerminalProfileCandidate],
          activeSessions:(@MainActor () async throws -> [TerminalProfileCandidate])? = nil,
-         refreshForSaving:(@MainActor () async throws -> [TerminalProfileCandidate])? = nil,
+         refreshForSaving:(@MainActor (Set<String>) async throws -> [TerminalProfileCandidate])? = nil,
          captureGroups:@escaping @MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup] = {_ in []},
          restoreGroups:@escaping @MainActor (TerminalSessionProfile,[TerminalProfileRestoreResult],[TerminalProfileCandidate]) async throws -> Void = {_,_,_ in},
          launch:(@Sendable (TerminalProfileEntry,String?) async throws -> String)? = nil,
          selectTab:(@Sendable (String) async throws -> Void)? = nil) {
         self.store=store;self.capture=capture;self.activeSessions=activeSessions ?? capture
-        self.refreshForSaving=refreshForSaving ?? capture
+        self.refreshForSaving=refreshForSaving ?? { _ in try await capture() }
         self.captureGroups=captureGroups;self.restoreGroups=restoreGroups
         self.launch=launch ?? {try await TerminalProfileLauncher.launch($0,anchorTTY:$1)}
         // A synthetic launcher cannot acquire an implicit path to real native UI.
@@ -135,7 +135,7 @@ struct SessionProfileEntryFilter:Equatable {
         self.init(store:TerminalProfileStore(directory:engine.paths.directory.appendingPathComponent("session-profiles",isDirectory:true)),
                   capture:{try await engine.terminalProfileCandidates()},
                   activeSessions:{try await engine.terminalProfileCandidates(includeLayout:false)},
-                  refreshForSaving:{try await engine.terminalProfileCandidates(includeLayout:false,refreshForSaving:true)},
+                  refreshForSaving:{try await engine.terminalProfileCandidates(includeLayout:false,refreshForSaving:true, sessionIDs:$0)},
                   captureGroups:{try engine.terminalProfileGroups(candidates:$0)},
                   restoreGroups:{try await engine.restoreTerminalProfileGroups($0,results:$1,previous:$2)})
     }
@@ -203,7 +203,9 @@ struct SessionProfileEntryFilter:Equatable {
         if let draft,draft.profileID==profile.id {
             var groups=draft.groups
             if draft.capturesLiveSessions {
-                let fresh=try await refreshForSaving()
+                let chosenIDs = Set(value.entries.map(\.id))
+                let runtimes = Set(draft.candidates.filter { chosenIDs.contains($0.entry.id) }.map(\.id))
+                let fresh=try await refreshForSaving(runtimes)
                 var selected:[TerminalProfileCandidate]=[]
                 for index in value.entries.indices {
                     let chosen=value.entries[index]

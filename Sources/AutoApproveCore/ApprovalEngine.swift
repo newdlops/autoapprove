@@ -244,6 +244,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var goalRecoveryTask:Task<Void,Never>?
     private var nextGoalRecovery=Date.distantPast
     private var recoveringGoalIntents=false
+    private var groupBlockedGoals = Set<String>()
     private var manualGoalHoldCache:[String:String]=[:]
     private var clearingCodexQueues = Set<String>()
     private var replyingQuestions = Set<String>()
@@ -1189,14 +1190,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let keep = Set(inventory.map { "pty:" + $0.ptyID })
         for id in Array(sessions.keys) where id.hasPrefix("pty:") && !keep.contains(id) { sessions.removeValue(forKey: id) }
     }
-    /// Prefer the exact live rollout. A daemon-backed TUI can also bind a unique
-    /// full server name to its current terminal title; unresolved rows keep a picker.
-    public func terminalProfileCandidates(includeLayout:Bool = true, refreshForSaving:Bool = false) async throws -> [TerminalProfileCandidate] {
+    public func terminalProfileCandidates(includeLayout:Bool = true, refreshForSaving:Bool = false, sessionIDs:Set<String>? = nil) async throws -> [TerminalProfileCandidate] {
         guard !remoteInputStopped else {throw AppError.message("앱이 종료 중입니다.")}
-        let targets=snapshot.sessions.filter {$0.agent != .shell && $0.phase != .ended && $0.pid>0}
+        let epoch = observationEpoch
+        let targets = snapshot.sessions.filter {
+            $0.agent != .shell && $0.phase != .ended && $0.pid > 0 && !isBackgroundGroupSession($0) && (sessionIDs?.contains($0.id) ?? true)
+        }
+        let targetsByID = Dictionary(uniqueKeysWithValues: targets.map { ($0.id, $0) })
         guard targets.count<=128 else {throw AppError.message("프로필에는 최대 128개 세션을 저장합니다.")}
         let reader=processReader
-        let observed=try await readSessionGroupSessions(reconcile:false)
+        let observed=try await readSessionGroupSessions(selectedIDs: Set(targetsByID.keys), reconcile:false, priority:.userInitiated)
         let identities=Dictionary(uniqueKeysWithValues:observed.map {($0.id,$0)})
         var result:[TerminalProfileCandidate]=[]
         var conversationLists:[String:[String:[CodexQueueConversation]]]=[:]
@@ -1265,8 +1268,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 guard let title=candidate.entry.terminalTab?.customTitle,!title.isEmpty,
                       let home=candidate.entry.providerHome,
                       let conversations=conversationLists[home]?[candidate.entry.cwd] else {continue}
-                // Terminal's freshly read title can be newer than the polling
-                // snapshot (notably immediately after startup or /resume).
                 if let bound=CodexProfileConversationBinding.match(title:title,cwd:candidate.entry.cwd,conversations:conversations),let name=bound.name {
                     if !candidate.entry.conversationID.isEmpty,namedCodexBindings[candidate.id]==nil,
                        UUID(uuidString:candidate.entry.conversationID) != UUID(uuidString:bound.id) {
@@ -1283,20 +1284,26 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         if includeLayout || refreshForSaving {
             let settingsReader = profileExecutionSettingsReader
-            for index in result.indices {
-                let entry = result[index].entry
-                guard let session = targets.first(where: { $0.id == result[index].id }), UUID(uuidString: entry.conversationID) != nil else { continue }
+            let inputs = result.enumerated().compactMap { index, candidate -> (Int, SessionGroupLiveSession)? in
+                let entry = candidate.entry
+                guard let session = targetsByID[candidate.id], UUID(uuidString: entry.conversationID) != nil else { return nil }
                 let home = entry.providerHome ?? NSHomeDirectory() + (entry.agent == "codex" ? "/.codex" : "/.claude")
-                let settingsTarget = SessionGroupLiveSession(session: session, conversationID: entry.conversationID, providerHome: home)
-                result[index].entry.executionSettings = await Task.detached(priority: .utility) { settingsReader(settingsTarget) }.value
+                return (index, SessionGroupLiveSession(session: session, conversationID: entry.conversationID, providerHome: home))
+            }
+            let settings = try await sessionMetadataReads.map(inputs, priority: .userInitiated) { index, live in (index, settingsReader(live)) }
+            for (index, value) in settings {
+                let entry = result[index].entry
+                result[index].entry.executionSettings = value
                 if result[index].entry.executionSettings == nil || (entry.agent == "codex" && result[index].entry.executionSettings?.serviceTier == nil) {
                     result[index].detail = (result[index].detail.map { $0 + " " } ?? "") + "일부 실행 설정을 확인하지 못했습니다. 저장 화면에서 모델·추론 수준·처리 속도를 확인해주세요."
                 }
             }
         }
-        let fresh=try await Task.detached(priority:.utility) {try reader()}.value
-        guard !remoteInputStopped,result.allSatisfy({candidate in
-            guard let original=targets.first(where:{$0.id == candidate.id}),let current=sessions[candidate.id] else {return false}
+        let fresh=try await Task.detached(priority:.userInitiated) {ProcessDiscovery.index(try reader())}.value
+        try Task.checkCancellation()
+        guard observationEpoch == epoch, !remoteInputStopped,result.allSatisfy({candidate in
+            guard let original=targetsByID[candidate.id],let current=sessions[candidate.id],current.phase != .ended, !isBackgroundGroupSession(current),
+                  current.tty == original.tty, current.terminal == original.terminal, let process=fresh[original.pid] else {return false}
             if let thread=explicitCodexBindings[candidate.id],current.codexApprovalBinding?.threadID != thread {return false}
             if let name=namedCodexBindings[candidate.id] {
                 let matches=CodexProfileConversationBinding.terminalName(current.terminalTitle,cwd:current.cwd)==name
@@ -1305,7 +1312,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                    CodexProfileConversationBinding.terminalName(title,cwd:current.cwd) != name {return false}
             }
             return current.pid == original.pid && current.started == original.started && current.cwd == original.cwd &&
-                fresh.contains(where:{$0.key == original.id && $0.agent == original.agent && "/dev/"+$0.tty == original.tty})
+                process.key == original.id && process.agent == original.agent && "/dev/"+process.tty == original.tty
         }) else {throw AppError.message("대화를 확인하는 동안 창이 바뀌었습니다. 현재 세션을 다시 불러와주세요.")}
         return result
     }
@@ -2523,6 +2530,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func discardGroupMCPIdentities(for runtime: String) {
         groupMCPIdentities = groupMCPIdentities.filter { $0.value.runtimeID != runtime }
     }
+    private let sessionMetadataReads = SessionMetadataReads()
     private var groupIdentityObservationTask: Task<[SessionGroupLiveSession], Error>?
     private var groupStatusQueries: Set<String> = []
     private var groupClearOperations: [SessionGroupClearOperation]?
@@ -2542,6 +2550,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let savedSnapshots=profile.groups ?? TerminalProfileGroup.capture(saved,candidates:profile.entries.map {.init(id:$0.id.uuidString,entry:$0)})
         let snapshots = try TerminalProfileGroupRestore.resolveMemberIDs(savedSnapshots, in: saved)
         let successful=results.filter {$0.phase == .opened || $0.phase == .alreadyOpen}
+        guard !snapshots.isEmpty, !successful.isEmpty else { return }
         var next=try TerminalProfileGroupRestore.merge(snapshots,into:saved,restored:Set(successful.map(\.id)))
         var pending:[TerminalProfileGroupAttachment]=[]
         for snapshot in snapshots {
@@ -2565,7 +2574,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             profileGroupAttachments.removeAll {$0.groupID==attachment.groupID && $0.memberID==attachment.memberID}
             profileGroupAttachments.append(attachment)
         }
-        _ = try await sessionGroupSessions()
+        if !pending.isEmpty { _ = try await sessionGroupSessions() }
         refreshSessionGroupBadges()
     }
 
@@ -2976,9 +2985,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         session.terminal == .claudeBackground || claudeParents[session.id] != nil || registeredBackgroundClaude.contains(session.id)
     }
 
-    private func readSessionGroupSessions(runtimeID: String? = nil, reconcile: Bool = true, useStatusCache: Bool = true, priority: TaskPriority = .utility) async throws -> [SessionGroupLiveSession] {
+    private func readSessionGroupSessions(runtimeID: String? = nil, selectedIDs: Set<String>? = nil, reconcile: Bool = true, useStatusCache: Bool = true, priority: TaskPriority = .utility) async throws -> [SessionGroupLiveSession] {
         let epoch = observationEpoch
-        let candidates = runtimeID.map { sessions[$0].map { [$0] } ?? [] } ?? Array(sessions.values)
+        let candidates = runtimeID.map { sessions[$0].map { [$0] } ?? [] } ?? selectedIDs.map { $0.compactMap { sessions[$0] } } ?? Array(sessions.values)
         let originals = candidates.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 && !isBackgroundGroupSession($0) }
         guard !originals.isEmpty || runtimeID == nil else { return [] }
         guard originals.count <= 512 else { throw AppError.message("세션이 너무 많아 그룹 구성을 확인하지 못했습니다.") }
@@ -2986,68 +2995,62 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let reader: @Sendable () throws -> [ProcessRecord] = { if let pid { return try readOne(pid) }; return try readAll() }
         let registry = claudeRegistryReader, codexReader = codexGroupReader, codexEnvironment = codexGroupEnvironment
         let records = try await Task.detached(priority: priority) { ProcessDiscovery.index(try reader()) }.value
-        let agyRevisions = agyEvents.mapValues(\.revision)
-        var terminalEnvironments: [String: [String: String]] = [:]
-        var result: [SessionGroupLiveSession] = []
-        for original in originals {
-            try Task.checkCancellation()
-            guard let record = records[original.pid], record.key == original.id, record.agent == original.agent, "/dev/" + record.tty == original.tty else { continue }
-            let environment = await Task.detached(priority: priority) {
-                original.agent == .codex ? codexEnvironment(record) : ProcessEnvironment.read(record)
-            }.value
-            terminalEnvironments[original.id] = environment
-            var home: String?, conversation: String?, messagingName: String?, claudeStatus: String?
-            var claudeActivity: ClaudeSessionActivity?
-            if original.agent == .codex {
-                home = CodexGroupIdentity.home(environment: environment)
-                let location = try? await Task.detached(priority: priority) {
-                    try codexReader(record)
-                }.value
-                if let location, UUID(uuidString: location.threadID) != nil {
-                    conversation = location.threadID
-                    home = URL(fileURLWithPath: location.database).deletingLastPathComponent().resolvingSymlinksInPath().path
-                }
-            } else if original.agent == .agy {
-                home = AgyHookInstaller.file.deletingLastPathComponent().path
-                conversation = await Task.detached(priority: priority) {
-                    ProcessOpenFiles.agyConversation(pid: record.pid, started: record.started)
-                }.value ?? agyEvents[original.id]?.conversationId
-            } else {
-                let rows: [ClaudeSessionRegistration]
-                if let environment {
-                    let path = environment["CLAUDE_CONFIG_DIR"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude").path
-                    home = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
-                    let directory = URL(fileURLWithPath: path)
-                    rows = await Task.detached(priority: priority) { ClaudeSessionRegistry.read(records: [record], directory: directory) }.value
-                } else {
-                    rows = await Task.detached(priority: priority) { registry([record]) }.value
-                }
-                let registrations = rows.filter { $0.processID == original.id }
-                guard !registrations.contains(where: { $0.kind == "bg" }) else { continue }
-                let ids = Set(registrations.compactMap(\.conversationID))
-                if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil { conversation = id }
-                let matching = registrations.filter { $0.conversationID == conversation }
-                if conversation != nil, matching.count == 1 {
-                    messagingName = matching[0].peerName
-                    claudeStatus = matching[0].status
-                    claudeActivity = matching[0].activity
-                }
-            }
-            guard let current = sessions[original.id], current.pid == original.pid, current.started == original.started,
-                  current.tty == original.tty, current.agent == original.agent, current.cwd == original.cwd,
-                  current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
-                  current.phase != .ended else { continue }
-            var observation = SessionGroupLiveSession(session: current, conversationID: conversation, providerHome: home, messagingName: messagingName)
-            observation.inheritsClaudeConfigHome = original.agent == .claude && environment != nil && environment?["CLAUDE_CONFIG_DIR"] == nil
-            observation.claudePromptChannel = environment?[ClaudePromptBridge.key]
-            observation.claudeRegisteredStatus = claudeStatus
-            observation.claudeRegisteredActivity = claudeActivity
-            result.append(observation)
+        let agySnapshot = agyEvents
+        let inputs = originals.compactMap { original -> (AgentSession, ProcessRecord)? in
+            guard let record = records[original.pid], record.key == original.id, record.agent == original.agent,
+                  "/dev/" + record.tty == original.tty else { return nil }
+            return (original, record)
         }
+        let rows = try await sessionMetadataReads.map(inputs, priority: priority) { pair -> (SessionGroupLiveSession, [String: String]?)? in
+            let (original, record) = pair
+            let environment = original.agent == .codex ? codexEnvironment(record) : ProcessEnvironment.read(record)
+            var row = SessionGroupLiveSession(session: original, conversationID: nil, providerHome: nil)
+            switch original.agent {
+            case .codex:
+                row.providerHome = CodexGroupIdentity.home(environment: environment)
+                do {
+                    if let location = try codexReader(record), UUID(uuidString: location.threadID) != nil {
+                        row.conversationID = location.threadID
+                        row.providerHome = URL(fileURLWithPath: location.database).deletingLastPathComponent().resolvingSymlinksInPath().path
+                    }
+                } catch CodexThreadLocationFailure.ambiguous { row.providerIdentityAmbiguous = true }
+                catch {}
+            case .agy:
+                row.providerHome = AgyHookInstaller.file.deletingLastPathComponent().path
+                let ids = try? ProcessOpenFiles.agyConversations(pid: record.pid, started: record.started)
+                row.providerIdentityAmbiguous = (ids?.count ?? 0) > 1
+                row.conversationID = ids?.count == 1 ? ids?.first : agySnapshot[original.id]?.conversationId
+            case .claude:
+                let registrations: [ClaudeSessionRegistration]
+                if let environment {
+                    let path = environment["CLAUDE_CONFIG_DIR"] ?? NSHomeDirectory() + "/.claude"
+                    let home = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+                    row.providerHome = home.path
+                    registrations = ClaudeSessionRegistry.read(records: [record], directory: home)
+                    row.inheritsClaudeConfigHome = environment["CLAUDE_CONFIG_DIR"] == nil
+                    row.claudePromptChannel = environment[ClaudePromptBridge.key]
+                } else { registrations = registry([record]) }
+                let own = registrations.filter { $0.processID == original.id }
+                guard !own.contains(where: { $0.kind == "bg" }) else { return nil }
+                let ids = Set(own.compactMap(\.conversationID))
+                row.providerIdentityAmbiguous = ids.count > 1
+                if ids.count == 1, let id = ids.first, UUID(uuidString: id) != nil {
+                    row.conversationID = id
+                    let matching = own.filter { $0.conversationID == id }
+                    if matching.count == 1 {
+                        row.messagingName = matching[0].peerName
+                        row.claudeRegisteredStatus = matching[0].status
+                        row.claudeRegisteredActivity = matching[0].activity
+                    }
+                }
+            case .shell: return nil
+            }
+            return (row, environment)
+        }.compactMap { $0 }
         let byPID = try await Task.detached(priority: priority) { ProcessDiscovery.index(try reader()) }.value
         try Task.checkCancellation()
         guard observationEpoch == epoch, !remoteInputStopped else { throw CancellationError() }
-        let observed = result.compactMap { observation -> SessionGroupLiveSession? in
+        let observed = rows.compactMap { observation, environment -> SessionGroupLiveSession? in
             guard let current = sessions[observation.id], current.phase != .ended, !isBackgroundGroupSession(current),
                   current.pid == observation.session.pid, current.started == observation.session.started,
                   current.tty == observation.session.tty, current.cwd == observation.session.cwd,
@@ -3056,10 +3059,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   let process = byPID[current.pid], process.key == observation.id, process.agent == current.agent, "/dev/" + process.tty == current.tty else { return nil }
             var result = observation
             result.session = current
-            if current.agent == .agy, agyRevisions[current.id] != agyEvents[current.id]?.revision {
+            if current.agent == .agy, agySnapshot[current.id]?.revision != agyEvents[current.id]?.revision {
                 result.conversationID = agyEvents[current.id]?.conversationId
             }
-            result.tabShell = SessionGroupTabShell.observe(current, process: process, records: byPID, environment: terminalEnvironments[current.id])
+            result.tabShell = SessionGroupTabShell.observe(current, process: process, records: byPID, environment: environment)
             let mcp = current.agent == .codex ? groupMCPIdentity(for: current, home: result.providerHome) : nil
             if let mcp, let id = mcp.conversationID {
                 groupStatusIdentities.removeValue(forKey: current.id)
@@ -3968,10 +3971,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func validateGoalAssignment(_ object: JSONObject, group: UUID, member: UUID, leader: UUID, thread: String) throws {
+    private func validateGoalAssignment(_ object: JSONObject, group: SessionGroup, member: UUID, leader: UUID, thread: String) throws {
         let requested = try GroupWaitRequest.uuid(object,"taskID")
-        let task = try groupOrchestration().current(groupID:group,workerMemberID:member)
-        if let task, task.status == .working, task.parentMemberID != leader { throw Self.taskOwnershipConflict(task) }
+        let task = try groupOrchestration().current(groupID:group.id,workerMemberID:member)
+        if let task, task.status == .working, task.parentMemberID != leader {
+            guard !group.isLeader(task.parentMemberID), group.goalReviewLeaders(for: member).contains(leader),
+                  group.reaches(leader, member: task.parentMemberID), group.reaches(task.parentMemberID, member: member) else {
+                throw Self.taskOwnershipConflict(task)
+            }
+        }
         if let requested {
             guard let task, task.id == requested, task.status == .working, task.workerConversationID == thread else {
                 throw RemoteHTTPError(409,"지정한 작업과 현재 대화의 배정을 다시 확인해주세요.")
@@ -4002,7 +4010,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let observed = await evidence()
         func validate() throws {
-            try verifyGroupDirection(group.id,caller:leader,target:member)
+            guard let latest = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == group.id }),
+                  latest.sameMembership(as: group), latest.canManageGoal(leader.id, member: member.id), !groupClearActive(group.id) else {
+                throw GroupJobProvider.stale()
+            }
             guard currentJobEndpoint(live,group:group,member:member),
                   !modifying || (!snapshot.paused && !remoteInputStopped && sessions[live.id]?.pendingInTerminal == false && !automaticInputBusy(live.id)) else {
                 throw GroupJobProvider.stale()
@@ -4037,7 +4048,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         default:
             objective = supplied
         }
-        if ["create","set","edit","resume"].contains(action) { try validateGoalAssignment(object,group:group.id,member:member.id,leader:leader.id,thread:thread) }
+        if ["create","set","edit","resume"].contains(action) { try validateGoalAssignment(object,group:group,member:member.id,leader:leader.id,thread:thread) }
         let line = try TerminalGroupGoal.command(agent:member.agent,action:action,objective:objective)
         if action == "pause", let objective { _ = try TerminalGroupGoal.command(agent:member.agent,action:"resume",objective:objective) }
         func revalidate() async throws {
@@ -4118,8 +4129,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             throw RemoteHTTPError(400, "그룹과 구성원 ID를 지정해주세요.")
         }
         let (group, leader) = try await groupMailboxCaller(object, groupID: gid, verified: true)
-        guard group.isLeader(leader.id), group.canDirect(leader.id, worker: mid) else {
-            throw RemoteHTTPError(403, "그룹장이 직속 구성원의 Goal을 관리할 수 있습니다.")
+        guard group.canManageGoal(leader.id, member: mid) else {
+            throw RemoteHTTPError(403, "담당 그룹장만 이 구성원의 Goal을 관리할 수 있습니다.")
         }
         let (_, member, endpoint) = try await groupEvidenceTarget(object, groupID: gid, memberID: mid)
         guard let endpoint, let thread = endpoint.conversationID, let session = sessions[endpoint.id] else { throw GroupJobProvider.stale() }
@@ -4139,7 +4150,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             return result
         }
         let (confirmedGroup, confirmedMember, confirmedEndpoint) = try await groupEvidenceTarget(object, groupID: gid, memberID: mid)
-        guard confirmedGroup.isLeader(leader.id), confirmedGroup.canDirect(leader.id, worker: mid),
+        guard confirmedGroup.canManageGoal(leader.id, member: mid),
               confirmedGroup.sameMembership(as: group), confirmedMember == member,
               confirmedEndpoint?.id == endpoint.id, confirmedEndpoint?.conversationID == thread,
               confirmedEndpoint?.providerHome == target.home else { throw GroupJobProvider.stale() }
@@ -4153,7 +4164,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let objective: String?
         if ["create","set","edit"].contains(action) {
-            try validateGoalAssignment(object, group:gid, member:mid, leader:leader.id, thread:thread)
+            try validateGoalAssignment(object, group:group, member:mid, leader:leader.id, thread:thread)
             guard let text = (object["objective"] as? String)?.trimmingCharacters(in:.whitespacesAndNewlines),
                   !text.isEmpty, text.count <= SessionGroupOrchestration.maximumTaskLength, !text.contains("\0"),
                   SessionGroupOrchestration.commandPrefix(text) == nil else { throw RemoteHTTPError(400,"목표 설명을 확인해주세요.") }
@@ -7222,7 +7233,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if manualGoalHoldCache.count>512 {manualGoalHoldCache=manualGoalHoldCache.filter {sessions[$0.key] != nil || $0.key==id}}
         return value
     }
-    private func hasManualGoalHold(_ id:String)->Bool {codexAccountInputHeld(id) || codexAccountContinuationHeld(id) || !manualGoalHold(id).isEmpty}
+    private func hasManualGoalHold(_ id:String)->Bool {groupBlockedGoals.contains(id) || codexAccountInputHeld(id) || codexAccountContinuationHeld(id) || !manualGoalHold(id).isEmpty}
     private func codexAccountContinuationHeld(_ id: String) -> Bool {
         guard let session = sessions[id], session.agent == .codex else { return false }
         for state in codexAccountTransitionStates.values {
@@ -8696,6 +8707,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             live.insert(session.id)
             if session.agent == .codex { liveCodex.insert(session.id) }
         }
+        groupBlockedGoals.formIntersection(live)
         claudePromptChannels = claudePromptChannels.filter { live.contains($0.key) }
         claudePromptAutomatic = claudePromptAutomatic.filter { live.contains($0.key) }
         for record in records where live.contains(record.key) && record.agent == .claude && claudePromptChannels[record.key] == nil {
@@ -10883,11 +10895,71 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
+    private func deferBlockedGoalToLeader(_ session: AgentSession, reason: String, at now: Date) -> Bool {
+        let groups: [SessionGroup]
+        do { groups = try SessionGroupStore(directory: paths.directory).load() }
+        catch { groupBlockedGoals.insert(session.id); return true }
+        let live = groupConnectionObservation?.sessions ?? []
+        let evidence = live.first { $0.id == session.id && $0.session.tty == session.tty && $0.session.cwd == session.cwd }
+        var held = false
+        for group in groups {
+            let members = group.members.filter { member in
+                guard member.agent == session.agent else { return false }
+                if member.runtimeID == session.id { return true }
+                guard let evidence else { return false }
+                return SessionGroupMatching.policySession(member, in: live)?.id == evidence.id
+            }
+            if members.isEmpty {
+                if group.members.contains(where: { member in
+                    guard member.agent == session.agent, member.cwd == session.cwd,
+                          member.runtimeID.flatMap({ sessions[$0] })?.phase == .ended || member.runtimeID.flatMap({ sessions[$0] }) == nil else { return false }
+                    if let saved = member.tabShell?.terminalSessionID, let observed = evidence?.tabShell?.terminalSessionID, saved != observed { return false }
+                    if let expected = UUID(uuidString: member.conversationID), let current = evidence?.conversationID.flatMap(UUID.init(uuidString:)), expected != current { return false }
+                    return true
+                }) {
+                    held = true
+                    if groupBadgeTask == nil, now.timeIntervalSince(groupBadgeRefreshedAt) > 4 { refreshSessionGroupBadges() }
+                }
+                continue
+            }
+            held = true
+            guard members.count == 1, let member = members.first else { continue }
+            if let saved = UUID(uuidString: member.conversationID) {
+                let ids = [evidence?.conversationID, session.codexApprovalBinding?.threadID].compactMap { $0.flatMap(UUID.init(uuidString:)) }
+                if ids.contains(where: { $0 != saved }) {
+                    if groupBadgeTask == nil, now.timeIntervalSince(groupBadgeRefreshedAt) > 4 { refreshSessionGroupBadges() }
+                    continue
+                }
+            }
+            if sessions[session.id]?.interruption?.needsAttention != true || sessions[session.id]?.interruption?.kind != .goalBlocked {
+                sessions[session.id]?.interruption = SessionInterruption(id: UUID().uuidString, kind: .goalBlocked, detail: reason, date: now)
+                _ = persistInterruption(session.id)
+            }
+            guard let event = sessions[session.id]?.interruption, let box = try? groupMailbox() else { continue }
+            for leader in group.goalReviewLeaders(for: member.id) {
+                let key = "goalBlocked:" + [group.id.uuidString, member.id.uuidString, leader.uuidString, event.id].joined(separator: ":")
+                do {
+                    guard try box.message(sourceKey: key) == nil else { continue }
+                    let body = "[AutoApprove Goal 차단] " + member.diagnosticLabel + "의 Goal이 차단되었습니다. 마지막 상태 문구: " + reason +
+                        "\nGoal 중지·삭제·수정·재개 여부를 결정해주세요."
+                    _ = try box.enqueue(groupID: group.id, senderID: member.id, recipientID: leader, kind: .notice, text: body, sourceKey: key)
+                    scheduleGroupMailboxDelivery()
+                } catch { continue }
+            }
+        }
+        if held { groupBlockedGoals.insert(session.id); capacityStates.removeValue(forKey: session.id) }
+        else { groupBlockedGoals.remove(session.id) }
+        return held
+    }
+
     private func observeCapacity(_ id: String, analysis: ScreenAnalysis, raw: String, at now: Date) {
         restoreLegacyResumeDraft(id, raw: raw)
         guard let session = sessions[id], session.agent != .shell, session.phase != .ended else { return }
-        // A newline is not a submitted continuation. An exact saved owned draft
-        // can be completed later or after restart, without typing its text again.
+        if let reason = analysis.blockedGoalReason {
+            if deferBlockedGoalToLeader(session, reason: reason, at: now) { return }
+        } else if analysis.activity.phase == .working || analysis.activity.phase == .idle {
+            groupBlockedGoals.remove(id)
+        }
         if session.automatic, session.interruption?.resumeUncertain == true,
            session.interruption?.resumeSubmissionCancelled != true,
            let saved = session.interruption?.resumeStop,
@@ -10934,9 +11006,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 case .sending:
                     capacityStates[id] = state
                 case .sent:
-                    // Time alone cannot prove another failure. An unchanged error may
-                    // remain after completion; only a changed transcript or observed work
-                    // followed by this stop can authorize another continuation.
                     let elapsed = now.timeIntervalSince(state.sentAt ?? now)
                     let newFailedTurn = failedTurnAdvanced(id, after: state.turnIdentity, at: now)
                     if stop.continuationKey != state.stop.continuationKey || state.workingObserved || newFailedTurn {
@@ -10948,8 +11017,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 case .waiting, .unavailable, .review, .cancelled:
                     let advanced = state.phase == .review && failedTurnAdvanced(id, after: state.turnIdentity, at: now)
                     if stop.continuationKey != state.stop.continuationKey || advanced {
-                        // Someone continued by hand. A spacing-only redraw is still ours.
-                        // A later failed root turn also resolves an uncertain earlier send.
                         if advanced { sessions[id]?.interruption?.resumeUncertain = false; persistInterruption(id) }
                         startCapacityRun(id, stop: stop, channel: channel, attempt: advanced ? state.attempt + 1 : 1, at: now)
                     } else {
@@ -10972,16 +11039,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     if elapsed > 10, CodexResumeCheck.draftVisible(raw, text: state.stop.continuationText) {
                         capacityStates[id]?.phase = .review
                     } else if phase == .idle || (phase != .unknown && elapsed >= capacityProgressWindow) {
-                        // Ended normally, or kept working: the run of failures is over.
                         sessions[id]?.interruption?.recoveredAt = now
                         sessions[id]?.interruption?.resumeUncertain = false
                         persistInterruption(id)
                         capacityStates.removeValue(forKey: id)
                     }
                 case .review where CodexResumeCheck.draftVisible(raw, text: state.stop.continuationText):
-                    break // Our unsent text still waits in the composer for the user.
+                    break
                 case .waiting, .unavailable, .review, .cancelled:
-                    // The user typed or a turn is running. A partial repaint keeps the stop.
                     if phase != .unknown || CodexResumeCheck.composerChanged(raw, region: state.stop.region) {
                         capacityStates.removeValue(forKey: id)
                     }
@@ -10992,7 +11057,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    /// One phase per frame: a stopped turn shows as such, and asks for attention only once automation gave up.
     private func presentPhase(_ id: String, _ observed: ActivityObservation, at now: Date) {
         // Turning idle is the moment a held group message can be typed, for every agent and screen
         // source; waking the delivery loop here replaces retrying held messages on a timer.
@@ -11107,7 +11171,24 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if let host = sessions[id].flatMap({ ScreenHost(kind: $0.terminal) }) { screenPollSignals[host]?.notify() }
             }
         }
-        let observed = try await readSessionGroupSessions(reconcile: false, priority: .userInitiated)
+        if let discoveryTask { await discoveryTask.value }
+        var observed = try await readSessionGroupSessions(reconcile: false, priority: .userInitiated)
+        let unresolved = expected.members.filter { SessionGroupMatching.policySession($0, in: observed) == nil }
+        if !unresolved.isEmpty {
+            let needsDiscovery = unresolved.contains { member in
+                guard let runtime = member.runtimeID else { return member.tabShell != nil }
+                return !observed.contains { $0.id == runtime }
+            }
+            let missingIdentity = unresolved.contains { member in
+                observed.contains { $0.id == member.runtimeID && $0.conversationID == nil && !$0.providerIdentityAmbiguous }
+            }
+            if needsDiscovery { await refreshDiscovery() }
+            if needsDiscovery || missingIdentity {
+                try Task.checkCancellation()
+                guard observationEpoch == epoch, !remoteInputStopped else { throw CancellationError() }
+                observed = try await readSessionGroupSessions(reconcile: false, priority: .userInitiated)
+            }
+        }
         try Task.checkCancellation()
         guard observationEpoch == epoch, !remoteInputStopped else { throw CancellationError() }
         let groups = try SessionGroupStore(directory: paths.directory).load()
@@ -11115,7 +11196,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
               group.sameMembership(as: expected) else {
             throw AppError.message("그룹 구성이 바뀌었거나 초기화 중입니다. 그룹을 새로고침한 뒤 다시 열어주세요.")
         }
-        let matches = group.members.map { SessionGroupMatching.match($0, in: observed) }
+        let matches = group.members.map { SessionGroupMatching.policySession($0, in: observed) }
         let owners = Dictionary(grouping: matches.compactMap { $0 }, by: \.id)
         var results: [GroupOSPermissionResult] = []
         withScreenPublicationBatch {
@@ -11123,9 +11204,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 func record(_ outcome: GroupOSPermissionResult.Outcome, _ detail: String) {
                     results.append(.init(id: member.id, member: member.diagnosticLabel, outcome: outcome, detail: detail))
                 }
-                guard let match, owners[match.id]?.count == 1, let session = sessions[match.id],
-                      session.phase != .ended, osPermissionSource(session) == osPermissionSource(match.session) else {
-                    record(.skipped, "실행 중인 구성원 세션을 고유하게 확인할 수 없습니다.")
+                guard let match else {
+                    let active = observed.filter { SessionGroupMatching.ownsTerminal(member, $0) }
+                    if active.isEmpty { record(.skipped, "원래 프로세스나 터미널 탭을 현재 실행 목록에서 확인할 수 없습니다.") }
+                    else { record(.skipped, "저장된 대화와 실행 중인 탭의 신원 증거가 부족하거나 서로 충돌합니다.") }
+                    continue
+                }
+                guard owners[match.id]?.count == 1, !group.members.contains(where: {
+                    $0.id != member.id && SessionGroupMatching.ownsTerminal($0, match)
+                }) else { record(.skipped, "여러 구성원이 같은 실행 세션에 연결되어 있습니다."); continue }
+                guard let session = sessions[match.id], session.phase != .ended,
+                      osPermissionSource(session) == osPermissionSource(match.session) else {
+                    record(.skipped, "확인 중에 구성원 프로세스나 터미널이 바뀌었습니다.")
                     continue
                 }
                 let existing = Set(osPermissionPolicySources[session.id] == osPermissionSource(session) ? session.osPermissionPolicy?.allowed ?? [] : [])
@@ -13605,6 +13695,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
               let process = live?.first(where: { $0.pid == session.pid && $0.started == session.started && $0.agent == session.agent
                   && "/dev/" + $0.tty == session.tty }), process.isForeground else {
             if capacityStates[id]?.scheduledID == scheduledID { capacityStates[id]?.scheduledID = nil }
+            return
+        }
+        if state.stop.continuationText == CodexCapacityStop.goalResumeText,
+           deferBlockedGoalToLeader(session, reason: screenAnalyses[id]?.blockedGoalReason ?? state.stop.error, at: .now) {
+            publish()
             return
         }
         capacityStates[id]?.phase = .sending; capacityStates[id]?.scheduledID = nil

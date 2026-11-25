@@ -298,8 +298,9 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
     public func restore(_ profile: TerminalSessionProfile,selected: Set<UUID>,active: [TerminalProfileEntry],
                         activeTerminalTTYs:[String:String]=[:],
                         directoryExists: @Sendable (String)->Bool = {var directory:ObjCBool=false;return FileManager.default.fileExists(atPath:$0,isDirectory:&directory)&&directory.boolValue},
-                        terminalIsOpen: @Sendable (String) async throws -> Bool = {tty in
-                            try await Task.detached(priority:.utility) {try ProcessDiscovery.read().contains {"/dev/"+$0.tty == tty}}.value
+                        terminalIsOpen: (@Sendable (String) async throws -> Bool)? = nil,
+                        openTerminalTTYs: @Sendable () async throws -> Set<String> = {
+                            try await Task.detached(priority:.userInitiated) { Set(try ProcessDiscovery.read().map { "/dev/" + $0.tty }) }.value
                         },
                         launch: @Sendable (TerminalProfileEntry,String?) async throws -> String,
                         selectTab:@Sendable (String) async throws -> Void = {_ in},
@@ -316,9 +317,8 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
         let activeKeys=Set(active.map(\.key))
         var anchors:[String:String]=[:],knownTTYs:[String:String]=[:],openedGroups=Set<String>()
         var unresolvedGroups=Set<String>(),unconfirmedTabs=Set<String>()
-        // Reuse only the exact saved conversation's verified current Terminal.
-        // Without an anchor, an uncertain first launch cannot authorize another
-        // window for the remaining tabs of that same saved window.
+        var checkedTTYs: Set<String>?
+        var readTTYs = false
         for entry in entries {
             if let tty=activeTerminalTTYs[entry.key],activeKeys.contains(entry.key),TerminalProfileLauncher.validTTY(tty) {
                 knownTTYs[entry.key]=tty
@@ -328,7 +328,12 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
             if activeKeys.contains(entry.key),let key=group(entry) {unresolvedGroups.insert(key)}
             if let receipt=dispatched[entry.key] {
                 if let tty=receipt.tty {
-                    let open=try? await terminalIsOpen(tty)
+                    let open: Bool?
+                    if let terminalIsOpen { open = try? await terminalIsOpen(tty) }
+                    else {
+                        if !readTTYs { checkedTTYs = try? await openTerminalTTYs(); readTTYs = true }
+                        open = checkedTTYs?.contains(tty)
+                    }
                     if open==false {dispatched.removeValue(forKey:entry.key)}
                     else if open==true {
                         knownTTYs[entry.key]=tty
@@ -353,9 +358,9 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
         for (position,entry) in selectedEntries.enumerated() {
             let key=group(entry)
             let result:TerminalProfileRestoreResult
-            if !active.contains(where:{$0.key == entry.key}),let receipt=dispatched[entry.key],receipt.tty == nil {
+            if !activeKeys.contains(entry.key),let receipt=dispatched[entry.key],receipt.tty == nil {
                 result = .init(id:entry.id,phase:.needsReview,detail:"이전 복원 결과를 확인하지 못했습니다. 같은 항목을 다시 열기 전에 터미널을 확인해주세요."+(receipt.failure.map {" 원인: "+$0} ?? ""))
-            } else if active.contains(where:{$0.key == entry.key}) || dispatched[entry.key] != nil {
+            } else if activeKeys.contains(entry.key) || dispatched[entry.key] != nil {
                 result = .init(id:entry.id,phase:.alreadyOpen,detail:"이미 열려 있거나 복원 명령을 전달한 세션입니다.",tty:knownTTYs[entry.key])
             } else if entry.resumesConversation && active.contains(where:{$0.agent == entry.agent && $0.cwd == entry.cwd && $0.providerHome == entry.providerHome && UUID(uuidString:$0.conversationID)==nil}) {
                 result = .init(id:entry.id,phase:.needsReview,detail:"같은 폴더의 CLI가 실행 중입니다. 원래 대화를 확인한 뒤 복원해주세요.")
@@ -378,8 +383,6 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                     let notStarted=diagnostics?["delivery"] == "not_started" || diagnostics?["command_delivery"] == "not_started"
                     if notStarted {dispatched.removeValue(forKey:entry.key)}
                     else {dispatched[entry.key]?.failure=error.localizedDescription}
-                    // A failed sibling must not discard the last verified tab
-                    // and turn every subsequent launch into a separate window.
                     if let key {
                         if !notStarted {unresolvedGroups.insert(key)}
                         if diagnostics?["tab_creation"] == "unknown" {unconfirmedTabs.insert(key)}
@@ -389,9 +392,6 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                 }
             }
             results.append(result);progress(result)
-            // Complete the current window, including its saved selection,
-            // before opening the next. A final Set traversal revisited earlier
-            // windows in an arbitrary order after all launches had finished.
             if let key,position+1==selectedEntries.count || group(selectedEntries[position+1]) != key {
                 await finishGroup(key)
             }

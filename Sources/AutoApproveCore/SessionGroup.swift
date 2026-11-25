@@ -153,6 +153,21 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
         return (member.parentMemberID ?? (isLeader(memberID) ? nil : leaderMemberID)).map { [$0] } ?? []
     }
 
+    package func canManageGoal(_ leader: UUID, member: UUID) -> Bool {
+        isLeader(leader) && (canDirect(leader, worker: member) || goalReviewLeaders(for: member).contains(leader))
+    }
+
+    func goalReviewLeaders(for member: UUID) -> Set<UUID> {
+        var pending = parentIDs(of: member), visited: Set<UUID> = [member], leaders = Set<UUID>()
+        while let id = pending.popLast() {
+            guard visited.insert(id).inserted else { continue }
+            if isLeader(id) { leaders.insert(id) }
+            else { pending.append(contentsOf: parentIDs(of: id)) }
+        }
+        if leaders.isEmpty { return isLeader(member) ? [member] : Set(leaderMemberIDs.filter { canManage($0, member: member) }) }
+        return leaders
+    }
+
     public func parentID(of memberID: UUID) -> UUID? { parentIDs(of: memberID).first }
 
     public func children(of memberID: UUID) -> [SessionGroupMember] {
@@ -378,6 +393,7 @@ public struct SessionGroupLiveSession: Identifiable, Equatable {
     public var providerHome: String?
     public var messagingName: String?
     var tabShell: SessionGroupTabShell?
+    var providerIdentityAmbiguous = false
     var codexIdentityFromMCP = false
     var inheritsClaudeConfigHome = false
     var claudePromptChannel: String?
@@ -608,6 +624,17 @@ public enum SessionGroupMatching {
         if candidates.count == 1 { return candidates[0] }
         guard candidates.isEmpty else { return nil }
         return match(member, in: live)
+    }
+
+    package static func policySession(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
+        if let match = match(member, in: live) { return match.providerIdentityAmbiguous ? nil : match }
+        guard let saved = UUID(uuidString: member.conversationID), let tab = member.tabShell,
+              let row = currentTerminal(member, in: live), row.id == member.runtimeID,
+              tab.identifies(row.tabShell), !row.providerIdentityAmbiguous, row.conversationID == nil,
+              member.providerHome == nil || member.providerHome == row.providerHome,
+              permitsIdentityRefresh(member, candidate: row, conversation: saved, live: live) else { return nil }
+        let otherEvidence = [row.session.codexApprovalBinding?.threadID, row.session.providerID].compactMap { $0 }
+        return otherEvidence.allSatisfy { UUID(uuidString: $0) == saved } ? row : nil
     }
 
     public static func match(_ member: SessionGroupMember, in live: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {

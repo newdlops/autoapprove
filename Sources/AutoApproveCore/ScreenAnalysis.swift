@@ -11,6 +11,7 @@ struct ScreenAnalysis: Sendable {
     let request: PendingScreenRequest?
     let modelChoice: TerminalChoiceQuestion?
     let activity: ActivityObservation
+    let blockedGoalReason: String?
     let capacityStop: CodexCapacityStop?
     let fingerprint: String
 
@@ -25,6 +26,14 @@ struct ScreenAnalysis: Sendable {
         self.activity = activity
         let stop = CodexCapacityStop.detect(raw, agent: agent, activity: activity, prepared: lines)
         capacityStop = stop
+        if agent == .codex, activityTail.contains(where: { $0.contains("Goal") }),
+           CodexResumeCheck.goalStalled(lines.trimmed), let composer = lines.trimmed.lastIndex(where: CodexResumeCheck.isComposer) {
+            let paragraph = lines.trimmed[..<composer].reversed().drop(while: { $0.isEmpty }).prefix(while: { !$0.isEmpty }).reversed()
+            if let stop, stop.kind != .goalBlocked { blockedGoalReason = String(stop.error.prefix(400)) }
+            else if let first = paragraph.first, first.hasPrefix("• ") || first.hasPrefix("■ ") {
+                blockedGoalReason = String(paragraph.joined(separator: " ").dropFirst(2).prefix(400))
+            } else { blockedGoalReason = "화면에 구체적인 차단 사유가 표시되지 않았습니다." }
+        } else { blockedGoalReason = nil }
         let request: PendingScreenRequest?
         if mayHaveInteractiveRows, prompt == nil, stop == nil {
             if let detected = QuestionDetector.detect(agent: agent, prepared: lines) { request = detected }
@@ -35,15 +44,12 @@ struct ScreenAnalysis: Sendable {
             } else { request = nil }
         } else { request = nil }
         self.request = request
-        // A model decision requires a model reference in its question. Reject
-        // unrelated questions before reconstructing their full menu identity.
         if agent != .shell, prompt == nil, stop == nil, request?.phase == .input,
            let request, AutomaticQuestionDecision.mentionsModel(request.summary),
            let choice = TerminalChoiceQuestion.detect(raw, agent: agent, prepared: lines, permissionPrompt: prompt, request: request),
            AutomaticQuestionDecision.currentModelIndex(question: choice.question, options: choice.options) != nil {
             modelChoice = choice
         } else { modelChoice = nil }
-        // ActivityTracker asks for this only when confirming an idle composer.
         fingerprint = activity.phase == .idle ? ActivityDetector.readinessFingerprint(tail: activityTail) : ""
         sourceByteCount = lines.sourceByteCount
     }
