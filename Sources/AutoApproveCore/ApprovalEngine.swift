@@ -6802,7 +6802,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             let frame = try await remoteTerminal(sessionID: worker.id, realtime: true)
             let fresh = question.isPermission ? delegablePermission(sessions[worker.id] ?? current) : frame.question
-            guard let live = fresh, live.id == question.id, live.options == question.options else {
+            guard let live = fresh, question.matches(live) else {
                 var state = try groupOrchestration(); state.clearQuestion(item.id); try saveGroupOrchestration(state)
                 throw RemoteHTTPError(409, "작업자의 질문이 바뀌어 답하지 않았습니다. 새 질문은 다시 보고됩니다.")
             }

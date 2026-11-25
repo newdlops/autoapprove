@@ -1153,7 +1153,18 @@ extension ApprovalTests {
         try expect(try await waitForGroup(10) { await engine.refreshScreens(); return phase(leader.id) == .idle }, "The parent must be idle to receive reports")
 
         // Any other permission prompt is delegated: the parent's choice counts as the user's approval.
-        writer.show("Do you want to proceed?\n$ echo fixture\n❯ 1. Yes\n  2. No\nEsc to cancel", on: workerTTY)
+        let approvalScope = "Yes, and don't ask again for commands that start with `python3 -B /tmp/" +
+            String(repeating: "fixture-directory/", count: 12) + "verify.py`"
+        let approvalOptions = ["Yes", approvalScope, "No"]
+        let recorded = GroupWorkerQuestion(id: "approval-fixture", text: "Allow?", options: approvalOptions, permission: true)
+        let restored = try JSONDecoder().decode(GroupWorkerQuestion.self, from: JSONEncoder().encode(recorded))
+        let changedScope = approvalScope.replacingOccurrences(of: "verify.py", with: "ver ify.py")
+        let changed = GroupWorkerQuestion(id: recorded.id, text: recorded.text, options: ["Yes", changedScope, "No"],
+                                          seenAt: recorded.seenAt, permission: true)
+        try expectEqual(restored, recorded)
+        try expectEqual(changed.options, recorded.options)
+        try expect(restored != changed)
+        writer.show("Do you want to proceed?\n$ echo fixture\n❯ 1. Yes\n  2. \(approvalScope)\n  3. No\nEsc to cancel", on: workerTTY)
         let delegated = try await waitForGroup(20) {
             await engine.refreshScreens()
             return messages().contains { $0.text.contains("[AutoApprove 그룹 승인 요청") }
@@ -1163,6 +1174,8 @@ extension ApprovalTests {
         let request = permissionMessage.text
         _ = try await call("ack_group_messages", from: leader.id, ["messageIDs": [permissionMessage.id.uuidString]])
         try expect(request.contains("echo fixture") && request.contains("1) Yes") && request.contains("사용자 승인으로 처리"))
+        try expect(approvalScope.count > 200)
+        try expectEqual(try await question()?["options"] as? [String], ["Yes", String(approvalScope.prefix(200)), "No"])
         let beforeApproval = writer.writes(to: workerTTY).count
         let approved = try await call("answer_group_question", from: leader.id, ["choice": 1])
         try expectEqual(approved["permission"] as? Bool, true)

@@ -65,12 +65,24 @@ public struct GroupWorkerQuestion: Codable, Equatable {
     public var reportedAt: Date?
     /// A permission prompt the user delegated to the parent: its choice counts as the user's approval.
     public var permission: Bool?
+    private var optionsFingerprint: String?
 
     public init(id: String, text: String, options: [String], seenAt: Date = Date(), permission: Bool = false) {
         self.id = id; self.text = String(text.prefix(1200)); self.options = Array(options.prefix(9).map { String($0.prefix(200)) }); self.seenAt = seenAt
         self.permission = permission ? true : nil
+        optionsFingerprint = Self.fingerprint(options)
     }
     public var isPermission: Bool { permission == true }
+
+    func matches(_ live: TerminalChoiceQuestion) -> Bool {
+        guard live.id == id else { return false }
+        if let optionsFingerprint { return optionsFingerprint == Self.fingerprint(live.options) }
+        return options == live.options
+    }
+
+    private static func fingerprint(_ options: [String]) -> String {
+        PromptDetector.fingerprint(options.map { "\($0.utf8.count):\($0)" }.joined())
+    }
 }
 
 /// Assignment history for every group. AutoApprove keeps only the reports a parent has not received yet;
