@@ -196,6 +196,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private let groupTranscriptReader: SessionGroupModelSettingsReader
     private var groupRecoveryAt = Date.distantPast
     private let groupClaudeCompletionReader: @Sendable (SessionGroupLiveSession, Date, String) -> WorkCompletion?
+    private let groupProcessReader: @Sendable (Set<Int32>) throws -> [ProcessRecord]
     private let singleProcessReader: @Sendable (Int32) throws -> [ProcessRecord]
     private let discoveryReader: @Sendable () throws -> [ProcessRecord]
     private var workingDirectoriesBySession: [String: String] = [:]
@@ -249,8 +250,29 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var clearingCodexQueues = Set<String>()
     private var replyingQuestions = Set<String>()
     private var sendingMessages = Set<String>()
-    /// Session group task history, read from the store on first use.
-    private var groupOrchestrationCache: SessionGroupOrchestration?
+    private struct GroupTaskBadge {
+        var task: SessionGroupBadge.TaskState?
+        var pendingReports = 0
+    }
+    private var groupTaskBadges: [UUID: [UUID: GroupTaskBadge]] = [:]
+    private var groupOrchestrationCache: SessionGroupOrchestration? {
+        didSet {
+            var next: [UUID: [UUID: GroupTaskBadge]] = [:]
+            for item in groupOrchestrationCache?.assignments ?? [] where item.status != .superseded {
+                let task: SessionGroupBadge.TaskState?
+                switch item.status {
+                case .working: task = item.question.map { $0.isPermission ? .approval : .question } ?? .working
+                case .completed: task = .reporting
+                default: task = nil
+                }
+                next[item.groupID, default: [:]][item.workerMemberID, default: GroupTaskBadge()].task = task
+                if item.status == .completed || (item.status == .working && item.question != nil && item.question?.reportedAt == nil) {
+                    next[item.groupID, default: [:]][item.parentMemberID, default: GroupTaskBadge()].pendingReports += 1
+                }
+            }
+            groupTaskBadges = next
+        }
+    }
     private var groupWorkerActions = Set<String>()
     private var groupDeliveryTask: Task<Void, Never>?
     private var groupMailboxStore: SessionGroupMailbox?
@@ -725,8 +747,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.groupModelSettingsReader = groupModelSettingsReader ?? { modelReader.read($0) }
         self.profileExecutionSettingsReader = profileExecutionSettingsReader ?? (processReader == nil ? { TerminalProfileExecutionSettingsReader.read($0) } : { _ in nil })
         self.groupClaudeCompletionReader = groupClaudeCompletionReader ?? { modelReader.completion($0, after: $1, task: $2) }
-        // Native window checks need one original process, not a system-wide
-        // snapshot. Keep injected readers authoritative and every check fresh.
+        if let processReader { self.groupProcessReader = { _ in try processReader() } }
+        else { self.groupProcessReader = { try ProcessDiscovery.sessionRecords(for: $0) } }
         if let singleProcessReader { self.singleProcessReader = singleProcessReader }
         else if let processReader { self.singleProcessReader = { _ in try processReader() } }
         else { self.singleProcessReader = { try ProcessDiscovery.read(pid: $0) } }
@@ -3118,8 +3140,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let originals = candidates.filter { $0.agent != .shell && $0.phase != .ended && $0.pid > 0 && !isBackgroundGroupSession($0) }
         guard !originals.isEmpty || runtimeID == nil else { return [] }
         guard originals.count <= 512 else { throw AppError.message("세션이 너무 많아 그룹 구성을 확인하지 못했습니다.") }
-        let readAll = processReader, readOne = singleProcessReader, pid = runtimeID == nil ? nil : originals.first?.pid
-        let reader: @Sendable () throws -> [ProcessRecord] = { if let pid { return try readOne(pid) }; return try readAll() }
+        let readGroup = groupProcessReader, readOne = singleProcessReader
+        let selectedPIDs = Set(originals.map(\.pid)), pid = runtimeID == nil ? nil : originals.first?.pid
+        let reader: @Sendable () throws -> [ProcessRecord] = {
+            if let pid { return try readOne(pid) }
+            return try readGroup(selectedPIDs)
+        }
         let registry = claudeRegistryReader, codexReader = codexGroupReader, codexEnvironment = codexGroupEnvironment
         let records = try await Task.detached(priority: priority) { ProcessDiscovery.index(try reader()) }.value
         let agySnapshot = agyEvents
@@ -3361,7 +3387,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let delay: TimeInterval
         do {
             let box = try groupMailbox()
-            if try box.pendingCount > 0 || !box.outstandingQuestions().isEmpty { scheduleGroupMailboxDelivery() }
+            if try box.pendingCount > 0 || box.hasOutstandingQuestions { scheduleGroupMailboxDelivery() }
             guard try box.hasUnresolvedWaits() else { return }
             let state = try groupOrchestration()
             try box.transaction { try box.reconcileWaits(assignments: state.assignments) }
@@ -4720,17 +4746,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         self.refreshGroupWaits()
                         self.publish()
                     }
-                    let questions = try box.outstandingQuestions()
-                    let hasDelivery = try box.hasNotificationWork || box.hasPendingReceipts || box.hasAbsentSenders || !questions.isEmpty
+                    let hasDelivery = try box.hasNotificationWork || box.hasPendingReceipts || box.hasAbsentSenders || box.hasOutstandingQuestions
                     guard hasDelivery || expiration != nil else { self.groupMailboxTask = nil; return }
                     if !hasDelivery, let expiration { delay = max(0.1, expiration.timeIntervalSinceNow) }
-                    if !self.snapshot.paused, Date().timeIntervalSince(self.groupRecoveryAt) >= 5, !questions.isEmpty {
+                    if !self.snapshot.paused, Date().timeIntervalSince(self.groupRecoveryAt) >= 5 {
                         self.groupRecoveryAt = Date()
-                        await self.recoverGroupQuestions(questions)
+                        let questions = try box.outstandingQuestions()
+                        if !questions.isEmpty { await self.recoverGroupQuestions(questions) }
                     }
                     if hasDelivery { try await self.deliverGroupMailboxNotifications() }
                     if let expiration { delay = min(delay, max(0.1, expiration.timeIntervalSinceNow)) }
-                } catch { /* Keep durable messages; query tools surface the storage error. */ }
+                } catch {}
                 await change.waitForChange(timeout: delay)
             }
         }
@@ -5701,21 +5727,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 #endif
 
-    /// Adds the cached group badge and the member's current task to a published row.
     private func projectSessionGroup(_ session: AgentSession) -> AgentSession {
         guard var badge = sessionGroupBadges[session.id] else {
             guard session.sessionGroup != nil else { return session }
             var value = session; value.sessionGroup = nil; return value
         }
-        if let state = try? groupOrchestration() {
-            switch state.current(groupID: badge.groupID, workerMemberID: badge.memberID) {
-            case let item? where item.status == .working:
-                badge.task = item.question.map { $0.isPermission ? .approval : .question } ?? .working
-            case let item? where item.status == .completed: badge.task = .reporting
-            default: badge.task = nil
-            }
-            badge.pendingReports = (state.undelivered + state.undeliveredQuestions)
-                .filter { $0.groupID == badge.groupID && $0.parentMemberID == badge.memberID }.count
+        if groupOrchestrationCache == nil { _ = try? groupOrchestration() }
+        if groupOrchestrationCache != nil {
+            let task = groupTaskBadges[badge.groupID]?[badge.memberID]
+            badge.task = task?.task
+            badge.pendingReports = task?.pendingReports ?? 0
         }
         var value = session; value.sessionGroup = badge
         return value
@@ -5868,17 +5889,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
         }
-        let pending = state.undelivered.map({ ($0, false) }) + state.undeliveredQuestions.map({ ($0, true) })
-        // This pass repeats every two seconds while a report waits for its
-        // parent's ACK. Read the group file once per pass, and leave a report
-        // already stored in the mailbox to the mailbox's own retry schedule.
+        let pending = state.undelivered.map { ($0, false, "report:" + $0.id.uuidString) } +
+            state.undeliveredQuestions.map { ($0, true, "question:" + $0.id.uuidString + ":" + $0.question!.id) }
         let groups = pending.isEmpty ? [] : (try? SessionGroupStore(directory: paths.directory).load())
-        for (item, isQuestion) in pending {
+        let stored = try? groupMailbox().storedReportSources(pending.map { item, _, source in
+            [source, item.groupID.uuidString, item.workerMemberID.uuidString, item.parentMemberID.uuidString]
+        })
+        for (item, isQuestion, source) in pending {
             do {
-                let source = isQuestion ? "question:\(item.id.uuidString):\(item.question!.id)" : "report:\(item.id.uuidString)"
-                if let stored = try groupMailbox().message(sourceKey: source), stored.acknowledgedAt == nil,
-                   stored.groupID == item.groupID, stored.senderID == item.workerMemberID, stored.recipientID == item.parentMemberID {
-                    scheduleGroupMailboxDelivery()
+                let exists: Bool
+                if let stored { exists = stored.contains(source) }
+                else {
+                    let row = try groupMailbox().message(sourceKey: source)
+                    exists = row?.acknowledgedAt == nil && row?.groupID == item.groupID && row?.senderID == item.workerMemberID && row?.recipientID == item.parentMemberID
+                }
+                if exists {
+                    if groupMailboxTask == nil { scheduleGroupMailboxDelivery() }
                     continue
                 }
                 guard let group = groups?.first(where: { $0.id == item.groupID }),
@@ -5895,7 +5921,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if try box.message(message.id)?.acknowledgedAt != nil { try applyGroupMessageAcknowledgements([message.id]) }
                 else { scheduleGroupMailboxDelivery() }
             } catch {
-                if var latest = try? groupOrchestration() { latest.noteDeliveryFailure([item.id], error.localizedDescription); try? saveGroupOrchestration(latest) }
+                if var latest = try? groupOrchestration(), latest.noteDeliveryFailure([item.id], error.localizedDescription) {
+                    try? saveGroupOrchestration(latest)
+                }
             }
         }
         return (try? groupOrchestration())?.needsWatching ?? false

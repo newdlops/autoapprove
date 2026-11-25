@@ -15,6 +15,17 @@ enum NativeProcessReader {
     static func readSessions() throws -> [ProcessRecord] {
         try autoreleasepool { try records(pid: nil, sessionsOnly: true) }
     }
+    static func sessionRecords(for pids: Set<Int32>) throws -> [ProcessRecord] {
+        guard !pids.isEmpty else { return [] }
+        return try autoreleasepool {
+            let entries = try snapshot(pid: nil)
+            var selected = pids
+            for entry in entries where pids.contains(entry.kp_proc.p_pid) {
+                selected.insert(entry.kp_eproc.e_ppid)
+            }
+            return try records(entries: entries.filter { selected.contains($0.kp_proc.p_pid) })
+        }
+    }
     static func readAncestorChain(of pid:Int32,through ancestor:Int32?) throws -> [ProcessRecord] {
         try autoreleasepool {
             func readChain() throws -> [ProcessRecord] {

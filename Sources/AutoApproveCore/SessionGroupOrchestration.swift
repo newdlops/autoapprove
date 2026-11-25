@@ -248,11 +248,17 @@ public struct SessionGroupOrchestration: Codable, Equatable {
         }
     }
 
-    public mutating func noteDeliveryFailure(_ ids: [UUID], _ message: String) {
+    @discardableResult
+    public mutating func noteDeliveryFailure(_ ids: [UUID], _ message: String) -> Bool {
+        let reason = String(message.prefix(300))
+        var changed = false
         for index in assignments.indices where ids.contains(assignments[index].id) &&
-            (assignments[index].status == .completed || assignments[index].question != nil) {
-            assignments[index].deliveryError = String(message.prefix(300))
+            (assignments[index].status == .completed || assignments[index].question != nil) &&
+            assignments[index].deliveryError != reason {
+            assignments[index].deliveryError = reason
+            changed = true
         }
+        return changed
     }
 
     /// The parent restarted as a new process of the same saved conversation.

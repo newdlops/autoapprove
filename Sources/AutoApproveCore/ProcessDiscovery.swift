@@ -151,6 +151,11 @@ public enum ProcessDiscovery {
         catch is CancellationError { throw CancellationError() }
         catch { return try legacyRead() }
     }
+    static func sessionRecords(for pids: Set<Int32>) throws -> [ProcessRecord] {
+        do { return try NativeProcessReader.sessionRecords(for: pids) }
+        catch is CancellationError { throw CancellationError() }
+        catch { return try legacyRead() }
+    }
     private static func legacyRead(pid: Int32? = nil) throws -> [ProcessRecord] {
         // Finder-launched apps inherit the macOS locale; helpers may inherit a different shell locale.
         let fields = "pid=,ppid=,tty=,pgid=,tpgid=,lstart=,comm="

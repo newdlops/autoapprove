@@ -250,6 +250,10 @@ public final class SessionGroupMailbox {
                 CREATE INDEX IF NOT EXISTS wait_deadlines ON group_waits(state,deadline);
                 CREATE INDEX IF NOT EXISTS wait_group ON group_waits(group_id,state);
                 CREATE INDEX IF NOT EXISTS wait_task ON group_waits(owner_task);
+                CREATE INDEX IF NOT EXISTS wait_notification_member ON group_waits(group_id,\(Self.waitMember),state) WHERE \(Self.compoundWait);
+                CREATE INDEX IF NOT EXISTS message_notification_candidates ON messages(group_id,recipient_id,sequence) WHERE \(Self.notificationCandidate);
+                CREATE INDEX IF NOT EXISTS message_receipt_due ON messages(next_attempt) WHERE \(Self.awaitingReceipt);
+                CREATE INDEX IF NOT EXISTS message_open_questions ON messages(sequence) WHERE kind='question' AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired';
                 """)
             try execute("""
                 UPDATE messages AS q SET last_result='answered',last_error=NULL
@@ -316,6 +320,24 @@ public final class SessionGroupMailbox {
     }
     public func message(_ id: UUID) throws -> SessionGroupMessage? { try rows("WHERE id=?", [id.uuidString]).first }
     public func message(sourceKey: String) throws -> SessionGroupMessage? { try rows("WHERE source_key=?", [sourceKey]).first }
+    func storedReportSources(_ routes: [[String]]) throws -> Set<String> {
+        guard !routes.isEmpty else { return [] }
+        let keys = String(decoding: try JSONEncoder().encode(routes), as: UTF8.self)
+        let query = try statement("""
+            SELECT m.source_key FROM json_each(?) r JOIN messages m ON m.source_key=json_extract(r.value,'$[0]')
+            WHERE m.acknowledged IS NULL AND m.group_id=json_extract(r.value,'$[1]') COLLATE NOCASE
+              AND m.sender_id=json_extract(r.value,'$[2]') COLLATE NOCASE AND m.recipient_id=json_extract(r.value,'$[3]') COLLATE NOCASE
+            """, [keys])
+        defer { sqlite3_finalize(query) }
+        var sources = Set<String>()
+        while true {
+            let status = sqlite3_step(query)
+            if status == SQLITE_DONE { return sources }
+            guard status == SQLITE_ROW, let value = sqlite3_column_text(query, 0) else { throw AppError.message("저장된 그룹 보고를 확인하지 못했습니다.") }
+            sources.insert(String(cString: value))
+        }
+    }
+
     private static let pendingFilter = "acknowledged IS NULL AND last_result IS NOT 'answered' AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'"
 
     var hasAbsentSenders: Bool { get throws {
@@ -640,21 +662,25 @@ public final class SessionGroupMailbox {
         return .init(conversations: Array(ordered.prefix(300)), messages: Array(messages.prefix(150)),
                      hasMore: ordered.count > 300 || messages.count > 150)
     }
-    // Results owned by a compound wait are sent in its single ready message.
-    // Results remain individually readable in their original inbox.
-    private static let notificationFilter = """
-        m.acknowledged IS NULL
-        AND (m.last_result IS NULL OR m.last_result NOT IN
+    private static let notificationCandidate = """
+        acknowledged IS NULL AND (last_result IS NULL OR last_result NOT IN
             ('sender_absent','answered','superseded','expired','direct_attempting','direct_submitted','direct_unknown','late','batched','undelivered'))
-        AND NOT EXISTS (
+        """
+    private static let compoundWait = """
+        state IN ('waiting','ready','expired') AND (json_array_length(request,'$.questions')<>1
+            OR json_array_length(request,'$.tasks')>0 OR json_extract(request,'$.external')=1)
+        """
+    private static let waitMember = "CAST(json_extract(request,'$.member') AS TEXT)"
+    private static let notificationFilter = """
+        \(notificationCandidate)
+        AND CASE WHEN m.source_key GLOB 'answer:*' OR m.source_key GLOB 'report:*' THEN NOT EXISTS (
             SELECT 1 FROM group_waits w
-            WHERE w.group_id=m.group_id AND w.state IN ('waiting','ready','expired')
-              AND json_extract(w.request,'$.member')=m.recipient_id
-              AND (json_array_length(w.request,'$.questions')<>1
-                   OR json_array_length(w.request,'$.tasks')>0 OR json_extract(w.request,'$.external')=1)
-              AND (m.source_key IN (SELECT 'answer:' || value FROM json_each(w.request,'$.questions'))
-                OR m.source_key IN (SELECT 'report:' || value FROM json_each(w.request,'$.tasks')))
-        )
+            WHERE w.group_id=m.group_id AND \(waitMember)=m.recipient_id AND \(compoundWait)
+              AND ((m.source_key GLOB 'answer:*' AND EXISTS (
+                    SELECT 1 FROM json_each(w.request,'$.questions') WHERE 'answer:' || value=m.source_key))
+                OR (m.source_key GLOB 'report:*' AND EXISTS (
+                    SELECT 1 FROM json_each(w.request,'$.tasks') WHERE 'report:' || value=m.source_key)))
+        ) ELSE 1 END
         """
 
     private static let notificationOrder = "CASE WHEN m.category='permissionRequest' AND COALESCE(m.priority_override,m.requested_priority)='urgent' THEN -4 WHEN m.source_key LIKE 'userButton:rename:%' THEN -3 WHEN m.source_key LIKE 'userButton:questionPriority:%' THEN -2 WHEN (m.kind='notice' AND m.body LIKE '[AutoApprove 닉네임 요청]%') THEN -1 WHEN COALESCE(m.priority_override,m.requested_priority)='urgent' THEN 0 WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 1 ELSE 2 END,CASE WHEN m.source_key LIKE 'userButton:rename:%' THEN -m.sequence ELSE m.sequence END"
@@ -819,12 +845,16 @@ public final class SessionGroupMailbox {
                    [id.uuidString, String(date.timeIntervalSince1970)])
     }
 
+    private static let outstandingQuestionFilter = """
+        kind='question' AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'
+          AND NOT EXISTS(SELECT 1 FROM messages answer WHERE answer.source_key='answer:' || messages.id)
+        """
+    var hasOutstandingQuestions: Bool {
+        get throws { try scalar("SELECT EXISTS(SELECT 1 FROM messages WHERE " + Self.outstandingQuestionFilter + ")") != 0 }
+    }
+
     func outstandingQuestions() throws -> [SessionGroupMessage] {
-        try rows("""
-            WHERE kind='question' AND last_result IS NOT 'superseded' AND last_result IS NOT 'expired'
-              AND NOT EXISTS(SELECT 1 FROM messages answer WHERE answer.source_key='answer:' || messages.id)
-            ORDER BY sequence
-            """)
+        try rows("WHERE " + Self.outstandingQuestionFilter + " ORDER BY sequence")
     }
 
     package func pendingReplies(group: UUID, member: UUID, senders: [UUID], after: Int64 = 0, limit: Int = 51,

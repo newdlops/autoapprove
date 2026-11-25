@@ -714,7 +714,8 @@ extension ApprovalTests {
         try expectEqual(SessionGroupOrchestration.commandPrefix("  !rm -rf build"), "!")
         try expect(SessionGroupOrchestration.commandPrefix("/clear") == "/" && SessionGroupOrchestration.commandPrefix("빌드하세요") == nil)
 
-        state.noteDeliveryFailure([second.id], "busy")
+        try expect(state.noteDeliveryFailure([second.id], "busy"))
+        try expect(!state.noteDeliveryFailure([second.id], "busy"))
         try expectEqual(state.undelivered.first?.deliveryError, "busy")
         state.markReported([second.id])
         try expect(state.undelivered.isEmpty)
