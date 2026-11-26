@@ -33,6 +33,95 @@ private final class ChoiceProbe: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testClaudeFeedbackDismissalAndClippedPermissionFrames() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = ProcessDiscovery.parse("993901 1 ttys990 993901 993901 Wed Oct 28 22:00:00 2026 /fixture/claude")[0]
+        var session = AgentSession(id: record.key, agent: .claude, pid: record.pid, started: record.started,
+            tty: "/dev/ttys990", cwd: "/fixture", terminal: .iterm)
+        session.channel = .itermScreen
+        let probe = ChoiceProbe(), tty = session.tty
+        let idle = "─────────────────\n❯\n─────────────────"
+        let survey = "● How is Claude doing this session? (optional)\n1: Bad  2: Fine  3: Good  0: Dismiss\n" + idle
+        let draft = idle + "\n1 to review · 2 to send · 0 to dismiss\n⏵⏵ auto mode on · 1 feedback draft"
+        probe.screen = idle
+        let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot(screens: [TerminalScreen(tty: tty, contents: probe.screen)]) },
+            approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { _,expected,_,input in
+                guard probe.screen == expected else { return .screenChanged }
+                return try probe.write(input)
+            })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] },
+            screenAdapters: [.iterm: adapter], isolateByDefault: true, nativeKeyboardActivity: .inactive)
+        defer { engine.stop() }
+        engine.updateDiscovery([session], records: [record])
+        await engine.connectScreenHost(.iterm)
+        try engine.setAutomatic(session.id, enabled: false)
+        func observe(_ value: String) {
+            engine.receiveScreen(sessionID: session.id, raw: value, generation: "fixture", source: .itermScreen)
+        }
+        try engine.setPaused(true)
+        probe.screen = survey
+        observe(survey)
+        try expectEqual(engine.snapshot.sessions.first?.phase, .input)
+        try expectFalse(ClaudeComposerReadiness.isEmpty(survey))
+        try engine.setPaused(false)
+        probe.screen = idle
+        observe(survey)
+        try await Task.sleep(nanoseconds: 60_000_000)
+        try expect(probe.sent.isEmpty, "A stale rating must never insert a zero in the normal composer")
+        for (index, frame) in [survey, draft].enumerated() {
+            probe.screen = idle
+            observe(idle)
+            probe.screen = frame
+            let deadline = Date().addingTimeInterval(4)
+            repeat {
+                observe(frame)
+                try await Task.sleep(nanoseconds: 30_000_000)
+            } while probe.sent.count <= index && Date() < deadline
+            try expectEqual(probe.sent.map(\.bytes), Array(repeating: "0", count: index + 1))
+            observe(frame)
+            try await Task.sleep(nanoseconds: 40_000_000)
+            try expectEqual(probe.sent.count, index + 1)
+        }
+        for value in [survey.replacingOccurrences(of: "How is Claude doing this session?", with: "Which environment?"),
+                      survey.replacingOccurrences(of: "0: Dismiss", with: "0: Submit"),
+                      survey.replacingOccurrences(of: "❯\n", with: "❯ writing\n"), draft + "\nEnter to select", survey + "\nnew output",
+                      "```\n" + String(repeating: "quoted output\n", count: 50) + survey] {
+            probe.screen = value
+            observe(value)
+            try expect(engine.snapshot.sessions.first?.pendingSummary != "Claude 피드백 요청")
+        }
+        let menu = "❯ 1. Yes\n  2. Yes, and don't ask again for this command\n  3. No\nEsc to cancel"
+        for history in ["", String(repeating: "long command output\n", count: 500)] {
+            let clipped = history + menu
+            probe.screen = clipped
+            observe(clipped)
+            try expectEqual(engine.snapshot.sessions.first?.phase, .approval)
+            try expectNil(PromptDetector.detect(clipped, agent: .claude))
+        }
+        for stale in [menu + "\n" + idle, "```\n" + menu, menu.replacingOccurrences(of: "  2.", with: "  4.")] {
+            probe.screen = stale
+            observe(stale)
+            try expect(engine.snapshot.sessions.first?.phase != .approval)
+        }
+        let codex = ProcessDiscovery.parse("993902 1 ttys991 993902 993902 Wed Oct 28 22:00:00 2026 /fixture/codex")[0]
+        var other = AgentSession(id: codex.key, agent: .codex, pid: codex.pid, started: codex.started,
+            tty: "/dev/ttys991", cwd: "/fixture", terminal: .iterm)
+        other.channel = .itermScreen
+        engine.updateDiscovery([session, other], records: [record, codex])
+        let codexMenu = "› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\nPress enter to confirm or esc to cancel"
+        let clipped = try OriginalTerminalScreen.render(ansi: "Would you like to run the following command?\r\n" +
+            String(repeating: "long command argument\r\n", count: 50) + codexMenu.replacingOccurrences(of: "\n", with: "\r\n"),
+            columns: 90, rows: 4, tty: other.tty).contents
+        try expectFalse(clipped.contains("Would you like"))
+        engine.receiveScreen(sessionID: other.id, raw: clipped, generation: "codex", source: .itermScreen)
+        try expectEqual(engine.snapshot.sessions.first(where: { $0.id == other.id })?.phase, .approval)
+        try expectNil(PromptDetector.detect(clipped, agent: .codex))
+        engine.receiveScreen(sessionID: other.id, raw: survey, generation: "codex", source: .itermScreen)
+        try expect(engine.snapshot.sessions.first(where: { $0.id == other.id })?.pendingSummary != "Claude 피드백 요청")
+        try expectEqual(probe.sent.map(\.bytes), ["0", "0"])
+    }
+
     func testTerminalChoicePreflightKeepsUnicodeSpacingAndTrailingBlankRows() throws {
         for agent in [AgentKind.codex, .claude] {
             for separator in ["\n", "\r\n", "\r"] {

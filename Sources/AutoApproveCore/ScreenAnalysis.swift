@@ -9,6 +9,7 @@ struct ScreenAnalysis: Sendable {
     let agent: AgentKind
     let prompt: ApprovalPrompt?
     let request: PendingScreenRequest?
+    let claudeFeedback: String?
     let modelChoice: TerminalChoiceQuestion?
     let activity: ActivityObservation
     let blockedGoalReason: String?
@@ -22,6 +23,7 @@ struct ScreenAnalysis: Sendable {
         let prompt: ApprovalPrompt? = mayHaveInteractiveRows ? PromptDetector.detect(raw, agent: agent, prepared: lines) : nil
         self.prompt = prompt
         let activityTail = agent == .shell ? [] : ActivityDetector.nonemptyTail(raw)
+        claudeFeedback = agent == .claude && prompt == nil ? ClaudeComposerReadiness.feedbackToDismiss(raw, tail: activityTail) : nil
         let activity = ActivityDetector.detect(raw, agent: agent, preparedTail: activityTail, permissionPrompt: { prompt != nil })
         self.activity = activity
         let stop = CodexCapacityStop.detect(raw, agent: agent, activity: activity, prepared: lines)
@@ -35,8 +37,11 @@ struct ScreenAnalysis: Sendable {
             } else { blockedGoalReason = "화면에 구체적인 차단 사유가 표시되지 않았습니다." }
         } else { blockedGoalReason = nil }
         let request: PendingScreenRequest?
-        if mayHaveInteractiveRows, prompt == nil, stop == nil {
+        if claudeFeedback != nil {
+            request = PendingScreenRequest(phase: .input, summary: "Claude 피드백 요청")
+        } else if mayHaveInteractiveRows, prompt == nil, stop == nil {
             if let detected = QuestionDetector.detect(agent: agent, prepared: lines) { request = detected }
+            else if let clipped = QuestionDetector.clippedPermission(agent: agent, prepared: lines) { request = clipped }
             else if agent == .codex, TerminalChoiceQuestion.hasCodexOverlay(prepared: lines) {
                 let question = TerminalChoiceQuestion.detect(raw, agent: agent, prepared: lines,
                     permissionPrompt: prompt, request: nil)?.question

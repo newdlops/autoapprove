@@ -105,6 +105,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private struct RemoteInitialRead { var read: RemoteScreenRead; var waiters: Set<UUID> }
     private var remoteInitialReads: [String: RemoteInitialRead] = [:]
     private var remoteMonitorFrames: [String: RemoteObservedScreen] = [:]
+    private var claudeFeedbackDismissals: [String: (identity: String, token: UUID)] = [:]
     private var remoteObservedScreens: [String: RemoteObservedScreen] = [:]
     private var remoteTerminalChanges: [String: RemoteTerminalChangeSignal] = [:]
     private var remoteFrames: [String: (frame: RemoteTerminalFrame, raw: String, generation: String, usesRawPresentation: Bool, orcaBinding: RemoteOrcaBinding?, nativeBinding: NativeBridgeBinding?, agent: AgentKind)] = [:]
@@ -1080,6 +1081,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for pending in remoteScreenReads.values { pending.task.cancel() }
         for pending in remoteInitialReads.values { pending.read.task.cancel() }; remoteInitialReads.removeAll()
         remoteMonitorFrames.removeAll()
+        claudeFeedbackDismissals.removeAll()
         remoteInputReplies.removeAll(); remoteFrames.removeAll(); remoteObservedScreens.removeAll(); remoteScreenReads.removeAll(); remoteStreams.removeAll(); remoteOrcaBindings.removeAll(); screenAnalyses.removeAll(); screenAnalysisCacheBytes = 0
         remoteTerminalChanges.values.forEach { $0.notify() }; remoteTerminalChanges.removeAll()
         for capture in nativeWindowCaptures.values { capture.invalidate() }
@@ -10861,6 +10863,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         // every input validates the original process, TTY and foreground job.
         if !keepRemote {
             cancelRemoteInitialRead(id)
+            claudeFeedbackDismissals.removeValue(forKey: id)
             remoteObservedScreens.removeValue(forKey: id); remoteFrames.removeValue(forKey: id); remoteScreenReads.removeValue(forKey: id)?.task.cancel()
         }
         remoteTerminalChanges[id]?.notify()
@@ -10961,6 +10964,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
            screenAnalysisCacheBytes + screenBytes <= screenAnalysisCacheTotalLimit {
             screenAnalyses[sessionID] = analysis
             screenAnalysisCacheBytes += screenBytes
+        }
+        if session.agent == .claude {
+            if let feedback = analysis.claudeFeedback {
+                scheduleClaudeFeedbackDismissal(session, feedback: feedback, generation: generation)
+            } else if analysis.activity.phase == .idle || analysis.prompt != nil || analysis.activity.phase == .working {
+                claudeFeedbackDismissals.removeValue(forKey: sessionID)
+            }
         }
         let sessionBeforeScreen = session
         let capacityBeforeScreen = capacityResumeProjection(for: sessionID)
@@ -11090,6 +11100,48 @@ private struct ScreenAnalysisStorageKey: Hashable {
         sessions[sessionID]?.pendingRequestID = "screen:\(generation):\(prompt.requestIdentity)"
         sessions[sessionID]?.lastActivity = Date()
         scheduleScreenApproval(sessionID)
+    }
+
+    private func scheduleClaudeFeedbackDismissal(_ session: AgentSession, feedback: String, generation: String) {
+        let id = session.id, identity = generation + ":" + feedback
+        guard claudeFeedbackDismissals[id]?.identity != identity, !remoteInputStopped, !snapshot.paused,
+              !hasOSPermissionWait(id), !userInputHasPriority(id), !automaticInputBusy(id),
+              remoteInputReason(session) == nil else { return }
+        let token = UUID()
+        claudeFeedbackDismissals[id] = (identity, token)
+        automationRuntime.launch(id) { [weak self] epoch in
+            guard let self else { return }
+            var keepReceipt = false
+            defer {
+                if !keepReceipt, self.claudeFeedbackDismissals[id]?.token == token {
+                    self.claudeFeedbackDismissals.removeValue(forKey: id)
+                }
+            }
+            @MainActor func authorize() throws {
+                guard !Task.isCancelled, self.automationRuntime.epoch(id) == epoch, !self.remoteInputStopped,
+                      !self.snapshot.paused, !self.hasOSPermissionWait(id), !self.restartingTerminal(id),
+                      !self.nativeUserInputHasPriority(id), !self.settingSessionPolicy(id), !self.changingGoals.contains(id),
+                      !self.hasBackgroundChildren(id), self.claudeParents[id] == nil,
+                      !self.liveClaudeHooks.values.contains(where: { $0.request.sessionID == id }),
+                      let current = self.sessions[id], current.phase != .ended, current.agent == .claude,
+                      current.pid == session.pid, current.started == session.started, current.tty == session.tty,
+                      self.claudeFeedbackDismissals[id]?.token == token,
+                      let observed = self.remoteObservedScreens[id], observed.generation == generation,
+                      ClaudeComposerReadiness.feedbackToDismiss(observed.raw) == feedback else { throw CancellationError() }
+            }
+            do {
+                try authorize()
+                let frame = try await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true)
+                try authorize()
+                guard !self.userInputHasPriority(id), !self.automaticInputBusy(id), frame.inputReason == nil,
+                      frame.keys.contains("characters"), ClaudeComposerReadiness.feedbackToDismiss(frame.screen) == feedback else { return }
+                _ = try await self.remoteInput(["sessionID":id, "revision":frame.revision, "kind":"characters", "text":"0"],
+                    automaticAuthorization: authorize, authorizationSource: "Claude 피드백 건너뛰기")
+                keepReceipt = true
+            } catch let error as RemoteHTTPError {
+                keepReceipt = error.diagnostics?["delivery"] == "unknown"
+            } catch {}
+        }
     }
 
     private func cancelModelRetention(_ id: String) {

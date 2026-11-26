@@ -44,10 +44,9 @@ public enum SessionRestartCommand {
         /// Original arguments that are not passed again, such as an initial prompt.
         public var dropped: [String]
         public var command: String { arguments.map(HookInstaller.quote).joined(separator: " ") }
-        /// For a shell that did not start the CLI, such as a new tab: return to the CLI's folder and restore
-        /// the configuration home the CLI was started with.
         public func command(cwd: String?, environment: [String: String]) -> String {
-            let assignments = ["CLAUDE_CONFIG_DIR", "CODEX_HOME", ClaudePromptBridge.key].compactMap { name in environment[name].map { HookInstaller.quote(name + "=" + $0) } }
+            var assignments = ["CLAUDE_CONFIG_DIR", "CODEX_HOME", ClaudePromptBridge.key].compactMap { name in environment[name].map { HookInstaller.quote(name + "=" + $0) } }
+            if environment[ClaudePromptBridge.key] != nil { assignments.append(HookInstaller.quote(ClaudePromptBridge.disableFeedbackSurvey)) }
             let launch = (assignments.isEmpty ? "" : "env " + assignments.joined(separator: " ") + " ") + command
             guard let cwd, !cwd.isEmpty else { return launch }
             return "cd -- " + HookInstaller.quote(cwd) + " && " + launch

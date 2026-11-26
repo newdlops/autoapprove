@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 
 enum ClaudePromptBridge {
+    static let disableFeedbackSurvey = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1"
     static let key = "AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE"
     static let plugin: URL = {
         let relative = "AutoApprove_AutoApproveCore.bundle/ClaudePromptBridge.zip"

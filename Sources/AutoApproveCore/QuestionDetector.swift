@@ -41,6 +41,35 @@ public enum QuestionDetector {
         return PendingScreenRequest(phase: permission ? .approval : .input, summary: String(dialog.joined(separator: "\n").prefix(4000)))
     }
 
+    static func clippedPermission(agent: AgentKind, prepared: DetectionLines) -> PendingScreenRequest? {
+        guard agent == .claude || agent == .codex else { return nil }
+        let suffix = prepared.normalizedSuffix(32)
+        guard suffix.rows.contains(where: { $0.localizedCaseInsensitiveContains("yes,") || $0.contains("Codex") }) else { return nil }
+        let lines = suffix.rows.map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let last = lines.lastIndex(where: PromptDetector.isOption),
+              let footer = PromptDetector.dialogFooterStart(in: lines, after: last),
+              let first = lines[..<last].lastIndex(where: { $0.range(of: #"^[›❯»>]\s*1\.\s+"#, options: .regularExpression) != nil }),
+              !prepared.hasOpenCodeFence(beforeSuffixRow: first, in: suffix),
+              !lines[first..<footer].contains(where: { $0.contains("```") }) else { return nil }
+        var labels: [String] = []
+        for row in lines[first..<footer] where !row.isEmpty {
+            if let prefix = row.range(of: PromptDetector.optionPrefix, options: .regularExpression) {
+                guard row[prefix].filter(\.isNumber) == String(labels.count + 1),
+                      labels.isEmpty || row.first?.isNumber == true else { return nil }
+                labels.append(String(row[prefix.upperBound...]))
+            } else if !labels.isEmpty { labels[labels.count - 1] += " " + row }
+        }
+        let normalized = agent == .codex ? labels.map(YesNoConfirmation.codexTerminalLabel) : labels
+        guard YesNoConfirmation.singleApprovalIndex(normalized) == 0 else { return nil }
+        let specific = labels.contains { label in
+            let text = label.lowercased().replacingOccurrences(of:"’",with:"'")
+            return text.hasPrefix("yes, and don't ask again") || text.hasPrefix("yes, allow all edits") ||
+                (agent == .codex && text.hasPrefix("no, and tell codex what to do differently"))
+        }
+        guard specific else { return nil }
+        return PendingScreenRequest(phase: .approval, summary: "승인 선택지가 보입니다. 요청 본문은 원래 터미널에서 확인해주세요.")
+    }
+
     enum NativeCodexQuestion {
         case absent
         case request(PendingScreenRequest)

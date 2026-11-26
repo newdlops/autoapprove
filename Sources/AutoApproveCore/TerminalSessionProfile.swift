@@ -87,7 +87,7 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         if entry.agent == "claude", entry.providerHome == nil { arguments += ["-u", "CLAUDE_CONFIG_DIR"] }
         if entry.agent != "agy", let home=entry.providerHome {arguments.append((agent == "codex" ? "CODEX_HOME":"CLAUDE_CONFIG_DIR")+"="+home)}
         if let searchPath=compatibleCLI?.environment["PATH"] {arguments.append("PATH="+searchPath)}
-        if entry.agent == "claude" { arguments.append(ClaudePromptBridge.key + "=" + ClaudePromptBridge.channel(AppPaths()).path) }
+        if entry.agent == "claude" { arguments += [ClaudePromptBridge.key + "=" + ClaudePromptBridge.channel(AppPaths()).path, ClaudePromptBridge.disableFeedbackSurvey] }
         arguments.append(compatibleCLI?.executable ?? bundledRuntime?.executable ?? agent)
         if bundledRuntime != nil || compatibleCLI != nil {
             arguments += standalone ? ["-c","features.daemon_auto_start=false"]:["--remote","unix://"]

@@ -178,6 +178,7 @@ extension ApprovalTests {
         try expectEqual(normalized.conversationID,"");try expect(!normalized.resumesConversation)
         try expectEqual(try normalized.resumeCommand(),"cd -- '/tmp/fresh-workspace' && 'env' '-u' 'AUTOAPPROVE_NATIVE_RUNTIME_ROOT' '-u' 'AUTOAPPROVE_SELECTED_TRANSITION_SOCKET' 'codex'")
         var claude=normalized;claude.id=UUID();claude.agent="claude"
+        try expect(try claude.resumeCommand().contains("'CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1'"))
         try expect(try claude.resumeCommand().contains("'env' '-u' 'CLAUDE_CONFIG_DIR'"))
         claude.providerHome="/tmp/provider with space"
         try expect(try claude.resumeCommand().contains("'CLAUDE_CONFIG_DIR=/tmp/provider with space' 'AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE=") && claude.resumeCommand().contains("'claude' '--plugin-dir'"),

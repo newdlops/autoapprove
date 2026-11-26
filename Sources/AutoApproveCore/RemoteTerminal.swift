@@ -330,6 +330,7 @@ public struct RemoteTerminalInput: Codable, Equatable, Sendable {
 
 enum RemoteMessageReadiness {
     static func hasMenu(_ screen: String, agent: AgentKind) -> Bool {
+        if agent == .claude, ClaudeComposerReadiness.feedbackToDismiss(screen) != nil { return true }
         if agent == .codex, TerminalChoiceQuestion.hasCodexOverlay(screen) { return true }
         if PromptDetector.detect(screen, agent: agent) != nil || QuestionDetector.detect(screen, agent: agent) != nil { return true }
         let rows = Array(PromptDetector.normalizedLines(screen).suffix(30)).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }

@@ -506,6 +506,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Presentation heartbeat: group identity and connection changes", tests.testGroupPresentationKeepsFreshIdentitiesAndConnectionChanges),
             ("App updates: GitHub checks, persisted opt-out and isolation", tests.testGitHubAppUpdatePreferencesAndChecks),
             ("Monitoring: screen polling cadence is per session",tests.testScreenPollingCadenceIsPerSession),
+            ("Claude feedback dismissal and clipped permission frames",tests.testClaudeFeedbackDismissalAndClippedPermissionFrames),
             ("Approval recognition: manual permission reaches the group inbox on the first frame",tests.testManualPermissionReachesGroupInboxOnFirstFrame),
             ("Approval recognition: main thread overlay and consecutive worker requests",tests.testMainApprovalOverlayAndConsecutiveWorkerRequests),
             ("Session groups: offline reconnect uses original terminal",tests.testGroupOfflineReconnectUsesOriginalTerminal),

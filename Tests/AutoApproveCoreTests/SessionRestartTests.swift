@@ -315,6 +315,7 @@ extension ApprovalTests {
         try expectEqual(terminal.typed, ["\u{1b}"], "Send exactly one Escape before restarting")
         try expectEqual(terminal.launched.count, 1)
         let command = terminal.launched[0]
+        try expect(command.contains("'CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1'"))
         try expect(command.hasPrefix("env 'AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE="))
         try expect(command.contains(["/fixture/claude", "--model", "opus", "--effort", "max", "--resume", conversation, "--plugin-dir"].map(HookInstaller.quote).joined(separator: " ")))
         terminal.status = "idle"

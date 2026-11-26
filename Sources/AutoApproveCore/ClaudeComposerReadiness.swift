@@ -78,6 +78,43 @@ public enum ClaudeComposerReadiness {
         return border(rows[index - 1]) && border(rows[index + 1])
     }
 
+    static func feedbackToDismiss(_ screen: String, tail: [String]? = nil) -> String? {
+        let rows = tail ?? ActivityDetector.nonemptyTail(screen)
+        guard let feedback = feedbackShortcut(rows) else { return nil }
+        let prepared = DetectionLines(screen), suffix = prepared.normalizedSuffix(64)
+        guard let prompt = suffix.rows.lastIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "❯" }),
+              !prepared.hasOpenCodeFence(beforeSuffixRow: prompt, in: suffix) else { return nil }
+        return feedback
+    }
+
+    private static func feedbackShortcut(_ rows: [String]) -> String? {
+        guard let prompt = rows.lastIndex(where: { $0.hasPrefix("❯") }), rows[prompt] == "❯",
+              prompt > 0, prompt + 1 < rows.count, border(rows[prompt - 1]), border(rows[prompt + 1]) else { return nil }
+        let footer = rows.dropFirst(prompt + 2)
+        guard footer.count <= 8, !footer.contains(where: { border($0) || $0.contains("```") || $0.contains("Enter to select") || $0.contains("Esc to cancel") }) else { return nil }
+        if let status = footer.indices.last, footer[status].contains("feedback draft"),
+           footer[status].range(of: #"\b[1-9][0-9]* feedback drafts?$"#, options: .regularExpression) != nil {
+            let shortcuts = footer[..<status].joined().filter { !$0.isWhitespace }
+            if shortcuts == "1toreview·2tosend·0todismiss" {
+                return "draft:" + (footer[status].components(separatedBy: "·").last ?? footer[status]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        guard footer.isEmpty || ActivityDetector.detect("", agent: .claude, preparedTail: rows, permissionPrompt: { false }).phase == .idle else { return nil }
+        let before = rows.prefix(prompt - 1).suffix(10)
+        guard let first = before.lastIndex(where: { $0.hasPrefix("● ") }),
+              rows[..<first].filter({ $0.hasPrefix("```") }).count.isMultiple(of: 2) else { return nil }
+        let panel = before[first...].joined(separator: " ").filter { !$0.isWhitespace }
+        let headings = ["How is Claude doing this session? (optional)", "How did that compaction go? (optional)",
+                        "How was Claude's recollection?", "How well is Claude following the instructions you gave earlier in this conversation? (optional)"]
+        for heading in headings {
+            let prefix = "●" + heading.filter { !$0.isWhitespace }
+            guard panel.hasPrefix(prefix) else { continue }
+            let choices = String(panel.dropFirst(prefix.count))
+            if choices.range(of: #"^1:Bad2:Fine3:Good(?:4:Unsure)?0:(?:Dismiss|Skip)$"#, options: .regularExpression) != nil { return heading }
+        }
+        return nil
+    }
+
     public static func isEmpty(_ screen: String) -> Bool {
         let rows = ActivityDetector.nonemptyTail(screen)
         let tail = rows.joined(separator: "\n")
