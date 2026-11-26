@@ -97,6 +97,63 @@ private final class GroupObservationReads: @unchecked Sendable {
 }
 
 extension ApprovalTests {
+    func testCodexGroupGoalPermissionUsesWorkerKeyboardTarget() async throws {
+        let records = ProcessDiscovery.parse("""
+        88201 1 ttys891 88201 88201 Wed Oct 28 12:00:00 2026 /fixture/codex
+        88202 1 ttys892 88202 88202 Wed Oct 28 12:00:01 2026 /fixture/codex
+        """)
+        let sessions = records.map { AgentSession(id: $0.key, agent: .codex, pid: $0.pid, started: $0.started,
+            tty: "/dev/" + $0.tty, cwd: "/project", terminal: .terminal) }
+        let leaderThread = UUID().uuidString.lowercased(), workerThread = UUID().uuidString.lowercased()
+        let target = CodexReplyTarget(executable: "/fixture/codex", home: "/fixture/home", threadID: workerThread)
+        let transport = CodexReplyTransport(prepare: { _,_ in target }, send: { _,_ in throw CancellationError() },
+            prepareMessage: { _ in target })
+        let goal = CodexGoal(threadId: workerThread, objective: "Fixture", status: .active, createdAt: 1, updatedAt: 1,
+            instanceID: UUID().uuidString)
+        actor Goals {
+            var value: CodexGoal?
+            init(_ value: CodexGoal) { self.value = value }
+            func clear() { value = nil }
+        }
+        for activeTTY in [sessions[0].tty, sessions[1].tty, nil] {
+            let goals = Goals(goal)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let keyboard = NativeKeyboardActivity(idleSeconds: { 0 }, frontmostBundle: { ScreenHost.terminal.bundleID },
+                inputTargetTTY: { _ in activeTTY })
+            let engine = try ApprovalEngine(paths: .init(directory: directory), questionTransport: transport,
+                processReader: { records },
+                codexGroupReader: { .init(threadID: $0.pid == records[0].pid ? leaderThread : workerThread, database: "/fixture/home/state.sqlite") },
+                codexGroupEnvironment: { _ in ["CODEX_HOME":"/fixture/home"] }, nativeKeyboardActivity: keyboard,
+                codexGoals: .init(read: { _,_ in await goals.value }, change: { _,_,_,_ in await goals.clear(); return nil }))
+            defer { engine.stop(); try? FileManager.default.removeItem(at: directory) }
+            engine.updateDiscovery(sessions, records: records)
+            let leader = SessionGroupLiveSession(session: sessions[0], conversationID: leaderThread, providerHome: target.home).member
+            let worker = SessionGroupLiveSession(session: sessions[1], conversationID: workerThread, providerHome: target.home).member
+            let group = SessionGroup(name: "Fixture", members: [leader, worker], leaderMemberID: leader.id)
+            try SessionGroupStore(directory: directory).save([group])
+            var request = groupMCPProof(sessions[0], id: leaderThread, owner: UUID().uuidString)
+            request["tool"] = "manage_group_member_goal"
+            request["groupID"] = group.id.uuidString
+            request["memberID"] = worker.id.uuidString
+            request["action"] = "clear"
+            request["threadID"] = workerThread
+            request["goalRevision"] = goal.revision
+            if activeTTY == sessions[0].tty {
+                _ = try await engine.mcpAction(request)
+                try expectNil(await goals.value)
+            } else {
+                do {
+                    _ = try await engine.mcpAction(request)
+                    throw AppError.message("An active or unknown keyboard target must keep its Goal")
+                } catch let error as RemoteHTTPError {
+                    try expectEqual(error.diagnostics?["delivery"], "not_started")
+                    try expect(error.message.contains("입력"))
+                    try expectEqual(await goals.value, goal)
+                }
+            }
+        }
+    }
+
     func testCodexMCPIdentitySurvivesHistoricalWelcomeWithoutLosingResetSafety() async throws {
         for host in [ScreenHost.terminal, .iterm] {
             let directory = URL(fileURLWithPath: "/private/tmp/aa-status-banner-" + UUID().uuidString)

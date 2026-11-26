@@ -4536,6 +4536,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
               confirmedGroup.sameMembership(as: group), confirmedMember == member,
               confirmedEndpoint?.id == endpoint.id, confirmedEndpoint?.conversationID == thread,
               confirmedEndpoint?.providerHome == target.home else { throw GroupJobProvider.stale() }
+        if modifying {
+            let held = await userInputHasPriority(session.id, backgroundOnly: session.terminal == .terminal)
+            guard currentJobEndpoint(endpoint, group: confirmedGroup, member: confirmedMember) else { throw GroupJobProvider.stale() }
+            guard !held else {
+                throw RemoteHTTPError(409, "대상 세션의 입력이 끝난 뒤 Goal 변경을 다시 요청해주세요.", diagnostics: ["delivery":"not_started"])
+            }
+        }
         try validateCodexQueueSession(session, threadID: thread)
         guard modifying else { return try details(current) }
         guard let action = Self.groupGoalAction(object),
@@ -4558,9 +4565,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             objective = nil
         }
         let threadKey = target.home + "\0" + thread
-        guard !snapshot.paused, !remoteInputStopped, !userInputHasPriority(session.id), !automaticInputBusy(session.id),
+        guard !snapshot.paused, !remoteInputStopped, !automaticInputBusy(session.id),
               !groupWorkerActions.contains(session.id), !changingGoalThreads.contains(threadKey), !changingGoals.contains(session.id),
-              !groupClearActive(gid) else { throw GroupJobProvider.stale() }
+              !groupClearActive(gid) else {
+            throw RemoteHTTPError(409, "자동화 일시 중지 또는 진행 중인 작업으로 Goal 변경을 시작하지 못했습니다.", diagnostics: ["delivery":"not_started"])
+        }
         changingGoals.insert(session.id)
         changingGoalThreads.insert(threadKey)
         groupWorkerActions.insert(session.id)
@@ -15155,7 +15164,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let deliveredAt = Date()
         let original=sessions[id],validation=original.flatMap {session in
             session.terminal == .terminal ? screenAdapters[.terminal]?.validationScreens:nil
-        },reader=processReader
+        },reader=singleProcessReader
         automationRuntime.launch(id) { [weak self] epoch in
             // A repeated Computer Use permission can have exactly the same text
             // after a brief real turn. Normal 1–2 s polling can miss that turn.
@@ -15174,7 +15183,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let observed:(String,ScreenAnalysis)?
                     do {
                         observed=try await Task.detached(priority:.userInitiated) {() throws -> (String,ScreenAnalysis)? in
-                            let live=try reader()
+                            let live=try reader(original.pid)
                             guard live.contains(where:{$0.pid==original.pid && $0.started==original.started && $0.agent==original.agent && "/dev/"+$0.tty==original.tty}) else {return nil}
                             let snapshot=try validation([target]),frames=snapshot.screens.filter {$0.tty==target.tty}
                             guard frames.count==1 else {return nil}
@@ -15591,7 +15600,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let scheduledRevision = revision
         let scheduledID = UUID()
         screens[id]?.scheduledID = scheduledID
-        let reader = processReader
+        let reader = terminalProcessReader
         automationRuntime.launch(id) { [weak self] epoch in
             if let retryAfter = state.retryAfter {
                 let delay = retryAfter.timeIntervalSinceNow
@@ -15605,7 +15614,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if self.screens[id]?.scheduledID == scheduledID { self.screens[id]?.scheduledID = nil }
                 return
             }
-            let live = try? await Task.detached { try reader() }.value
+            let live = try? await Task.detached { try reader(session.tty, session.pid) }.value
             let heldAfterRead = await self.userInputHasPriority(id, backgroundOnly: checkTargetTab)
             guard !Task.isCancelled, self.automationRuntime.epoch(id) == epoch, !self.automationNeedsFreshScreen.contains(id),
                   !self.hasOSPermissionWait(id),self.revision == scheduledRevision, !self.snapshot.paused, !heldAfterRead, !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
@@ -15652,7 +15661,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         let navigation = try await CodexChildApprovalNavigation.approve(target: target, initial: raw,
                             parentThreadID: session.codexApprovalBinding?.threadID, adapter: adapter, host: host, valid: { [weak self] in
                                 guard let self else { return false }
-                                let records = try? await Task.detached { try reader() }.value
+                                let records = try? await Task.detached { try reader(session.tty, session.pid) }.value
                                 return await self.codexChildNavigationValid(session, epoch: epoch, records: records)
                             })
                         delivery = navigation.delivery; navigatedChild = navigation
@@ -15738,12 +15747,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// original. Re-read only that target; never replay a sent/uncertain input.
     private func refreshRejectedApproval(_ original:AgentSession,target:ScreenTarget,generation:String,
         requestIdentity:String,epoch:UInt64,read:@escaping @Sendable([ScreenTarget]) throws->TerminalSnapshot) async {
-        let id=original.id,startedAt=Date(),reader=processReader
+        let id=original.id,startedAt=Date(),reader=singleProcessReader
         guard let before=remoteObservedScreens[id] else{return}
         let worker=Task.detached(priority:.userInitiated) {() throws -> (String,ScreenAnalysis)? in
             func stillOriginal() throws -> Bool {
                 try Task.checkCancellation()
-                return try reader().contains{$0.pid==original.pid && $0.started==original.started && $0.agent==original.agent && "/dev/"+$0.tty==original.tty && $0.isForeground}
+                return try reader(original.pid).contains{$0.pid==original.pid && $0.started==original.started && $0.agent==original.agent && "/dev/"+$0.tty==original.tty && $0.isForeground}
             }
             guard try stillOriginal() else{return nil}
             let snapshot=try read([target]),frames=snapshot.screens.filter{$0.tty==original.tty}
@@ -15753,8 +15762,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         do {
             let value=try await withTaskCancellationHandler(operation:{try await worker.value},onCancel:{worker.cancel()})
-            guard let value,!Task.isCancelled,automationRuntime.epoch(id)==epoch,!remoteInputStopped,!snapshot.paused,
-                  !automationNeedsFreshScreen.contains(id),!userInputHasPriority(id),sessions[id]?.automatic==true,
+            guard let value else { return }
+            let inputHeld = await userInputHasPriority(id, backgroundOnly: original.channel == .terminalScreen)
+            guard !Task.isCancelled,automationRuntime.epoch(id)==epoch,!remoteInputStopped,!snapshot.paused,
+                  !automationNeedsFreshScreen.contains(id),!inputHeld,sessions[id]?.automatic==true,
                   sessions[id]?.pid==original.pid,sessions[id]?.started==original.started,sessions[id]?.tty==original.tty,
                   sessions[id]?.channel==original.channel,sessions[id]?.screenHandle==original.screenHandle,
                   screens[id]?.generation==generation,screens[id]?.prompt.requestIdentity==requestIdentity,

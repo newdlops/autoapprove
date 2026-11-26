@@ -744,6 +744,8 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session profiles: save completes during an occupied Terminal transaction",tests.testProfileSaveCompletesWhileTerminalIsOccupied),
             ("Goal resume: revalidate the owned draft after status footer changes", tests.testBlockedGoalScriptsVerifyTheLifecycleFooter),
             ("Mailbox priority: urgent permission routing and durable interrupt reservations", tests.testMailboxPriorityRoutingAndInterruptReservation),
+            ("Group Goal permission: background screen refresh during sibling typing", tests.testGroupGoalPermissionRefreshWhileTypingInAnotherTab),
+            ("Group Goal permission: MCP writes respect the worker keyboard target", tests.testCodexGroupGoalPermissionUsesWorkerKeyboardTarget),
             ("Group Goals: native CLI commands and user Goal evidence", tests.testNativeGroupGoalCommandsAndEvidence),
             ("Web interaction: MCP stdio initialization, tool list and errors", tests.testMCPStdioProtocolAndToolErrors),
             ("Web interaction: explicit screen capture, cache, permission and stop", tests.testTestScreenCaptureIsExplicitAndStops),

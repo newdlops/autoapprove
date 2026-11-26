@@ -232,6 +232,37 @@ extension ApprovalTests {
         try expectEqual(probe.acceptanceReadCounts,[1],"Unchanged monitor frames cannot starve the first fresh original read; post-delivery checks are separate")
         }
     }
+    func testGroupGoalPermissionRefreshWhileTypingInAnotherTab() async throws {
+        let goalFrame = """
+        Field 1/1
+        Allow the autoapprove MCP server to run tool "manage_group_member_goal"?
+
+        action: create
+        goalRevision: none
+        groupID: 00000000-0000-4000-8000-000000000001
+
+        › 1. Allow                  Run the tool and continue
+          2. Allow for this session Run the tool and remember this choice for this session
+          3. Always allow           Run the tool and remember this choice for future tool calls
+          4. Cancel                 Cancel this tool call
+        enter to submit | esc to cancel
+        """
+        let stale = goalFrame.replacingOccurrences(of: "action: create", with: "action: edit")
+        let probe = ApprovalRecoveryProbe(), frames = DeliveredFrameProbe(goalFrame)
+        probe.requiredFrame = goalFrame
+        let keyboard = NativeKeyboardActivity(idleSeconds: { 0 }, frontmostBundle: { ScreenHost.terminal.bundleID },
+            inputTargetTTY: { _ in "/dev/ttys891" })
+        let (engine, sessions, directory) = try recoveryEngine(probe, agents: [.codex, .codex],
+            nativeKeyboardActivity: keyboard, host: .terminal, validation: { frames.read($0) })
+        defer { engine.stop(); try? FileManager.default.removeItem(at: directory) }
+        let worker = sessions[1]
+        engine.receiveScreen(sessionID: worker.id, raw: stale, generation: "worker")
+        try await waitForRecovery({ probe.inputs.contains { $0.1 == goalFrame } },
+            "A rejected stale frame must refresh on the worker tab while typing on the leader tab")
+        try expectEqual(probe.inputs.map { $0.1 }, [stale, goalFrame])
+        try expect(probe.inputs.allSatisfy { $0.0.tty == worker.tty })
+    }
+
     func testApprovalReflowFreshQuestionRetiresOldPermissionWithoutAnAnswer() async throws {
         let stale=recoveryPrompt("echo old-permission"),question="Which environment should we use?\n\n› 1. Staging\n  2. Production\n\nEnter to confirm or esc to cancel"
         let probe=ApprovalRecoveryProbe();probe.requiredFrame="never-valid"
