@@ -165,8 +165,13 @@ public enum RemoteTerminalPolling {
         let due = pending.union(dueTargets(ids, intervals: intervals, lastRead: lastRead, now: now))
         let candidates = ids.filter { due.contains($0) }
         guard candidates.count > limit else { return candidates }
+        func deadline(_ id: String) -> TimeInterval {
+            guard let previous = lastRead[id] else { return -.infinity }
+            let regular = previous + (intervals[id] ?? 3)
+            return pending.contains(id) ? min(regular, now - 4) : regular
+        }
         return Array(candidates.sorted {
-            (lastRead[$0] ?? -.infinity, $0) < (lastRead[$1] ?? -.infinity, $1)
+            (deadline($0), lastRead[$0] ?? -.infinity, $0) < (deadline($1), lastRead[$1] ?? -.infinity, $1)
         }.prefix(limit))
     }
 

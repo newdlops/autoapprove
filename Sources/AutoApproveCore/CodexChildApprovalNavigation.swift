@@ -1,8 +1,5 @@
 import Foundation
 
-/// Official Codex presents inactive-thread approvals in the current widget.
-/// Enter their owner before answering; a resolved request needs navigation only.
-/// All writes are exact-frame inputs. No command, draft or uncertain write is replayed.
 enum CodexChildApprovalNavigation {
     struct Interrupted: LocalizedError {
         let reason: String
@@ -11,10 +8,12 @@ enum CodexChildApprovalNavigation {
     struct Outcome: Sendable {
         let delivery: TerminalDelivery
         let approved: Bool
+        var nextRequestVisible = false
     }
     struct Request: Equatable, Sendable {
         let label: String
         let content: String
+        var belongsToMain: Bool { label == "Main [default]" }
     }
     private static func compact(_ text: String) -> String {
         text.precomposedStringWithCanonicalMapping.filter { !$0.isWhitespace }
@@ -35,17 +34,22 @@ enum CodexChildApprovalNavigation {
               lines.filter({ $0.hasPrefix("Thread: ") }).count == 1,
               index > 0,let end=lines[(index+1)...].firstIndex(of:""),end-index<=8 else { return nil }
         let label = String(lines[index].dropFirst(8))+lines[(index+1)..<end].joined()
-        // Preserve every label character across terminal reflow. A clipped or
-        // ambiguous label still cannot identify a navigation destination.
-        guard label.hasPrefix("/root/"), !label.contains("…"), !label.contains("["),
-              !label.contains(where: \.isWhitespace),
+        let isChild = label.hasPrefix("/root/") && !label.contains("…") && !label.contains("[") && !label.contains(where: \.isWhitespace)
+        guard isChild || label == "Main [default]",
               let content = content(prompt, removing: index..<end) else { return nil }
         return Request(label: label, content: content)
     }
     private static func content(_ prompt: ApprovalPrompt, removing thread: Range<Int>? = nil) -> String? {
         let lines = rows(prompt.dialog)
         guard let choice = lines.firstIndex(where: { $0.range(of: #"^[›❯»>]\s*1\.\s+"#, options: .regularExpression) != nil }) else { return nil }
-        return compact(lines[..<choice].enumerated().filter {thread?.contains($0.offset) != true}.map(\.element).joined(separator: "\n"))
+        let original = PromptDetector.normalizedLines(prompt.dialog)
+        return original[..<choice].enumerated().filter { thread?.contains($0.offset) != true && !lines[$0.offset].isEmpty }.map(\.element).joined(separator: "\n")
+    }
+    private static func mainReady(_ raw: String) -> Bool {
+        guard PromptDetector.detect(raw, agent: .codex) == nil, QuestionDetector.detect(raw, agent: .codex) == nil else { return false }
+        var lines = rows(raw).filter { !$0.isEmpty }
+        if lines.last == "← for agents · ? for shortcuts" { lines.removeLast() }
+        return lines.last.map { $0 == "Main [default]" || $0.hasSuffix("· Main [default]") } == true
     }
     static func childReady(_ raw: String, label: String) -> Bool {
         guard PromptDetector.detect(raw, agent: .codex) == nil,
@@ -132,10 +136,12 @@ enum CodexChildApprovalNavigation {
         guard opened == .sent else { return Outcome(delivery: opened, approved: false) }
         do {
             var frame = try await awaitFrame { raw in
-                childReady(raw, label: original.label) || PromptDetector.detect(raw, agent: .codex).map {
+                request(raw).map { $0 != original } == true ||
+                (original.belongsToMain ? mainReady(raw) : childReady(raw, label: original.label)) || PromptDetector.detect(raw, agent: .codex).map {
                     !compact($0.dialog).contains("orotoopenthread") && content($0) == original.content
                 } == true
             }
+            if request(frame) != nil { return Outcome(delivery: .sent, approved: false, nextRequestVisible: true) }
             var approved = false
             if let prompt = PromptDetector.detect(frame, agent: .codex) {
                 guard content(prompt) == original.content else { throw AppError.message("하위 요청이 바뀌었습니다.") }
@@ -143,13 +149,22 @@ enum CodexChildApprovalNavigation {
                 let delivery = try await work { try adapter.dispatchInput(host,budget:10) { try adapter.approve(target, expected, .codex) } }
                 guard delivery == .sent else { throw AppError.message("하위 요청의 승인 입력을 전달하지 못했습니다.") }
                 approved = true
-                frame = try await awaitFrame { childReady($0, label: original.label) }
+                if original.belongsToMain {
+                    frame = try await awaitFrame { raw in
+                        guard let current = PromptDetector.detect(raw, agent: .codex) else { return true }
+                        return request(raw).map { $0 != original } ?? (content(current) != original.content)
+                    }
+                    return Outcome(delivery: .sent, approved: true, nextRequestVisible: PromptDetector.detect(frame, agent: .codex) != nil)
+                }
+                frame = try await awaitFrame { raw in
+                    childReady(raw, label: original.label) || request(raw).map { $0 != original } == true
+                }
+                if request(frame) != nil { return Outcome(delivery: .sent, approved: true, nextRequestVisible: true) }
             }
-            // Alt+Left cycles through siblings, so select the primary UUID in the
-            // official picker instead. The disabled child composer has no draft.
+            if original.belongsToMain { return Outcome(delivery: .sent, approved: false) }
             try await send(.init(kind: .characters, text: "/subagents"), frame: frame)
             frame = try await awaitFrame { rows($0).contains("› /subagents") }
-            try await Task.sleep(for: .milliseconds(350)) // Codex's ASCII paste-burst window.
+            try await Task.sleep(for: .milliseconds(350))
             try await send(.init(kind: .enter), frame: frame)
             frame = try await awaitFrame { picker($0) != nil }
             var selectedParent = false
@@ -159,18 +174,12 @@ enum CodexChildApprovalNavigation {
                     selectedParent = parentThreadID == nil || selected.id == parentThreadID?.lowercased()
                     break
                 }
-                // Physical Home may scroll Terminal.app's buffer rather than send
-                // a key to Codex. Use ordinary arrows and verify each selected UUID.
                 try await send(.init(kind: .up), frame: frame)
                 frame = try await awaitFrame { picker($0)?.first(where: \.selected)?.id != selected.id && picker($0) != nil }
             }
             guard selectedParent else { throw AppError.message("원래 부모 세션을 목록에서 확인하지 못해 선택하지 않았습니다.") }
             try await send(.init(kind: .enter), frame: frame)
-            _ = try await awaitFrame { raw in
-                let footer = Array(rows(raw).filter { !$0.isEmpty }.suffix(2))
-                return (footer.last?.hasSuffix("Main [default]") == true ||
-                    footer.count == 2 && footer[0].hasSuffix("Main [default]") && footer[1] == "← for agents · ? for shortcuts") && picker(raw) == nil
-            }
+            _ = try await awaitFrame(mainReady)
             return Outcome(delivery: .sent, approved: approved)
         } catch { throw Interrupted(reason: error.localizedDescription) }
     }

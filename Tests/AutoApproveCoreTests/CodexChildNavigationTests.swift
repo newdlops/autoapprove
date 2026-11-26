@@ -1,7 +1,10 @@
-#if DEBUG
 import Foundation
 import TerminalInputSupport
+#if DEBUG
 @testable import AutoApproveCore
+#else
+import AutoApproveCore
+#endif
 
 private let navigationParent = "00000000-0000-4000-8000-000000000001"
 private let navigationChild = "00000000-0000-4000-8000-000000000002"
@@ -19,6 +22,8 @@ $ printf APPROVAL_FIX_OK
 Press enter to confirm or esc to cancel
 """
 private let navigationOverlay = navigationOwn.replacingOccurrences(of: "Environment: local", with: "Thread: \(navigationLabel)\n\nEnvironment: local") + " or o to open thread"
+private let navigationMain = navigationOverlay.replacingOccurrences(of: navigationLabel, with: "Main [default]")
+private let mainDraft = "› OWNED_DRAFT_MUST_SURVIVE\nfixture-model default · ~ · Main [default]"
 private let navigationReady = "› Viewing sub-agent — direct input is disabled\nfixture-model default · ~ · \(navigationLabel)"
 private let navigationPicker = """
 Subagents
@@ -32,9 +37,13 @@ private final class NavigationProbe: @unchecked Sendable {
     private var frame = navigationOverlay
     private var writes: [String] = []
     let resolved: Bool
+    let followingMain: Bool
+    private var openedMain = false
     var uncertainAt: String?
     var rejectOpen = false
-    init(resolved: Bool = false) { self.resolved = resolved }
+    init(resolved: Bool = false, initial: String = navigationOverlay, followingMain: Bool = false) {
+        self.resolved = resolved; self.frame = initial; self.followingMain = followingMain
+    }
     var inputs: [String] { lock.lock(); defer { lock.unlock() }; return writes }
     var screen: String { lock.lock(); defer { lock.unlock() }; return frame }
     var adapter: ScreenHostAdapter {
@@ -49,17 +58,48 @@ private final class NavigationProbe: @unchecked Sendable {
         writes.append(value)
         if uncertainAt == value { throw AppError.message("Owned uncertain input") }
         switch value {
-        case "o": frame = resolved ? navigationReady : navigationOwn
-        case "approve": frame = navigationReady
+        case "o":
+            openedMain = frame == navigationMain
+            frame = resolved ? (openedMain ? mainDraft : navigationReady) : navigationOwn
+        case "approve": frame = openedMain ? mainDraft : (followingMain ? navigationMain : navigationReady)
         case "/subagents": frame = "› /subagents"
         case "up": frame = navigationPicker.replacingOccurrences(of: "  1.", with: "› 1.").replacingOccurrences(of: "› 2.", with: "  2.")
-        case "enter": frame = frame == "› /subagents" ? navigationPicker : "› OWNED_DRAFT_MUST_SURVIVE\nfixture-model default · ~ · Main [default]"
+        case "enter": frame = frame == "› /subagents" ? navigationPicker : mainDraft
         default: throw AppError.message("Unexpected input")
         }
         return .sent
     }
 }
 extension ApprovalTests {
+    func testMainApprovalOverlayAndConsecutiveWorkerRequests() async throws {
+        for (first, resolved) in [(navigationMain, false), (navigationMain, true), (navigationOverlay, false)] {
+            let queued = first == navigationOverlay
+            let probe = NavigationProbe(resolved: resolved, initial: first, followingMain: queued)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let records = ProcessDiscovery.parse("82001 1 ttys891 82001 82001 Wed Oct 28 22:00:00 2026 /fixture/codex")
+            let record = records[0]
+            let engine = try ApprovalEngine(paths: .init(directory: directory), processReader: { records },
+                screenAdapters: [.iterm: probe.adapter], isolateByDefault: true)
+            defer { engine.stop(); try? FileManager.default.removeItem(at: directory) }
+            var session = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started,
+                tty: "/dev/ttys891", cwd: directory.path, terminal: .iterm)
+            session.channel = .itermScreen
+            engine.updateDiscovery([session], records: records)
+            try engine.setAutomatic(session.id, enabled: true)
+            let deadline = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < deadline {
+                engine.receiveScreen(sessionID: session.id, raw: probe.screen, generation: "fixture")
+                if probe.screen == mainDraft && engine.snapshot.events.contains(where: {
+                    $0.outcome == (resolved ? "처리된 승인창 정리" : "원래 대화에서 승인 입력 전달")
+                }) { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            try expectEqual(probe.inputs, queued ? ["o", "approve", "o", "approve"] : resolved ? ["o"] : ["o", "approve"])
+            try expectEqual(probe.screen, mainDraft)
+            try expectEqual(engine.snapshot.sessions.first?.automatic, true)
+        }
+    }
+#if DEBUG
     func testOfficialChildNavigationEngineReservationAndUncertainReplay() async throws {
         for scenario in ["terminal", "missingIdentity", "uncertain"] {
             let uncertain = scenario == "uncertain"
@@ -169,5 +209,5 @@ extension ApprovalTests {
         try expectNil(CodexChildApprovalNavigation.picker(navigationPicker + "\nunknown footer"))
         try expectNil(CodexChildApprovalNavigation.picker(navigationPicker.replacingOccurrences(of: navigationChild, with: navigationParent)))
     }
-}
 #endif
+}

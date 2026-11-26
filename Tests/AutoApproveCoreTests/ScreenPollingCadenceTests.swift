@@ -2,6 +2,51 @@ import Foundation
 import AutoApproveCore
 
 extension ApprovalTests {
+    func testManualPermissionReachesGroupInboxOnFirstFrame() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let record = ProcessDiscovery.parse("993901 1 ttys990 993901 993901 Wed Oct 28 22:00:00 2026 /fixture/claude")[0]
+        let leader = SessionGroupMember(agent: .codex, title: "parent", cwd: "/tmp", conversationID: UUID().uuidString)
+        var member = SessionGroupMember(agent: .claude, title: "worker", cwd: "/tmp", conversationID: UUID().uuidString)
+        member.runtimeID = record.key
+        let group = SessionGroup(name: "fixture", members: [leader, member], leaderMemberID: leader.id)
+        try SessionGroupStore(directory: directory).save([group])
+        let work = SessionGroupAssignment(groupID: group.id, workerMemberID: member.id, parentMemberID: leader.id,
+            workerSessionID: record.key, parentSessionID: "fixture-parent", task: "fixture task")
+        var state = SessionGroupOrchestration(assignments: [work])
+        state.markDelivered(work.id)
+        let paths = AppPaths(directory: directory)
+        try AuditStore(path: paths.database).set(SessionGroupOrchestration.storeKey, String(decoding: JSONEncoder().encode(state), as: UTF8.self))
+        let box = try SessionGroupMailbox(directory: directory)
+        let engine = try ApprovalEngine(paths: paths, claudeRegistryReader: { _ in [] }, processReader: { [record] }, isolateByDefault: true)
+        defer { engine.stop() }
+        var session = AgentSession(id: record.key, agent: .claude, pid: record.pid, started: record.started,
+            tty: "/dev/" + record.tty, cwd: "/tmp", terminal: .iterm)
+        session.channel = .itermScreen
+        engine.updateDiscovery([session], records: [record])
+        _ = try engine.sessionGroupAssignments()
+        let raw = "Do you want to proceed?\n$ echo fixture\n❯ 1. Yes\n  2. No\nEsc to cancel"
+        func observe(_ text: String) { engine.receiveScreen(sessionID: record.key, raw: text, generation: "fixture", source: .itermScreen) }
+        func inbox() throws -> [SessionGroupMessage] { try box.list(groupID: group.id, memberID: leader.id, includeAcknowledged: true) }
+        try engine.setPaused(true)
+        observe(raw)
+        try expect(try inbox().isEmpty)
+        try engine.setPaused(false)
+        try engine.setAutomatic(record.key, enabled: true)
+        observe(raw.replacingOccurrences(of: "echo fixture", with: "echo automatic"))
+        try expect(try inbox().isEmpty)
+        try engine.setAutomatic(record.key, enabled: false)
+        observe(raw)
+        let message = try inbox().first
+        try expectEqual(message?.category, .permissionRequest)
+        try expectEqual(message?.senderID, member.id)
+        try expect(message?.text.contains("echo fixture") == true)
+        observe(raw)
+        try expectEqual(try inbox().count, 1)
+        observe(raw.replacingOccurrences(of: "echo fixture", with: "echo second"))
+        try expectEqual(try inbox().count, 2)
+    }
+
     func testScreenPollingCadenceIsPerSession() throws {
         let question = RemoteTerminalPolling.sessionInterval(priorityInput: false, automatic: true, awaitingAnswer: true,
             interrupted: false, active: false, unchangedReads: 0)
@@ -50,6 +95,15 @@ extension ApprovalTests {
             for id in batch { readAt[id] = Double(pass) }
         }
         try expect(pending.isEmpty)
+        let mixed = ["idle", "request", "working"]
+        let mixedIntervals = ["idle": 4.0, "request": 0.5, "working": 2.0]
+        let recent = ["idle": 5.9, "request": 9.9, "working": 7.6]
+        try expectEqual(RemoteTerminalPolling.monitorBatch(mixed, pending: ["request"], intervals: mixedIntervals,
+            lastRead: recent, now: 10, limit: 1), ["request"])
+        try expectEqual(RemoteTerminalPolling.monitorBatch(mixed, pending: ["request"], intervals: mixedIntervals,
+            lastRead: recent.merging(["idle": 1.0]) { _, new in new }, now: 10, limit: 1), ["idle"])
+        try expectEqual(RemoteTerminalPolling.monitorBatch(mixed, pending: [], intervals: mixedIntervals,
+            lastRead: recent.merging(["request": 9.0]) { _, new in new }, now: 10, limit: 1), ["request"])
         var size = RemoteTerminalPolling.BatchSize()
         try expectEqual(size.limit, 2)
         for _ in 0..<6 { size.completed(count:size.limit, elapsed:0.3) }

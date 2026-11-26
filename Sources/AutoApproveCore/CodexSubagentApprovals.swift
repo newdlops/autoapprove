@@ -11,6 +11,13 @@ public struct CodexActivitySnapshot: Codable, Equatable, Sendable {
     public var parent: CodexThreadActivity
     public var children: [CodexThreadActivity]
 
+    func hasNewApproval(since previous: Self?) -> Bool {
+        if parent.phase == .approval && previous?.parent.phase != .approval { return true }
+        guard children.contains(where: { $0.phase == .approval }) else { return false }
+        let waiting = Set((previous?.children ?? []).lazy.filter { $0.phase == .approval }.map(\.id))
+        return children.contains { $0.phase == .approval && !waiting.contains($0.id) }
+    }
+
     var phase: SessionPhase {
         let phases = [parent.phase] + children.map(\.phase)
         for phase: SessionPhase in [.input, .approval, .working, .unknown] {

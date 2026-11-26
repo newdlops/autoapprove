@@ -6006,9 +6006,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
         }
-        let pending = state.undelivered.map { ($0, false, "report:" + $0.id.uuidString) } +
-            state.undeliveredQuestions.map { ($0, true, "question:" + $0.id.uuidString + ":" + $0.question!.id) }
-        let groups = pending.isEmpty ? [] : (try? SessionGroupStore(directory: paths.directory).load())
+        guard let latest = try? groupOrchestration() else { return false }
+        enqueueGroupReports(reports: latest.undelivered, questions: latest.undeliveredQuestions)
+        return (try? groupOrchestration())?.needsWatching ?? false
+    }
+
+    private func enqueueGroupReports(reports: [SessionGroupAssignment], questions: [SessionGroupAssignment]) {
+        let pending = reports.map { ($0, false, "report:" + $0.id.uuidString) } +
+            questions.compactMap { item in item.question.map { (item, true, "question:" + item.id.uuidString + ":" + $0.id) } }
+        guard !pending.isEmpty else { return }
+        let groups = try? SessionGroupStore(directory: paths.directory).load()
         let stored = try? groupMailbox().storedReportSources(pending.map { item, _, source in
             [source, item.groupID.uuidString, item.workerMemberID.uuidString, item.parentMemberID.uuidString]
         })
@@ -6043,7 +6050,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
         }
-        return (try? groupOrchestration())?.needsWatching ?? false
     }
 
     /// A missing Stop hook must not strand a delivered task forever. Only an
@@ -6126,20 +6132,36 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (group, caller, callerMember, target, worker, current)
     }
 
-    /// Records a choice question that has kept a working worker waiting for the grace period.
-    /// The grace leaves time for automatic answers, such as a yes/no confirmation, to happen first.
+    private func reportManualGroupPermission(_ session: AgentSession, screen: String) {
+        guard !remoteInputStopped, !snapshot.paused, session.channel.isScreen,
+              !effectiveAutomatic(session.id) || screens[session.id]?.isCurrent != true,
+              let cached = groupOrchestrationCache else { return }
+        let assignments = cached.assignments.filter {
+            $0.workerSessionID == session.id && $0.status == .working && $0.isDelivered &&
+                $0.sentAt <= (remoteObservedScreens[session.id]?.observedAt ?? .distantPast) && !groupClearActive($0.groupID)
+        }
+        guard !assignments.isEmpty, let permission = delegablePermission(session, screen: screen),
+              savedReply("terminalChoice:\(session.id):\(permission.id)") == nil else { return }
+        let question = GroupWorkerQuestion(id: permission.id, text: permission.question, options: permission.options, permission: true)
+        let changed = recordGroupQuestions(assignments.map { ($0.id, question) }, clearing: [])
+        enqueueGroupReports(reports: [], questions: changed)
+    }
+
     private func watchGroupQuestions() async {
         guard let initial = try? groupOrchestration() else { return }
         let working = initial.assignments.filter { $0.status == .working }
         groupQuestionSeen = groupQuestionSeen.filter { id, _ in working.contains { $0.id == id } }
-        var noted: [(UUID, GroupWorkerQuestion)] = [], cleared: [UUID] = []
+        var noted: [(task: UUID, worker: String, request: String?, question: GroupWorkerQuestion)] = []
+        var cleared: [(task: UUID, worker: String)] = []
         for item in working {
             guard let worker = sessions[item.workerSessionID], worker.phase == .input || worker.phase == .approval, !remoteInputStopped else {
                 groupQuestionSeen[item.id] = nil
-                if item.question != nil { cleared.append(item.id) }
+                if item.question != nil { cleared.append((item.id, item.workerSessionID)) }
                 continue
             }
             guard let frame = try? await remoteTerminal(sessionID: worker.id, realtime: true) else { continue }
+            guard let current = sessions[worker.id], current.phase == worker.phase,
+                  current.pendingRequestID == worker.pendingRequestID else { continue }
             let permission = worker.phase == .approval
             guard let question = permission ? delegablePermission(sessions[worker.id] ?? worker) : frame.question,
                   question.reply == nil, savedReply("terminalChoice:\(worker.id):\(question.id)") == nil,
@@ -6149,25 +6171,40 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 continue
             }
             guard Date().timeIntervalSince(seen.since) >= groupQuestionGrace, item.question?.id != question.id else { continue }
-            noted.append((item.id, GroupWorkerQuestion(id: question.id, text: question.question, options: question.options, permission: permission)))
+            noted.append((item.id, worker.id, worker.pendingRequestID,
+                          GroupWorkerQuestion(id: question.id, text: question.question, options: question.options, permission: permission)))
         }
-        guard !noted.isEmpty || !cleared.isEmpty, var state = try? groupOrchestration() else { return }
+        let current = noted.filter { item in
+            guard let session = sessions[item.worker] else { return false }
+            return session.pendingRequestID == item.request && session.phase == (item.question.isPermission ? .approval : .input)
+        }
+        let gone = cleared.filter { item in
+            let phase = sessions[item.worker]?.phase
+            return phase != .approval && phase != .input
+        }
+        _ = recordGroupQuestions(current.map { ($0.task, $0.question) }, clearing: gone.map(\.task))
+    }
+
+    private func recordGroupQuestions(_ noted: [(UUID, GroupWorkerQuestion)], clearing cleared: [UUID]) -> [SessionGroupAssignment] {
+        guard !noted.isEmpty || !cleared.isEmpty, var state = try? groupOrchestration() else { return [] }
         cleared.forEach { state.clearQuestion($0) }
+        var changed: [SessionGroupAssignment] = []
         for (id, question) in noted where state.noteQuestion(id, question) {
             if let item = state.assignments.first(where: { $0.id == id }) {
+                changed.append(item)
                 log(AuditEvent(sessionID: item.workerSessionID, summary: "세션 그룹 작업 \(item.shortID)",
                                outcome: question.isPermission ? "그룹장 위임 승인 요청 대기" : "그룹 작업 질문 보고 대기",
                                source: "세션 그룹", tool: "group_question", request: question.text))
             }
         }
-        try? saveGroupOrchestration(state)
+        guard !changed.isEmpty || !cleared.isEmpty else { return [] }
+        do { try saveGroupOrchestration(state); return changed }
+        catch { return [] }
     }
 
-    /// A permission prompt the user delegated to the worker's parent. The global pause, macOS permission
-    /// dialogs and system changes that AutoApprove never approves in the app stay with the user.
-    private func delegablePermission(_ session: AgentSession) -> TerminalChoiceQuestion? {
+    private func delegablePermission(_ session: AgentSession, screen: String? = nil) -> TerminalChoiceQuestion? {
         guard !snapshot.paused, !hasOSPermissionWait(session.id), systemSafetyStates[session.id]?.notice.isPending != true,
-              let raw = remoteFrames[session.id]?.raw else { return nil }
+              let raw = screen ?? remoteFrames[session.id]?.raw else { return nil }
         if let prompt = PromptDetector.detect(raw, agent: session.agent),
            Self.screenApprovalRisk(prompt, agent: session.agent, cwd: session.cwd) != nil { return nil }
         return TerminalChoiceQuestion.detectPermission(raw, agent: session.agent)
@@ -7867,6 +7904,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
         for entry in registrations where entry.kind != "bg" {
             interactive[entry.processID] = entry.status
             activities[entry.processID] = entry.activity
+            if let activity = entry.activity, activity.status == "waiting", activity.waitingFor == "permission prompt",
+               activity != claudeInteractiveActivity[entry.processID], activity.changedAt > (claudeHookObservedAt[entry.processID] ?? .distantPast),
+               let session = sessions[entry.processID], session.phase != .approval {
+                requestApprovalScreen(session)
+            }
         }
         claudeRegistryStatus = interactive
         claudeInteractiveActivity = activities
@@ -8353,6 +8395,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func pollingTargets(_ host: ScreenHost) -> [AgentSession] {
         sessions.values.filter { $0.agent != .shell && $0.terminal == host.kind && $0.phase != .ended }
+    }
+
+    private func requestApprovalScreen(_ session: AgentSession) {
+        guard !remoteInputStopped, session.phase != .ended, let host = ScreenHost(kind: session.terminal),
+              !registeredBackgroundClaude.contains(session.id), claudeParents[session.id] == nil,
+              !hasBackgroundChildren(session.id),
+              !liveClaudeHooks.values.contains(where: { $0.request.sessionID == session.id }) else { return }
+        requestScreenRefresh(host, ids: [session.id])
     }
 
     private func requestScreenRefresh(_ host: ScreenHost, ids: Set<String>? = nil) {
@@ -10039,7 +10089,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 session.pendingRequestID = "hook:\(providerID):\(requestID)"
             }
         }
+        let newPermission = session.phase == .approval && session.pendingInTerminal &&
+            (sessions[key]?.phase != .approval || sessions[key]?.pendingRequestID != session.pendingRequestID)
         sessions[key] = session
+        if !deferApproval, newPermission,
+           event == "PermissionRequest" || (event == "Notification" && payload["notification_type"] as? String == "permission_prompt") {
+            requestApprovalScreen(session)
+        }
         if groupMailboxTask != nil, session.phase == .idle,
            event == "Stop" || (event == "Notification" && payload["notification_type"] as? String == "idle_prompt") {
             groupMailboxIdleSessions.insert(key)
@@ -10339,6 +10395,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             outcome: "터미널에서 확인", source: "Claude 훅", tool: pending.request.tool, request: pending.request.inputJSON))
         try saveClaudeReceipt(receipt)
         removeLiveClaudeHook(requestID, terminal: true)
+        if let session = sessions[sessionID], session.phase == .approval { requestApprovalScreen(session) }
         publish()
     }
 
@@ -10841,6 +10898,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 sessionChanged = current != sessionBeforeScreen
             } else {
                 sessionChanged = true
+            }
+            if let current = sessions[sessionID], current.phase == .approval,
+               sessionBeforeScreen.phase != .approval || current.pendingRequestID != sessionBeforeScreen.pendingRequestID {
+                reportManualGroupPermission(current, screen: raw)
             }
             if sessionChanged || capacityResumeProjection(for: sessionID) != capacityBeforeScreen {
                 publish()
@@ -15133,6 +15194,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func setCodexActivity(_ id: String, epoch: UUID, activity: CodexActivitySnapshot) {
         guard codexApprovalEpochs[id] == epoch, sessions[id]?.phase != .ended,
               sessions[id]?.codexApprovalBinding?.threadID == activity.parent.id else { return }
+        if let session = sessions[id], activity.hasNewApproval(since: session.codexActivity) {
+            requestApprovalScreen(session)
+        }
         sessions[id]?.codexActivity = activity
         publish()
     }
@@ -15281,9 +15345,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             requestIdentity:current.prompt.requestIdentity,epoch:epoch,read:adapter.validationScreens ?? adapter.screens)
                     }
                     if delivery == .sent { self.watchDeliveredApproval(id, dispatchID: scheduledID, generation: state.generation, requestIdentity: state.prompt.requestIdentity) }
-                    event.outcome = delivery == .sent
-                        ? navigatedChild.map { $0.approved ? "하위 요청 승인 입력 전달 · 부모 화면 복귀 확인" : "처리된 하위 요청 화면 정리 · 부모 화면 복귀 확인" } ?? "승인 입력 전달"
-                        : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
+                    if let navigation = navigatedChild, navigation.delivery == .sent {
+                        let result = navigation.approved ? "원래 대화에서 승인 입력 전달" : "처리된 승인창 정리"
+                        event.outcome = navigation.nextRequestVisible ? result + " · 다음 승인창 확인" : result
+                        self.requestApprovalScreen(session)
+                    } else {
+                        event.outcome = delivery == .sent ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
+                    }
                     self.log(event)
                 } catch is AutomationIPC.InputNotStarted {
                     self.retryUnsentApproval(id,dispatchID:scheduledID,generation:state.generation)
