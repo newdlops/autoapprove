@@ -752,6 +752,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Approval recovery: consecutive Claude panels tolerate history and reflow", tests.testClaudeConsecutivePanelsAndHistoryReflow),
             ("Approval recovery: confirmed non-write retries without another output event", tests.testConfirmedNonWriteRecoversWithoutAnotherOutputEvent),
             ("Approval recovery: exact Terminal tab works without frontmost app or focus", tests.testApprovalTargetsTabWithoutFrontmostAppOrKeyboardFocus),
+            ("Approval recovery: typing in a sibling Terminal tab holds only its own approval", tests.testBackgroundApprovalWhileTypingInAnotherTerminalTab),
             ("Approval recovery: uncertain input is not retried after reflow or resume", tests.testUncertainApprovalDoesNotRetryAfterReflow),
             ("Approval recovery: real terminal cells across widths and clipped heights", tests.testPermissionDetectionAcrossTerminalGridSizes),
             ("Native processes: fresh metadata and original terminal host parity", tests.testNativeProcessMetadataAndOriginalHostParity),

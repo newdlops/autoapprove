@@ -14943,20 +14943,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return nil
     }
 
-    private func retryUnsentApproval(_ id: String, dispatchID: UUID, generation: String) {
+    private func retryUnsentApproval(_ id: String, dispatchID: UUID, generation: String, inputHeld: Bool = false) {
         guard let state = screens[id], state.generation == generation, state.dispatchID == dispatchID else { return }
         screens[id]?.dispatchID = nil
-        screens[id]?.validationFailures += 1
-        // Only a definitive non-write enters this path. A fast repaint must not
-        // permanently exhaust a retry budget; back off, then validate the complete
-        // dialog at the target again even if no more output/resize event arrives.
-        let delay = min(4, 0.25 * pow(2, Double(min(state.validationFailures, 4))))
+        if !inputHeld { screens[id]?.validationFailures += 1 }
+        let delay = inputHeld ? 1.5 : min(4, 0.25 * pow(2, Double(min(state.validationFailures, 4))))
         screens[id]?.retryAfter = Date().addingTimeInterval(delay)
         screens[id]?.attempted = false
         screens[id]?.reviewDetail = nil
         if state.isCurrent {
             sessions[id]?.pendingInTerminal = false
-            sessions[id]?.activityDetail = "화면이 바뀌어 승인 요청을 다시 확인하고 있습니다."
+            sessions[id]?.activityDetail = inputHeld ? "원래 탭의 사용자 입력이 끝나기를 기다리고 있습니다." : "화면이 바뀌어 승인 요청을 다시 확인하고 있습니다."
         }
     }
 
@@ -15416,14 +15413,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if delay > 0 { do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return } }
             }
             guard !Task.isCancelled, let self else { return }
-            await self.nativeKeyboardActivity.waitForSample(session.terminal)
-            guard !Task.isCancelled, !self.userInputHasPriority(id) else {
+            let checkTargetTab = session.channel == .terminalScreen &&
+                !(session.agent == .codex && CodexChildApprovalNavigation.requiresNavigation(state.raw))
+            let inputHeld = await self.userInputHasPriority(id, backgroundOnly: checkTargetTab)
+            guard !Task.isCancelled, !inputHeld else {
                 if self.screens[id]?.scheduledID == scheduledID { self.screens[id]?.scheduledID = nil }
                 return
             }
             let live = try? await Task.detached { try reader() }.value
+            let heldAfterRead = await self.userInputHasPriority(id, backgroundOnly: checkTargetTab)
             guard !Task.isCancelled, self.automationRuntime.epoch(id) == epoch, !self.automationNeedsFreshScreen.contains(id),
-                  !self.hasOSPermissionWait(id),self.revision == scheduledRevision, !self.snapshot.paused, !self.userInputHasPriority(id), !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
+                  !self.hasOSPermissionWait(id),self.revision == scheduledRevision, !self.snapshot.paused, !heldAfterRead, !self.automaticInputBusy(id), self.sessions[id]?.automatic == true,
                   self.sessions[id] != nil,
                   self.sessions[id]?.channel == session.channel,
                   self.sessions[id]?.bridgeID == session.bridgeID,
@@ -15484,7 +15484,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         self.requireApprovalReview(id, dispatchID: scheduledID, generation: state.generation,
                             requestIdentity: current.prompt.requestIdentity, detail: "하위 승인창을 연 Codex 프로세스를 확인하지 못했습니다. 원래 터미널을 확인해주세요.")
                     } else if delivery != .sent {
-                        self.retryUnsentApproval(id, dispatchID: scheduledID, generation: state.generation)
+                        self.retryUnsentApproval(id, dispatchID: scheduledID, generation: state.generation, inputHeld: delivery == .inputHeld)
                     }
                     if delivery == .screenChanged {
                         await self.refreshRejectedApproval(session,target:target,generation:state.generation,
@@ -15495,6 +15495,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         let result = navigation.approved ? "원래 대화에서 승인 입력 전달" : "처리된 승인창 정리"
                         event.outcome = navigation.nextRequestVisible ? result + " · 다음 승인창 확인" : result
                         self.requestApprovalScreen(session)
+                    } else if delivery == .inputHeld {
+                        event.outcome = "승인 입력 미전달 · 원래 탭의 사용자 입력 대기"
                     } else {
                         event.outcome = delivery == .sent ? "승인 입력 전달" : "입력 미전달 · 새 화면 확인 (\(delivery.rawValue))"
                     }

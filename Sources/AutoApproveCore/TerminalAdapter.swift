@@ -221,7 +221,7 @@ enum AutomationScript {
     }
 }
 
-public enum TerminalDelivery: String, Codable, Sendable { case sent, screenChanged, missingTarget, agentMissing }
+public enum TerminalDelivery: String, Codable, Sendable { case sent, screenChanged, missingTarget, agentMissing, inputHeld }
 
 public struct TerminalWindowBounds: Codable, Equatable, Sendable {
     public let x: Double
@@ -616,7 +616,7 @@ public enum TerminalAdapter {
         """
     }
     @discardableResult public static func approve(tty: String, expectedScreen: String, agent: AgentKind) throws -> TerminalDelivery {
-        if NativeKeyboardActivity.live.hasPriority(terminal:.terminal) {return .screenChanged}
+        if NativeKeyboardActivity.live.hasPriority(terminal: .terminal, tty: tty) { return .inputHeld }
         let result = try javascript(approvalScript(tty: tty, expectedScreen: expectedScreen, agent: agent))
         guard let delivery = TerminalDelivery(rawValue: result) else { throw AppError.message("승인 입력의 전달 결과를 확인하지 못했습니다.") }
         return delivery
@@ -630,7 +630,18 @@ public enum TerminalAdapter {
         return """
         (() => {
         const app = Application('com.apple.Terminal'); const target = \(data);
-        \(AutomationScript.terminalSelectionGuard)
+        function inputHeld() {
+          if (!app.frontmost()) return false;
+          try {
+            ObjC.import('CoreGraphics');
+            const idle = Math.min($.CGEventSourceSecondsSinceLastEventType(1, 10), $.CGEventSourceSecondsSinceLastEventType(1, 11));
+            const flags = Number($.CGEventSourceFlagsState(1));
+            if (!Number.isFinite(idle) || idle < 0 || !Number.isFinite(flags)) return true;
+            if (idle >= 1.5 && !(flags & 0x1e0000)) return false;
+            const tty = app.windows[0].selectedTab().tty();
+            return typeof tty !== 'string' || !tty.startsWith('/dev/') || tty === target.tty;
+          } catch (_) { return true; }
+        }
         function normalize(text) { return String(text).normalize('NFC').replace(/\\r\\n?/g, '\\n'); }
         function activeDialog(text) {
           const lines = normalize(text).split('\\n');
@@ -649,9 +660,9 @@ public enum TerminalAdapter {
         }
         if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || []) {
           if (skipClosed(() => tab.tty()) !== target.tty) continue;
-          if (activeDialog(tab.contents()) !== normalize(target.dialog)) return 'screenChanged';
           if (!tab.processes().some(p => p.toLowerCase().includes(target.agent))) return 'agentMissing';
-          if (!preservesSelection(target.tty)) return 'screenChanged';
+          if (inputHeld()) return 'inputHeld';
+          if (tab.tty() !== target.tty || activeDialog(tab.contents()) !== normalize(target.dialog)) return 'screenChanged';
           app.doScript(target.submitSelected ? '' : '1', {in:tab});
           return 'sent';
         }

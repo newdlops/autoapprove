@@ -645,25 +645,52 @@ extension ApprovalTests {
         let context = JSContext()!, dialog = recoveryPrompt("echo focus-fixture")
         context.setObject(dialog, forKeyedSubscript: "dialog" as NSString)
         context.evaluateScript("""
-        var writes = [], frontmostApp = 'other.app', notifications = 0;
+        var writes = [], frontmostApp = 'other.app', selectedTTY = '/dev/other', idle = 0;
+        const ObjC = {import: () => {}};
+        const $ = {CGEventSourceSecondsSinceLastEventType: () => idle, CGEventSourceFlagsState: () => 0};
         const targetTab = {tty: () => '/dev/fixture', contents: () => dialog, processes: () => ['codex']};
         const otherTab = {tty: () => '/dev/other', contents: () => { throw Error('Unrelated tab'); }};
         function Application(identifier) {
           if (identifier !== 'com.apple.Terminal') throw Error('Global keyboard access is forbidden');
-          return {running: () => true, windows: () => [{tabs: () => [otherTab, targetTab]}],
+          const windows = () => [{tabs: () => [otherTab, targetTab]}];
+          windows[0] = {selectedTab: () => ({tty: () => selectedTTY})};
+          return {running: () => true, windows,
             frontmost: () => frontmostApp === 'com.apple.Terminal', activate: () => { throw Error('Must not steal focus'); },
             doScript: (text, options) => { if (options.in !== targetTab) throw Error('Wrong tab'); writes.push(text); }};
         }
         """)
-        for app in ["other.app", "notification.center", "another.app"] {
+        for app in ["other.app", "com.apple.Terminal"] {
             context.setObject(app, forKeyedSubscript: "frontmostApp" as NSString)
-            context.evaluateScript("notifications++")
             try expectEqual(context.evaluateScript(try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: dialog, agent: .codex))?.toString(), "sent")
             try expectNil(context.exception)
+            try expectEqual(context.evaluateScript("selectedTTY")?.toString(), "/dev/other")
         }
-        context.evaluateScript("frontmostApp='com.apple.Terminal'")
-        try expectEqual(context.evaluateScript(try TerminalAdapter.approvalScript(tty:"/dev/fixture",expectedScreen:dialog,agent:.codex))?.toString(),"screenChanged")
+        let script = try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: dialog, agent: .codex)
+        for selected in ["/dev/fixture", ""] {
+            context.setObject(selected, forKeyedSubscript: "selectedTTY" as NSString)
+            try expectEqual(context.evaluateScript(script)?.toString(), "inputHeld")
+        }
+        context.evaluateScript("selectedTTY='/dev/fixture'; idle=5")
+        try expectEqual(context.evaluateScript(script)?.toString(), "sent")
+        context.evaluateScript("selectedTTY='/dev/other'; idle=0; targetTab.contents = () => 'Working'")
+        try expectEqual(context.evaluateScript(script)?.toString(), "screenChanged")
         try expectEqual(context.evaluateScript("writes.join(',')")?.toString(), "1,1,1")
+    }
+
+    func testBackgroundApprovalWhileTypingInAnotherTerminalTab() async throws {
+        let probe = ApprovalRecoveryProbe()
+        let keyboard = NativeKeyboardActivity(idleSeconds: { 0 }, frontmostBundle: { ScreenHost.terminal.bundleID },
+            inputTargetTTY: { _ in "/dev/ttys891" })
+        let (engine, sessions, directory) = try recoveryEngine(probe, agents: [.codex, .claude], nativeKeyboardActivity: keyboard, host: .terminal)
+        defer { engine.stop(); try? FileManager.default.removeItem(at: directory) }
+        for _ in 0..<3 {
+            for session in sessions {
+                engine.receiveScreen(sessionID: session.id, raw: recoveryPrompt("pwd", agent: session.agent), generation: "same-tabs")
+            }
+        }
+        try await waitForRecovery({ probe.inputs.count == 1 }, "Typing in the selected tab should hold only its approval")
+        try expectEqual(probe.inputs.map { $0.0.tty }, [sessions[1].tty])
+        try expectEqual(engine.snapshot.sessions.first(where: { $0.id == sessions[0].id })?.phase, .approval)
     }
 
     func testUncertainApprovalDoesNotRetryAfterReflow() async throws {
