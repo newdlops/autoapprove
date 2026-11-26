@@ -1,5 +1,6 @@
 import Foundation
 import AutoApproveCore
+import CSQLite
 
 private func unwrapGroup<T>(_ value: T?) throws -> T {
     guard let value else { throw AppError.message("Expected session group test value") }
@@ -1139,23 +1140,42 @@ extension ApprovalTests {
     }
 
     @MainActor func testGroupWorkerChoiceQuestionReachesParentAndIsAnswered() async throws {
+        try await checkWorkerPermissionDelivery(parentAgent: .claude)
+    }
+
+    @MainActor func testActiveGoalReceivesUrgentPermissionsWithoutInterrupt() async throws {
+        try await checkWorkerPermissionDelivery(parentAgent: .codex)
+    }
+
+    @MainActor private func checkWorkerPermissionDelivery(parentAgent: AgentKind) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("group-question-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let records = ProcessDiscovery.parse("""
-        100561 1 fixture8 100561 100561 Wed Oct 28 12:00:00 2026 /fixture/claude
+        100561 1 fixture8 100561 100561 Wed Oct 28 12:00:00 2026 /fixture/\(parentAgent.rawValue)
         100562 1 fixture9 100562 100562 Wed Oct 28 12:00:00 2026 /fixture/claude
         """)
         var sessions = records.map { AgentSession(id: $0.key, agent: $0.agent!, pid: $0.pid, started: $0.started, tty: "/dev/" + $0.tty, cwd: "/tmp/group-fixture", terminal: .iterm) }
         for index in sessions.indices { sessions[index].phase = .idle; sessions[index].channel = .itermScreen }
-        let ids = [records[0].pid: UUID().uuidString, records[1].pid: UUID().uuidString]
+        let ids = [records[0].pid: UUID().uuidString.lowercased(), records[1].pid: UUID().uuidString]
         let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { records in
-            records.compactMap { record in ids[record.pid].map { .init(processID: record.key, kind: "interactive", activity: .init(providerID: $0, status: "idle", changedAt: Date())) } }
+            records.filter { $0.agent == .claude }.compactMap { record in ids[record.pid].map { .init(processID: record.key, kind: "interactive", activity: .init(providerID: $0, status: "idle", changedAt: Date())) } }
         }
         let writer = GroupTerminalWriter()
         let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: writer.screen($0.tty)) }) },
             approve: { _, _, _ in .missingTarget }, reveal: { _ in nil }, input: { target, _, _, input in writer.send(target, input) })
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.iterm: adapter])
+        let home = directory.path
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { records }, screenAdapters: [.iterm: adapter],
+            codexGroupReader: { r in ids[r.pid].map { .init(threadID: $0, database: home + "/thread_history_1.sqlite") } })
         defer { engine.stop() }
+        var goalDB: OpaquePointer?
+        defer { sqlite3_close(goalDB) }
+        if parentAgent == .codex {
+            try expectEqual(sqlite3_open(home + "/goals_1.sqlite", &goalDB), SQLITE_OK)
+            try expectEqual(sqlite3_exec(goalDB, """
+                CREATE TABLE thread_goals(thread_id TEXT PRIMARY KEY,goal_id TEXT,objective TEXT,status TEXT,token_budget INTEGER,tokens_used INTEGER,time_used_seconds INTEGER,created_at_ms INTEGER,updated_at_ms INTEGER);
+                INSERT INTO thread_goals VALUES('\(ids[records[0].pid]!)','fixture','fixture','active',NULL,0,0,1,1);
+                """, nil, nil, nil), SQLITE_OK)
+        }
         engine.groupQuestionGrace = 0.2; engine.groupDeliveryInterval = 0.2; engine.groupMailboxPollInterval = 0.2
         engine.updateDiscovery(sessions, records: records); await engine.connectScreenHost(.iterm)
         let observed = try await engine.sessionGroupSessions()
@@ -1182,11 +1202,12 @@ extension ApprovalTests {
         let workerTTY = "/dev/" + records[1].tty, leaderTTY = "/dev/" + records[0].tty
         try expectEqual(writer.writes(to: workerTTY).count, 1)
 
-        writer.show("결과 정리\n\n❯ Try “다음 작업”\n? for shortcuts", on: leaderTTY)
+        let glyph = parentAgent == .codex ? "›" : "❯"
+        writer.show("결과 정리\n\n" + glyph + " \n? for shortcuts", on: leaderTTY)
         try expect(try await waitForGroup(10) { await engine.refreshScreens(); return phase(leader.id) == .idle }, "The parent must be idle to receive reports")
 
-        let workingScreen = "Working… (esc to interrupt)\n────────────\n❯ \n────────────\n ? for shortcuts"
-        writer.show(workingScreen.replacingOccurrences(of:"❯ ", with:"❯ my draft"), on:leaderTTY)
+        let workingScreen = "• Working (esc to interrupt)\n────────────\n" + glyph + " \n────────────\n ? for shortcuts"
+        writer.show(workingScreen.replacingOccurrences(of:glyph + " ", with:glyph + " my draft"), on:leaderTTY)
         await engine.refreshScreens()
         let approvalScope = "Yes, and don't ask again for commands that start with `python3 -B /tmp/" +
             String(repeating: "fixture-directory/", count: 12) + "verify.py`"
@@ -1211,6 +1232,19 @@ extension ApprovalTests {
         try await Task.sleep(for:.milliseconds(650))
         try expectFalse(writer.writes(to:leaderTTY).contains("\u{1b}"))
         writer.show(workingScreen, on:leaderTTY)
+        if parentAgent == .codex {
+            await engine.refreshScreens()
+            try expectEqual(phase(leader.id), .working)
+            let inbox = try await call("get_group_messages", from: leader.id)
+            try expect((inbox["messages"] as? [JSONObject])?.contains { $0["messageID"] as? String == permissionMessage.id.uuidString } == true)
+            try await Task.sleep(for: .milliseconds(750))
+            try expectFalse(writer.writes(to: leaderTTY).contains("\u{1b}"))
+            _ = try mailbox.enqueue(groupID: group.id, senderID: workerMember.id, recipientID: leaderMember.id, kind: .question, text: "fixture question")
+            let feedback = try await engine.prioritizeSessionGroupReplies(groupID: group.id, memberID: leaderMember.id)
+            try expect(feedback.contains("예약"))
+            try expectFalse(writer.writes(to: leaderTTY).contains("\u{1b}"))
+            try expectEqual(sqlite3_exec(goalDB, "UPDATE thread_goals SET status='complete'", nil, nil, nil), SQLITE_OK)
+        }
         let interrupted = try await waitForGroup(10) {
             await engine.refreshScreens()
             return writer.writes(to:leaderTTY).contains("\u{1b}")
@@ -1221,7 +1255,7 @@ extension ApprovalTests {
             throw AppError.message("Expected one parent Escape, phases=\(phases), empty=\(ClaudeComposerReadiness.isEmpty(writer.screen(leaderTTY))), result=\(current?.lastResult ?? "-"), detail=\(current?.lastError ?? "-"), claimAvailable=\(try mailbox.reservePermissionInterrupt(permissionMessage.id))")
         }
         try expectEqual(writer.writes(to:leaderTTY).filter { $0 == "\u{1b}" }.count,1)
-        writer.show("Finished\n❯ \n ? for shortcuts", on:leaderTTY)
+        writer.show("Finished\n" + glyph + " \n ? for shortcuts", on:leaderTTY)
         await engine.refreshScreens()
         let request = permissionMessage.text
         _ = try await call("ack_group_messages", from: leader.id, ["messageIDs": [permissionMessage.id.uuidString]])
@@ -1259,8 +1293,6 @@ extension ApprovalTests {
         do { _ = try await call("answer_group_question", from: leader.id, ["choice": 2]); throw AppError.message("An answered question accepted a second answer") }
         catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
 
-        // A system change that AutoApprove never approves in the app is not delegated to the parent.
-        // The command is assembled so that this source text is not itself a system change request.
         let persistence = "launch" + "ctl bootstrap gui/501 /fixture/test.plist"
         writer.show("Do you want to proceed?\n$ \(persistence)\n❯ 1. Yes\n  2. No\nEsc to cancel", on: workerTTY)
         try expect(try await waitForGroup(10) {

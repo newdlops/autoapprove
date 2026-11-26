@@ -3632,6 +3632,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return answer.id
     }
 
+    private func groupMessageMayInterrupt(_ live: SessionGroupLiveSession) -> Bool {
+        guard live.session.agent == .codex else { return true }
+        guard !live.providerIdentityAmbiguous, let home = live.providerHome,
+              let thread = live.conversationID.flatMap(UUID.init(uuidString:)) else { return false }
+        do {
+            let goal = try CodexGoalTransport.readDatabase(home: home, threadID: thread.uuidString.lowercased())
+            return goal == nil || goal?.status == .complete
+        } catch { return false }
+    }
+
     public func prioritizeSessionGroupReplies(groupID: UUID, memberID: UUID) async throws -> String {
         guard !remoteInputStopped, !snapshot.paused, !groupClearActive(groupID),
               let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
@@ -3646,7 +3656,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let (request, fresh) = try box.requestPriorityReplies(group: groupID, member: memberID, conversation: conversation, senders: group.members.map(\.id))
         defer { scheduleGroupMailboxDelivery() }
         guard fresh else { return "이미 이 구성원에게 우선 회신을 요청했습니다." }
-        guard session.phase == .working || live.claudeRegisteredStatus == "busy" else {
+        guard (session.phase == .working || live.claudeRegisteredStatus == "busy"), groupMessageMayInterrupt(live) else {
             return "우선 회신을 예약했습니다. 입력할 수 있게 되면 오래된 질문부터 처리합니다."
         }
         do {
@@ -3657,7 +3667,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                       $0.localizedCaseInsensitiveContains("esc to interrupt") || $0.localizedCaseInsensitiveContains("esc to cancel")
                   }) else { return "우선 회신을 예약했습니다. 현재 턴의 중단 키를 확인할 수 있어야 작업을 멈출 수 있습니다." }
             _ = try await remoteInput(["sessionID": live.id, "revision": frame.revision, "kind": "escape"], automaticAuthorization: {
-                guard !self.snapshot.paused, !self.groupClearActive(groupID),
+                guard !self.snapshot.paused, !self.groupClearActive(groupID), self.groupMessageMayInterrupt(live),
                       let now = self.sessions[live.id], now.started == session.started, now.tty == session.tty,
                       ![.input, .approval, .ended].contains(now.phase), !now.pendingInTerminal,
                       !self.codexAccountInputHeld(live.id), !self.changingGoals.contains(live.id),
@@ -4914,7 +4924,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   let pending = delegablePermission(worker), question.matches(pending) else { return false }
             return true
         }
-        guard try valid(), !(await userInputHasPriority(live.id, backgroundOnly:true)) else { return }
+        guard try valid(), groupMessageMayInterrupt(live), !(await userInputHasPriority(live.id, backgroundOnly:true)) else { return }
         let frame = try await remoteTerminal(sessionID:live.id, realtime:true, textOnly:true)
         guard frame.inputReason == nil, frame.outputReason == nil,
               !RemoteMessageReadiness.hasMenu(frame.screen, agent:session.agent),
@@ -4923,7 +4933,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
               try valid(), try box.reservePermissionInterrupt(message.id) else { return }
         do {
             _ = try await remoteInput(["sessionID":live.id, "revision":frame.revision, "kind":"escape"], automaticAuthorization: {
-                guard try valid() else { throw RemoteHTTPError(409, "권한 요청이나 그룹장 상태가 바뀌었습니다.") }
+                guard try valid(), self.groupMessageMayInterrupt(live) else {
+                    throw RemoteHTTPError(409, "권한 요청이나 그룹장 상태가 바뀌었습니다.", diagnostics: ["delivery": "not_started"])
+                }
             }, authorizationSource:"긴급 그룹 권한 요청", backgroundOnly:true)
         } catch {
             if (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started" {
@@ -11265,7 +11277,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func deferBlockedGoalToLeader(_ session: AgentSession, reason: String, at now: Date) -> Bool {
         let groups: [SessionGroup]
         do { groups = try SessionGroupStore(directory: paths.directory).load() }
-        catch { groupBlockedGoals.insert(session.id); return true }
+        catch {
+            groupBlockedGoals.insert(session.id)
+            capacityStates.removeValue(forKey: session.id)
+            return true
+        }
         let live = groupConnectionObservation?.sessions ?? []
         let evidence = live.first { $0.id == session.id && $0.session.tty == session.tty && $0.session.cwd == session.cwd }
         var held = false
@@ -11289,21 +11305,29 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 continue
             }
-            held = true
-            guard members.count == 1, let member = members.first else { continue }
+            guard members.count == 1, let member = members.first else { held = true; continue }
             if let saved = UUID(uuidString: member.conversationID) {
                 let ids = [evidence?.conversationID, session.codexApprovalBinding?.threadID].compactMap { $0.flatMap(UUID.init(uuidString:)) }
                 if ids.contains(where: { $0 != saved }) {
+                    held = true
                     if groupBadgeTask == nil, now.timeIntervalSince(groupBadgeRefreshedAt) > 4 { refreshSessionGroupBadges() }
                     continue
                 }
             }
+            let reviewers = group.goalReviewLeaders(for: member.id).subtracting([member.id])
+            if reviewers.isEmpty, group.isLeader(member.id) {
+                do {
+                    if try groupMailbox().hasActiveWait(group: group.id, member: member.id) { held = true }
+                } catch { held = true }
+                continue
+            }
+            held = true
             if sessions[session.id]?.interruption?.needsAttention != true || sessions[session.id]?.interruption?.kind != .goalBlocked {
                 sessions[session.id]?.interruption = SessionInterruption(id: UUID().uuidString, kind: .goalBlocked, detail: reason, date: now)
                 _ = persistInterruption(session.id)
             }
             guard let event = sessions[session.id]?.interruption, let box = try? groupMailbox() else { continue }
-            for leader in group.goalReviewLeaders(for: member.id) {
+            for leader in reviewers {
                 let key = "goalBlocked:" + [group.id.uuidString, member.id.uuidString, leader.uuidString, event.id].joined(separator: ":")
                 do {
                     guard try box.message(sourceKey: key) == nil else { continue }
@@ -11496,7 +11520,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             sessions[id]?.interruption?.resumeUncertain = false
             persistInterruption(id)
         }
-        if delays.isEmpty || !stop.kind.retryable || (sessions[id]?.interruption?.resumeUncertain == true &&
+        if stop.continuationText == CodexCapacityStop.goalResumeText, let receipt = sessions[id]?.interruption,
+           receipt.resumeSubmissionCancelled == true, !advanced,
+           receipt.resumeStop.map({ $0.continuationKey == stop.continuationKey }) ?? (receipt.detail == stop.error) {
+            state.phase = .cancelled
+        } else if delays.isEmpty || !stop.kind.retryable || (sessions[id]?.interruption?.resumeUncertain == true &&
             (previousIdentity == stop.continuationKey || previousIdentity == stop.identity ||
                 (sessions[id]?.interruption?.resumeCommand == nil && previousIdentity == stop.legacyContinuationKey))) {
             state.phase = .review
@@ -14043,7 +14071,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func dispatchCapacityResume(_ id: String, scheduledID: UUID, revision scheduledRevision: UInt64, automationEpoch: UInt64) async {
         func current() -> (CapacityState, AgentSession, ScreenHostAdapter?)? {
-            guard !hasOSPermissionWait(id),!Task.isCancelled, automationRuntime.epoch(id) == automationEpoch, !automationNeedsFreshScreen.contains(id),
+            guard !hasOSPermissionWait(id), !hasManualGoalHold(id), !Task.isCancelled, automationRuntime.epoch(id) == automationEpoch, !automationNeedsFreshScreen.contains(id),
                   let state = capacityStates[id], state.scheduledID == scheduledID, state.phase == .waiting,
                   revision == scheduledRevision, !snapshot.paused, !userInputHasPriority(id), !automaticInputBusy(id), let session = sessions[id], session.automatic,
                   session.unansweredQuestions.allSatisfy({ $0.hasLaterUserMessage == true }),
@@ -14485,9 +14513,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
             sessions[id]?.interruption?.recoveryDetail = "같은 대화의 자동 복구를 취소했습니다."
             persistInterruption(id); saveExitRecoveries(); publish(); return
         }
-        guard let phase = capacityStates[id]?.phase, phase == .waiting || phase == .unavailable else { return }
+        guard let state = capacityStates[id], state.phase == .waiting || state.phase == .unavailable else { return }
         capacityStates[id]?.phase = .cancelled; capacityStates[id]?.scheduledID = nil
         sessions[id]?.interruption?.resumeSubmissionCancelled = true
+        if state.stop.continuationText == CodexCapacityStop.goalResumeText {
+            sessions[id]?.interruption?.resumeStop = state.stop
+            sessions[id]?.interruption?.resumeTurnIdentity = state.turnIdentity
+        }
         persistInterruption(id)
         publish()
     }

@@ -175,10 +175,6 @@ public final class SessionGroupMailbox {
     public init(directory: URL, maximumPending: Int = 1000) throws {
         self.maximumPending = maximumPending
         try AppPaths(directory: directory).prepare()
-        // macOS exposes legitimate /var and /tmp aliases. Resolve the parent, while
-        // still refusing a symlink at the database itself (including SQLite's open).
-        // Foundation canonicalizes /private/var back to /var on macOS; SQLite's
-        // NOFOLLOW rejects that alias too. realpath supplies the physical parent.
         guard let parent = realpath(directory.path, nil) else { throw AppError.message("그룹 수신함 폴더를 확인하지 못했습니다.") }
         let path = String(cString: parent) + "/group-messages.sqlite"
         free(parent)
@@ -278,6 +274,9 @@ public final class SessionGroupMailbox {
                 """)
             try installConversationRevision()
             try execute("""
+                UPDATE messages SET last_result='superseded',last_error=NULL,acknowledged=strftime('%s','now')
+                WHERE source_key GLOB 'goalBlocked:*' AND kind='notice' AND acknowledged IS NULL AND sender_id=recipient_id
+                  AND source_key GLOB ('goalBlocked:' || group_id || ':' || sender_id || ':' || recipient_id || ':????????-????-????-????-????????????');
                 UPDATE messages AS q SET last_result='answered',last_error=NULL
                 WHERE kind='question' AND \(Self.pendingFilter)
                   AND EXISTS(SELECT 1 FROM messages a WHERE a.source_key='answer:' || q.id
@@ -343,6 +342,11 @@ public final class SessionGroupMailbox {
         guard sqlite3_step(s) == SQLITE_ROW else { throw AppError.message("그룹 수신함 상태를 읽지 못했습니다.") }
         return Int(sqlite3_column_int64(s, 0))
     }
+    func hasActiveWait(group: UUID, member: UUID) throws -> Bool {
+        try scalar("SELECT EXISTS(SELECT 1 FROM group_waits WHERE group_id=? AND state='waiting' AND \(Self.waitMember)=?)",
+                   [group.uuidString, member.uuidString]) != 0
+    }
+
     private func rows(_ suffix: String, _ values: [String] = [], alias: Bool = false) throws -> [SessionGroupMessage] {
         let projection = alias ? columns.replacingOccurrences(of: "messages.id", with: "m.id") : columns
         let s = try statement("SELECT " + projection + (alias ? " FROM messages m " : " FROM messages ") + suffix, values); defer { sqlite3_finalize(s) }
