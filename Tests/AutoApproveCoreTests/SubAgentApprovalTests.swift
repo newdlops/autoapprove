@@ -48,7 +48,7 @@ extension ApprovalTests {
         context.evaluateScript("""
         var writes = [];
         var tab = {tty: () => '/dev/fixture', contents: () => current, processes: () => ['codex']};
-        function Application(id) { return {running: () => true, windows: () => [{tabs: () => [tab]}], doScript: (value) => writes.push(value)}; }
+        function Application(id) { return {frontmost:()=>false,running: () => true, windows: () => [{tabs: () => [tab]}], doScript: (value) => writes.push(value)}; }
         """)
         let delivery = context.evaluateScript(try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: subAgentApproval, agent: .codex))
         try expectNil(context.exception)

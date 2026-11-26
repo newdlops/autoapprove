@@ -87,12 +87,18 @@ public enum SessionRestartCommand {
         dropFlag: ["--last", "--all", "--include-non-interactive", "--worktree"],
         dropVariadic: ["-i", "--image"])
 
-    /// `argv` is the original argument list without the executable path.
-    public static func plan(agent: AgentKind, executable: String, argv: [String], conversationID: String) throws -> Plan {
+    private static func isEffortOverride(_ value: String) -> Bool {
+        guard let equals = value.firstIndex(of: "=") else { return false }
+        return String(value[..<equals]).trimmingCharacters(in: .whitespaces) == "model_reasoning_effort"
+    }
+
+    public static func plan(agent: AgentKind, executable: String, argv: [String], conversationID: String, currentSettings: TerminalProfileExecutionSettings? = nil) throws -> Plan {
         guard let id = UUID(uuidString: conversationID)?.uuidString.lowercased() else { throw AppError.message("대화 ID를 확인하지 못했습니다.") }
         guard executable.hasPrefix("/"), !executable.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else {
             throw AppError.message("CLI 실행 파일 경로를 확인하지 못했습니다.")
         }
+        let effort = TerminalProfileExecutionSettings(reasoningEffort: currentSettings?.reasoningEffort)
+        let effortArguments = try effort.arguments(agent: agent.rawValue)
         if agent == .agy {
             var options: [String] = [], index = 0
             while index < argv.count {
@@ -112,14 +118,12 @@ public enum SessionRestartCommand {
                       name != "--conversation" || UUID(uuidString: value) != nil else {
                     throw AppError.message("agy 실행 옵션 값을 확인하지 못했습니다.")
                 }
-                if name != "--conversation" { options += [name, value] }
+                if name != "--conversation", name != "--effort" || currentSettings == nil { options += [name, value] }
             }
-            return Plan(arguments: [executable] + options + ["--conversation", id], dropped: [])
+            return Plan(arguments: [executable] + options + effortArguments + ["--conversation", id], dropped: [])
         }
         var tokens = argv
         if agent == .codex, let first = tokens.firstIndex(where: { !$0.hasPrefix("-") }) {
-            // A subcommand can only come before any of its own options' values, so check the first bare word
-            // after skipping known option values.
             var index = 0, subcommand: Int?
             while index < tokens.count {
                 let token = tokens[index], name = token.split(separator: "=", maxSplits: 1).first.map(String.init) ?? token
@@ -138,6 +142,11 @@ public enum SessionRestartCommand {
         func values(from start: Int) -> Int { var end = start; while end < tokens.count, !tokens[end].hasPrefix("-") { end += 1 }; return end }
         while index < tokens.count {
             let token = tokens[index]
+            if agent == .codex, token.hasPrefix("-c"), !token.hasPrefix("--"), token.count > 2,
+               isEffortOverride(String(token.dropFirst(2)).trimmingCharacters(in: CharacterSet(charactersIn: "="))) {
+                if currentSettings == nil { kept.append(token) }
+                index += 1; continue
+            }
             if token == "--" { dropped += tokens[index...]; break }
             guard token.hasPrefix("-"), token.count > 1 else { dropped.append(token); index += 1; continue }
             let parts = token.split(separator: "=", maxSplits: 1).map(String.init)
@@ -146,9 +155,13 @@ public enum SessionRestartCommand {
             if rules.flag.contains(name) { kept.append(token); index += 1; continue }
             if rules.dropFlag.contains(name) { dropped.append(token); index += 1; continue }
             if rules.value.contains(name) {
-                if inline { kept.append(token); index += 1; continue }
-                guard index + 1 < tokens.count else { throw AppError.message("실행 옵션 \(name)의 값을 확인하지 못했습니다.") }
-                kept += [token, tokens[index + 1]]; index += 2; continue
+                guard inline || index + 1 < tokens.count else { throw AppError.message("실행 옵션 \(name)의 값을 확인하지 못했습니다.") }
+                let value = inline ? parts[1] : tokens[index + 1]
+                let consumed = inline ? 1 : 2
+                let oldEffort = agent == .claude ? name == "--effort" :
+                    (["-c", "--config"].contains(name) && isEffortOverride(value))
+                if currentSettings == nil || !oldEffort { kept += tokens[index..<index + consumed] }
+                index += consumed; continue
             }
             if rules.variadic.contains(name) {
                 let end = inline ? index + 1 : values(from: index + 1)
@@ -163,6 +176,7 @@ public enum SessionRestartCommand {
             if rules.dropVariadic.contains(name) { let end = inline ? index + 1 : values(from: index + 1); dropped += tokens[index..<end]; index = end; continue }
             throw AppError.message("알 수 없는 실행 옵션(\(name))이 있어 다시 시작하지 않습니다.")
         }
+        kept += effortArguments
         let arguments = agent == .codex ? [executable, "resume"] + kept + [id] : [executable] + kept + ["--resume", id]
         return Plan(arguments: arguments, dropped: dropped)
     }

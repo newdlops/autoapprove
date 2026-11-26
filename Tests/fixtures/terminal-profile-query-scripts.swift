@@ -13,6 +13,7 @@ import AutoApproveCore
                 "prepare":try TerminalProfileTabOpener.prepareScript(anchorTTY:anchor,settingsName:"Pro"),
                 "confirm":try TerminalProfileTabOpener.confirmationScript(anchorTTY:anchor,windowID:77,previousTTYs:previous),
                 "launch":try TerminalProfileLauncher.script(entry,targetTTY:target),
+                "restoreSelection":try TerminalProfileLauncher.selectionScript(anchor,afterOpening:target),
                 "select":try TerminalProfileLauncher.selectionScript(anchor)]
         }
         print(String(decoding:try JSONSerialization.data(withJSONObject:rows,options:[.sortedKeys]),as:UTF8.self))

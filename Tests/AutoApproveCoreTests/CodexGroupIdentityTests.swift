@@ -886,7 +886,7 @@ extension ApprovalTests {
             adapter.backgroundInput = { target, raw, agent, input in
                 try TerminalDeviceInput.deliverBackground(target: target, screen: raw, agent: agent, input: input,
                     captureIdentity: { _ in identity }, run: { script in
-                        try expect(!script.contains("activate") && !script.contains("selectedTab") && !script.contains("System Events"), "Group delivery must not select or focus any window")
+                        try expect(!script.contains("activate") && !script.contains("selectedTab=") && !script.contains("selectedTab =") && !script.contains("System Events"), "Group delivery must not select or focus any window")
                         try expect(script.contains("app.doScript(target.text, {in: tab})"))
                         _ = screen.send(input)
                         return "sent"

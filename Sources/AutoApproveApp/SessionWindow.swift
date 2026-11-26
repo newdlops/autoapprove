@@ -383,7 +383,11 @@ import AutoApproveCore
                 Button {
                     refreshing = true
                     let ids = selection
-                    Task { await engine.refresh(sessionIDs: ids); refreshing = false }
+                    Task {
+                        await engine.refresh(sessionIDs: ids)
+                        await viewUpdates.refreshModels(engine)
+                        refreshing = false
+                    }
                 } label: { Label("새로고침", systemImage: "arrow.clockwise") }
                 .disabled(refreshing || selection.isEmpty).keyboardShortcut("r").help(refreshing ? "세션과 연결 상태를 확인하고 있습니다." : "선택한 세션의 화면과 질문 상태를 다시 확인합니다. ⌘R")
                 Button { perform { try engine.setPaused(!engine.snapshot.paused) } } label: {

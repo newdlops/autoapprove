@@ -10,16 +10,26 @@ import AutoApproveCore
     private var modelSessions: [SessionGroupLiveSession] = []
     private var settings: [String: SessionGroupModelSettings] = [:]
 
+    private var modelRequest = UUID()
+
+    func refreshModels(_ engine: ApprovalEngine, sessions: [SessionGroupLiveSession]? = nil) async {
+        let request = UUID()
+        modelRequest = request
+        let observed: [SessionGroupLiveSession]
+        if let sessions { observed = sessions }
+        else { observed = (try? await engine.modelDisplaySessions()) ?? [] }
+        let values = await engine.sessionModelSettings(observed)
+        guard !Task.isCancelled, request == modelRequest else { return }
+        if settings != values || !modelSessions.elementsEqual(observed, by: { $0.hasSamePresentation(as: $1) }) {
+            objectWillChange.send()
+            modelSessions = observed
+            settings = values
+        }
+    }
+
     func observeModels(_ engine: ApprovalEngine) async {
         while !Task.isCancelled {
-            let observed = (try? await engine.modelDisplaySessions()) ?? []
-            let values = await engine.sessionModelSettings(observed)
-            guard !Task.isCancelled else { return }
-            if settings != values || !modelSessions.elementsEqual(observed, by: { $0.hasSamePresentation(as: $1) }) {
-                objectWillChange.send()
-                modelSessions = observed
-                settings = values
-            }
+            await refreshModels(engine)
             do { try await Task.sleep(for: .seconds(15)) } catch { return }
         }
     }

@@ -186,6 +186,13 @@ extension ApprovalTests {
         try expectEqual(codex.dropped, ["--last", "-i", "a.png", "b.png", "다음 작업"])
         try expectEqual(try SessionRestartCommand.plan(agent: .codex, executable: "/opt/codex", argv: ["--model=o3"], conversationID: id).arguments,
                         ["/opt/codex", "resume", "--model=o3", id.lowercased()])
+        let old = ["resume", "-c", "model_reasoning_effort=low", "--config=model_reasoning_effort=medium",
+                   "-cmodel_reasoning_effort=high", "-c", "unrelated=7", id]
+        let updated = try SessionRestartCommand.plan(agent: .codex, executable: "/opt/codex", argv: old,
+            conversationID: id, currentSettings: .init(reasoningEffort: "max"))
+        try expectEqual(updated.arguments, ["/opt/codex", "resume", "-c", "unrelated=7", "-c", "model_reasoning_effort=\"max\"", id.lowercased()])
+        let unset = try SessionRestartCommand.plan(agent: .codex, executable: "/opt/codex", argv: old, conversationID: id, currentSettings: .init())
+        try expectEqual(unset.arguments, ["/opt/codex", "resume", "-c", "unrelated=7", id.lowercased()])
         let agy = try SessionRestartCommand.plan(agent: .agy, executable: "/opt/agy", argv: ["--model=m1", "--effort", "high", "--sandbox", "--conversation", UUID().uuidString], conversationID: id)
         try expectEqual(agy.arguments, ["/opt/agy", "--model", "m1", "--effort", "high", "--sandbox", "--conversation", id.lowercased()])
         for (agent, argv) in [(AgentKind.agy, ["--model"]), (.agy, ["--conversation", "invalid"]), (.claude, ["--unknown-option", "x"]), (.claude, ["-p", "요약"]), (.codex, ["exec", "작업"]), (.codex, ["--mystery"])] {
@@ -277,7 +284,10 @@ extension ApprovalTests {
             rows.filter { $0.pid == 100601 || $0.pid == 100602 }.map { .init(processID: $0.key, kind: "interactive", sessionID: conversation, status: terminal.status) }
         }
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), claudeRegistryReader: registry, processReader: { terminal.records },
-                                        screenAdapters: [.iterm: adapter], singleProcessReader: { pid in terminal.records.filter { $0.pid == pid } })
+                                        screenAdapters: [.iterm: adapter], groupModelSettingsReader: { live in
+                                            guard live.conversationID == conversation else { return nil }
+                                            return .init(model: "opus", reasoningEffort: "max", source: "fixture")
+                                        }, singleProcessReader: { pid in terminal.records.filter { $0.pid == pid } })
         defer { engine.stop() }
         let sessionDirectory = ProcessDiscovery.sessions(running).first { $0.agent == .claude }!.cwd
         engine.repairClaudeMCPRegistration = { executable, cwd, _ in
@@ -286,7 +296,7 @@ extension ApprovalTests {
         }
         engine.processTerminator = { terminal.terminate($0) }
         engine.restartResumeSettle = 0.5
-        engine.processArgumentsReader = { record in record.pid == 100601 ? ["/fixture/claude", "--model", "opus", "처음 프롬프트"] : nil }
+        engine.processArgumentsReader = { record in record.pid == 100601 ? ["/fixture/claude", "--model", "opus", "--effort=low", "처음 프롬프트"] : nil }
         var session = ProcessDiscovery.sessions(running).first { $0.agent == .claude }!
         session.terminal = .iterm; session.channel = .itermScreen; session.providerID = conversation
         engine.updateDiscovery([session], records: running); await engine.connectScreenHost(.iterm)
@@ -306,7 +316,7 @@ extension ApprovalTests {
         try expectEqual(terminal.launched.count, 1)
         let command = terminal.launched[0]
         try expect(command.hasPrefix("env 'AUTOAPPROVE_CLAUDE_PROMPT_BRIDGE="))
-        try expect(command.contains(["/fixture/claude", "--model", "opus", "--resume", conversation, "--plugin-dir"].map(HookInstaller.quote).joined(separator: " ")))
+        try expect(command.contains(["/fixture/claude", "--model", "opus", "--effort", "max", "--resume", conversation, "--plugin-dir"].map(HookInstaller.quote).joined(separator: " ")))
         terminal.status = "idle"
         var next = ProcessDiscovery.sessions(reopened).first { $0.agent == .claude }!
         next.terminal = .iterm; next.channel = .itermScreen; next.providerID = conversation

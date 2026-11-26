@@ -120,7 +120,7 @@ struct SessionProfileEntryFilter:Equatable {
     private let captureGroups:@MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup]
     private let restoreGroups:@MainActor (TerminalSessionProfile,[TerminalProfileRestoreResult],[TerminalProfileCandidate]) async throws -> Void
     private let launch:@Sendable (TerminalProfileEntry,String?) async throws -> String
-    private let selectTab:@Sendable (String) async throws -> Void
+    private let selectTab:@Sendable (String,String) async throws -> Void
     private let restorer=TerminalProfileRestorer()
     private var repositoryTask:Task<Void,Never>?
     private var repositoryGeneration=UUID()
@@ -131,15 +131,15 @@ struct SessionProfileEntryFilter:Equatable {
          captureGroups:@escaping @MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup] = {_ in []},
          restoreGroups:@escaping @MainActor (TerminalSessionProfile,[TerminalProfileRestoreResult],[TerminalProfileCandidate]) async throws -> Void = {_,_,_ in},
          launch:(@Sendable (TerminalProfileEntry,String?) async throws -> String)? = nil,
-         selectTab:(@Sendable (String) async throws -> Void)? = nil) {
+         selectTab:(@Sendable (String,String) async throws -> Void)? = nil) {
         self.store=store;self.activeSessions=activeSessions ?? capture
         self.captureForSaving=captureForSaving ?? { _,_ in try await capture() }
         self.queryConversation=queryConversation
         self.captureGroups=captureGroups;self.restoreGroups=restoreGroups
         self.launch=launch ?? {try await TerminalProfileLauncher.launch($0,anchorTTY:$1)}
         if let selectTab {self.selectTab=selectTab}
-        else if launch == nil {self.selectTab={try await TerminalProfileLauncher.selectTab($0)}}
-        else {self.selectTab={_ in}}
+        else if launch == nil {self.selectTab={try await TerminalProfileLauncher.selectTab($0,afterOpening:$1)}}
+        else {self.selectTab={_,_ in}}
     }
     convenience init(engine:ApprovalEngine) {
         self.init(store:TerminalProfileStore(directory:engine.paths.directory.appendingPathComponent("session-profiles",isDirectory:true)),
@@ -173,10 +173,15 @@ struct SessionProfileEntryFilter:Equatable {
         if reset {entryFilter = .init();selectedEntries=Set(profile.entries.map(\.id))}
         else {selectedEntries.formIntersection(profile.entries.map(\.id))}
         resolvingRepositories=true
-        let paths=profile.entries.map(\.cwd)
+        let entries = profile.entries
         repositoryTask=Task { [weak self] in
-            let value=await Task.detached(priority:.utility) {SessionProfileEntryFilter.repositories(for:paths)}.value
+            let (value, refreshed) = await Task.detached(priority:.utility) {
+                (SessionProfileEntryFilter.repositories(for:entries.map(\.cwd)), TerminalProfileExecutionSettingsReader.refreshed(entries))
+            }.value
             guard let self,self.repositoryGeneration==generation,self.selectedID==profile.id else {return}
+            if let index = self.profiles.firstIndex(where: { $0.id == profile.id }), self.profiles[index].entries == entries, refreshed != entries {
+                self.profiles[index].entries = refreshed
+            }
             self.repositories=value;self.resolvingRepositories=false
         }
     }
@@ -233,6 +238,13 @@ struct SessionProfileEntryFilter:Equatable {
         busy=true;defer {busy=false};let store=store
         var value=profile
         if let draft,draft.profileID==profile.id {
+            for index in value.entries.indices {
+                let chosen = value.entries[index]
+                if let baseline = draft.candidates.first(where: { $0.entry.id == chosen.id }),
+                   chosen.executionSettings?.reasoningEffort != baseline.entry.executionSettings?.reasoningEffort {
+                    value.entries[index].usesProfileReasoningEffort = true
+                }
+            }
             var groups=draft.groups
             if draft.capturesLiveSessions {
                 let chosenIDs = Set(value.entries.map(\.id))
@@ -251,7 +263,11 @@ struct SessionProfileEntryFilter:Equatable {
                     if followsCurrent {
                         guard current.entry.resumesConversation else {throw AppError.message("현재 대화 ID를 확인할 수 없습니다. 현재 창을 다시 불러와주세요.")}
                         value.entries[index].conversationID=current.entry.conversationID
-                        if chosen.executionSettings==original.entry.executionSettings {value.entries[index].executionSettings=current.entry.executionSettings}
+                        var settings = chosen.executionSettings ?? .init()
+                        if chosen.executionSettings?.model == original.entry.executionSettings?.model { settings.model = current.entry.executionSettings?.model }
+                        if chosen.usesProfileReasoningEffort != true { settings.reasoningEffort = current.entry.executionSettings?.reasoningEffort }
+                        if chosen.executionSettings?.serviceTier == original.entry.executionSettings?.serviceTier { settings.serviceTier = current.entry.executionSettings?.serviceTier }
+                        value.entries[index].executionSettings = settings.isEmpty ? nil : settings
                     }
                     value.entries[index].providerHome=current.entry.providerHome
                     if !draft.readsWindowLayout {

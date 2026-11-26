@@ -898,8 +898,8 @@ extension ApprovalTests {
         context.evaluateScript("""
         var writes = [], contents = 'screen', processes = ['codex'];
         var tab = {tty:()=>'/dev/ttys081', contents:()=>contents, processes:()=>processes};
-        var win = {id:()=>96,tabs:()=>[tab]};
-        Object.defineProperty(win,'selectedTab',{set:()=>{},get:()=>()=>tab});
+        var win = {id:()=>96,miniaturized:()=>false,tabs:()=>[tab]};
+        Object.defineProperty(win,'selectedTab',{set:()=>{throw Error("Unexpected tab selection");},get:()=>()=>tab});
         function Application() { return {running:()=>true,windows:()=>[
           {tabs:()=>{throw Error('closed tab');}},win
         ],frontmost:()=>true,activate:()=>{},doScript:text=>writes.push(text)}; }
@@ -923,18 +923,16 @@ extension ApprovalTests {
         try expectThrows(try RemoteTerminalInput(kind: .characters, text: "hidden\nReturn").validate())
         try expectThrows(try RemoteTerminalInput(kind: .backspace, text: "hidden text").validate())
 
-        // JXA prepares only the exact tab/window. Native CGEvent delivery is
-        // checked by the isolated keyboard fixture, with no real event posts.
         let keyboard = JSContext()!
         keyboard.evaluateScript("""
-        var keys = [], contents = 'screen', front = true, wrongTab = false, changeOnActivate = false, childAXChecks = 0;
+        var keys = [], contents = 'screen', front = true, wrongTab = false, activations = 0, childAXChecks = 0;
         var ObjC = {import:()=>{}}; var $ = {AXIsProcessTrusted:()=>{childAXChecks++; return false;}};
         var tab = {tty:()=>'/dev/ttys081', contents:()=>contents, processes:()=>['codex']};
-        var win = {id:()=>96, tabs:()=>[tab]};
-        Object.defineProperty(win, 'selectedTab', {set:()=>{}, get:()=>()=>wrongTab ? {tty:()=>'/dev/other'} : tab});
+        var win = {id:()=>96, miniaturized:()=>false, tabs:()=>[tab]};
+        Object.defineProperty(win, 'selectedTab', {set:()=>{throw Error("Unexpected tab selection");}, get:()=>()=>wrongTab ? {tty:()=>'/dev/other'} : tab});
         function Application(id) {
           if (id === 'com.apple.systemevents') return {keystroke:text=>keys.push(text), keyCode:(code,options)=>keys.push([code,options])};
-          return {running:()=>true, windows:()=>[win], frontmost:()=>front, activate:()=>{if(changeOnActivate) contents='changed';}};
+          return {running:()=>true, windows:()=>[win], frontmost:()=>front, activate:()=>{activations++;}};
         }
         """)
         for input in [RemoteTerminalInput(kind: .characters, text: "한글 🧪"), .init(kind: .backspace), .init(kind: .left), .init(kind: .right), .init(kind: .interrupt)] {
@@ -946,10 +944,10 @@ extension ApprovalTests {
         keyboard.evaluateScript("wrongTab=true;")
         try expectEqual(keyboard.evaluateScript(raw)?.toString(), "missingTarget")
         keyboard.evaluateScript("wrongTab=false; front=false;")
-        try expectEqual(keyboard.evaluateScript(raw)?.toString(), "ready:96", "Native delivery waits for asynchronous focus after exact-window preparation")
-        keyboard.evaluateScript("front=true; changeOnActivate=true;")
+        try expectEqual(keyboard.evaluateScript(raw)?.toString(), "missingTarget", "Background input must preserve focus")
+        keyboard.evaluateScript("front=true; contents='changed';")
         try expectEqual(keyboard.evaluateScript(raw)?.toString(), "screenChanged")
-        try expectEqual(keyboard.evaluateScript("keys.length")?.toInt32(), 0)
+        try expectEqual(keyboard.evaluateScript("keys.length + activations")?.toInt32(), 0)
         let liveKey = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: "screen", agent: .codex, input: .init(kind: .left, relay: true))
         try expectEqual(keyboard.evaluateScript(liveKey)?.toString(), "ready:96", "Live keys prepare the exact tab while output changes")
         keyboard.evaluateScript("wrongTab=true;")

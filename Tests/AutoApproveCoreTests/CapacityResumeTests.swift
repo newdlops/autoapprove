@@ -476,7 +476,7 @@ extension ApprovalTests {
               return frames[Math.min(draftAt + 1 + submittedReads++, frames.length - 1)];
             }
             var tab = {tty: () => tty, contents: screen, processes: () => processes};
-            function Application(id) { return {running: () => true, windows: () => \(windows),
+            function Application(id) { return {frontmost:()=>false,running: () => true, windows: () => \(windows),
               doScript: (value, options) => { if (options.in !== tab) throw Error('wrong target'); writes.push(value); }}; }
             """)
             // Process hands osascript its arguments decomposed (NFD), Korean text included.

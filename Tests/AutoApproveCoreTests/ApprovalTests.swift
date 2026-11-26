@@ -633,6 +633,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session profiles: restore geometry once and invalidate reused TTYs after a Terminal restart",tests.testProfileRestoresGeometryOnceAndDiscardsPreviousTerminalReceipts),
             ("Session profiles: fixed resume grammar and native host contracts",tests.testTerminalProfileFixedCommandsAndNativeHostContracts),
             ("Session profiles: optional conversation starts CLI and saves separate entries",tests.testTerminalProfileFreshCLICommandsAndPrivateFiles),
+            ("Session profiles: passive layout and foreground focus preservation",tests.testTerminalProfileFocusPreservation),
             ("Session profiles: fresh CLI tabs and bounded duplicate launch receipts",tests.testTerminalProfileFreshCLIRestoreKeepsTabsAndReceipts),
             ("Session profiles: duplicate prevention, missing folder and uncertain delivery",tests.testTerminalProfileRestoreDeduplicationAndPartialFailure),
             ("Account login: independent providers, duplicate rejection and cancellation before private PTY launch", tests.testAccountLoginIsolationAndCancellationDuringPreparation),

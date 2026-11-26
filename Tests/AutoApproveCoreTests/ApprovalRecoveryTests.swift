@@ -94,7 +94,7 @@ extension ApprovalTests {
         try expectNotNil(PromptDetector.detect(raw,agent:.codex))
         let context=JSContext()!
         context.setObject(raw,forKeyedSubscript:"current" as NSString)
-        context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/fixture',contents:()=>current,processes:()=>['codex']};function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
+        context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/fixture',contents:()=>current,processes:()=>['codex']};function Application(){return {frontmost:()=>false,running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
         let script=try TerminalAdapter.approvalScript(tty:"/dev/fixture",expectedScreen:raw,agent:.codex)
         try expectEqual(context.evaluateScript(script)?.toString(),"sent")
         try expectEqual(context.evaluateScript("writes.join(',')")?.toString(),"1")
@@ -248,7 +248,7 @@ extension ApprovalTests {
         context.evaluateScript("""
         var writes=[],submitted=0,pasted=0;
         const fixtureTab={tty:()=>'/dev/fixture',contents:()=>frame,processes:()=>['codex']};
-        function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[fixtureTab]}],doScript:(text,options)=>{
+        function Application(){return {frontmost:()=>false,running:()=>true,windows:()=>[{tabs:()=>[fixtureTab]}],doScript:(text,options)=>{
           if(options.in!==fixtureTab)throw Error('wrong tab');writes.push(text);
           // Text plus Return is a paste to Codex's single-choice field. A
           // standalone Return submits the already selected Allow option.
@@ -444,7 +444,7 @@ extension ApprovalTests {
                 context.evaluateScript("""
                 var writes = [];
                 const tab = {tty: () => '/dev/fixture', contents: () => current, processes: () => ['\(agent.rawValue)']};
-                function Application(id) { return {running: () => true, windows: () => [{tabs: () => [tab]}], doScript: value => writes.push(value)}; }
+                function Application(id) { return {frontmost:()=>false,running: () => true, windows: () => [{tabs: () => [tab]}], doScript: value => writes.push(value)}; }
                 """)
                 let expected = agent == .claude ? "Earlier output\n" + frame : frame
                 try expectEqual(context.evaluateScript(try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: expected, agent: agent))?.toString(), "sent")
@@ -614,7 +614,7 @@ extension ApprovalTests {
             try await waitForRecovery({ probe.inputs.count == expected }, "A large file panel is a new request")
             let context = JSContext()!
             context.setObject(large, forKeyedSubscript: "current" as NSString)
-            context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/large',contents:()=>current,processes:()=>['claude']};function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
+            context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/large',contents:()=>current,processes:()=>['claude']};function Application(){return {frontmost:()=>false,running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
             let script = try TerminalAdapter.approvalScript(tty: "/dev/large", expectedScreen: large, agent: .claude)
             try expectEqual(context.evaluateScript(script)?.toString(), "sent")
             context.setObject(large.replacingOccurrences(of: "fixture.swift", with: "other.swift"), forKeyedSubscript: "current" as NSString)
@@ -651,7 +651,7 @@ extension ApprovalTests {
         function Application(identifier) {
           if (identifier !== 'com.apple.Terminal') throw Error('Global keyboard access is forbidden');
           return {running: () => true, windows: () => [{tabs: () => [otherTab, targetTab]}],
-            frontmost: () => { throw Error('Must not depend on focus'); }, activate: () => { throw Error('Must not steal focus'); },
+            frontmost: () => frontmostApp === 'com.apple.Terminal', activate: () => { throw Error('Must not steal focus'); },
             doScript: (text, options) => { if (options.in !== targetTab) throw Error('Wrong tab'); writes.push(text); }};
         }
         """)
@@ -661,6 +661,8 @@ extension ApprovalTests {
             try expectEqual(context.evaluateScript(try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: dialog, agent: .codex))?.toString(), "sent")
             try expectNil(context.exception)
         }
+        context.evaluateScript("frontmostApp='com.apple.Terminal'")
+        try expectEqual(context.evaluateScript(try TerminalAdapter.approvalScript(tty:"/dev/fixture",expectedScreen:dialog,agent:.codex))?.toString(),"screenChanged")
         try expectEqual(context.evaluateScript("writes.join(',')")?.toString(), "1,1,1")
     }
 

@@ -114,7 +114,7 @@ extension ApprovalTests {
                         var writes=[];
                         const session={tty:()=>'/dev/fixture',contents:()=>current,processes:()=>['codex'],variable:()=>42,rows:()=>100,write:v=>writes.push(v.text)};
                         const tab={...session,sessions:()=>[session]};
-                        function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:v=>writes.push(v)};}
+                        function Application(){return {frontmost:()=>false,running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:v=>writes.push(v)};}
                         """)
                         let target = ScreenTarget(tty:"/dev/fixture",jobPIDs:[42])
                         let script = iterm ? try ITermAdapter.approvalScript(target:target,expectedScreen:frame,agent:.codex)
@@ -209,7 +209,7 @@ extension ApprovalTests {
                 const session = {tty: () => '/dev/fixture', contents: () => current, processes: () => ['codex'],
                   variable: () => 42, rows: () => 100, write: value => writes.push(value.text)};
                 const tab = {...session, sessions: () => [session]};
-                function Application() { return {running: () => true, windows: () => [{tabs: () => [tab]}], doScript: value => writes.push(value)}; }
+                function Application() { return {frontmost:()=>false,running: () => true, windows: () => [{tabs: () => [tab]}], doScript: value => writes.push(value)}; }
                 """)
                 let script = iterm
                     ? try ITermAdapter.approvalScript(target: ScreenTarget(tty: "/dev/fixture", jobPIDs: [42]), expectedScreen: screen, agent: .codex)
@@ -233,7 +233,7 @@ extension ApprovalTests {
             context.evaluateScript("""
             var writes = [];
             const tab = {tty: () => '/dev/fixture', contents: () => current, processes: () => ['codex']};
-            function Application() { return {running: () => true, windows: () => [{tabs: () => [tab]}], doScript: value => writes.push(value)}; }
+            function Application() { return {frontmost:()=>false,running: () => true, windows: () => [{tabs: () => [tab]}], doScript: value => writes.push(value)}; }
             """)
             let encoded = context.evaluateScript(try TerminalAdapter.screenScript(ttys: ["/dev/fixture"]))!.toString()!
             try expectNil(context.exception)
@@ -414,7 +414,7 @@ extension ApprovalTests {
         try expectEqual(PromptDetector.detect(edits, agent: .codex)?.answer, "1")
         let context = JSContext()!
         context.setObject(edits, forKeyedSubscript: "current" as NSString)
-        context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/large',contents:()=>current,processes:()=>['codex']};function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
+        context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/large',contents:()=>current,processes:()=>['codex']};function Application(){return {frontmost:()=>false,running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
         let script = try TerminalAdapter.approvalScript(tty: "/dev/large", expectedScreen: edits, agent: .codex)
         try expectEqual(context.evaluateScript(script)?.toString(), "sent")
         context.setObject(edits.replacingOccurrences(of: "file.swift", with: "other.swift"), forKeyedSubscript: "current" as NSString)
@@ -461,7 +461,7 @@ extension ApprovalTests {
             context.evaluateScript("""
             var writes = [];
             var tab = {tty: () => tty, contents: () => current, processes: () => processes};
-            function Application(id) { return {running: () => true, windows: () => \(windows), doScript: (value, options) => { if (options.in !== tab) throw Error('wrong target'); writes.push(value); }}; }
+            function Application(id) { return {frontmost:()=>false,running: () => true, windows: () => \(windows), doScript: (value, options) => { if (options.in !== tab) throw Error('wrong target'); writes.push(value); }}; }
             """)
             let result = context.evaluateScript(try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: expected, agent: agent))
             try expectNil(context.exception)
@@ -518,7 +518,7 @@ extension ApprovalTests {
             context.evaluateScript("""
             var writes = [];
             var tab = {tty: () => '/dev/fixture', contents: () => current, processes: () => ['codex']};
-            function Application(id) { return {running: () => true, windows: () => \(windows), doScript: (value) => { \(write); }}; }
+            function Application(id) { return {frontmost:()=>false,running: () => true, windows: () => \(windows), doScript: (value) => { \(write); }}; }
             """)
             context.evaluateScript(try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: permissionFixture, agent: .codex))
             try expectNotNil(context.exception)

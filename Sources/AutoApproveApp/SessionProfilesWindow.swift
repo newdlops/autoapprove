@@ -230,6 +230,7 @@ struct SessionProfileEditor:View {
         Binding(get: { entry.wrappedValue.executionSettings?[keyPath:key] ?? "" }, set: { text in
             var value = entry.wrappedValue.executionSettings ?? .init()
             let text = text.trimmingCharacters(in:.whitespacesAndNewlines)
+            if key == \.reasoningEffort { entry.wrappedValue.usesProfileReasoningEffort = true }
             value[keyPath:key] = text.isEmpty ? nil : text
             entry.wrappedValue.executionSettings = value.isEmpty ? nil : value
         })

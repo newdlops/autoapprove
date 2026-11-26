@@ -87,7 +87,7 @@ extension ApprovalTests {
                 var tab = {tty: () => '/dev/ttys901', contents: () => frames[Math.min(writes.length, frames.length - 1)],
                   processes: () => ['login','zsh','codex'], rows: () => 30, variable: () => 42,
                   write: options => writes.push(options)};
-                function Application(id) { return {running: () => true, windows: () => [{tabs: () => [Object.assign(tab, {sessions: () => [tab]})]}],
+                function Application(id) { return {frontmost:()=>false,running: () => true, windows: () => [{tabs: () => [Object.assign(tab, {sessions: () => [tab]})]}],
                   doScript: value => writes.push(value)}; }
                 """)
                 let region = frames.first == initial ? owned.region : stop.region

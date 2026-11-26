@@ -14,7 +14,7 @@ public enum TerminalDeviceInput {
             let latest = try TerminalAdapter.screens(ttys:[target.tty], includeCursor:false, includeTitles:false, purpose:.validation)
             guard latest.screens.first(where: { $0.tty == target.tty })?.contents == screen else { return .screenChanged }
             return try TerminalKeyboard.deliver(target:target, expected:screen, agent:agent,
-                input:.init(kind:input.kind, relay:true), environment:try .live(sourcePID:pid), allowActivation:false)
+                input:.init(kind:input.kind, relay:true), environment:try .live(sourcePID:pid))
         }
         let codexReady = agent == .codex && CodexProgressScreen.emptyComposer(screen)
         let claudeClear = agent == .claude && input.text == "/clear" &&
@@ -46,6 +46,7 @@ public enum TerminalDeviceInput {
         let script = """
         (() => {
           const app = Application('com.apple.Terminal'), target = \(data);
+          \(AutomationScript.terminalSelectionGuard)
           const normalize = value => String(value).normalize('NFC').replace(/\\r\\n?/g, '\\n');
           if (!app.running()) return 'missingTarget';
           function skipClosed(read) {try {return read();} catch(error) {if ([-1743,-1744].includes(Number(error.errorNumber || error.number))) throw error;return null;}}
@@ -61,6 +62,7 @@ public enum TerminalDeviceInput {
           const tab = matches[0];
           if (normalize(tab.contents()) !== normalize(target.screen)) return 'screenChanged';
           if (!tab.processes().some(name => String(name).toLowerCase().includes(target.agent))) return 'agentMissing';
+          if (!preservesSelection(target.tty)) return 'screenChanged';
           app.doScript(target.text, {in: tab});
           return 'sent';
         })();
@@ -78,7 +80,7 @@ public enum TerminalDeviceInput {
               identity.uid == getuid(), identity.effectiveUID == geteuid() else { return .agentMissing }
         let environment = try TerminalKeyboard.Environment.live(sourcePID: pid)
         return try TerminalKeyboard.deliver(target: target, expected: "", agent: agent, input: .init(kind: .escape, relay: true),
-            environment: environment, timeout: 0.8, allowActivation: false)
+            environment: environment, timeout: 0.8)
     }
 
     public static let unavailableBeforeInputMessage = "Mac의 손쉬운 사용에서 AutoApprove의 직접 입력 권한을 허용해주세요."

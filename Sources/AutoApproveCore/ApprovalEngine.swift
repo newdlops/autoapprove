@@ -192,7 +192,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
     private let codexGroupReader: @Sendable (ProcessRecord) throws -> CodexThreadLocation?
     private let codexGroupEnvironment: @Sendable (ProcessRecord) -> [String: String]?
-    private let groupModelSettingsReader: @Sendable (SessionGroupLiveSession) -> SessionGroupModelSettings?
+    private let groupModelSettingsReader: @Sendable ([SessionGroupLiveSession]) -> [String: SessionGroupModelSettings]
     private let profileExecutionSettingsReader: @Sendable (SessionGroupLiveSession) -> TerminalProfileExecutionSettings?
     private let groupTranscriptReader: SessionGroupModelSettingsReader
     private var groupRecoveryAt = Date.distantPast
@@ -750,7 +750,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         self.codexGroupEnvironment = codexGroupEnvironment ?? { ProcessEnvironment.read($0) }
         let modelReader = SessionGroupModelSettingsReader()
         self.groupTranscriptReader = modelReader
-        self.groupModelSettingsReader = groupModelSettingsReader ?? { modelReader.read($0) }
+        if let groupModelSettingsReader {
+            self.groupModelSettingsReader = { targets in
+                var result: [String: SessionGroupModelSettings] = [:]
+                for live in targets where live.conversationID.flatMap(UUID.init(uuidString:)) != nil && !live.providerIdentityAmbiguous {
+                    result[live.id] = groupModelSettingsReader(live)
+                }
+                return result
+            }
+        } else { self.groupModelSettingsReader = { modelReader.readAll($0) } }
         self.profileExecutionSettingsReader = profileExecutionSettingsReader ?? (processReader == nil ? { TerminalProfileExecutionSettingsReader.read($0) } : { _ in nil })
         self.groupClaudeCompletionReader = groupClaudeCompletionReader ?? { modelReader.completion($0, after: $1, task: $2) }
         if let processReader { self.terminalProcessReader = { _, _ in try processReader() } }
@@ -1443,7 +1451,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let inputs = result.enumerated().compactMap { index, candidate -> (Int, SessionGroupLiveSession)? in
                 let entry = candidate.entry
                 guard let session = targetsByID[candidate.id], UUID(uuidString: entry.conversationID) != nil else { return nil }
-                let home = entry.providerHome ?? NSHomeDirectory() + (entry.agent == "codex" ? "/.codex" : "/.claude")
+                let home = entry.providerHome ?? TerminalProfileExecutionSettingsReader.home(for: session.agent)
                 return (index, SessionGroupLiveSession(session: session, conversationID: entry.conversationID, providerHome: home))
             }
             let settings = try await sessionMetadataReads.map(inputs, priority: .userInitiated) { index, live in (index, settingsReader(live)) }
@@ -4112,6 +4120,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             } else { row["canAcceptTask"] = false }
             row["model"] = live.flatMap { models[$0.id]?.model }
+            row["reasoningEffort"] = live.flatMap { models[$0.id]?.reasoningEffort }
             row["lastActivity"] = live.map { formatter.string(from: $0.session.lastActivity) }
             row["deliveryHold"] = inbox[member.id]?.lastDeliveryFailure.map { String($0.prefix(160)) }
             if let task {
@@ -5517,10 +5526,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if conversation == nil, let status = groupStatusIdentities[id], status.session.started == original.started, status.session.tty == original.tty {
             conversation = valid(status.conversationID)
         }
-        if conversation == nil {
-            let observed = try? await readSessionGroupSessions(runtimeID: id, reconcile: false)
-            conversation = valid(observed?.first?.conversationID)
-        }
+        let observed = try? await readSessionGroupSessions(runtimeID: id, reconcile: false, useStatusCache: false).first
+        if observed?.providerIdentityAmbiguous == true { return fail("원래 대화를 식별하지 못해 재시작을 중단했습니다.") }
+        conversation = valid(observed?.conversationID) ?? conversation
         let scopedReader = terminalProcessReader
         @Sendable func reader() throws -> [ProcessRecord] { try scopedReader(original.tty, original.pid) }
         guard let records = try? await Task.detached(operation: { try reader() }).value,
@@ -5592,9 +5600,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         } catch is CancellationError {return}
         catch {return fail(error.localizedDescription)}
         let codexHome = codexContext.flatMap { CodexGroupIdentity.home(environment: $0.environment) }
+        let home = codexHome ?? observed?.providerHome ?? TerminalProfileExecutionSettingsReader.home(for: original.agent, environment: environment)
+        let live = SessionGroupLiveSession(session: original, conversationID: conversation, providerHome: home)
+        let observedEffort = await sessionModelSettings([live])[id]?.reasoningEffort
+        let currentSettings = try? TerminalProfileExecutionSettings(reasoningEffort: observedEffort).validated(agent: original.agent.rawValue)
         var plan: SessionRestartCommand.Plan
-        do { plan = try SessionRestartCommand.plan(agent: original.agent, executable: codexContext?.executable ?? executable, argv: Array(argv.dropFirst()), conversationID: conversation) }
-        catch { return fail(error.localizedDescription) }
+        do {
+            plan = try SessionRestartCommand.plan(agent: original.agent, executable: codexContext?.executable ?? executable,
+                argv: Array(argv.dropFirst()), conversationID: conversation, currentSettings: currentSettings ?? .init())
+        } catch { return fail(error.localizedDescription) }
         if original.agent == .claude {
             if recovery && !plan.arguments.contains("--strict-mcp-config") {
                 updateRestart(id, .waiting, "현재 Claude 설정 홈의 AutoApprove MCP 등록을 확인합니다.")
@@ -5653,6 +5667,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             .contains(where: { $0.key == shell.key }) }),
               restartTerminalOwners[slot] == id, !restartInputInFlight(on:slot) else {
             return fail("CLI와 셸의 연결 또는 입력 상태가 바뀌어 종료하지 않았습니다.")
+        }
+        if host == .terminal, nativeKeyboardActivity.frontmostBundle() == host.bundleID {
+            let inputTargetTTY = nativeKeyboardActivity.inputTargetTTY
+            let focusedTTY = await Task.detached(priority:.userInitiated) {inputTargetTTY(.terminal)}.value
+            guard focusedTTY == original.tty else {return fail("다른 Terminal 탭을 사용 중이어서 원래 CLI를 유지했습니다. 대상 탭을 선택하거나 다른 앱으로 이동한 뒤 다시 시도해주세요.")}
         }
         let recoveryStarted = Date()
         updateRestart(id, .exiting, "선택한 CLI에 종료 신호를 보내고 있습니다.")
@@ -6478,19 +6497,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     public func sessionModelSettings(_ targets: [SessionGroupLiveSession]) async -> [String: SessionGroupModelSettings] {
         let reader = groupModelSettingsReader
-        var settings = await Task.detached(priority: .utility) {
-            var result: [String: SessionGroupModelSettings] = [:]
-            for live in targets where result[live.id] == nil {
-                guard live.conversationID.flatMap(UUID.init(uuidString:)) != nil else { continue }
-                result[live.id] = reader(live)
-            }
-            return result
-        }.value
+        var settings = await Task.detached(priority: .utility) { reader(targets) }.value
         for live in targets where live.session.agent == .agy {
             if let event = agyEvents[live.id], event.conversationId == live.conversationID?.lowercased(), let name = event.modelName {
                 if let recorded = settings[live.id], recorded.model == name ||
                     (recorded.recordedAt ?? .distantPast) >= (event.modelRecordedAt ?? .distantPast) { continue }
-                var setting = SessionGroupModelSettings(model: nil, reasoningEffort: nil, source: "agy_hook", recordedAt: event.modelRecordedAt)
+                var setting = SessionGroupModelSettings(model: nil, reasoningEffort: SessionGroupModelSettingsReader.agyEffort(name), source: "agy_hook", recordedAt: event.modelRecordedAt)
                 setting.model = String(name.prefix(160)).components(separatedBy: .controlCharacters).joined()
                 settings[live.id] = setting
             }

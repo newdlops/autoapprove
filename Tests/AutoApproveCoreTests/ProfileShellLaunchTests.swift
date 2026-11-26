@@ -38,15 +38,20 @@ extension ApprovalTests {
             context.evaluateScript("""
             const ObjC={import:()=>{}}, tty='/dev/ttys980';
             const tab={tty:()=>tty,processes:()=>['login','zsh'],busy:()=>false};
-            let front=31;
+            let front=31,active=true;
             const windows={id:()=>front===31?[31,22]:[22,31],tabs:{tty:()=>windows.id().map(id=>[id===22?tty:'/dev/ttys931'])},
               byId:id=>({id:()=>id,exists:()=>[22,31].includes(id),set index(value){if(value===1)front=id;},
                          tabs:{whose:query=>()=>id===22&&query.tty===tty?[tab]:[]}})};
-            function Application(){return {windows,frontmost:()=>true,doScript:(line,options)=>{
+            windows[0]={exists:()=>true,miniaturized:()=>false,selectedTab:()=>({tty:()=>front===22?tty:'/dev/ttys931'})};
+            function Application(){return {windows,frontmost:()=>active,doScript:(line,options)=>{
               if(options.in!==tab || !deliver(line))throw Error('Fixture shell failed');
-              front=22;
+              if(active)front=22;
             }};}
             """)
+            let held=try JSONSerialization.jsonObject(with:Data(context.evaluateScript(body)!.toString()!.utf8)) as! [String:Any]
+            try expectEqual(held["commandAttempted"] as? Bool,false)
+            try expectEqual(context.evaluateScript("front")?.toInt32(),31)
+            context.evaluateScript("active=false;")
             guard let reply = context.evaluateScript(body)?.toString(), context.exception == nil else {
                 throw AppError.message("Background delivery script failed")
             }

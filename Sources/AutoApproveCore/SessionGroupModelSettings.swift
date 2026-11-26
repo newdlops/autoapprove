@@ -5,6 +5,7 @@ import CSQLite
 public struct SessionGroupModelSettings: Equatable, Sendable {
     public var model: String?
     public var reasoningEffort: String?
+    public var serviceTier: String?
     public var source: String
     public var recordedAt: Date?
 
@@ -12,7 +13,7 @@ public struct SessionGroupModelSettings: Equatable, Sendable {
         self.model = Self.token(model); self.reasoningEffort = Self.token(reasoningEffort)
         self.source = source; self.recordedAt = recordedAt
     }
-    private static func token(_ value: String?) -> String? {
+    fileprivate static func token(_ value: String?) -> String? {
         guard let value, !value.isEmpty, value.utf8.count <= 256,
               value.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "-_.:/+".contains($0)) }) else { return nil }
         return value
@@ -50,18 +51,64 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
     }
     private let lock = NSLock()
     private var cache: [String: Cached] = [:]
-    public init() {}
+    private let threadReader: (@Sendable (String, String) -> JSONObject?)?
+    private var checkpoints: [String: (UUID, Identity, SessionGroupModelSettings?)] = [:]
+
+    public init(threadReader: (@Sendable (String, String) -> JSONObject?)? = nil) {
+        self.threadReader = threadReader
+    }
 
     public func read(_ live: SessionGroupLiveSession) -> SessionGroupModelSettings? {
-        guard let uuid = live.conversationID.flatMap(UUID.init(uuidString:)), let home = live.providerHome,
-              home.hasPrefix("/") else { return nil }
+        read(live, connection: CodexThreadSettingsConnection())
+    }
+
+    func readAll(_ targets: [SessionGroupLiveSession]) -> [String: SessionGroupModelSettings] {
+        let connection = CodexThreadSettingsConnection()
+        var result: [String: SessionGroupModelSettings] = [:], seen = Set<String>()
+        for live in targets where seen.insert(live.id).inserted && !Task.isCancelled {
+            result[live.id] = read(live, connection: connection)
+        }
+        return result
+    }
+
+    private func read(_ live: SessionGroupLiveSession, connection: CodexThreadSettingsConnection) -> SessionGroupModelSettings? {
+        guard !live.providerIdentityAmbiguous else { return nil }
+        return read(agent: live.session.agent, cwd: live.session.cwd, conversationID: live.conversationID,
+                    home: live.providerHome, connection: connection)
+    }
+
+    func read(agent: AgentKind, cwd: String, conversationID: String?, home: String?, includeTier: Bool = false,
+              connection: CodexThreadSettingsConnection) -> SessionGroupModelSettings? {
+        guard let uuid = conversationID.flatMap(UUID.init(uuidString:)), let home, home.hasPrefix("/") else { return nil }
         let id = uuid.uuidString.lowercased()
-        if live.session.agent == .codex { return codex(home: home, id: id) }
-        if live.session.agent == .agy {
+        switch agent {
+        case .codex:
+            let row: JSONObject?
+            if let threadReader { row = threadReader(home, id) }
+            else { row = connection.read(home: home, id: id) }
+            if let row {
+                guard (row["id"] as? String).flatMap(UUID.init(uuidString:)) == uuid,
+                      let directory = row["cwd"] as? String,
+                      URL(fileURLWithPath: directory).resolvingSymlinksInPath().path == URL(fileURLWithPath: cwd).resolvingSymlinksInPath().path else { return nil }
+                if row["reasoningEffort"] != nil {
+                    var value = SessionGroupModelSettings(model: row["model"] as? String, reasoningEffort: row["reasoningEffort"] as? String,
+                        source: "codex_thread_read", recordedAt: (row["updatedAt"] as? Double).map(Date.init(timeIntervalSince1970:)))
+                    if includeTier || row["model"] == nil {
+                        let saved = codex(home: home, id: id)
+                        if row["model"] == nil { value.model = saved?.model }
+                        value.serviceTier = saved?.serviceTier
+                    }
+                    return value
+                }
+            }
+            return codex(home: home, id: id)
+        case .agy:
             let brain = URL(fileURLWithPath: home).deletingLastPathComponent().appendingPathComponent("antigravity-cli/brain")
             return agy(brain: brain, id: id)
+        case .claude:
+            return claude(cwd, home: home, id: id, field: .model)?.value
+        case .shell: return nil
         }
-        return claude(live, home: home, id: id, field: .model)?.value
     }
 
     private func agy(brain: URL, id: String) -> SessionGroupModelSettings? {
@@ -92,8 +139,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
                 guard let row = (try? JSONSerialization.jsonObject(with: Data(line))) as? JSONObject,
                       row["source"] as? String == "MODEL", row["type"] as? String == "PLANNER_RESPONSE",
                       let model = row["model"] as? String else { continue }
-                let effort = model.hasPrefix("gemini-4-neon-") ? String(model.dropFirst("gemini-4-neon-".count)) : ""
-                let settings = SessionGroupModelSettings(model: model, reasoningEffort: ["low","medium","high"].contains(effort) ? effort : nil,
+                let settings = SessionGroupModelSettings(model: model, reasoningEffort: Self.agyEffort(model),
                     source: "agy_transcript", recordedAt: (row["created_at"] as? String).flatMap(Self.date))
                 if settings.model != nil { value = settings; break }
             }
@@ -105,7 +151,7 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
 
     public func completion(_ live: SessionGroupLiveSession, after: Date, task: String? = nil) -> WorkCompletion? {
         guard let uuid = live.conversationID.flatMap(UUID.init(uuidString:)), let home = live.providerHome,
-              home.hasPrefix("/"), let turn = claude(live, home: home, id: uuid.uuidString.lowercased(), field: .completion)?.finalTurn,
+              home.hasPrefix("/"), live.session.agent == .claude, let turn = claude(live.session.cwd, home: home, id: uuid.uuidString.lowercased(), field: .completion)?.finalTurn,
               turn.completion.date >= after, turn.completion.date <= Date().addingTimeInterval(5) else { return nil }
         if let task {
             guard let promptAt = turn.promptAt, promptAt >= after, promptAt <= turn.completion.date,
@@ -119,13 +165,15 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
     package func groupTurns(_ live: SessionGroupLiveSession) -> [UUID: GroupTurn] {
         guard let id = live.conversationID.flatMap(UUID.init(uuidString:))?.uuidString.lowercased(),
               let home = live.providerHome, home.hasPrefix("/") else { return [:] }
-        return claude(live, home: home, id: id, field: .groupTurns)?.groupTurns ?? [:]
+        guard live.session.agent == .claude else { return [:] }
+        return claude(live.session.cwd, home: home, id: id, field: .groupTurns)?.groupTurns ?? [:]
     }
 
     func claudeGoal(_ live: SessionGroupLiveSession) -> ClaudeGroupGoalEvidence? {
         guard let id = live.conversationID.flatMap(UUID.init(uuidString:))?.uuidString.lowercased(),
               let home = live.providerHome, home.hasPrefix("/") else { return nil }
-        return claude(live, home:home, id:id, field: .goal)?.goal
+        guard live.session.agent == .claude else { return nil }
+        return claude(live.session.cwd, home:home, id:id, field: .goal)?.goal
     }
 
     private static func groupTurns(_ bytes: Data, id: String) -> [UUID: GroupTurn] {
@@ -160,14 +208,13 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         return turns
     }
 
-    private func claude(_ live: SessionGroupLiveSession, home: String, id: String, field: Field) -> Cached? {
-        guard live.session.agent == .claude else { return nil }
+    private func claude(_ cwd: String, home: String, id: String, field: Field) -> Cached? {
         lock.lock(); defer { lock.unlock() }
         let key = home + "\n" + id
         if let previous = cache[key], let identity = Identity(previous.path), previous.identity == identity,
            previous.fields.contains(field) { return previous }
         let projects = URL(fileURLWithPath: home).appendingPathComponent("projects", isDirectory: true)
-        let encoded = live.session.cwd.replacingOccurrences(of: "[^a-zA-Z0-9]", with: "-", options: .regularExpression)
+        let encoded = cwd.replacingOccurrences(of: "[^a-zA-Z0-9]", with: "-", options: .regularExpression)
         let direct = projects.appendingPathComponent(encoded, isDirectory: true).appendingPathComponent(id + ".jsonl").path
         let path: String
         if Identity(direct) != nil { path = direct }
@@ -208,18 +255,45 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         return result
     }
 
+    static func agyEffort(_ model: String) -> String? {
+        let prefix = "gemini-4-neon-"
+        guard model.hasPrefix(prefix) else { return nil }
+        let effort = String(model.dropFirst(prefix.count))
+        return ["low", "medium", "high"].contains(effort) ? effort : nil
+    }
+
     static func claude(_ bytes: Data, id: String) -> SessionGroupModelSettings? {
+        var selection: SessionGroupModelSettings?
         for line in bytes.split(separator: 10).reversed() {
             guard let row = try? JSONSerialization.jsonObject(with: Data(line)) as? JSONObject,
-                  row["type"] as? String == "assistant", row["isSidechain"] as? Bool != true,
-                  (row["sessionId"] as? String).flatMap(UUID.init(uuidString:)) == UUID(uuidString: id),
-                  let message = row["message"] as? JSONObject else { continue }
-            let value = SessionGroupModelSettings(model: message["model"] as? String ?? row["requestedModel"] as? String,
-                reasoningEffort: row["perTurnEffort"] as? String ?? row["effort"] as? String,
+                  row["isSidechain"] as? Bool != true, (row["sessionId"] as? String)?.lowercased() == id else { continue }
+            if selection == nil, row["type"] as? String == "system", row["subtype"] as? String == "local_command",
+               let run = row["commandRun"] as? JSONObject, let command = run["command"] as? String,
+               ["effort", "/effort"].contains(command), let content = row["content"] as? String,
+               content.hasPrefix("<local-command-stdout>"), content.hasSuffix("</local-command-stdout>") {
+                let output = content.dropFirst("<local-command-stdout>".count).dropLast("</local-command-stdout>".count)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let prefixes = ["Set effort level to ", "Effort level set to ", "Effort set to "]
+                if let prefix = prefixes.first(where: { output.hasPrefix($0) }) {
+                    let level = String(output.dropFirst(prefix.count)).lowercased()
+                    if ["low", "medium", "high", "xhigh", "max", "auto", "default"].contains(level) {
+                        selection = .init(model: nil, reasoningEffort: ["auto", "default"].contains(level) ? nil : level,
+                                          source: "claude_effort_command", recordedAt: (row["timestamp"] as? String).flatMap(date))
+                    }
+                }
+            }
+            guard row["type"] as? String == "assistant", let message = row["message"] as? JSONObject else { continue }
+            let model = message["model"] as? String ?? row["requestedModel"] as? String
+            if var selection {
+                selection.model = SessionGroupModelSettings.token(model)
+                return selection
+            }
+            let level = row["effort"] as? String ?? row["perTurnEffort"] as? String
+            let value = SessionGroupModelSettings(model: model, reasoningEffort: ["auto", "default"].contains(level) ? nil : level,
                 source: "claude_turn_metadata", recordedAt: (row["timestamp"] as? String).flatMap(date))
             return value.model == nil && value.reasoningEffort == nil ? nil : value
         }
-        return nil
+        return selection
     }
 
     private static func claudeCompletion(_ bytes: Data, id: String) -> FinalTurn? {
@@ -255,16 +329,58 @@ public final class SessionGroupModelSettingsReader: @unchecked Sendable {
         guard Identity(path) != nil, let db = try? CodexHistoryAccess.open(path, subject: "모델 설정") else { return nil }
         defer { sqlite3_close_v2(db) }
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT model, reasoning_effort, updated_at FROM threads WHERE id = ? LIMIT 1", -1, &statement, nil) == SQLITE_OK,
-              let statement else { return nil }
+        let select = "SELECT model,reasoning_effort,updated_at,"
+        let filter = " FROM threads WHERE id=? LIMIT 1"
+        if sqlite3_prepare_v2(db, select + "rollout_path" + filter, -1, &statement, nil) != SQLITE_OK {
+            guard sqlite3_prepare_v2(db, select + "NULL" + filter, -1, &statement, nil) == SQLITE_OK else { return nil }
+        }
+        guard let statement else { return nil }
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_text(statement, 1, id, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        if let raw = sqlite3_column_text(statement, 3), let uuid = UUID(uuidString: id),
+           let checkpoint = checkpoint(path: String(cString: raw), home: home, id: uuid) { return checkpoint }
         let timestamp = sqlite3_column_double(statement, 2)
         let value = SessionGroupModelSettings(model: sqlite3_column_text(statement, 0).map { String(cString: $0) },
             reasoningEffort: sqlite3_column_text(statement, 1).map { String(cString: $0) }, source: "codex_session_metadata",
             recordedAt: timestamp > 0 && timestamp.isFinite ? Date(timeIntervalSince1970: timestamp > 1_000_000_000_000 ? timestamp / 1000 : timestamp) : nil)
         return value.model == nil && value.reasoningEffort == nil ? nil : value
+    }
+
+    private func checkpoint(path: String, home: String, id: UUID) -> SessionGroupModelSettings? {
+        let file = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        let root = URL(fileURLWithPath: home).resolvingSymlinksInPath().path
+        guard file.path.hasPrefix(root + "/sessions/") || file.path.hasPrefix(root + "/archived_sessions/"),
+              let identity = Identity(file.path) else { return nil }
+        if let cached = lock.withLock({ checkpoints[file.path] }), cached.0 == id, cached.1 == identity { return cached.2 }
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? handle.close() }
+        guard let first = try? CodexThreadLocation.readMetadataLine({ try handle.read(upToCount: $0) }),
+              let header = try? JSONSerialization.jsonObject(with: first) as? JSONObject, header["type"] as? String == "session_meta",
+              let payload = header["payload"] as? JSONObject, (payload["id"] as? String).flatMap(UUID.init(uuidString:)) == id else { return nil }
+        let start = max(0, identity.size - 4_194_304)
+        guard (try? handle.seek(toOffset: UInt64(start))) != nil, let data = try? handle.read(upToCount: 4_194_304),
+              let end = data.lastIndex(of: 10) else { return nil }
+        var lines = data[..<end].split(separator: 10)[...]
+        if start > 0 { lines = lines.dropFirst() }
+        let marker = Data("thread_settings_applied".utf8)
+        var value: SessionGroupModelSettings?
+        for line in lines.reversed() where line.range(of: marker) != nil {
+            guard let row = try? JSONSerialization.jsonObject(with: line) as? JSONObject,
+                  row["type"] as? String == "event_msg", let event = row["payload"] as? JSONObject,
+                  event["type"] as? String == "thread_settings_applied", (event["thread_id"] as? String).flatMap(UUID.init(uuidString:)) == id,
+                  let settings = event["thread_settings"] as? JSONObject else { continue }
+            value = SessionGroupModelSettings(model: settings["model"] as? String, reasoningEffort: settings["reasoning_effort"] as? String,
+                source: "codex_thread_settings", recordedAt: (row["timestamp"] as? String).flatMap(Self.date))
+            value?.serviceTier = settings["service_tier"] as? String ?? "default"
+            break
+        }
+        guard Identity(file.path) == identity else { return nil }
+        lock.withLock {
+            if checkpoints.count >= 256, checkpoints[file.path] == nil { checkpoints.removeAll(keepingCapacity: true) }
+            checkpoints[file.path] = (id, identity, value)
+        }
+        return value
     }
 
     private static func date(_ text: String) -> Date? {

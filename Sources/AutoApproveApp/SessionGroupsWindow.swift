@@ -360,6 +360,7 @@ import AutoApproveCore
             notice = "\(member.diagnosticLabel) · 세션 ID 조회 중…"
             let result = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id)
             groups = try store.load(); live = try await engine.sessionGroupSessions()
+            await viewUpdates.refreshModels(engine, sessions: live)
             error = nil
             notice = result.changed ? "현재 세션 ID로 갱신했습니다." : "현재 세션 ID가 기존과 일치합니다."
         } catch { notice = nil; self.error = member.diagnosticLabel + " · " + error.localizedDescription }
@@ -410,6 +411,7 @@ import AutoApproveCore
         }
         do { live = try await engine.sessionGroupSessions(); groups = try store.load() }
         catch { self.error = "조회 결과를 다시 표시하지 못했습니다. " + error.localizedDescription }
+        await viewUpdates.refreshModels(engine, sessions: live)
         let remaining = group.members.count - attempted
         notice = "\(group.name) · ID 변경 \(changed)개 · 기존 ID 확인 \(confirmed)개 · 보류·실패 \(bulkFailures.count)개" + (merged.isEmpty ? "" : " · 중복 정리 \(merged.count)개") + (recoveredLeader ? " · 그룹장 자동 복구" : "") + (remaining > 0 ? " · 미조회 \(remaining)개 (중단)" : "")
     }
@@ -434,6 +436,7 @@ import AutoApproveCore
             try Task.checkCancellation()
             let saved = try store.load()
             groups = saved; live = sessions; assignments = try engine.sessionGroupAssignments(); error = nil
+            await viewUpdates.refreshModels(engine, sessions: sessions)
             observed = true
             if let id = selectedID, !groups.contains(where: { $0.id == id }) { selectedID = nil }
             if let id = selectedID, name.isEmpty { name = groups.first { $0.id == id }?.name ?? "" }
@@ -523,6 +526,7 @@ import AutoApproveCore
         do {
             _ = try await engine.refreshSessionGroupMemberID(groupID: group.id, memberID: member.id, expectedGroup: group, selectedReplacement: target.id, expectedConversationID: target.conversationID)
             groups = try store.load(); live = try await engine.sessionGroupSessions()
+            await viewUpdates.refreshModels(engine, sessions: live)
             error = nil; notice = "기존 구성원을 선택한 대화에 연결했습니다."
         } catch { self.error = error.localizedDescription }
     }

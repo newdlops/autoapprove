@@ -32,12 +32,14 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
     public var providerHome: String?
     public var host: Host
     public var terminalTab:TerminalProfileTabLayout?
+    public var usesProfileReasoningEffort: Bool?
     public var executionSettings: TerminalProfileExecutionSettings?
     public init(id: UUID = UUID(), title: String, agent: String, cwd: String, conversationID: String,
                 providerHome: String? = nil, host: Host = .terminal,terminalTab:TerminalProfileTabLayout?=nil, executionSettings: TerminalProfileExecutionSettings? = nil) {
         self.id=id; self.title=title; self.agent=agent; self.cwd=cwd; self.conversationID=conversationID
         self.providerHome=providerHome; self.host=host;self.terminalTab=terminalTab
         self.executionSettings = executionSettings
+        self.usesProfileReasoningEffort = executionSettings?.reasoningEffort == nil ? nil : true
     }
     public var resumesConversation:Bool {!conversationID.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty}
     public var key: String {
@@ -64,7 +66,7 @@ public struct TerminalProfileEntry: Codable, Equatable, Identifiable, Sendable {
         value.hasPrefix("/") && value.utf8.count <= 4096 && !value.unicodeScalars.contains(where:CharacterSet.controlCharacters.contains)
     }
     public func resumeCommand(nativeRuntimeRoot:String?=nil) throws -> String {
-        try resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:nil)
+        try TerminalProfileExecutionSettingsReader.refreshed([self])[0].resumeCommand(nativeRuntimeRoot:nativeRuntimeRoot,bundledRuntime:nil)
     }
     func resumeCommand(nativeRuntimeRoot:String?,bundledRuntime:CodexBundledRuntime.Installation?,compatibleCLI:CodexCLIContext?=nil,standalone:Bool=false) throws -> String {
         let entry=try validated()
@@ -305,7 +307,7 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                         },
                         launch: @Sendable (TerminalProfileEntry,String?) async throws -> String,
                         placeWindow: @Sendable (String, TerminalWindowBounds) async throws -> Void = { try await TerminalProfileLauncher.placeWindow(tty:$0,bounds:$1) },
-                        selectTab:@Sendable (String) async throws -> Void = {_ in},
+                        selectTab:@Sendable (String,String) async throws -> Void = {_,_ in},
                         progress: @MainActor (TerminalProfileRestoreResult)->Void = {_ in}) async throws -> [TerminalProfileRestoreResult] {
         guard !busy else {throw AppError.message("이미 프로필을 복원하고 있습니다.")}
         let profile=try profile.validated();guard !selected.isEmpty,selected.isSubset(of:Set(profile.entries.map(\.id))) else {throw AppError.message("복원할 세션을 선택해주세요.")}
@@ -352,12 +354,13 @@ public struct TerminalProfileRestoreResult: Identifiable, Sendable {
                 } else if let key=group(entry) {unresolvedGroups.insert(key)}
             }
         }
+        let existingGroups = Set(anchors.keys).union(unresolvedGroups)
         func finishGroup(_ key:String) async {
-            guard openedGroups.contains(key),!Task.isCancelled else {return}
+            guard openedGroups.contains(key),!existingGroups.contains(key),!Task.isCancelled,let lastOpened=anchors[key] else {return}
             let candidates=entries.filter {selected.contains($0.id) && group($0)==key && knownTTYs[$0.key] != nil}
             guard let target=candidates.first(where:{$0.terminalTab?.selected == true}) ?? candidates.first,
-                  let tty=knownTTYs[target.key] else {return}
-            do {try await selectTab(tty)}
+                  let tty=knownTTYs[target.key],tty != lastOpened else {return}
+            do {try await selectTab(tty,lastOpened)}
             catch {
                 if let index=results.firstIndex(where: {result in result.phase == .opened && entries.contains(where:{$0.id==result.id && group($0)==key})}) {
                     results[index].detail += " 선택 탭 복원은 확인하지 못했습니다: "+error.localizedDescription;progress(results[index])
@@ -428,7 +431,16 @@ public enum TerminalProfileLauncher {
     static func script(_ entry:TerminalProfileEntry,targetTTY:String?,command rawCommand:String,commandFile:TerminalProfileCommandFile? = nil) throws ->String {
         let command=try AutomationScript.literal(rawCommand)
         if entry.host == .iterm {
-            return "const app=Application('com.googlecode.iterm2'); const window=app.createWindowWithDefaultProfile({command:\(command)}); JSON.stringify({tty:window.currentSession().tty()});"
+            return """
+            (()=>{
+              const app=Application('com.googlecode.iterm2');
+              if(app.running() && app.frontmost() && app.windows().length)
+                return JSON.stringify({error:'iTerm2에서 작업 중입니다. 다른 앱으로 이동한 뒤 새 창 복원을 다시 시도해주세요.',commandAttempted:false});
+              const window=app.createWindowWithDefaultProfile({command:\(command)});
+              return JSON.stringify({tty:window.currentSession().tty()});
+            })();
+            """
+
         }
         let target=try AutomationScript.literal(targetTTY as Any? ?? NSNull()),settings=try AutomationScript.literal(entry.terminalTab?.settingsName as Any? ?? NSNull()),title=try AutomationScript.literal(entry.terminalTab?.customTitle as Any? ?? NSNull())
         if let commandFile {
@@ -437,30 +449,22 @@ public enum TerminalProfileLauncher {
             (()=>{
               ObjC.import('Foundation');
               const app=Application('com.apple.Terminal'),target=\(target),settings=\(settings),title=\(title);
+              \(AutomationScript.terminalSelectionGuard)
               let commandAttempted=false,created=false;
               try {
                 const profile=settings===null ? null:app.settingsSets.byName(settings);
                 if(profile!==null&&!profile.exists())throw Error('저장한 Terminal 설정 프로필이 없습니다.');
                 \(TerminalProfileScriptQueries.inventory)
-                function frontWindow(){
-                  try {return app.frontmost() ? realWindowIDs(app.windows.id())[0] : null;}catch(_){return null;}
-                }
-                function returnFocus(previous,opened){
-                  if(previous && previous!==opened && frontWindow()===opened){
-                    try {const window=app.windows.byId(previous);if(window.exists())window.index=1;}catch(_){}
-                  }
-                }
-                let tty=target, previous=null;
+                let tty=target;
                 if(tty===null){
                   const before=new Set(inventory().map(row=>row.tty));
-                  previous=frontWindow();
+                  if(before.size && app.frontmost())throw Error('Terminal에서 작업 중입니다. 다른 앱으로 이동한 뒤 새 창 복원을 다시 시도해주세요.');
                   created=true;
                   tty=app.doScript('').tty();
                   if(!tty||before.has(tty))throw Error('새 Terminal 창의 탭을 확인하지 못했습니다.');
                 }
                 const row=inventory().find(row=>row.tty===tty);
                 if(!row)throw Error('복원할 Terminal 탭이 닫혔습니다.');
-                if(created)returnFocus(previous,row.windowID);
                 const {tab}=exactTab(row),deadline=Date.now()+8000;
                 let shell;
                 do {
@@ -474,10 +478,9 @@ public enum TerminalProfileLauncher {
                 if(profile!==null && tab.currentSettings().name()!==settings)tab.currentSettings=profile;
                 if(title!==null && tab.customTitle()!==title)tab.customTitle=title;
                 if(tab.tty()!==tty||tab.busy())throw Error('복원할 탭이 바뀌었습니다.');
-                previous=frontWindow();
+                if(!preservesSelection(tty))throw Error('다른 Terminal 탭을 사용 중입니다. 대상 탭의 명령 전송을 보류했습니다.');
                 commandAttempted=true;
                 app.doScript((['fish','tcsh','csh'].includes(shell)?'/bin/sh ':'. ')+\(path),{in:tab});
-                returnFocus(previous,row.windowID);
                 return JSON.stringify({tty});
               }catch(error){return JSON.stringify({error:String(error.message||error),commandAttempted,created});}
             })();
@@ -486,6 +489,7 @@ public enum TerminalProfileLauncher {
         return """
         (()=>{
           const app=Application('com.apple.Terminal'),target=\(target),settings=\(settings),title=\(title);
+          \(AutomationScript.terminalSelectionGuard)
           let stage='Terminal 연결 준비',commandAttempted=false;
           try {
           const profile=settings===null ? null:app.settingsSets.byName(settings);
@@ -498,15 +502,17 @@ public enum TerminalProfileLauncher {
             if(tab.busy() || !processes.length || !processes.every(p=>/^(?:-?(?:zsh|bash|sh|fish|tcsh|csh|dash|ksh)|login)$/.test(String(p).trim().split(/\\s+/)[0].split('/').pop())))throw Error('새 탭에서 다른 작업이 실행 중이어서 대화 명령을 보내지 않았습니다.');
             if(profile!==null)tab.currentSettings=profile;
             if(title!==null)tab.customTitle=title;
+            if(!preservesSelection(target))throw Error('다른 Terminal 탭을 사용 중입니다. 대상 탭의 명령 전송을 보류했습니다.');
             stage='대화 명령 전달';commandAttempted=true;
             app.doScript(\(command),{in:tab});
           }else{
+            if(app.running() && app.frontmost() && app.windows().length)throw Error('Terminal에서 작업 중입니다. 다른 앱으로 이동한 뒤 새 창 복원을 다시 시도해주세요.');
             stage='새 창에 대화 명령 전달';commandAttempted=true;
             tab=app.doScript(\(command));
             if(profile!==null)tab.currentSettings=profile;
             if(title!==null)tab.customTitle=title;
           }
-          stage='복원된 터미널 확인';app.activate();return JSON.stringify({tty:tab.tty()});
+          stage='복원된 터미널 확인';return JSON.stringify({tty:tab.tty()});
           }catch(error){return JSON.stringify({error:stage+': '+String(error.message||error),commandAttempted});}
         })();
         """
@@ -537,7 +543,8 @@ public enum TerminalProfileLauncher {
             }
             let command:String, file:TerminalProfileCommandFile?
             do {
-                command=try entry.resumeCommand(nativeRuntimeRoot:nil,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed,standalone:launchRuntime?.standalone ?? false)
+                let refreshed = TerminalProfileExecutionSettingsReader.refreshed([entry])[0]
+                command=try refreshed.resumeCommand(nativeRuntimeRoot:nil,bundledRuntime:launchRuntime?.bundled,compatibleCLI:launchRuntime?.installed,standalone:launchRuntime?.standalone ?? false)
                 file=entry.host == .terminal ? try TerminalProfileCommandFile(command:command):nil
             } catch { throw RemoteHTTPError(409,error.localizedDescription,diagnostics:["command_delivery":"not_started"]) }
             defer { file?.withdraw() }
@@ -620,25 +627,47 @@ public enum TerminalProfileLauncher {
         }.value
     }
 
-    public static func selectTab(_ tty:String) async throws {
-        guard validTTY(tty) else {throw AppError.message("선택할 Terminal 탭을 확인하지 못했습니다.")}
-        _ = try await Task.detached(priority:.utility) {
+    public static func selectTab(_ tty:String, afterOpening lastTTY:String) async throws {
+        guard validTTY(tty),validTTY(lastTTY),tty != lastTTY else {return}
+        try await Task.detached(priority:.utility) {
             try AutomationIPC.shared.run(host:"Terminal",readOnly:false,budget:6,admissionWait:3) {
-                try AutomationScript.run(selectionScript(tty,activate:false,preserveForeground:true),app:"Terminal",denied:.permissionDenied,timeout:6)
+                guard let owner = try? TerminalProcessLookup.running(),
+                      let last = try TerminalAppleEvents.profileWindowMetadata(tty:lastTTY,owner:owner),
+                      !last.minimized,last.selected else {return}
+                let reader = try TerminalNativeTabReader.terminal(owner:owner)
+                let rows = try TerminalProfileTopology.readRows([tty,lastTTY],timeout:3)
+                guard let target = rows.first(where:{$0.tty == tty}),let previous = rows.first(where:{$0.tty == lastTTY}),
+                      previous.windowID == last.windowID,previous.selected else {return}
+                if previous.windowID == target.windowID {
+                    let script = try selectionScript(tty,afterOpening:lastTTY)
+                    _ = try AutomationScript.run(script,app:"Terminal",denied:.permissionDenied,timeout:3)
+                } else {
+                    try reader.selectRestoredTab(row:target,afterOpening:last.windowID)
+                }
             }
         }.value
     }
-    public static func selectionScript(_ tty:String,activate:Bool = true,preserveForeground:Bool = false) throws -> String {
+    public static func selectionScript(_ tty:String,afterOpening lastTTY:String? = nil) throws -> String {
         guard validTTY(tty) else {throw AppError.message("선택할 Terminal 탭을 확인하지 못했습니다.")}
         let target=try AutomationScript.literal(tty)
+        let selection:String
+        if let lastTTY {
+            guard validTTY(lastTTY) else {throw AppError.message("복원한 탭을 확인하지 못했습니다.")}
+            let previous=try AutomationScript.literal(lastTTY)
+            selection="""
+              if(window.miniaturized() || window.selectedTab().tty()!==\(previous) || app.frontmost())return 'user selection preserved';
+              window.selectedTab=tab;
+            """
+        } else {selection="window.miniaturized=false;window.selectedTab=tab;window.index=1;app.activate();"}
         return """
         (()=>{
           const app=Application('com.apple.Terminal');
           \(TerminalProfileScriptQueries.inventory)
           const row=inventory().find(row=>row.tty===\(target));
           if(!row)throw Error('선택할 탭이 닫혔거나 바뀌었습니다.');
-          \(preserveForeground ? "if(app.frontmost() && app.windows[0].selectedTab().tty()!==row.tty)return 'user selection preserved';" : "")
-          const {window,tab}=exactTab(row);window.selectedTab=tab;window.miniaturized=false;window.index=1;\(activate ? "app.activate();" : "")return 'selected';
+          const {window,tab}=exactTab(row);
+          \(selection)
+          return 'selected';
         })();
         """
     }

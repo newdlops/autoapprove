@@ -72,7 +72,15 @@ extension ApprovalTests {
         let reader = SessionGroupModelSettingsReader()
         try save(row)
         try expectEqual(reader.read(live)?.model, "claude-opus-5-5")
-        try expectEqual(reader.read(live)?.reasoningEffort, "xhigh")
+        try expectEqual(reader.read(live)?.reasoningEffort, "medium")
+        let effortChange: JSONObject = ["type": "system", "subtype": "local_command", "sessionId": id,
+            "commandRun": ["command": "/effort", "args": "max"], "content": "<local-command-stdout>Set effort level to max</local-command-stdout>"]
+        try save(row, suffix: encoded(effortChange))
+        try expectEqual(reader.read(live)?.reasoningEffort, "max")
+        var reset = effortChange; reset["content"] = "<local-command-stdout>Effort level set to auto</local-command-stdout>"
+        try save(row, suffix: encoded(reset))
+        try expectNil(reader.read(live)?.reasoningEffort)
+        try save(row)
         try expectEqual(reader.completion(live, after: ended.addingTimeInterval(-1))?.summary, "Fixture final result")
         try expectNil(reader.completion(live, after: ended.addingTimeInterval(1)))
         let prompt: JSONObject = ["type": "user", "sessionId": id, "timestamp": formatter.string(from: ended.addingTimeInterval(-0.5)),
@@ -107,7 +115,7 @@ extension ApprovalTests {
         try save(row, suffix: encoded(["type": "user", "sessionId": id, "message": ["role": "user"]]))
         try expectNil(reader.completion(live, after: ended.addingTimeInterval(-1)))
         row["message"] = ["model": "claude-sonnet-5-5", "stop_reason": "tool_use", "content": [["type": "text", "text": "Still working"]]]
-        row["perTurnEffort"] = "high"; try save(row)
+        row["effort"] = "high"; try save(row)
         try expectEqual(reader.read(live)?.model, "claude-sonnet-5-5"); try expectEqual(reader.read(live)?.reasoningEffort, "high")
         try expectNil(reader.completion(live, after: ended.addingTimeInterval(-1)))
         live.conversationID = UUID().uuidString; try expectNil(reader.read(live))

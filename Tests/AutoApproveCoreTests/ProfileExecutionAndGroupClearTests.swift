@@ -100,14 +100,14 @@ extension ApprovalTests {
         const chosen={tty:()=>tty,contents:()=>raw,processes:()=>[agent]};
         const alias={tty:()=>tty,contents:()=>raw+\(try literal(conflict ? " changed" : "")),processes:()=>[agent]};
         const other={tty:()=>'/dev/unrelated',contents:()=>{throw Error('unrelated screen read')},processes:()=>[]};
-        const app={running:()=>true,windows:()=>[{tabs:()=>{throw Error('closed window')}},{tabs:()=>[other,chosen]},{tabs:()=>[alias]}],doScript:(text,options)=>{if(options.in!==chosen)throw Error('wrong tab');writes.push(text);}};
+        const app={frontmost:()=>false,running:()=>true,windows:()=>[{tabs:()=>{throw Error('closed window')}},{tabs:()=>[other,chosen]},{tabs:()=>[alias]}],doScript:(text,options)=>{if(options.in!==chosen)throw Error('wrong tab');writes.push(text);}};
         function Application(){return app;}
         """)
         let result=context.evaluateScript(script)?.toString() ?? ""
         try expect(context.exception == nil,context.exception?.toString() ?? "Background script failed")
         try expectEqual(context.evaluateScript("writes.length")?.toInt32(),conflict ? 0:1)
         if !conflict,agent == .claude {try expectEqual(context.evaluateScript("writes[0]")?.toString(),"/clear")}
-        for forbidden in ["activate", "selectedTab", "System Events"] {try expectFalse(script.contains(forbidden))}
+        for forbidden in ["activate","selectedTab=","selectedTab =", "System Events"] {try expectFalse(script.contains(forbidden))}
         return result
     }
 
@@ -228,6 +228,40 @@ extension ApprovalTests {
         let value = TerminalProfileExecutionSettingsReader.read(live)
         try expectEqual(value?.model, "gpt-6.1-sol"); try expectEqual(value?.reasoningEffort, "xhigh"); try expectEqual(value?.serviceTier, "ultrafast")
         try write([row(id, tier: nil)]); try expectEqual(TerminalProfileExecutionSettingsReader.read(live)?.serviceTier, "default")
+        let groupReader = SessionGroupModelSettingsReader(threadReader: { _, _ in nil })
+        try expectEqual(groupReader.read(live)?.reasoningEffort, "xhigh")
+        let liveReader = SessionGroupModelSettingsReader(threadReader: { _, thread in
+            ["id": thread, "cwd": "/project", "model": "gpt-6.1-sol", "reasoningEffort": "ultra"]
+        })
+        try expectEqual(liveReader.read(live)?.reasoningEffort, "ultra")
+        let inherited = SessionGroupModelSettingsReader(threadReader: { _, thread in
+            ["id": thread, "cwd": "/project", "model": "gpt-6.1-sol", "reasoningEffort": NSNull()]
+        })
+        try expectNil(inherited.read(live)?.reasoningEffort)
+        let mismatched = SessionGroupModelSettingsReader(threadReader: { _, _ in
+            ["id": foreign, "cwd": "/project", "reasoningEffort": "high"]
+        })
+        try expectNil(mismatched.read(live))
+        var different = row(id, tier: "priority")
+        var event = different["payload"] as! JSONObject
+        event["thread_settings"] = ["model": "gpt-6.1-sol", "reasoning_effort": "max", "service_tier": "priority"]
+        different["payload"] = event
+        try write([row(id, tier: nil), different])
+        let append = try FileHandle(forWritingTo: log)
+        _ = try append.seekToEnd(); try append.write(contentsOf: Data("{".utf8)); try append.close()
+        try expectEqual(groupReader.read(live)?.reasoningEffort, "max")
+        var legacy = TerminalProfileEntry(title: "fixture", agent: "codex", cwd: "/project", conversationID: id, providerHome: root.path)
+        legacy.executionSettings = .init(model: "example", reasoningEffort: "low", serviceTier: "priority")
+        let decoded = try JSONDecoder().decode(TerminalProfileEntry.self, from: JSONEncoder().encode(legacy))
+        let refreshed = TerminalProfileExecutionSettingsReader.refreshed([decoded])[0]
+        try expectEqual(refreshed.executionSettings, .init(model: "example", reasoningEffort: "max", serviceTier: "priority"))
+        try expect(try decoded.resumeCommand().contains("model_reasoning_effort=\"max\""))
+        legacy.usesProfileReasoningEffort = true
+        try expect(try legacy.resumeCommand().contains("model_reasoning_effort=\"low\""))
+        legacy.usesProfileReasoningEffort = nil; legacy.conversationID = ""
+        try expect(try legacy.resumeCommand().contains("model_reasoning_effort=\"low\""))
+        legacy.conversationID = foreign
+        try expectFalse(try legacy.resumeCommand().contains("model_reasoning_effort"))
         try write([row(foreign, tier: "ultrafast")]); try expectNil(TerminalProfileExecutionSettingsReader.read(live)?.serviceTier)
     }
 

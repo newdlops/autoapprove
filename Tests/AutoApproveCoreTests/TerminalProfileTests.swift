@@ -139,11 +139,16 @@ extension ApprovalTests {
             context.setObject(record,forKeyedSubscript:"record" as NSString)
             context.evaluateScript("""
                 const fixtureTab={tty:()=>'/dev/ttys099'};
-                const fixtureApp={activate:()=>record('activate'),doScript:command=>{record(command);return fixtureTab;},createWindowWithDefaultProfile:options=>{record(options.command);return {currentSession:()=>fixtureTab};}};
+                const fixtureApp={running:()=>true,frontmost:()=>false,activate:()=>record('activate'),doScript:command=>{record(command);return fixtureTab;},createWindowWithDefaultProfile:options=>{record(options.command);return {currentSession:()=>fixtureTab};}};
                 function Application(name){record(name);return fixtureApp;}
                 """)
             let result=context.evaluateScript(try TerminalProfileLauncher.script(entry))?.toString()
             try expect(exception==nil,exception ?? "Native host contract");try expectEqual(result,#"{"tty":"/dev/ttys099"}"#)
+            try expectEqual(calls.filter {($0 as? String)==command}.count,1)
+            try expect(!calls.contains("activate"))
+            context.evaluateScript("fixtureApp.frontmost=()=>true;fixtureApp.windows=()=>[{}];")
+            let paused=try JSONSerialization.jsonObject(with:Data(context.evaluateScript(try TerminalProfileLauncher.script(entry))!.toString()!.utf8)) as! [String:Any]
+            try expectEqual(paused["commandAttempted"] as? Bool,false)
             try expectEqual(calls.filter {($0 as? String)==command}.count,1)
             try expect(calls.contains(host == .terminal ? "com.apple.Terminal":"com.googlecode.iterm2"))
         }
@@ -151,7 +156,7 @@ extension ApprovalTests {
         for afterDispatch in [false,true] {
             let context=JSContext()!
             context.evaluateScript("""
-                const fixtureApp={activate:()=>{},doScript:()=>{throw Error('Error');},settingsSets:{byName:()=>{throw Error('Error');}}};
+                const fixtureApp={running:()=>true,frontmost:()=>false,activate:()=>{},doScript:()=>{throw Error('Error');},settingsSets:{byName:()=>{throw Error('Error');}}};
                 function Application(){return fixtureApp;}
                 """)
             var failing=entry
@@ -187,7 +192,7 @@ extension ApprovalTests {
             let context=JSContext()!
             context.evaluateScript("""
             var commands=[];const tab={tty:()=>'/dev/ttys099'};
-            function Application(){return {activate:()=>{},doScript:command=>{commands.push(command);return tab;},createWindowWithDefaultProfile:options=>{commands.push(options.command);return {currentSession:()=>tab};}};}
+            function Application(){return {running:()=>true,frontmost:()=>false,activate:()=>{},doScript:command=>{commands.push(command);return tab;},createWindowWithDefaultProfile:options=>{commands.push(options.command);return {currentSession:()=>tab};}};}
             """)
             let result=context.evaluateScript(try TerminalProfileLauncher.script(entry))?.toString()
             try expectNil(context.exception);try expectEqual(result,#"{"tty":"/dev/ttys099"}"#)
@@ -202,6 +207,32 @@ extension ApprovalTests {
         var specific=normalized;specific.conversationID=" 00000000-0000-4000-8000-000000000001 "
         try expectEqual(try specific.validated().conversationID,"00000000-0000-4000-8000-000000000001")
         try expect(try specific.resumeCommand().contains("'codex' 'resume'"))
+    }
+
+    func testTerminalProfileFocusPreservation() async throws {
+        let bar=TerminalNativeTabGroup(id:8,tabs:[11,12],selected:12)
+        var left=TerminalProfileTabSnapshot(tty:"/dev/ttys410",windowID:81,windowOrder:1,tabOrder:0,selected:true)
+        left.tabLabel="First"
+        let right=TerminalProfileTabSnapshot(tty:"/dev/ttys411",windowID:82,windowOrder:0,tabOrder:0,selected:true)
+        let captured=try TerminalProfileNativeCapture.capture([left,right],visible:[82:bar],standalone:[],labels:[11:"First",12:"Second"])
+        try expectEqual(captured.map(\.selected),[false,true])
+        try expectEqual(captured.map(\.tabOrder),[0,1])
+        try expectEqual(Set(captured.map(\.windowID)).count,1)
+        try expectThrows(try TerminalProfileNativeCapture.capture([left,right],visible:[82:bar],standalone:[],labels:[11:"First",12:"First"]))
+
+        let group=UUID(),restorer=TerminalProfileRestorer(),launches=FreshProfileLaunchRecorder(),selections=ProfileLaunchRecorder()
+        var a=profileEntry(),b=profileEntry(),c=profileEntry()
+        a.terminalTab = .init(window:group,windowOrder:0,tabOrder:0,selected:true)
+        b.terminalTab = .init(window:group,windowOrder:0,tabOrder:1)
+        c.terminalTab = .init(window:group,windowOrder:0,tabOrder:2)
+        let profile=TerminalSessionProfile(name:"tabs",entries:[a,b,c])
+        let select: @Sendable (String,String) async throws -> Void = { tty,previous in await selections.add(tty+" "+previous) }
+        _ = try await restorer.restore(profile,selected:[a.id,b.id],active:[],directoryExists:{_ in true},
+            launch:{try await launches.launch($0,$1)},selectTab:select)
+        try expectEqual(await selections.keys,["/dev/ttys980 /dev/ttys981"])
+        _ = try await restorer.restore(profile,selected:[a.id,b.id,c.id],active:[a,b],activeTerminalTTYs:[a.key:"/dev/ttys980",b.key:"/dev/ttys981"],
+            directoryExists:{_ in true},terminalIsOpen:{_ in true},launch:{try await launches.launch($0,$1)},selectTab:select)
+        try expectEqual(await selections.keys.count,1,"Adding a sibling to an existing window must preserve its selection")
     }
 
     func testTerminalProfileFreshCLIRestoreKeepsTabsAndReceipts() async throws {

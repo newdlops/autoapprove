@@ -19,11 +19,11 @@ private func preparationContext() -> JSContext {
         var childAXChecks = 0, systemEvents = 0, writes = [], front = true, wrongTab = false, changed = false, processes = ['codex'];
         var ObjC = {import:()=>{}}; var $ = {AXIsProcessTrusted:()=>{childAXChecks++; return false;}};
         var tab = {tty:()=>'/dev/ttys081', contents:()=>changed ? 'changed' : 'screen', processes:()=>processes};
-        var win = {id:()=>96, tabs:()=>[tab]};
-        Object.defineProperty(win, 'selectedTab', {set:()=>{}, get:()=>()=>wrongTab ? {tty:()=>'/dev/other'} : tab});
+        var win = {id:()=>96, miniaturized:()=>false, tabs:()=>[tab]};
+        Object.defineProperty(win, 'selectedTab', {set:()=>{throw Error('unexpected tab selection');}, get:()=>()=>wrongTab ? {tty:()=>'/dev/other'} : tab});
         function Application(id) {
           if (id === 'com.apple.systemevents') { systemEvents++; throw Error('System Events must never receive a command'); }
-          return {running:()=>true, windows:()=>[win], frontmost:()=>front, activate:()=>{}, doScript:text=>writes.push(text)};
+          return {running:()=>true, windows:()=>[win], frontmost:()=>front, activate:()=>{throw Error('unexpected activation');}, doScript:text=>writes.push(text)};
         }
         """)
     return context
@@ -47,8 +47,7 @@ private final class NativeProbe: @unchecked Sendable {
     var trusted = true, posting = true, focused = true, cancelled = false, ownerBundle = "com.apple.Terminal", now: TimeInterval = 0
     var focusedRole = kAXTextAreaRole
     var metadataReads = 0, prepares = 0, faultAt = 0, fault: Fault?, throwPairAt = 0
-    var focusOnPrepare = false, frontmost = true, activationFails = false, metadataNeedsActivation = false
-    var activations = 0, pauses = 0, focusAfterPauses = 0
+    var frontmost = true
     var targetedReads = 0
     var identity: TTYInputIdentity = {
         let formatter=DateFormatter();formatter.locale=Locale(identifier:"en_US_POSIX");formatter.dateFormat="EEE MMM d HH:mm:ss yyyy"
@@ -105,7 +104,7 @@ private final class NativeProbe: @unchecked Sendable {
     }
     var environment: TerminalKeyboard.Environment {
         TerminalKeyboard.Environment(trusted: { self.read { $0.trusted } }, postingAllowed: { self.read { $0.posting } }, run: { script in
-            self.mutate { $0.prepares += 1; if $0.focusOnPrepare { $0.focused = true } }
+            self.mutate { $0.prepares += 1 }
             let context = preparationContext()
             if self.read({ $0.records.last?.agent == .claude }) { context.evaluateScript("processes = ['claude'];") }
             let value = context.evaluateScript(script)?.toString()
@@ -114,7 +113,6 @@ private final class NativeProbe: @unchecked Sendable {
                 "Native delivery must not depend on child AX/System Events or make JXA input writes")
             return value
         }, metadata: {
-            if self.read({ $0.metadataNeedsActivation && $0.activations == 0 }) { throw AppError.message("Background metadata timed out before activation") }
             return self.metadata($0)
         }, ownerBundle: { _ in self.read { $0.ownerBundle } }, focused: { _ in self.read { $0.focused && $0.focusedRole == kAXTextAreaRole } },
            processes: { self.read { $0.records } }, postPair: { try self.submit($0, $1, $2) }, clock: { self.read { $0.now } }, cancelled: { self.read { $0.cancelled } },
@@ -122,13 +120,7 @@ private final class NativeProbe: @unchecked Sendable {
                self.mutate { $0.clipboardText = text }
                return .init(isCurrent: { self.read { $0.clipboardCurrent } }, restore: { self.mutate { $0.restores += 1 } })
            }, pasteReady: { _, text, _ in self.read { $0.pasteConfirmed && $0.clipboardText == text } },
-           frontmost: { self.read { $0.frontmost } }, activate: {
-               self.mutate { $0.activations += 1 }
-               if self.read({ $0.activationFails }) { throw RemoteHTTPError(409,"Activation refused") }
-           }, pause: { interval in self.mutate {
-               $0.pauses += 1; $0.now += interval
-               if $0.focusAfterPauses > 0 && $0.pauses >= $0.focusAfterPauses { $0.focused = true }
-           } })
+           frontmost: { self.read { $0.frontmost } })
     }
 }
 #endif
@@ -147,52 +139,29 @@ private final class NativeProbe: @unchecked Sendable {
         context.evaluateScript("wrongTab = true;")
         try require(context.evaluateScript(script)?.toString() == "missingTarget", "Another selected TTY must fail before native delivery")
         context.evaluateScript("wrongTab = false; front = false;")
-        try require(context.evaluateScript(script)?.toString() == "ready:96", "JXA must leave asynchronous focus readiness to the native guard")
-        try require(context.evaluateScript("win.miniaturized === false && win.index === 1")?.toBool() == true,
-            "Preparation must restore and raise the exact target window")
-        var checks = ["exact original JXA preparation uses no child AX, System Events or terminal writes"]
+        try require(context.evaluateScript(script)?.toString() == "missingTarget", "Background preflight must preserve the current application")
+        try require(context.evaluateScript("win.index === undefined && typeof win.miniaturized === 'function'")?.toBool() == true,
+            "Preflight must preserve window order and minimized state")
+        var checks = ["read-only preflight for the exact selected window"]
 #if !KEYBOARD_PREFLIGHT_ONLY
-        let owner=TerminalProcessIdentity(pid:81000,startedSeconds:10,startedMicroseconds:20)
-        var writes=[String](),identities=0,pids=[Int32]()
-        try TerminalKeyboard.activateApplication(owner:owner,identity:{_ in identities+=1;return owner},setAttribute:{pid,name,value in
-            pids.append(pid);writes.append("\(name)=\(value)");return .success
-        })
-        try require(pids == [owner.pid,owner.pid] && writes == ["AXHidden=false","AXFrontmost=true"] && identities == 3,
-            "Activation must use the authorized Accessibility setter and revalidate the exact lifetime for each operation")
-        for failedWrite in [0,1] {
-            writes=[]
-            do {
-                try TerminalKeyboard.activateApplication(owner:owner,identity:{_ in owner},setAttribute:{_,name,_ in
-                    writes.append(name);return writes.count-1 == failedWrite ? .cannotComplete:.success
-                })
-                throw AppError.message("AX activation failure must be reported")
-            } catch let error as RemoteHTTPError {
-                try require(error.message.contains(String(AXError.cannotComplete.rawValue)) && error.message.contains(writes.last!),
-                    "Activation errors must identify the failed attribute and AX error code")
+        let inputs: [RemoteTerminalInput] = [.init(kind:.escape,relay:true), .init(kind:.characters,text:"live",relay:true),
+            .init(kind:.message,text:"hello"), .init(kind:.submit,text:"hello"), .init(kind:.choice,text:"0"), .init(kind:.enter)]
+        for input in inputs {
+            for condition in ["otherApp","otherTab","otherWindow","minimized"] {
+                let probe = NativeProbe()
+                probe.mutate {
+                    $0.frontmost = condition != "otherApp"
+                    $0.window.selected = condition != "otherTab"
+                    $0.focused = condition != "otherWindow"
+                    $0.window.minimized = condition == "minimized"
+                }
+                let delivery = try TerminalKeyboard.deliver(target:probe.target,expected:"screen",agent:.codex,
+                    input:input,environment:probe.environment)
+                try require(delivery == .missingTarget && probe.read { $0.prepares == 0 && $0.pairs.isEmpty && $0.clipboardText.isEmpty },
+                    "Inactive targets must leave selection, input and clipboard alone")
             }
-            try require(writes.count == failedWrite+1,"Failed activation must stop without retrying")
         }
-        for changedIdentityRead in [1,2,3] {
-            writes=[];identities=0
-            do {
-                try TerminalKeyboard.activateApplication(owner:owner,identity:{_ in
-                    identities+=1;return identities == changedIdentityRead ? TerminalProcessIdentity(pid:owner.pid,startedSeconds:10,startedMicroseconds:21):owner
-                },setAttribute:{_,name,_ in writes.append(name);return .success})
-                throw AppError.message("Replaced activation target must reject")
-            } catch is RemoteHTTPError {}
-            try require(writes.count == changedIdentityRead-1,"Replaced app must receive no further activation writes")
-        }
-        checks.append("activation uses exact-PID Accessibility attributes without cooperative AppKit activation; errors and replacements stop immediately")
-        for selected in [true, false] {
-            let probe = NativeProbe()
-            probe.mutate { $0.frontmost = false; $0.window.selected = selected }
-            let delivery = try TerminalKeyboard.deliver(target: probe.target, expected: "", agent: .codex,
-                input: .init(kind: .escape, relay: true), environment: probe.environment, allowActivation: false)
-            try require(delivery == (selected ? .sent : .missingTarget), "Restart Escape must target only the selected tab")
-            try require(probe.read { $0.activations == 0 && $0.prepares == 0 && $0.pairs.map(\.key) == (selected ? [53] : []) },
-                "Restart Escape must never select a different tab or activate Terminal")
-        }
-        checks.append("restart Escape reaches only the exact selected tab without activation")
+        checks.append("six input kinds preserve focus and clipboard across four inactive target states")
         let unicode = NativeProbe(), text = "한글 🧪 e\u{301} " + String(repeating: "a", count: 19) + "🧪" + String(repeating: "끝", count: 30)
         let unicodeInput = RemoteTerminalInput(kind: .characters, text: text, relay: true)
         try require(try TerminalKeyboard.deliver(target: unicode.target, expected: "screen", agent: .codex, input: unicodeInput, environment: unicode.environment) == .sent,
@@ -205,73 +174,13 @@ private final class NativeProbe: @unchecked Sendable {
             && $0.downFlags == 0 && $0.upFlags == 0 }, "Every Unicode pair must target only the exact owner and keep complete surrogate sequences without modifiers")
         checks.append("bounded Unicode down/up pairs target only the original owner, with no surrogate cuts or modifier leakage")
 
-        try require(unicode.read{$0.prepares == 0 && $0.activations == 0 && $0.pauses == 0}, "Focused exact-source live typing must not activate or launch a preparation script")
-        let focusChange = NativeProbe(); focusChange.mutate{$0.focused = false; $0.focusOnPrepare = true}
-        try require(try TerminalKeyboard.deliver(target:focusChange.target,expected:"screen",agent:.codex,
-            input:.init(kind:.characters,text:"live",relay:true),environment:focusChange.environment) == .sent,
-            "A different foreground app must still use the selection/activation preparation")
-        try require(focusChange.read{$0.prepares == 1 && $0.pairs.count == 1}, "Unfocused input must prepare exactly once before posting")
+        try require(unicode.read{$0.prepares == 0}, "Focused live typing must not run a preparation script")
         let boundRevision = NativeProbe()
         try require(try TerminalKeyboard.deliver(target:boundRevision.target,expected:"screen",agent:.codex,
             input:.init(kind:.characters,text:"bound"),environment:boundRevision.environment) == .sent,
             "Revision-bound input must retain its fresh script comparison")
         try require(boundRevision.read{$0.prepares == 1}, "Only live typing may skip scripted screen preparation")
-        checks.append("focused live typing uses fresh native checks without a script; focus changes and revision-bound input retain preparation")
-
-        let background = NativeProbe()
-        background.mutate { $0.frontmost = false; $0.focused = false; $0.metadataNeedsActivation = true; $0.focusAfterPauses = 3 }
-        try require(try TerminalKeyboard.deliver(target:background.target,expected:"screen",agent:.codex,
-            input:.init(kind:.characters,text:"restore",relay:true),environment:background.environment) == .sent,
-            "Background input must activate before metadata and wait for asynchronous focus")
-        try require(background.read { $0.activations == 1 && $0.prepares == 1 && $0.pauses == 3 && $0.pairs.count == 1 },
-            "Delayed focus must prepare and deliver once without retrying events")
-        for mode in ["refused", "neverFocused", "wrongRole", "focusStolen", "cancelled", "deadline", "permission", "staleSource"] {
-            let blocked = NativeProbe(); let originalTarget = blocked.target
-            blocked.mutate {
-                $0.frontmost = false; $0.focused = false
-                switch mode {
-                case "refused": $0.activationFails = true
-                case "wrongRole": $0.focused = true; $0.focusedRole = kAXTextFieldRole
-                case "focusStolen": $0.focusOnPrepare = true; $0.fault = .focus; $0.faultAt = 2
-                case "cancelled": $0.cancelled = true
-                case "deadline": $0.fault = .deadline; $0.faultAt = 1
-                case "permission": $0.trusted = false
-                case "staleSource": $0.records[1].started = "replaced source"
-                default: break
-                }
-            }
-            do {
-                let result = try TerminalKeyboard.deliver(target:originalTarget,expected:"screen",agent:.codex,
-                    input:.init(kind:.characters,text:"blocked",relay:true),environment:blocked.environment)
-                try require(mode == "staleSource" && result == .agentMissing,"Unready background input must reject: \(mode)")
-            } catch is RemoteHTTPError {} catch is CancellationError {}
-            try require(blocked.read { $0.pairs.isEmpty && $0.activations <= 1 && $0.pauses <= 25 },
-                "Unready background input must stay bounded and post nothing: \(mode)")
-            if ["cancelled","permission","staleSource"].contains(mode) {
-                try require(blocked.read { $0.activations == 0 && $0.prepares == 0 },"Invalid input must fail before revealing Terminal")
-            }
-            if mode == "refused" { try require(blocked.read { $0.prepares == 0 && $0.metadataReads == 0 },"Refused activation must not query or script Terminal") }
-        }
-        checks.append("background preparation activates before metadata, waits for exact focus, and rejects failed or stolen focus with zero posts")
-
-        for mode in ["ready","missing","changed","denied"] {
-            let native=NativeProbe();native.mutate {$0.frontmost=false;$0.focused=false}
-            var environment=native.environment
-            environment.prepareLive={tty in
-                if mode=="denied" {throw RemoteHTTPError(409,"Native preparation denied")}
-                if mode=="missing" {return nil}
-                native.mutate {$0.focused=true;if mode=="changed" {$0.fault = .selected;$0.faultAt=2}}
-                return native.metadata(tty)
-            }
-            do {
-                let result=try TerminalKeyboard.deliver(target:native.target,expected:"screen",agent:.codex,
-                    input:.init(kind:.characters,text:"native",relay:true),environment:environment)
-                try require(mode=="ready" ? result == .sent:mode=="missing" && result == .missingTarget,"Native selection must preserve failures")
-            } catch is RemoteHTTPError {try require(["changed","denied"].contains(mode),"Unexpected native selection failure")}
-            try require(native.read {$0.prepares==0 && $0.activations==1 && $0.pairs.count==(mode=="ready" ? 1:0)},
-                "Native live selection must not launch JXA, retry failure or skip the final selected-tab check")
-        }
-        checks.append("live background selection uses native events without JXA and still rejects changed selection before the first pair")
+        checks.append("revision-bound input compares the original screen without selecting a tab")
 
         let special = NativeProbe()
         let keyCodes: [(RemoteTerminalInput.Kind, Int64)] = [(.enter,36),(.escape,53),(.interrupt,8),(.up,126),(.down,125),(.left,123),(.right,124),(.backspace,51),(.delete,117),(.home,115),(.end,119),(.tab,48)]

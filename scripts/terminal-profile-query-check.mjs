@@ -49,7 +49,7 @@ function check(scenario,{placeholder=false}={}){
     whose:predicate=>()=>request('exactTTY',()=>windows.map(value=>value.tabs.filter(value=>value.tty===predicate.tty).map(tab)))};
   list.byId=id=>{const raw=windows.find(value=>value.id===id);return raw?window(raw):{exists:()=>request('exists',()=>false)};};
   const profile={exists:()=>request('settingsExists',()=>true)};
-  const app={windows:list,settingsSets:{byName:()=>profile},activate:()=>request('activate',()=>{activations++;}),
+  const app={windows:list,frontmost:()=>false,settingsSets:{byName:()=>profile},activate:()=>request('activate',()=>{activations++;}),
     doScript:(command,options)=>request('doScript',()=>{assert.ok(options?.in,'Never create a replacement window');commands.push({command,tty:rawByTab.get(options.in).tty});})};
   const context=vm.createContext({Application:()=>app,ObjC:{import:()=>{}},$:{NSThread:{sleepForTimeInterval:()=>{sleeps++;assert.fail('Ready shells must not sleep');}}}});
   const stages={};
@@ -63,7 +63,7 @@ function check(scenario,{placeholder=false}={}){
   assert.equal(confirmed.tty,scenario.target);assert.equal(confirmed.windowID,77+scenario.existing);
   assert.equal(JSON.parse(run('launch')).tty,scenario.target);
   assert.equal(run('select'),'selected');assert.equal(commands.length,1);assert.equal(commands[0].tty,scenario.target);
-  assert.equal(activations,3);assert.equal(sleeps,0);
+  assert.equal(activations,2);assert.equal(sleeps,0);
   return {existing:scenario.existing,stages,requests:Object.values(stages).reduce((total,stage)=>total+Object.values(stage).reduce((a,b)=>a+b,0),0),commands};
 }
 function capture(scenario,{placeholder=false,changed=false}={}) {
@@ -74,13 +74,14 @@ function capture(scenario,{placeholder=false,changed=false}={}) {
   let ttyReads=0,individual=0;
   const windows={
     id:()=>placeholder ? [null,...ids] : ids,
+    name:()=>ids.map(id=>"Window "+id),
     tabs:{tty:()=>{ttyReads++;return changed && ttyReads>1 ? rows.slice().reverse():rows;},
       currentSettings:{name:()=>rows.map(tabs=>tabs.map(()=>'Pro'))},
       customTitle:()=>rows.map(tabs=>tabs.map(()=>null))},
     selectedTab:{tty:()=>rows.map(tabs=>tabs[0]??null)},
     byId:id=>{
       const i=ids.indexOf(id),tabs=rows[i];
-      return {tabs:{tty:()=>{individual++;return tabs;},currentSettings:{name:()=>tabs.map(()=>'Pro')},customTitle:()=>tabs.map(()=>null)},
+      return {name:()=>"Window "+id,tabs:{tty:()=>{individual++;return tabs;},currentSettings:{name:()=>tabs.map(()=>'Pro')},customTitle:()=>tabs.map(()=>null)},
         selectedTab:()=>tabs.length ? {tty:()=>tabs[0]}:null};
     }
   };
@@ -88,6 +89,21 @@ function capture(scenario,{placeholder=false,changed=false}={}) {
   return {result:JSON.parse(vm.runInNewContext(scenario.capture,{Application:()=>app},{timeout:2000})),ttyReads,individual};
 }
 
+function restoreSelection(scenario) {
+  for (const front of [false,true]) for (const selected of [scenario.target,'/dev/ttys999']) {
+    const tab={tty:()=>scenario.anchor},win={exists:()=>true,id:()=>77,miniaturized:()=>false};
+    const writes=[];
+    Object.defineProperty(win,'selectedTab',{get:()=>()=>({tty:()=>selected}),set:value=>writes.push(value.tty())});
+    for(const key of ['miniaturized','index'])Object.defineProperty(win,key,{get:()=>()=>false,set:()=>assert.fail('window order changed')});
+    win.tabs={whose:()=>()=>[tab]};
+    const windows={id:()=>[77],tabs:{tty:()=>[[scenario.anchor,scenario.target]]},byId:()=>win};
+    const app={windows,frontmost:()=>front,activate:()=>assert.fail('unexpected activation')};
+    vm.runInNewContext(scenario.restoreSelection,{Application:()=>app});
+    assert.deepEqual(writes,(!front && selected===scenario.target) ? [scenario.anchor] : []);
+  }
+}
+
+restoreSelection(scripts[0]);
 for(const scenario of scripts.filter(value=>value.capture)){
   const fast=capture(scenario);
   assert.deepEqual(fast.result.map(row=>row.tty),scenario.previous);

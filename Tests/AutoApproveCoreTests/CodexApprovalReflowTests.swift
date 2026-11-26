@@ -66,7 +66,7 @@ extension ApprovalTests {
         let wrapped=approvalCellWrap(reflowPermission,width:40)
         let context=JSContext()!
         context.setObject(wrapped,forKeyedSubscript:"current" as NSString)
-        context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/reflow',contents:()=>current,processes:()=>['codex']};function Application(){return {running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
+        context.evaluateScript("var writes=[];var tab={tty:()=>'/dev/reflow',contents:()=>current,processes:()=>['codex']};function Application(){return {frontmost:()=>false,running:()=>true,windows:()=>[{tabs:()=>[tab]}],doScript:value=>writes.push(value)};}")
         let script=try TerminalAdapter.approvalScript(tty:"/dev/reflow",expectedScreen:wrapped,agent:.codex)
         try expectEqual(context.evaluateScript(script)?.toString(),"sent")
         try expectEqual(context.evaluateScript("writes.join(',')")?.toString(),"1")

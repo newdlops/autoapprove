@@ -190,6 +190,16 @@ public struct ScreenHostAdapter: Sendable {
 }
 
 enum AutomationScript {
+    static let terminalSelectionGuard = """
+    function preservesSelection(tty) {
+      if (!app.frontmost()) return true;
+      try {
+        const front = app.windows[0];
+        return front.exists() && !front.miniaturized() && front.selectedTab().tty() === tty;
+      } catch (_) { return false; }
+    }
+    """
+
     static func run(_ body: String, app: String, denied: TerminalAdapterError, timeout: TimeInterval = 8, readOnly: Bool = false) throws -> String {
         let result = try AutomationIPC.shared.run(host:app,readOnly:readOnly,budget:timeout) {
             try CommandRunner.run("/usr/bin/osascript", ["-l", "JavaScript"], timeout: timeout, input: Data(body.utf8))
@@ -285,6 +295,7 @@ public enum TerminalAdapter {
         return """
         (() => {
           const app = Application('com.apple.Terminal'), target = \(data);
+          \(AutomationScript.terminalSelectionGuard)
           \(CodexResumeScript.functions)
           function skipClosed(read) {
             try { return read(); } catch (error) {
@@ -296,6 +307,7 @@ public enum TerminalAdapter {
             if (skipClosed(() => tab.tty()) !== target.tty) continue;
             const read = () => tab.contents(), before = resumeRows(read());
             const enter = () => { if (!tab.processes().some(p => p.toLowerCase().includes(resumeAgent(target.region)))) return false;
+              if (!preservesSelection(target.tty)) return false;
               app.doScript('', {in:tab}); return true; };
             return submitDraft(read, enter, before, target.region, String(target.text).normalize('NFC'), target.footer);
           }
@@ -322,6 +334,7 @@ public enum TerminalAdapter {
         let output = try AutomationScript.run("""
         (() => {
           const app = Application('com.apple.Terminal'), target = \(literal);
+          \(AutomationScript.terminalSelectionGuard)
           if (!app.running()) return 'missingTarget';
           for (const window of app.windows()) {
             let tabs = [];
@@ -333,6 +346,7 @@ public enum TerminalAdapter {
               const jobs = tab.processes().map(p => String(p).toLowerCase()).filter(p => p !== 'login');
               if (jobs.length === 0 || jobs.every(p => /^(?:-)?(?:zsh|bash|sh|fish|dash|ksh)$/.test(p))) return 'agentMissing';
               if (target.expected !== undefined && String(tab.contents()).normalize('NFC').replace(/\\r\\n?/g, '\\n') !== target.expected.normalize('NFC').replace(/\\r\\n?/g, '\\n')) return 'screenChanged';
+              if (!preservesSelection(target.tty)) return 'screenChanged';
               app.doScript(String(target.text).normalize('NFC'), {in: tab});
               return 'sent';
             }
@@ -350,6 +364,7 @@ public enum TerminalAdapter {
         return """
         (() => {
           const app = Application('com.apple.Terminal'), target = \(literal);
+          \(AutomationScript.terminalSelectionGuard)
           const normalize = text => String(text).normalize('NFC').replace(/\\r\\n?/g,'\\n');
           if (!app.running()) return 'missingTarget';
           for (const window of app.windows()) for (const tab of window.tabs()) {
@@ -357,6 +372,7 @@ public enum TerminalAdapter {
             if (normalize(tab.contents()) !== normalize(target.screen)) return 'screenChanged';
             const jobs = tab.processes().map(p => String(p).toLowerCase()).filter(p => p !== 'login');
             if (jobs.length !== 1 || !/^(?:-)?(?:zsh|bash|sh|fish|dash|ksh)$/.test(jobs[0])) return 'agentMissing';
+            if (!preservesSelection(target.tty)) return 'screenChanged';
             app.doScript(String(target.command).normalize('NFC'), {in:tab});
             return 'sent';
           }
@@ -607,7 +623,6 @@ public enum TerminalAdapter {
     }
 
     public static func approvalScript(tty: String, expectedScreen: String, agent: AgentKind) throws -> String {
-        // Compare the complete active dialog, preserving command whitespace. Unrelated history can change.
         var target=try AutomationScript.dialogData(tty:tty,expectedScreen:expectedScreen,agent:agent)
         let compact=(target["dialog"] as? String ?? "").filter {!$0.isWhitespace}.lowercased()
         target["submitSelected"]=agent == .codex && compact.hasPrefix("allowcomputerusetouse")
@@ -615,6 +630,7 @@ public enum TerminalAdapter {
         return """
         (() => {
         const app = Application('com.apple.Terminal'); const target = \(data);
+        \(AutomationScript.terminalSelectionGuard)
         function normalize(text) { return String(text).normalize('NFC').replace(/\\r\\n?/g, '\\n'); }
         function activeDialog(text) {
           const lines = normalize(text).split('\\n');
@@ -625,8 +641,6 @@ public enum TerminalAdapter {
           for (let index = 0; index < lines.length; index++) if (lines[index].trim() === heading) start = index;
           return start < 0 ? null : lines.slice(start).join('\\n');
         }
-        // Terminal lists each native tab as a window, and can list one it no longer resolves.
-        // Skip windows and tabs that cannot be read; only the matching tab is compared and written.
         function skipClosed(read) {
           try { return read(); } catch (error) {
             if (Number(error.errorNumber || error.number) === -1743 || String(error).includes('-1743')) throw error;
@@ -637,9 +651,7 @@ public enum TerminalAdapter {
           if (skipClosed(() => tab.tty()) !== target.tty) continue;
           if (activeDialog(tab.contents()) !== normalize(target.dialog)) return 'screenChanged';
           if (!tab.processes().some(p => p.toLowerCase().includes(target.agent))) return 'agentMissing';
-          // Codex's Computer Use field treats text plus Return as a paste.
-          // The detector and final dialog check already prove Allow is selected;
-          // an empty script sends the standalone Return that submits that field.
+          if (!preservesSelection(target.tty)) return 'screenChanged';
           app.doScript(target.submitSelected ? '' : '1', {in:tab});
           return 'sent';
         }
@@ -659,6 +671,7 @@ public enum TerminalAdapter {
         return """
         (() => {
         const app = Application('com.apple.Terminal'); const target = \(data);
+        \(AutomationScript.terminalSelectionGuard)
         \(CodexResumeScript.functions)
         function skipClosed(read) {
           try { return read(); } catch (error) {
@@ -666,19 +679,18 @@ public enum TerminalAdapter {
             return null;
           }
         }
-        // Normalize input and the native terminal's text before comparison.
         const text = String(target.text).normalize('NFC');
         if (app.running()) for (const window of app.windows()) for (const tab of skipClosed(() => window.tabs()) || []) {
           if (skipClosed(() => tab.tty()) !== target.tty) continue;
           const before = resumeRows(tab.contents());
           if (!resumeReady(before, target.region, text)) return 'screenChanged';
           if (!tab.processes().some(p => p.toLowerCase().includes(resumeAgent(target.region)))) return 'agentMissing';
-          // do script types the text and Return in one write, which Codex keeps as a paste.
-          // A separate Return submits it, only while the draft sits in the same stopped composer.
+          if (!preservesSelection(target.tty)) return 'screenChanged';
           app.doScript(text, {in:tab});
           const state = awaitTypedState(() => tab.contents(), before, target.region, text);
           if (state === 'draft') return submitDraft(() => tab.contents(), () => {
             if (!tab.processes().some(p => p.toLowerCase().includes(resumeAgent(target.region)))) return false;
+            if (!preservesSelection(target.tty)) return false;
             app.doScript('', {in:tab}); return true;
           }, before, target.region, text, resumeFooter(before));
           return state === 'submitted' ? 'sent' : 'typed';

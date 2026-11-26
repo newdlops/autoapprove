@@ -13,8 +13,6 @@ private final class NativeOpenerState:@unchecked Sendable {
     var windows:[NSWindow]=[]
     var labels:[NSTextField]=[]
     var running=false
-    var originalSelections:[NSWindow]=[]
-    var originalKeyWindow:NSWindow?
     func applicationDidFinishLaunching(_ notification:Notification) {
         NSWindow.allowsAutomaticWindowTabbing=false
         for index in 0..<5 {windows.append(makeWindow(index))}
@@ -31,14 +29,16 @@ private final class NativeOpenerState:@unchecked Sendable {
     }
     @objc func startCheck() {
         guard !running else {return};running=true
-        originalSelections=[windows[0].tabGroup!.selectedWindow!,windows[3].tabGroup!.selectedWindow!]
-        originalKeyWindow=NSApp.keyWindow
-        let rows=windows.enumerated().map {index,window in TerminalProfileTabSnapshot(tty:"/dev/ttys\(800+index)",windowID:UInt32(window.windowNumber),windowOrder:index,tabOrder:0,selected:true,customTitle:"동일 제목")}
+        let rows=windows.enumerated().map {index,window in
+            var row = TerminalProfileTabSnapshot(tty:"/dev/ttys\(800+index)",windowID:UInt32(window.windowNumber),windowOrder:index,tabOrder:0,selected:true,customTitle:window.tab.title)
+            row.tabLabel=window.tab.title
+            return row
+        }
         DispatchQueue.global(qos:.userInitiated).async {self.run(rows)}
     }
     func makeWindow(_ index:Int)->NSWindow {
         let window=NSWindow(contentRect:NSRect(x:index<3 ? 80:880,y:180,width:740,height:440),styleMask:[.titled,.closable,.resizable,.miniaturizable],backing:.buffered,defer:false)
-        window.title="Native Tabs Check \(index+1)";window.tab.title="동일 제목";window.tabbingMode = .preferred
+        window.title="Native Tabs Check \(index+1)";window.tab.title="Fixture tab \(index+1)";window.tabbingMode = .preferred
         let label=NSTextField(wrappingLabelWithString:"격리된 macOS 기본 탭 \(index+1)\n생성된 창과 탭만 검사합니다.")
         label.font = .systemFont(ofSize:24);label.frame=NSRect(x:30,y:170,width:670,height:160)
         window.contentView?.addSubview(label);labels.append(label)
@@ -71,18 +71,8 @@ private final class NativeOpenerState:@unchecked Sendable {
             report["AXFrontmostValue"]=(frontmost as? NSNumber)?.boolValue ?? false
             guard live.ownsProcess(getpid(),Bundle.main.bundleIdentifier!),live.foreground(getpid())==active else {throw AppError.message("Own live AX foreground/owner validation failed")}
             let reader=TerminalNativeTabReader(ownerPID:getpid(),bundleID:Bundle.main.bundleIdentifier!)
-            var baseline:[TerminalNativeTabGroup]=[]
-            let captured=try TerminalProfileNativeCapture.capture(rows,environment:.init(groups:{baseline=try reader.groups();return baseline},focus:{tty in
-                let index=rows.firstIndex {$0.tty==tty}!
-                return DispatchQueue.main.sync {self.windows[index].makeKeyAndOrderFront(nil);NSApp.activate();return UInt32(self.windows[index].windowNumber)}
-            },focusedGroup:{try reader.focusedGroup()},restore:{_ in
-                // No TCC grant is requested for the fixture. Restore only our
-                // own AppKit windows; live Terminal uses the guarded AX action.
-                DispatchQueue.main.sync {
-                    for window in self.originalSelections {window.tabGroup?.selectedWindow=window}
-                    self.originalKeyWindow?.makeKeyAndOrderFront(nil)
-                }
-            }))
+            let baseline=try reader.groups()
+            let captured=try reader.capture(rows)
             report["nativeGroups"]=baseline.count;report["capturedWindowGroups"]=Set(captured.map(\.windowID)).count
             report["tabOrder"]=captured.map(\.tabOrder);report["selected"]=captured.map(\.selected)
             report["nativeRoles"]=nativeWindows.map {window in
@@ -95,14 +85,12 @@ private final class NativeOpenerState:@unchecked Sendable {
             let restored=try reader.groups()
             report["baselineGroups"]=baseline.map {["id":$0.id,"tabs":$0.tabs,"selected":$0.selected]}
             report["restoredGroups"]=restored.map {["id":$0.id,"tabs":$0.tabs,"selected":$0.selected]}
-            guard baseline.allSatisfy({restored.contains($0)}) else {throw AppError.message("Original native selection was not restored")}
+            guard baseline.allSatisfy({restored.contains($0)}) else {throw AppError.message("Layout capture changed the original native selection")}
             DispatchQueue.main.sync {self.windows[1].makeKeyAndOrderFront(nil)}
             guard let before=try reader.focusedGroup() else {throw AppError.message("Missing original native bar")}
             DispatchQueue.main.sync {
                 let added=self.makeWindow(5);self.windows[1].addTabbedWindow(added,ordered:.above);added.makeKeyAndOrderFront(nil);self.windows.append(added)
             }
-            // AppKit can publish its AX tree a run-loop turn after window
-            // creation. Wait for the observed condition without repeating it.
             let added:TerminalNativeTabGroup=try TerminalProfileReadiness.wait(message:"New native tab was not recognized") {
                 guard let group=try reader.focusedGroup(),group.addingOneTab(to:before) else {return nil}
                 return group
@@ -114,9 +102,6 @@ private final class NativeOpenerState:@unchecked Sendable {
                 guard let anchor=try reader.focusedGroup(),anchor.id==added.id,anchor.tabs==added.tabs,anchor.selected != added.selected else {return nil}
                 return anchor
             }
-            // Exercise the production opener from a singleton through nineteen
-            // additions. Only our AppKit windows implement the action boundary;
-            // native AX groups are real, while Terminal and key posting are not.
             let state=NativeOpenerState()
             DispatchQueue.main.sync {
                 let window=self.makeWindow(6);window.tabbingIdentifier="first-pair";window.makeKeyAndOrderFront(nil)
@@ -155,8 +140,6 @@ private final class NativeOpenerState:@unchecked Sendable {
                     state.windows[state.target]=window;self.windows.append(window)
                     state.selected=state.target
                     if state.posts.isMultiple(of:2),let group=window.tabGroup {
-                        // Recreate our own native bar on repeated additions,
-                        // retaining the actual NSWindow order and selection.
                         let ordered=group.windows
                         for member in ordered {group.removeWindow(member)}
                         var previous=ordered[0]

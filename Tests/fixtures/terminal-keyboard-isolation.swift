@@ -19,18 +19,16 @@ public typealias RemoteTerminalPerformance = AutoApproveCore.RemoteTerminalPerfo
 public typealias JSONObject = [String: Any]
 
 enum AutomationScript {
+    static let terminalSelectionGuard = "function preservesSelection(){throw Error('unexpected live input')}"
     static func literal(_ value: Any) throws -> String {
         String(decoding: try JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]), as: UTF8.self)
     }
-    static func run(_ body: String, app: String, denied: TerminalAdapterError, timeout: TimeInterval = 8) throws -> String {
+    static func run(_ body: String, app: String, denied: TerminalAdapterError, timeout: TimeInterval = 8, readOnly: Bool = false) throws -> String {
         throw AppError.message("Isolated native checks must inject all automation operations")
     }
 }
 enum ITermAdapter { static let visibleFunction = "throw Error('The isolated native check cannot use iTerm');" }
 enum TerminalAppleEvents {
-    static func prepareLiveInput(tty:String,owner:TerminalProcessIdentity? = nil) throws -> TerminalWindowMetadata? {
-        throw AppError.message("Isolated native checks must inject input preparation")
-    }
     static func profileWindowMetadata(tty:String,owner:TerminalProcessIdentity? = nil) throws -> TerminalWindowMetadata? {
         throw AppError.message("Isolated native checks must inject window metadata")
     }

@@ -32,9 +32,6 @@ public enum TerminalKeyboard {
         public var preparePasteboard: @Sendable (String) throws -> PasteboardLease
         public var pasteReady: @Sendable (ScreenTarget, String, String) throws -> Bool
         public var frontmost: @Sendable () -> Bool
-        public var activate: @Sendable () throws -> Void
-        public var pause: @Sendable (TimeInterval) -> Void
-        public var prepareLive: (@Sendable (String) throws -> TerminalWindowMetadata?)?
         public init(trusted: @escaping @Sendable () -> Bool, postingAllowed: @escaping @Sendable () -> Bool,
                     run: @escaping @Sendable (String) throws -> String,
                     metadata: @escaping @Sendable (String) throws -> TerminalWindowMetadata?,
@@ -45,21 +42,17 @@ public enum TerminalKeyboard {
                     cancelled: @escaping @Sendable () -> Bool = { Task<Never, Never>.isCancelled },
                     preparePasteboard: @escaping @Sendable (String) throws -> PasteboardLease = { _ in throw RemoteHTTPError(409,"붙여넣기 연결이 없습니다.") },
                     pasteReady: @escaping @Sendable (ScreenTarget,String,String) throws -> Bool = { _,_,_ in false },
-                    frontmost: @escaping @Sendable () -> Bool = { false },
-                    activate: @escaping @Sendable () throws -> Void = {},
-                    pause: @escaping @Sendable (TimeInterval) -> Void = { Thread.sleep(forTimeInterval:$0) },
-                    prepareLive: (@Sendable (String) throws -> TerminalWindowMetadata?)? = nil) {
+                    frontmost: @escaping @Sendable () -> Bool = { true }) {
             self.trusted = trusted; self.postingAllowed = postingAllowed; self.run = run; self.metadata = metadata
             self.ownerBundle = ownerBundle; self.focused = focused; self.processes = processes; self.postPair = postPair
             self.clock = clock; self.cancelled = cancelled
             self.preparePasteboard = preparePasteboard; self.pasteReady = pasteReady
-            self.frontmost = frontmost; self.activate = activate; self.pause = pause
-            self.prepareLive = prepareLive
+            self.frontmost = frontmost
         }
         public static var live: Self {
             var environment = Self(trusted: { TerminalKeyboard.isAvailable }, postingAllowed: { CGPreflightPostEventAccess() },
                 run: { script in try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
-                    try AutomationScript.run(script, app: "Terminal", denied: .permissionDenied, timeout: 3)
+                    try AutomationScript.run(script, app: "Terminal", denied: .permissionDenied, timeout: 3, readOnly: true)
                 } },
                 metadata: { tty in try RemoteTerminalPerformance.shared.measure(.inputWindowCheck) {
                     try TerminalAppleEvents.profileWindowMetadata(tty:tty)
@@ -74,13 +67,7 @@ public enum TerminalKeyboard {
                     guard let screen = latest.screens.first(where:{$0.tty == target.tty})?.contents,screen != before else { return false }
                     func compact(_ value:String)->String {String(value.precomposedStringWithCanonicalMapping.filter{!$0.isWhitespace})}
                     return compact(screen).contains(compact(text))
-                }, frontmost: { NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Terminal" },
-                activate: { try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
-                    let owner=try TerminalProcessLookup.running()
-                    try TerminalKeyboard.activateApplication(owner:owner)
-                } }, prepareLive: {tty in try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
-                    try TerminalAppleEvents.prepareLiveInput(tty:tty)
-                } })
+                }, frontmost: { NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.Terminal" })
             environment.usesHostIPC = true
             return environment
         }
@@ -102,38 +89,8 @@ public enum TerminalKeyboard {
                     try TerminalAppleEvents.profileWindowMetadata(tty:tty,owner:owner)
                 }
             }
-            value.activate = {
-                try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
-                    try TerminalKeyboard.activateApplication(owner:owner)
-                }
-            }
-            value.prepareLive = { tty in
-                try RemoteTerminalPerformance.shared.measure(.inputPreparation) {
-                    try TerminalAppleEvents.prepareLiveInput(tty:tty,owner:owner)
-                }
-            }
             return value
         }
-    }
-
-    public static func activateApplication(owner:TerminalProcessIdentity,
-        identity:(Int32)->TerminalProcessIdentity? = {TerminalProcessLookup.identity(pid:$0)},
-        setAttribute:(Int32,String,Bool)->AXError = {pid,name,value in
-            let app=AXUIElementCreateApplication(pid)
-            AXUIElementSetMessagingTimeout(app,0.3)
-            return AXUIElementSetAttributeValue(app,name as CFString,value ? kCFBooleanTrue:kCFBooleanFalse)
-        }) throws {
-        func checkOwner() throws {
-            guard identity(owner.pid)==owner else {throw RemoteHTTPError(409,"원래 Terminal 앱을 확인하지 못했습니다.")}
-        }
-        for (attribute,value) in [(kAXHiddenAttribute,false),(kAXFrontmostAttribute,true)] {
-            try checkOwner()
-            let result=setAttribute(owner.pid,attribute,value)
-            guard result == .success else {
-                throw RemoteHTTPError(409,"손쉬운 사용으로 Terminal 창을 활성화하지 못했습니다 (\(attribute): \(result.rawValue)). Mac 화면을 확인해주세요.")
-            }
-        }
-        try checkOwner()
     }
 
     private static func preparePasteboard(_ text: String) throws -> PasteboardLease {
@@ -201,12 +158,12 @@ public enum TerminalKeyboard {
     }
 
     public static func deliver(target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput,
-                               environment: Environment = .live, timeout: TimeInterval = 8, goalWorkingComparison: Bool = false, allowActivation: Bool = true) throws -> TerminalDelivery {
+                               environment: Environment = .live, timeout: TimeInterval = 8, goalWorkingComparison: Bool = false) throws -> TerminalDelivery {
         try input.validate()
         guard agent != .shell, timeout.isFinite, timeout > 0 else { throw RemoteHTTPError(400, "이 직접 입력 방식은 지원하지 않습니다.") }
         let write = {
             try deliverSequence(target:target, expected:expected, agent:agent, input:input, environment:environment,
-                                timeout:timeout, goalWorkingComparison:goalWorkingComparison, allowActivation:allowActivation)
+                                timeout:timeout, goalWorkingComparison:goalWorkingComparison)
         }
         if environment.usesHostIPC {
             return try AutomationIPC.shared.runInput(host:"Terminal",budget:min(timeout,8)+2,admissionWait:2,body:write)
@@ -215,8 +172,7 @@ public enum TerminalKeyboard {
     }
 
     private static func deliverSequence(target: ScreenTarget, expected: String, agent: AgentKind, input: RemoteTerminalInput,
-                                        environment: Environment, timeout: TimeInterval, goalWorkingComparison: Bool,
-                                        allowActivation: Bool) throws -> TerminalDelivery {
+                                        environment: Environment, timeout: TimeInterval, goalWorkingComparison: Bool) throws -> TerminalDelivery {
         let deadline = environment.clock() + min(timeout, 8)
         guard deliveryLock.lock(before: Date().addingTimeInterval(min(timeout, 8))) else {
             throw RemoteHTTPError(409, "다른 Terminal 입력이 끝나지 않아 입력하지 않았습니다. 화면을 확인해주세요.")
@@ -237,42 +193,19 @@ public enum TerminalKeyboard {
             try checkPermissionAndTime()
             let initialRecords = try environment.processes()
             guard let original = source(target, agent: agent, records: initialRecords) else { return .agentMissing }
-            let window: TerminalWindowMetadata
-            if input.isRelay, ![.message,.choice].contains(input.kind), (!allowActivation || environment.frontmost()),
-               let current = try environment.metadata(target.tty), current.tty == target.tty,
-               current.windowID > 0, current.ownerPID > 0, current.ownerBundleID == "com.apple.Terminal",
-               current.selected, !current.minimized, environment.focused(current) {
-                window = current
+            guard environment.frontmost(), let window = try environment.metadata(target.tty),
+                  window.tty == target.tty, window.windowID > 0, window.ownerPID > 0,
+                  window.ownerBundleID == "com.apple.Terminal", window.selected, !window.minimized,
+                  environment.focused(window) else { return .missingTarget }
+            if input.isRelay && ![.message, .choice].contains(input.kind) {
                 RemoteTerminalPerformance.shared.increment(.nativeInputPreparations)
             } else {
-                guard allowActivation else { return .missingTarget }
-                try environment.activate()
-                try checkPermissionAndTime()
-                let current:TerminalWindowMetadata
-                if input.isRelay, ![.message,.choice].contains(input.kind), let prepare=environment.prepareLive {
-                    guard let prepared=try prepare(target.tty),prepared.tty==target.tty,prepared.windowID>0,
-                          prepared.ownerPID>0,prepared.ownerBundleID=="com.apple.Terminal",prepared.selected,!prepared.minimized else {return .missingTarget}
-                    current=prepared
-                    RemoteTerminalPerformance.shared.increment(.nativeInputPreparations)
-                } else {
-                    let prepared = try environment.run(RemoteTerminalAdapter.script(host: .terminal, target: target, expected: expected, agent: agent, input: input, goalWorkingComparison: goalWorkingComparison))
-                    if let failure = TerminalDelivery(rawValue: prepared), failure != .sent { return failure }
-                    guard prepared.hasPrefix("ready:"), let windowID = UInt32(prepared.dropFirst(6)), windowID > 0,
-                          let metadata = try environment.metadata(target.tty), metadata.tty == target.tty, metadata.windowID == windowID,
-                          metadata.ownerPID > 0, metadata.ownerBundleID == "com.apple.Terminal", metadata.selected, !metadata.minimized else { return .missingTarget }
-                    current=metadata
-                    RemoteTerminalPerformance.shared.increment(.scriptedInputPreparations)
-                }
-                window=current
-                let focusDeadline=min(deadline,environment.clock()+0.5)
-                var ready=false
-                for attempt in 0..<26 {
-                    try checkPermissionAndTime()
-                    if environment.focused(current) {ready=true;break}
-                    guard attempt<25,environment.clock()<focusDeadline else {break}
-                    environment.pause(max(0,min(0.02,focusDeadline-environment.clock())))
-                }
-                guard ready else {throw RemoteHTTPError(409,"원래 Terminal 창으로 초점을 옮기지 못해 입력하지 않았습니다. Mac 화면을 확인해주세요.")}
+                let script = try RemoteTerminalAdapter.script(host: .terminal, target: target, expected: expected,
+                    agent: agent, input: input, goalWorkingComparison: goalWorkingComparison)
+                let prepared = try environment.run(script)
+                if let failure = TerminalDelivery(rawValue: prepared), failure != .sent { return failure }
+                guard prepared == "ready:\(window.windowID)", environment.focused(window) else { return .missingTarget }
+                RemoteTerminalPerformance.shared.increment(.scriptedInputPreparations)
             }
             let preparedRecords = try environment.processes()
             guard source(target, agent: agent, records: preparedRecords) == original,
@@ -322,6 +255,9 @@ public enum TerminalKeyboard {
                     throw RemoteHTTPError(409, "원래 CLI나 선택한 Terminal 창이 바뀌어 입력하지 않았습니다. 원래 터미널을 확인해주세요.")
                 }
                 try checkPermissionAndTime()
+                guard environment.frontmost(), environment.focused(currentWindow) else {
+                    throw RemoteHTTPError(409,"Terminal 초점이 바뀌어 입력을 중단했습니다.")
+                }
                 if packet.paste, pasteboard?.isCurrent() != true { throw RemoteHTTPError(409,"클립보드가 바뀌어 입력하지 않았습니다.") }
                 attemptedPairs += 1
                 try environment.postPair(owner.pid, down, up)
@@ -461,8 +397,7 @@ public enum RemoteTerminalAdapter {
         }
         if host == .terminal {
             let delivery = """
-              window.miniaturized = false; window.selectedTab = tab; window.index = 1; app.activate();
-              if (window.selectedTab().tty() !== target.tty) return 'missingTarget';
+              if (!app.frontmost() || window.miniaturized() || window.selectedTab().tty() !== target.tty) return 'missingTarget';
               if (!target.relay && normalize(tab.contents()) !== normalize(target.expected)) return 'screenChanged';
               const windowID = Number(window.id());
               if (!Number.isSafeInteger(windowID) || windowID <= 0 || windowID > 4294967295) return 'missingTarget';
