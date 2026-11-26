@@ -555,6 +555,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: a stalled message notifies its sender once",tests.testStalledGroupMessageNotifiesItsSenderOnce),
             ("Session groups: messages for a removed member are kept and reported",tests.testMessagesForRemovedMemberAreKeptAndReported),
             ("Session groups: Claude original reply without MCP",tests.testGroupClaudeReplyWithoutMCP),
+            ("Session subgroups: verified leadership and isolated dissolution",tests.testManagedSubgroupLifecycle),
             ("File protection: delete requests and original permission review",tests.testFileDeletionAndOriginalReview),
             ("Session groups: inbox migration and concurrent delivery claims",tests.testInboxMigrationAndConcurrentClaims),
             ("Session groups: leader unblocks a member inbox in delivery order",tests.testLeaderUnblocksMemberInbox),

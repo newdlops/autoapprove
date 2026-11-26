@@ -74,7 +74,12 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var name: String
     public var members: [SessionGroupMember]
-    public var parentGroupIDs: [UUID] = []
+    public var parentGroupIDs: [UUID] = [] {
+        didSet {
+            if let subgroupParentID, !parentGroupIDs.contains(subgroupParentID) { self.subgroupParentID = nil }
+        }
+    }
+    public internal(set) var subgroupParentID: UUID?
     public private(set) var leaderMemberIDs: [UUID]
     public var leaderMemberID: UUID? {
         get { leaderMemberIDs.first }
@@ -86,7 +91,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
         self.leaderMemberIDs = leaderMemberID.map { [$0] } ?? []
     }
 
-    private enum CodingKeys: String, CodingKey { case id, name, members, leaderMemberID, leaderMemberIDs, parentGroupIDs }
+    private enum CodingKeys: String, CodingKey { case id, name, members, leaderMemberID, leaderMemberIDs, parentGroupIDs, subgroupParentID }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -94,6 +99,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
         name = try values.decode(String.self, forKey: .name)
         members = try values.decode([SessionGroupMember].self, forKey: .members)
         parentGroupIDs = try values.decodeIfPresent([UUID].self, forKey: .parentGroupIDs) ?? []
+        subgroupParentID = try values.decodeIfPresent(UUID.self, forKey: .subgroupParentID)
         let legacy = try values.decodeIfPresent(UUID.self, forKey: .leaderMemberID)
         leaderMemberIDs = try values.decodeIfPresent([UUID].self, forKey: .leaderMemberIDs) ?? legacy.map { [$0] } ?? []
         if let legacy, leaderMemberIDs.first != legacy {
@@ -109,6 +115,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
         try values.encodeIfPresent(leaderMemberID, forKey: .leaderMemberID)
         try values.encode(leaderMemberIDs, forKey: .leaderMemberIDs)
         if !parentGroupIDs.isEmpty { try values.encode(parentGroupIDs, forKey: .parentGroupIDs) }
+        try values.encodeIfPresent(subgroupParentID, forKey: .subgroupParentID)
     }
 
     /// Learning an OS shell receipt changes neither group membership nor its permissions.
@@ -329,7 +336,7 @@ public struct SessionGroup: Codable, Equatable, Identifiable, Sendable {
             result.members[index] = member
         }
         let memberIDs = Set(members.map(\.id))
-        guard !parentGroupIDs.contains(id), Set(parentGroupIDs).count == parentGroupIDs.count,
+        guard subgroupParentID.map(parentGroupIDs.contains) ?? true, !parentGroupIDs.contains(id), Set(parentGroupIDs).count == parentGroupIDs.count,
               members.allSatisfy({ member in
                   guard let parents = member.assignedParentIDs else { return true }
                   return !parents.contains(member.id) && Set(parents).count == parents.count && memberIDs.isSuperset(of: parents)

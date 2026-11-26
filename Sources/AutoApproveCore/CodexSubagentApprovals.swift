@@ -88,13 +88,13 @@ struct CodexServerApproval {
                   let changes = fileItem["changes"] as? [JSONObject], !changes.isEmpty,
                   changes.allSatisfy({ ($0["path"] as? String)?.hasPrefix("/") == true }),
                   let data = try? JSONSerialization.data(withJSONObject: fileItem, options: [.sortedKeys]) else { return nil }
-            let deleted = changes.contains { change in
-                (change["kind"] as? String ?? (change["kind"] as? JSONObject)?["type"] as? String) == "delete"
-            }
-            risk = deleted ? FileDeletionCommand.risk : changes.compactMap { change -> SystemCommandRisk? in
+            let risks = changes.compactMap { change -> SystemCommandRisk? in
                 guard let path = change["path"] as? String else { return nil }
+                let kind = change["kind"] as? String ?? (change["kind"] as? JSONObject)?["type"] as? String
+                if kind == "delete" { return FileDeletionCommand.pathRisk(path, cwd: cwd) }
                 return SystemCommandRisk.detect(tool: "Edit", input: ["file_path": path], cwd: cwd)
-            }.first
+            }
+            risk = risks.first(where: \.blocksAutomatically) ?? risks.first
             text = String(decoding: data, as: UTF8.self)
         case "mcpServer/elicitation/request":
             // Computer Use permission is an empty form with an explicit Allow

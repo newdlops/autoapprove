@@ -42,7 +42,7 @@ private final class FixtureInput: @unchecked Sendable {
         let root = URL(fileURLWithPath: CommandLine.arguments[1]), paths = AppPaths(directory: root.appendingPathComponent("profile"))
         let records = ProcessDiscovery.parse("1 0 ?? 1 0 Tue Oct 13 09:00:00 2026 /sbin/launchd\n20 1 ?? 20 0 Tue Oct 13 09:00:00 2026 /fixture/iTerm2/iTermServer\n40 20 ttys980 40 41 Tue Oct 13 09:00:00 2026 /bin/zsh\n41 40 ttys980 41 41 Tue Oct 13 09:00:00 2026 codex\n50 20 ttys981 50 51 Tue Oct 13 09:00:00 2026 /bin/zsh\n51 50 ttys981 51 51 Tue Oct 13 09:00:00 2026 claude")
         let codex = records.first { $0.pid == 41 }!, claude = records.first { $0.pid == 51 }!, input = FixtureInput(root)
-        let request = "Would you like to run the following command?\n\nReason: 합성 시험 · 파일 삭제 요청의 긴 설명과 한글/emoji 🧪 줄바꿈 검사\n\n$ rm artifacts/" + String(repeating: "긴-경로/", count: 20) + "report.plist\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel"
+        let request = "Would you like to run the following command?\n\nReason: 합성 시험 · 파일 삭제 요청의 긴 설명과 한글/emoji 🧪 줄바꿈 검사\n\n$ rm /System/Library/" + String(repeating: "긴-경로/", count: 20) + "report.plist\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel"
         try request.write(to: root.appendingPathComponent("codex-screen"), atomically: true, encoding: .utf8)
         let adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: try targets.map {
             TerminalScreen(tty: $0.tty, contents: $0.tty == "/dev/ttys980" ? try String(contentsOf: root.appendingPathComponent("codex-screen"), encoding: .utf8) : "합성 Claude 대화\n❯ \n? for shortcuts")
@@ -58,7 +58,7 @@ private final class FixtureInput: @unchecked Sendable {
         try engine.start(poll: false); try engine.setWebEnabled(true, port: 0, bonjourEnabled: false, discoveryAddresses: { [] })
         let now = Date(), hook: JSONObject = ["autoapproveProtocol": 1, "requestID": UUID().uuidString, "autoapproveExpiresAt": now.addingTimeInterval(600).timeIntervalSince1970,
             "hook_event_name": "PermissionRequest", "session_id": "fixture-claude", "agentPID": claude.pid, "agentStarted": claude.started, "tty": "/dev/ttys981", "cwd": "/fixture",
-            "tool_name": "Bash", "tool_use_id": UUID().uuidString, "tool_input": ["command": "rm fixture-report.plist"]]
+            "tool_name": "Bash", "tool_use_id": UUID().uuidString, "tool_input": ["command": "rm /System/Library/fixture-report.plist"]]
         let pausedEnvelope = try engine.handleClaudeHook(hook)["autoapproveBridge"] as? JSONObject
         guard let pausedResponse = pausedEnvelope?["response"] as? JSONObject, pausedResponse.isEmpty else {
             throw AppError.message("일시 중단 중인 요청이 원본 터미널에 반환되지 않았습니다.")

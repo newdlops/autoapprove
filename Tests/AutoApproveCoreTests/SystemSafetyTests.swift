@@ -11,7 +11,7 @@ private let safetyRecords = ProcessDiscovery.parse("""
 """)
 private let safetyCodex = safetyRecords.first { $0.pid == 41 }!
 private let safetyClaude = safetyRecords.first { $0.pid == 51 }!
-private func safetyPrompt(_ command: String = "rm fixture-report.txt") -> String {
+private func safetyPrompt(_ command: String = "rm /System/Library/fixture-report.txt") -> String {
     "Would you like to run the following command?\n\nReason: fixture command review\n\n$ " + command + "\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel"
 }
 private func safetyReady(_ agent: AgentKind = .codex, body: String = "") -> String {
@@ -65,7 +65,7 @@ private final class SafetyProbe: @unchecked Sendable {
     session.channel = .itermScreen; engine.updateDiscovery([session], records: probe.processes())
     return engine
 }
-private func safetyHook(_ date: Date, event: String = "PermissionRequest", command: String = "rm fixture-report.txt") -> JSONObject {
+private func safetyHook(_ date: Date, event: String = "PermissionRequest", command: String = "rm /System/Library/fixture-report.txt") -> JSONObject {
     ["autoapproveProtocol": 1, "requestID": UUID().uuidString, "autoapproveExpiresAt": date.addingTimeInterval(600).timeIntervalSince1970,
      "hook_event_name": event, "session_id": "fixture-claude", "agentPID": NSNumber(value: safetyClaude.pid), "agentStarted": safetyClaude.started,
      "cwd": "/fixture", "tty": "/dev/ttys981", "tool_name": "Bash", "tool_use_id": UUID().uuidString, "tool_input": ["command": command]]
@@ -168,7 +168,7 @@ extension ApprovalTests {
     }
 
     func testSystemSafetyComposerOwnershipAndSubmission() throws {
-        let risk = SystemCommandRisk.detect("rm fixture-file")!, text = risk.guidance
+        let risk = SystemCommandRisk.detect("rm /System/Library/fixture-file")!, text = risk.guidance
         for agent in [AgentKind.codex, .claude] {
             let before = safetyReady(agent), composer = SystemSafetyComposer.capture(before, agent: agent, text: text)!
             let draft = safetyReady(agent, body: text)
@@ -307,7 +307,7 @@ extension ApprovalTests {
         defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try safetyHookEngine(paths, probe: SafetyProbe()), now = Date(); defer { engine.stop() }
         try engine.setAutomatic(safetyClaude.key, enabled: true)
-        let first = safetyHook(now), second = safetyHook(now, command: "unlink second-fixture")
+        let first = safetyHook(now), second = safetyHook(now, command: "unlink /Library/second-fixture")
         _ = try engine.handleClaudeHook(first, at: now); _ = try engine.handleClaudeHook(second, at: now)
         try expectEqual(engine.snapshot.sessions.first { $0.id == safetyClaude.key }?.systemSafety?.risk.kind, .fileDeletion)
         try engine.acknowledgeClaudeHook(first, at: now)
@@ -320,28 +320,51 @@ extension ApprovalTests {
 
 extension ApprovalTests {
     @MainActor func testFileDeletionAndOriginalReview() async throws {
-        for command in ["rm file", "/bin/rm -rf 'old directory'", "cd project && rm old", "sudo -u worker rm old",
-                        "git -C project rm old", "find . -name '*.old' -delete", "find . -name old -exec rm {} \\;",
-                        "sh -c 'unlink old'", "python3 -c 'import os; os.remove(path)'", "git clean -fd"] {
-            try expectEqual(SystemCommandRisk.detect(command)?.kind, .fileDeletion, command)
+        let cwd = "/Users/fixture/project"
+        for command in ["rm /System/Library/fixture", "rm -rf /Volumes/TestDisk", "cd /etc && unlink fixture",
+                        "find /Library -name '*.old' -delete", "git -C /System rm fixture", "rm /Volumes/External/System/fixture",
+                        "python3 -c 'import os; os.unlink(\"/etc/fixture\"); print(1)'",
+                        "diskutil eraseVolume APFS Fixture /dev/disk999", "dd if=/dev/zero of=/dev/rdisk999"] {
+            try expectEqual(SystemCommandRisk.detect(command, cwd: cwd)?.kind, .fileDeletion, command)
         }
-        for command in ["echo 'rm old'", "ls old", "git rm --cached file", "git clean -nfd", "chmod +x build.sh"] {
-            try expectNil(SystemCommandRisk.detect(command), command)
+        for command in ["rm file", "/bin/rm -rf 'old directory'", "cd project && rm old", "git -C project rm old",
+                        "find . -name '*.old' -delete", "find . -name old -exec rm {} \\;", "sh -c 'unlink old'",
+                        "rm build/*.log", "rm *.tmp", "git clean -fd", "echo 'rm old'", "ls old", "git rm --cached file",
+                        "rm /tmp/old.txt", "rm /tmp/*.log", "rm /Volumes/TestDisk/project/old.txt", "git clean -nfd", "chmod +x build.sh"] {
+            try expectNil(SystemCommandRisk.detect(command, cwd: cwd), command)
         }
-        try expectNil(SystemCommandRisk.detect(tool: "Bash", input: ["command": "git status"], summary: "security authorizationdb and rm old"))
+        for command in ["rm \"$TARGET\"", "cd project ; rm relative", "xargs rm optional-file"] {
+            try expectEqual(SystemCommandRisk.detect(command, cwd: cwd)?.kind, .settings, command)
+        }
+        try expectEqual(SystemCommandRisk.detect(tool: "apply_patch", input: ["patch": "*** Delete File: filename", "workdir": "/etc"], cwd: cwd)?.kind, .fileDeletion)
+        try expectNil(SystemCommandRisk.detect(tool: "apply_patch", input: ["patch": "diff --git a/image b/image\ndeleted file mode 100644\nBinary files differ"], cwd: cwd))
+        try expectNil(SystemCommandRisk.detect(tool: "Bash", input: ["command":"git status"], summary:"rm /System/fixture"))
         try expectNil(SystemCommandRisk.detect(tool: "Edit", input: ["file_path": "/fixture/file", "new_string": "rm old"]))
-        try expectEqual(SystemCommandRisk.detect(tool: "mcp__local__exec_command", input: ["cmd":"unlink old"])?.kind, .fileDeletion)
+        try expectNil(SystemCommandRisk.detect(tool: "mcp__local__exec_command", input: ["cmd":"unlink old", "workdir":cwd]))
         try expectNil(SystemCommandRisk.detect(tool: "manage_group_inbox", input: ["action":"delete","messageID":"fixture"]))
         try expectNil(SystemCommandRisk.detect(tool: "mcp__mailbox__delete", input: ["messageID": "fixture"]))
         try expectNil(SystemCommandRisk.detect(tool: "send_group_message", input: ["text": "fixture"], summary: "rm old"))
-        try expectEqual(SystemCommandRisk.detect(tool: "Delete", input: ["file_path": "/fixture/old"])?.kind, .fileDeletion)
-        try expectEqual(SystemCommandRisk.detect(tool: "apply_patch", input: ["patch": "*** Begin Patch\n*** Delete File: old\n*** End Patch"])?.kind, .fileDeletion)
-        try expectEqual(SystemCommandRisk.detect(tool: "mcp__filesystem__delete_file", input: ["path": "/fixture/file"])?.kind, .fileDeletion)
+        try expectNil(SystemCommandRisk.detect(tool: "Delete", input: ["file_path": "/fixture/old"]))
+        try expectNil(SystemCommandRisk.detect(tool: "apply_patch", input: ["patch": "*** Begin Patch\n*** Delete File: old\n*** End Patch"], cwd: cwd))
+        try expectEqual(SystemCommandRisk.detect(tool: "mcp__filesystem__delete_file", input: ["path": "/System/fixture"])?.kind, .fileDeletion)
+        try expectEqual(SystemCommandRisk.detect(tool: "apply_patch", input: ["patch": "*** Begin Patch\n*** Delete File: /etc/fixture\n*** End Patch"], cwd: cwd)?.kind, .fileDeletion)
         let paths = AppPaths(directory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
         defer { try? FileManager.default.removeItem(at: paths.directory) }
+        try FileManager.default.createDirectory(at: paths.directory, withIntermediateDirectories: true)
+        let link = paths.directory.appendingPathComponent("system-link")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "/System")
+        try expectNil(SystemCommandRisk.detect("unlink system-link", cwd: paths.directory.path))
+        try expectEqual(SystemCommandRisk.detect("rm system-link/Library/fixture", cwd: paths.directory.path)?.kind, .fileDeletion)
         let engine = try safetyHookEngine(paths, probe: SafetyProbe())
         defer { engine.stop() }
         try engine.setAutomatic(safetyClaude.key, enabled: true)
+        let start = Date()
+        let ordinary = safetyHook(start, command: "rm relative-fixture")
+        _ = try engine.handleClaudeHook(ordinary, at: start)
+        let bridge = try engine.handleClaudeHook(ordinary, at: start.addingTimeInterval(5))["autoapproveBridge"] as? JSONObject
+        let response = bridge?["response"] as? JSONObject
+        let hook = response?["hookSpecificOutput"] as? JSONObject
+        try expectEqual((hook?["decision"] as? JSONObject)?["behavior"] as? String, "allow")
         for command in ["chmod 777 /etc/fixture", "defaults write local.fixture setting 1", "sudo id"] {
             let now = Date()
             for event in ["PreToolUse", "PermissionRequest"] {

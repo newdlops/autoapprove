@@ -518,6 +518,14 @@ public final class SessionGroupMailbox {
                    [String(reason.prefix(500)), id.uuidString])
     }
 
+    func retireSubgroup(_ id: UUID) throws {
+        let reason = "서브그룹이 해산되었습니다."
+        try transaction {
+            try update("UPDATE group_waits SET state='cancelled',detail=? WHERE group_id=? AND state IN ('waiting','expired')", [reason, id.uuidString])
+            try update("UPDATE messages SET last_result='superseded',last_error=? WHERE group_id=? AND (" + Self.pendingFilter + " OR (" + Self.outstandingQuestionFilter + "))", [reason, id.uuidString])
+        }
+    }
+
     func submittedAt(_ id: UUID) throws -> Date? {
         let query = try statement("SELECT submitted FROM group_submissions WHERE message_id=?", [id.uuidString])
         defer { sqlite3_finalize(query) }

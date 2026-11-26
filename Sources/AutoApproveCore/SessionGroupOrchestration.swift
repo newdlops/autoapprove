@@ -167,6 +167,13 @@ public struct SessionGroupOrchestration: Codable, Equatable {
         }
     }
 
+    mutating func retireSubgroup(_ id: UUID) {
+        queue?.removeAll { $0.assignment.groupID == id }
+        for index in assignments.indices where assignments[index].groupID == id && [.working, .completed].contains(assignments[index].status) {
+            assignments[index].status = .superseded
+        }
+    }
+
     mutating func recordUncertainAssignment(_ id: UUID) {
         guard let index = assignments.firstIndex(where: { $0.id == id }) else { return }
         assignments[index].deliveryError = "unknown"

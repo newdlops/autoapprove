@@ -9,7 +9,7 @@ public enum MCPToolProfile: String {
         case .all: return true
         case .orchestrator: return name.contains("_group") || ["ask_user", "get_user_answers", "get_diagnostics"].contains(name)
         case .worker:
-            return name.hasPrefix("desktop_") || ["get_session_groups", "get_group_status", "reconnect_group_member",
+            return name.hasPrefix("desktop_") || ["get_session_groups", "get_group_status", "get_group_topology", "manage_group_subgroup", "reconnect_group_member",
                 "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "ack_group_messages",
                 "wait_group_dependencies", "update_group_wait", "complete_group_task", "set_group_member_title"].contains(name)
         case .desktop: return name.hasPrefix("desktop_") || name == "get_diagnostics"
@@ -49,6 +49,9 @@ public enum AutoApproveMCPServer {
             tool("ask_user", "휴대폰 웹에 선택지·직접 답변 폼을 게시합니다. 기본값을 답변으로 처리하지 않습니다. 반환된 requestID로 get_user_answers에서 사용자가 보낸 답변을 확인하세요.",
                  ["title": string, "questions": ["type": "array", "items": field, "minItems": 1, "maxItems": 8]], ["questions"]),
             tool("get_user_answers", "이 MCP 연결에서 게시한 질문의 응답을 확인합니다. waiting이면 아직 답변이 없습니다. answered의 answers만 실제 사용자 응답입니다.", ["requestID": string], ["requestID"], readOnly: true),
+            tool("manage_group_subgroup", "그룹장 본인이 groupID를 기준으로 서브그룹을 관리합니다. create에는 name과 하위 구성원의 memberIDs, 선택 사항인 leaderMemberID를 지정하세요. appoint와 dismiss는 subgroupID와 leaderMemberID로 공동 그룹장을 추가·해임합니다. dissolve는 subgroupID를 해산하고 직속 서브그룹을 한 단계 위로 연결합니다. 관리 가능한 ID는 get_group_topology의 canManageSubgroup에서 확인하세요.",
+                 ["groupID": string, "action": ["type":"string","enum":["create","appoint","dismiss","dissolve"]], "subgroupID":string, "name":["type":"string","minLength":1,"maxLength":80],
+                  "memberIDs":["type":"array","items":string,"minItems":1,"maxItems":128,"uniqueItems":true], "leaderMemberID":string,"conversationID":string], ["groupID","action"], destructive:true),
             tool("get_session_groups", "현재 그룹·역할·연결·모델 기록을 조회합니다. Codex는 conversationID를 생략하세요. 서브에이전트는 원래 구성원의 그룹과 역할을 조회합니다. 연결이 끊기고 canReconnect=true이면 reconnect_group_member로 복구하세요.", ["conversationID": string], readOnly: true),
             tool("reconnect_group_member", "canReconnect=true인 자신·직속 구성원(그룹장 없으면 같은 그룹)의 현재 대화를 재확인합니다. 초안·승인창이 있으면 보류합니다. 성공 후 connected와 conversationID를 확인하세요.",
                  ["groupID": string, "memberID": string, "conversationID": string], ["groupID", "memberID"]),
@@ -218,7 +221,7 @@ public enum AutoApproveMCPServer {
             let handle = {
             if let value = response(message, profile: profile, call: { tool, arguments in
                 var params = arguments; params["tool"] = tool; params["owner"] = owner
-                let groupTool = ["wait_group_dependencies", "update_group_wait", "complete_group_task", "get_session_groups", "get_group_status", "get_group_topology", "set_group_relationship", "assign_group_task", "assign_group_tasks", "list_group_background_jobs","stop_group_background_job","watch_group_events","explain_group_delivery","get_group_member_goal","manage_group_member_goal","manage_group_task","retry_group_submission","replace_group_task","clear_group_composer","interrupt_group_task", "manage_group_inbox", "cancel_group_messages", "set_group_message_priority", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "get_group_member_terminal", "ack_group_messages", "clear_session_group", "clear_group_member", "set_group_member_title", "set_group_member_tab_color", "get_group_clear_status"].contains(tool)
+                let groupTool = ["wait_group_dependencies", "update_group_wait", "complete_group_task", "get_session_groups", "get_group_status", "get_group_topology", "set_group_relationship", "manage_group_subgroup", "assign_group_task", "assign_group_tasks", "list_group_background_jobs","stop_group_background_job","watch_group_events","explain_group_delivery","get_group_member_goal","manage_group_member_goal","manage_group_task","retry_group_submission","replace_group_task","clear_group_composer","interrupt_group_task", "manage_group_inbox", "cancel_group_messages", "set_group_message_priority", "answer_group_question", "reconnect_group_member", "send_group_message", "ask_group_question", "reply_group_question", "get_group_messages", "get_group_member_terminal", "ack_group_messages", "clear_session_group", "clear_group_member", "set_group_member_title", "set_group_member_tab_color", "get_group_clear_status"].contains(tool)
                 params.removeValue(forKey: "codexCallerRuntimeID")
                 if groupTool {
                     params.removeValue(forKey: "sessionID"); params.removeValue(forKey: "agentKind")

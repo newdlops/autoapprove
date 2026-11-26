@@ -109,7 +109,7 @@ extension ApprovalTests {
         try await denied("send_group_message", workerChild, outgoing.merging(["groupID": UUID().uuidString]) { _, new in new })
         try await denied("get_group_member_terminal", workerChild, target)
         try await denied("get_group_member_terminal", child, ["groupID": other.id.uuidString, "memberID": member.id.uuidString])
-        for tool in ["clear_group_member", "answer_group_question", "set_group_relationship"] { try await denied(tool, child, target) }
+        for tool in ["clear_group_member", "answer_group_question", "set_group_relationship", "manage_group_subgroup"] { try await denied(tool, child, target) }
         try await denied("get_session_groups", nested, ["codexCallerParentID": root])
         try await denied("get_session_groups", child, ["codexCallerSessionID": worker])
         try await denied("get_session_groups", child, ["conversationID": root], status: 409)

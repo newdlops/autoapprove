@@ -934,6 +934,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     public func start(poll: Bool = true, webByDefault: Bool = false) throws {
         remoteInputStopped = false
+        try finishSubgroupDissolution()
         if poll { groupClearDiscoveryReady = false; startBackgroundJobMonitor() }
         if var state = try? groupOrchestration(), state.removeUndelivered() > 0 { try? saveGroupOrchestration(state) }
         if let state = try? groupOrchestration(), state.needsWatching { scheduleGroupDelivery() }
@@ -6559,6 +6560,77 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return settings
     }
 
+    private func finishSubgroupDissolution() throws {
+        let key = "pendingSubgroupDissolution"
+        guard let raw = store.value(key), let id = UUID(uuidString: raw) else { return }
+        if try !SessionGroupStore(directory: paths.directory).load().contains(where: { $0.id == id }) {
+            try groupMailbox().retireSubgroup(id)
+            let previous = try groupOrchestration()
+            var state = previous
+            state.retireSubgroup(id)
+            if state != previous { try saveGroupOrchestration(state) }
+            else { refreshGroupWaits() }
+        }
+        try store.set(key, "")
+    }
+
+    private func manageSubgroup(_ object: JSONObject, source: SessionGroup, actor: UUID,
+                                groups: [SessionGroup], observed: [SessionGroupLiveSession]) throws -> JSONObject {
+        try finishSubgroupDissolution()
+        let groupStore = SessionGroupStore(directory: paths.directory)
+        let appointed = try GroupWaitRequest.uuid(object, "leaderMemberID")
+        let target = try GroupWaitRequest.uuid(object, "subgroupID")
+        let action = object["action"] as? String
+        var next = groups
+        var result: SessionGroup
+        if action == "create" {
+            guard target == nil, let name = object["name"] as? String,
+                  let strings = object["memberIDs"] as? [String] else { throw RemoteHTTPError(400, "name과 memberIDs를 지정해주세요.") }
+            let ids = strings.compactMap(UUID.init(uuidString:))
+            guard ids.count == strings.count else { throw RemoteHTTPError(400, "memberIDs에는 UUID를 지정해주세요.") }
+            result = try source.formingSubgroup(name: name, memberIDs: ids, leader: actor, appointed: appointed)
+            let existing = groups.filter { $0.subgroupParentID == source.id && $0.name == result.name }
+            if let saved = existing.first {
+                guard existing.count == 1, Set(saved.members.map(\.id)) == Set(ids), saved.leaderMemberIDs == result.leaderMemberIDs else {
+                    throw RemoteHTTPError(409, "같은 이름의 서브그룹이 있습니다. get_group_topology에서 확인해주세요.")
+                }
+                result = saved
+            } else { next.append(result) }
+        } else {
+            guard let target, let action, ["appoint", "dismiss", "dissolve"].contains(action),
+                  object["name"] == nil, object["memberIDs"] == nil else { throw RemoteHTTPError(400, "서브그룹 ID와 유효한 action을 지정해주세요.") }
+            guard let index = next.firstIndex(where: { $0.id == target }) else {
+                if action == "dissolve", appointed == nil { return ["changed": false, "subgroupID": target.uuidString, "dissolved": true] }
+                throw RemoteHTTPError(404, "서브그룹을 찾을 수 없습니다.")
+            }
+            guard source.managedSubgroups(for: actor, in: groups).contains(target) else { throw RemoteHTTPError(403, "담당하는 서브그룹을 선택해주세요.") }
+            result = next[index]
+            let changingSessions = result.members.compactMap { SessionGroupMatching.connection($0, in: observed)?.id }
+            guard groupWorkerActions.isDisjoint(with: changingSessions),
+                  !groupClearActive(target), try !activeGroupMailboxMessages.contains(where: { try groupMailbox().message($0)?.groupID == target }) else {
+                throw RemoteHTTPError(409, "서브그룹에서 전송 또는 초기화 중입니다. 완료 후 다시 시도해주세요.")
+            }
+            if action == "dissolve" {
+                guard appointed == nil else { throw RemoteHTTPError(400, "dissolve에는 leaderMemberID를 생략해주세요.") }
+                next = try SessionGroup.dissolvingSubgroup(result, in: groups)
+            } else {
+                guard let appointed, result.members.contains(where: { $0.id == appointed }) else {
+                    throw RemoteHTTPError(400, "서브그룹에 속한 leaderMemberID를 지정해주세요.")
+                }
+                result = action == "appoint" ? result.addingLeader(appointed) : result.removingLeader(appointed)
+                next[index] = result
+            }
+        }
+        if next != groups {
+            if action == "dissolve" { try store.set("pendingSubgroupDissolution", result.id.uuidString) }
+            try groupStore.save(next, expected: groups)
+            if action == "dissolve" { try finishSubgroupDissolution() }
+            refreshSessionGroupBadges()
+        }
+        return ["changed": next != groups, "subgroupID": result.id.uuidString, "name": result.name,
+                "dissolved": action == "dissolve", "leaderMemberIDs": action == "dissolve" ? [] : result.leaderMemberIDs.map(\.uuidString)]
+    }
+
     public func mcpAction(_ object: JSONObject) async throws -> JSONObject {
         try await performGroupMCPAction(object, queuedID:nil)
     }
@@ -6585,7 +6657,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         func urls(_ fragment: String) -> [String] { webStatus.directURLs.map { $0 + "/#" + fragment } }
         switch tool {
-        case "get_group_topology", "set_group_relationship":
+        case "get_group_topology", "set_group_relationship", "manage_group_subgroup":
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try await sessionGroupCaller(object, observed: observed)
             let store = SessionGroupStore(directory: paths.directory), groups = try store.load()
@@ -6593,8 +6665,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   let source = groups.first(where: { $0.id == sourceID }),
                   let actor = source.members.first(where: { groupMemberIsCaller($0, in: source, caller: caller, observed: observed) }),
                   source.isLeader(actor.id) else { throw RemoteHTTPError(403, "현재 세션이 그룹장인 그룹을 지정해주세요.") }
+            if tool == "manage_group_subgroup" {
+                guard !groupClearActive(sourceID) else { throw RemoteHTTPError(409, "그룹 초기화 중입니다.") }
+                return try manageSubgroup(object, source: source, actor: actor.id, groups: groups, observed: observed)
+            }
+            let managed = source.managedSubgroups(for: actor.id, in: groups)
             let whole = source.hasGroupAuthority(actor.id)
-            let scope = whole ? SessionGroup.downstream(of: sourceID, in: groups) : [sourceID]
+            let scope = whole ? SessionGroup.downstream(of: sourceID, in: groups) : (tool == "get_group_topology" ? managed.union([sourceID]) : [sourceID])
             let target = try GroupWaitRequest.uuid(object, "targetGroupID")
             if let target, !scope.contains(target) { throw RemoteHTTPError(403, "관리 가능한 산하 그룹을 선택해주세요.") }
             func inBranch(_ member: UUID, group: SessionGroup) -> Bool {
@@ -6607,9 +6684,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let members: [JSONObject] = group.members.map { member in
                         ["id":member.id.uuidString, "name":member.nickname ?? member.title, "isLeader":group.isLeader(member.id),
                          "parentMemberIDs":group.parentIDs(of:member.id).map(\.uuidString),
-                         "canEdit":inBranch(member.id, group: group) && (member.id != actor.id || whole || group.id != sourceID)]
+                         "canEdit":(whole || group.id == sourceID) && inBranch(member.id, group: group) && (member.id != actor.id || whole || group.id != sourceID)]
                     }
-                    return ["id":group.id.uuidString, "name":group.name, "parentGroupIDs":group.parentGroupIDs.map(\.uuidString), "members":members]
+                    return ["id":group.id.uuidString, "name":group.name, "canManageSubgroup":managed.contains(group.id),
+                            "subgroupParentID":group.subgroupParentID?.uuidString as Any? ?? NSNull(), "parentGroupIDs":group.parentGroupIDs.map(\.uuidString), "members":members]
                 }
                 return ["groups":result, "canEditGroupLinks":whole]
             }
@@ -6630,6 +6708,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             } else if let parentGroup, member == nil, parent == nil {
                 guard whole else { throw RemoteHTTPError(403, "그룹 간 연결을 변경할 권한이 없습니다.") }
                 guard groups.contains(where: { $0.id == parentGroup }) else { throw RemoteHTTPError(404, "상위 그룹을 찾을 수 없습니다.") }
+                if !connect, groups[index].subgroupParentID == parentGroup {
+                    throw RemoteHTTPError(409, "결성한 상위 그룹과의 관계는 manage_group_subgroup의 dissolve로 해제해주세요.")
+                }
                 next[index] = try groups[index].linkingGroupParent(parentGroup, connected:connect)
             } else { throw RemoteHTTPError(400, "구성원 연결 또는 그룹 연결 중 하나를 지정해주세요.") }
             if next != groups { try store.save(next, expected:groups); refreshSessionGroupBadges() }
@@ -6858,7 +6939,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "parentMemberID": group.parentID(of: member.id)?.uuidString as Any? ?? NSNull()]
                 }
                 return ["id": group.id.uuidString, "name": group.name, "members": members,
-                        "leaderMemberIDs": group.leaderMemberIDs.map(\.uuidString),
+                        "subgroupParentID": group.subgroupParentID?.uuidString as Any? ?? NSNull(), "leaderMemberIDs": group.leaderMemberIDs.map(\.uuidString),
                         "leaderMemberID": group.leaderMemberID?.uuidString as Any? ?? NSNull()]
             }
             if output.isEmpty, caller.session.agent == .claude {
@@ -15240,15 +15321,28 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private static func isCodexFileEdit(_ prompt:ApprovalPrompt,agent:AgentKind)->Bool {
-        agent == .codex && prompt.summary.filter{!$0.isWhitespace}.hasPrefix("Wouldyouliketomakethefollowingedits?")
+        agent == .codex && prompt.dialog.prefix(256).filter { !$0.isWhitespace }.hasPrefix("Wouldyouliketomakethefollowingedits?")
     }
     private static func screenApprovalRisk(_ prompt:ApprovalPrompt,agent:AgentKind,cwd:String)->SystemCommandRisk? {
         if isCodexFileEdit(prompt, agent: agent) {
-            if FileDeletionCommand.deletesInPatch(prompt.dialog) ||
-                prompt.dialog.range(of: #"(?im)^\s*(?:description:\s*(?:delete|remove)\s+(?:a\s+|the\s+)?(?:file|director)|(?:deleted|delete file:)\s+\S)"#, options: .regularExpression) != nil {
-                return FileDeletionCommand.risk
+            let rows = prompt.dialog.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+            var risks = [FileDeletionCommand.patchRisk(rows.joined(separator: "\n"), cwd: cwd)].compactMap { $0 }
+            let description = rows.contains { $0.range(of: #"(?i)^description:\s*(?:delete|remove)\b"#, options: .regularExpression) != nil }
+            var paths = rows.compactMap { row -> String? in
+                for header in ["Deleted ", "Delete File: "] where row.hasPrefix(header) { return String(row.dropFirst(header.count)) }
+                return nil
             }
+            if description {
+                let destinations = rows.filter { $0.hasPrefix("Destination: ") }.map { String($0.dropFirst(13)) }
+                if destinations.isEmpty { risks.append(FileDeletionCommand.review) }
+                paths += destinations
+            }
+            risks += paths.compactMap { FileDeletionCommand.pathRisk($0, cwd: cwd) }
+            if let risk = risks.first(where: \.blocksAutomatically) ?? risks.first { return risk }
             return SystemCommandRisk.detect("write_text " + prompt.summary, cwd: cwd)
+        }
+        if agent == .codex, let option = prompt.dialog.range(of: #"(?m)^\s*[›❯»>]\s*1\.\s+"#, options: .regularExpression) {
+            return SystemCommandRisk.detect(String(prompt.dialog[..<option.lowerBound]), cwd: cwd)
         }
         return SystemCommandRisk.detect(prompt.summary, cwd: cwd)
     }

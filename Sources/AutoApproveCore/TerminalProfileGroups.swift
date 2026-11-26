@@ -126,6 +126,7 @@ public enum TerminalProfileGroupRestore {
             for leader in original.leaderMemberIDs { group = group.addingLeader(ids[leader] ?? leader) }
             group.members = members
             group.parentGroupIDs = original.parentGroupIDs
+            group.subgroupParentID = original.subgroupParentID
             return TerminalProfileGroup(group: try group.validated(), links: snapshot.links.map {
                 .init(entryID: $0.entryID, memberID: ids[$0.memberID] ?? $0.memberID)
             })

@@ -54,14 +54,14 @@ import Foundation
         let safety: JSONObject = ["id": "protected", "method": "item/commandExecution/requestApproval", "params": ["threadId": child, "turnId": "turn", "itemId": "command", "cwd": "/fixture", "command": "sudo launchctl bootstrap system /Library/LaunchDaemons/fixture.plist", "availableDecisions": ["accept", "cancel"]]]
         precondition(CodexServerApproval.parse(safety, threads: [child: rows[1]]) == nil)
         var removal = safety, params = safety["params"] as! JSONObject
-        params["command"] = "rm fixture.txt"
+        params["command"] = "rm /System/Library/fixture.txt"
         removal["params"] = params
         precondition(CodexServerApproval.parse(removal, threads: [child: rows[1]])?.result["decision"] as? String == "cancel")
         let fileRequest: JSONObject = ["id": "patch", "method": "item/fileChange/requestApproval",
             "params": ["threadId": child, "turnId": "turn", "itemId": "patch"]]
-        for (kind, expected) in [("delete", "decline"), ("update", "accept")] {
+        for (kind, path, expected) in [("delete", "/System/fixture.txt", "decline"), ("delete", "/fixture/file.txt", "accept"), ("update", "/fixture/file.txt", "accept")] {
             let fileItem: JSONObject = ["id": "patch", "type": "fileChange", "status": "inProgress",
-                "changes": [["path": "/fixture/file.txt", "kind": ["type": kind]]]]
+                "changes": [["path": path, "kind": ["type": kind]]]]
             let parsed = CodexServerApproval.parse(fileRequest, threads: [child: rows[1]], fileItem: fileItem)
             precondition(parsed?.result["decision"] as? String == expected)
         }

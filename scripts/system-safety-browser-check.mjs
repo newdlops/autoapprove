@@ -51,7 +51,7 @@ try {
  await page.emulateMedia({colorScheme:'dark'});await page.setViewportSize({width:390,height:844});await capture('mobile-dark-guided');
  await page.reload();await page.waitForFunction(()=>selectedItem?.session.systemSafety?.phase==='guided');assert.equal((await optional('inputs.jsonl')).trim().split('\n').length,4);
  await writeFile(path.join(root,'uncertain-write'),'fixture');
- await writeFile(path.join(root,'codex-screen'),'Would you like to run the following command?\n\n$ rm fixture-second.txt\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel');
+ await writeFile(path.join(root,'codex-screen'),'Would you like to run the following command?\n\n$ rm /System/Library/fixture-second.txt\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel');
  await page.waitForFunction(()=>selectedItem?.session.systemSafety?.phase==='uncertain');await capture('mobile-uncertain');
  const writesBefore=(await optional('inputs.jsonl')).trim().split('\n').length;
  await page.reload();await page.waitForFunction(()=>selectedItem?.session.systemSafety?.phase==='uncertain');await new Promise(r=>setTimeout(r,1200));

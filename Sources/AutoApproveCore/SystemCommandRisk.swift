@@ -13,9 +13,10 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         case .privileged: return "관리자 권한 실행"
         }
     }
-    var blocksAutomatically: Bool { kind == .fileDeletion }
+    var blocksAutomatically: Bool { self == FileDeletionCommand.risk }
     public var detail: String {
-        blocksAutomatically ? "파일 삭제 요청을 감지했습니다. 기존 파일을 보존하는 방법으로 계속합니다."
+        if self == FileDeletionCommand.review { return evidence + " 원래 터미널에서 확인해주세요." }
+        return blocksAutomatically ? "시스템 경로 또는 디스크·볼륨 전체가 삭제 대상이어서 요청을 차단했습니다."
             : title + " 요청입니다. 원래 터미널에서 승인 여부를 결정해주세요."
     }
     public var alternative: String { guidance }
@@ -45,17 +46,13 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
             compactValue = value
             return value
         }
-        // Most tool events are ordinary project commands. A single candidate
-        // scan avoids running the full policy regex set when no protected
-        // command, system path or persistence marker exists. Whitespace is
-        // stripped first so wrapped paths stay inside the conservative path.
         let candidate = compact()
         guard riskCandidates.contains(candidate) != false,
               matches(candidate, riskCandidatePattern) else { return nil }
         let command = commandText(text)
-        if FileDeletionCommand.deletesInPatch(command) || FileDeletionCommand.removesFile(command) { return FileDeletionCommand.risk }
-        // Only complete, simple read-only commands get this exception. Compound
-        // shell input still goes through all mutation checks.
+        let patch = FileDeletionCommand.patchRisk(command, cwd: cwd)
+        let deletion = FileDeletionCommand.commandRisk(command, cwd: cwd)
+        if let risk = [patch, deletion].compactMap({ $0 }).max(by: { !$0.blocksAutomatically && $1.blocksAutomatically }) { return risk }
         if isReadOnly(command) { return nil }
         if matches(command, #"(?i)\blaunchctl\s+(?:bootstrap|bootout|load|unload|enable|disable|kickstart|submit|setenv|unsetenv|config)\b|\bcrontab\s+|\b(?:systemctl|service)\s+(?:enable|disable|start|stop|restart)\b"#) {
             return Self(kind: .persistence, evidence: "자동 실행 서비스 등록·해제 또는 실행 제어")
@@ -71,8 +68,6 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
                 }
             }
             let value = compact()
-            // Skip only byte-identical inputs already tested with the same rule.
-            // No result, command or local installer source survives this call.
             guard !value.utf8.elementsEqual(text.utf8),
                   wrappedValue.map({ !value.utf8.elementsEqual($0.utf8) }) ?? true else { return false }
             return matches(value, protectedStartupPattern)
@@ -93,9 +88,6 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
             (matches(text, #"(?:^|[\s\"'=])(?:(?:/private)?/etc/|/System/|/Library/(?:Preferences|Security)/)"#) && matches(command, writePattern)) {
             return Self(kind: .settings, evidence: "Mac 전역 설정 또는 시스템 파일 쓰기")
         }
-        // Script filenames hide the operation from the terminal permission text.
-        // Inspect a bounded local installer source without running it. Restrict
-        // this to explicit installation flags and a file within the request's cwd.
         if matches(command, #"(?i)--(?:install|register)|\binstall_[^\s]+\.py\b"#),
            let script = localScript(command, cwd: cwd),
            (matches(script, protectedStartupPattern) || (matches(script, #"Path\.home\(|NSHomeDirectory\(|expanduser\(|(?:HOME|home_dir|homeDirectory)"#) && matches(script, #"LaunchAgents|LaunchDaemons|PrivilegedHelperTools|\.config/autostart"#))),
@@ -105,8 +97,6 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         return nil
     }
 
-    /// A waiting approval rechecks only commands that can inspect a local
-    /// installer source. Ordinary hook heartbeats avoid rereading scripts.
     static func mayReferenceInstaller(_ command: String) -> Bool {
         let value = command.lowercased()
         return value.contains("--install") || value.contains("--register") ||
@@ -115,22 +105,18 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
 
     public static func detect(tool: String, input: JSONObject, summary: String = "", cwd: String = "") -> SystemCommandRisk? {
         if ["Read", "Glob", "Grep", "LS"].contains(tool) { return nil }
-        // A general question only asks for a user's choice; its text is not an
-        // operation to deny or replace automatically. Actual tool permissions
-        // and yes/no requests still pass through the system-change guard.
         if tool == "AskUserQuestion", AutomaticQuestionDecision.detect(input) == nil { return nil }
         let name = tool.lowercased().components(separatedBy: "__").last ?? tool.lowercased()
+        let directory = input["workdir"] as? String ?? input["cwd"] as? String ?? cwd
         let deletesPath = name == "delete" && (input["file_path"] is String || input["path"] is String)
         if deletesPath || ["deletefile", "delete_file", "remove_file", "delete_directory", "remove_directory", "trash_file"].contains(name) {
-            return FileDeletionCommand.risk
+            return FileDeletionCommand.pathRisk(input["file_path"] as? String ?? input["path"] as? String, cwd: directory)
         }
         if name == "apply_patch", let patch = (input["patch"] ?? input["input"] ?? input["patchText"]) as? String,
-           FileDeletionCommand.deletesInPatch(patch) { return FileDeletionCommand.risk }
-        if let command = input["command"] as? String { return detect(command, cwd: cwd) }
+           let risk = FileDeletionCommand.patchRisk(patch, cwd: directory) { return risk }
+        if let command = input["command"] as? String { return detect(command, cwd: directory) }
         if ["exec_command", "run_command", "shell"].contains(name),
-           let command = (input["cmd"] ?? input["CommandLine"]) as? String { return detect(command, cwd: cwd) }
-        // File-edit hooks name the destination. Source code containing a system
-        // path is not itself a write to that system path.
+           let command = (input["cmd"] ?? input["CommandLine"]) as? String { return detect(command, cwd: directory) }
         if ["Write", "Edit", "MultiEdit"].contains(tool), let path = input["file_path"] as? String ?? input["path"] as? String {
             return detect("write_text " + path, cwd: cwd)
         }
@@ -138,11 +124,9 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
             .map { String(decoding: $0, as: UTF8.self) } ?? ""
         let operation = ["Write", "Edit", "MultiEdit"].contains(tool) ? "write_text " : ""
         let risk = detect(operation + encoded + "\n" + summary, cwd: cwd)
-        return risk?.kind == .fileDeletion && tool != "AskUserQuestion" ? nil : risk
+        return (risk?.kind == .fileDeletion || risk == FileDeletionCommand.review) && tool != "AskUserQuestion" ? nil : risk
     }
 
-    /// ASCII's six whitespace characters avoid a Unicode property lookup.
-    /// Multi-scalar Characters, including CRLF, retain Character.isWhitespace.
     private static func removingWhitespace(_ text: String) -> String {
         let compactASCII = text.utf8.withContiguousStorageIfAvailable { bytes -> String? in
             var count = 0
@@ -170,8 +154,6 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         }
         let native = text.isContiguousUTF8
         if native {
-            // UTF8 uses at most3 bytes per UTF16 unit. Preserve the exact32-unit
-            // cutoff while counting UTF16 only in the bounded32...95-byte band.
             let bytes = text.utf8.count
             if bytes < 32 || (bytes < 96 && text.utf16.count < 32) { return legacy() }
         } else {
@@ -189,8 +171,6 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
             let upper = view.index(view.startIndex, offsetBy: end)
             result.append(contentsOf: source[lower..<upper])
         }
-        // Use String's stateful Character iterator throughout. Substring's
-        // index-based iterator can repeatedly examine long regional-indicator runs.
         for character in source {
             let keep: Bool
             if let ascii = character.asciiValue { keep = ascii != 32 && (ascii < 9 || ascii > 13) }
