@@ -120,7 +120,7 @@ extension ApprovalTests {
                         let script = iterm ? try ITermAdapter.approvalScript(target:target,expectedScreen:frame,agent:.codex)
                             : try TerminalAdapter.approvalScript(tty:target.tty,expectedScreen:frame,agent:.codex)
                         try expectEqual(context.evaluateScript(script)?.toString(),"sent")
-                        try expectEqual(context.evaluateScript("JSON.stringify(writes)")?.toString(),"[\"1\"]")
+                        try expectEqual(context.evaluateScript("JSON.stringify(writes)")?.toString(),iterm ? "[\"1\"]" : "[\"\"]")
                         context.setObject(frame.replacingOccurrences(of:#"\u{4}"#,with:"changed argument"),forKeyedSubscript:"current" as NSString)
                         try expectEqual(context.evaluateScript(script)?.toString(),"screenChanged")
                         try expectEqual(context.evaluateScript("writes.length")?.toInt32(),1)
@@ -216,7 +216,7 @@ extension ApprovalTests {
                     : try TerminalAdapter.approvalScript(tty: "/dev/fixture", expectedScreen: screen, agent: .codex)
                 try expectEqual(context.evaluateScript(script)?.toString(), "sent", "Escaped tool names and arguments survive final validation")
                 try expectNil(context.exception)
-                try expectEqual(context.evaluateScript("writes.join(',')")?.toString(), "1", "Only the approval choice is delivered")
+                try expectEqual(context.evaluateScript("writes.join(',')")?.toString(), iterm ? "1" : "", "Submit the selected one-time option")
                 context.setObject(screen.replacingOccurrences(of: payload, with: "\u{4}"), forKeyedSubscript: "current" as NSString)
                 try expectEqual(context.evaluateScript(script)?.toString(), "screenChanged", "Literal escape text must differ from a real control byte")
                 try expectEqual(context.evaluateScript("writes.length")?.toInt32(), 1)
@@ -453,7 +453,7 @@ extension ApprovalTests {
     }
 
     func testTerminalApprovalValidation() throws {
-        func check(_ current: String, expected: String = permissionFixture, agent: AgentKind = .codex, processes: [String] = ["codex"], tty: String = "/dev/fixture", windows: String = "[{tabs: () => [tab, tab]}]", delivery: String, writes: Int) throws {
+        func check(_ current: String, expected: String = permissionFixture, agent: AgentKind = .codex, processes: [String] = ["codex"], tty: String = "/dev/fixture", windows: String = "[{tabs: () => [tab, tab]}]", delivery: String, writes: Int, input: String = "1") throws {
             let context = JSContext()!
             context.setObject(current, forKeyedSubscript: "current" as NSString)
             context.setObject(processes, forKeyedSubscript: "processes" as NSString)
@@ -467,7 +467,7 @@ extension ApprovalTests {
             try expectNil(context.exception)
             try expectEqual(result?.toString(), delivery)
             try expectEqual(context.evaluateScript("writes.length")?.toInt32(), Int32(writes))
-            if writes > 0 { try expectEqual(context.evaluateScript("writes[0]")?.toString(), "1") }
+            if writes > 0 { try expectEqual(context.evaluateScript("writes[0]")?.toString(), input) }
         }
         try check("Changed history\n" + permissionFixture.decomposedStringWithCanonicalMapping + "\n\n", expected: "Old history\n" + permissionFixture, delivery: "sent", writes: 1)
         try check(reportedCodexPermissionFixture, expected: reportedCodexPermissionFixture, delivery: "sent", writes: 1)
@@ -486,7 +486,7 @@ extension ApprovalTests {
         }
         try check(claudeBashPermissionFixture, expected: claudeBashPermissionFixture, agent: .claude, processes: ["claude"], delivery: "sent", writes: 1)
         let toolPermission = "Allow preview?\nTool: preview\n› 1. Allow                   Run the tool and continue.\n  2. Allow for this session  Run the tool and remember this choice for this session.\n  3. Always allow            Run the tool and remember this choice for future tool calls.\n  4. Cancel                  Cancel this tool call\nEnter to submit or esc to cancel"
-        try check(toolPermission, expected: toolPermission, delivery: "sent", writes: 1)
+        try check(toolPermission, expected: toolPermission, delivery: "sent", writes: 1, input: "")
         try check(toolPermission.replacingOccurrences(of: "Tool: preview", with: "Tool: changed"), expected: toolPermission, delivery: "screenChanged", writes: 0)
         for changed in [permissionFixture.replacingOccurrences(of: "echo 한글", with: "echo changed"), permissionFixture.replacingOccurrences(of: "  $", with: " $"), permissionFixture.replacingOccurrences(of: "› 1.", with: "  1."), permissionFixture + "\n› Next input"] {
             try check(changed, delivery: "screenChanged", writes: 0)

@@ -228,7 +228,7 @@ enum AutomationScript {
     static func dialogData(tty: String, expectedScreen: String, agent: AgentKind) throws -> JSONObject {
         guard agent != .shell else { throw AppError.message("일반 셸에는 승인 입력을 전달할 수 없습니다.") }
         guard let prompt = PromptDetector.detect(expectedScreen, agent: agent) else { throw AppError.message("승인 요청의 내용과 선택지를 확인하지 못했습니다.") }
-        return ["tty": tty, "dialog": prompt.dialog, "agent": agent.rawValue]
+        return ["tty": tty, "dialog": prompt.dialog, "agent": agent.rawValue, "submitSelected": prompt.isToolPermission]
     }
 }
 
@@ -634,9 +634,7 @@ public enum TerminalAdapter {
     }
 
     public static func approvalScript(tty: String, expectedScreen: String, agent: AgentKind) throws -> String {
-        var target=try AutomationScript.dialogData(tty:tty,expectedScreen:expectedScreen,agent:agent)
-        let compact=(target["dialog"] as? String ?? "").filter {!$0.isWhitespace}.lowercased()
-        target["submitSelected"]=agent == .codex && compact.hasPrefix("allowcomputerusetouse")
+        let target = try AutomationScript.dialogData(tty: tty, expectedScreen: expectedScreen, agent: agent)
         let data = try literal(target)
         return """
         (() => {

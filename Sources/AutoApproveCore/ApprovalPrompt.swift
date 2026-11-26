@@ -5,6 +5,7 @@ import CoreFoundation
 public struct ApprovalPrompt: Equatable, Sendable {
     public var summary: String
     public var answer: String
+    var isToolPermission = false
     public var fingerprint: String
     public var dialog: String
     public var identity: String { PromptDetector.fingerprint(dialog) }
@@ -71,7 +72,8 @@ public enum PromptDetector {
                 labels[labels.count - 1] += " " + line
             }
         }
-        if agent == .codex, heading.marker == "Allow " || heading.marker == "Approve app tool call?" {
+        let isToolPermission = agent == .codex && (heading.marker == "Allow " || heading.marker == "Approve app tool call?")
+        if isToolPermission {
             guard YesNoConfirmation.isToolPermissionMenu(labels) else { return nil }
         }
         let permissionLabels=agent == .codex ? labels.map(YesNoConfirmation.codexTerminalLabel):labels
@@ -92,7 +94,7 @@ public enum PromptDetector {
             if let ascii = $0.asciiValue { return ascii != 32 && (ascii < 9 || ascii > 13) }
             return !$0.isWhitespace
         }
-        return ApprovalPrompt(summary: String(context.suffix(4000)), answer: "1", fingerprint: fingerprint(screen),
+        return ApprovalPrompt(summary: String(context.suffix(4000)), answer: "1", isToolPermission: isToolPermission, fingerprint: fingerprint(screen),
             dialog: rawLines[start...].joined(separator: "\n"), requestIdentity: fingerprint(compactIdentity),
             hasRequestBoundary: requestStart != nil)
     }
