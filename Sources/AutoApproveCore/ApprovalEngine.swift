@@ -3752,7 +3752,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             message = try box.transaction {
                 try box.retireQueued(ids, group: groupID, sender: sender.id, recipient: memberID, replacement: id)
                 let next = try box.insertMessage(id: id, groupID: groupID, senderID: sender.id, recipientID: memberID, kind: kind, text: body, sourceKey: key, priority: priority)
-                guard next.text == body, next.id == id else { throw RemoteHTTPError(409, "같은 대체 요청의 본문이 바뀌었습니다.") }
+                guard (next.originalText ?? next.text) == body, next.id == id else { throw RemoteHTTPError(409, "같은 대체 요청의 본문이 바뀌었습니다.") }
                 return next
             }
         } else if blocking, let id = requestedID {
@@ -4925,8 +4925,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func deliverGroupMailboxNotifications() async throws {
         guard !snapshot.paused, !remoteInputStopped else { return }
-        // Both checks read the group store and scan held messages; their thresholds are minutes long,
-        // so running them on every pass of the loop only repeats the same answer.
         if Date().timeIntervalSince(groupHousekeepingAt) >= groupMailboxHousekeepingInterval {
             groupHousekeepingAt = Date()
             parkMessagesForRemovedMembers()
@@ -4958,16 +4956,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
         }
         let dueAt = Date()
-        for message in heads where message.nextAttemptAt <= dueAt ||
-            (message.lastResult == "not_started" && eligible[message.groupID]?.contains(message.recipientID) == true) {
+        for selected in heads where selected.nextAttemptAt <= dueAt ||
+            (selected.lastResult == "not_started" && eligible[selected.groupID]?.contains(selected.recipientID) == true) {
             guard !Task.isCancelled, !remoteInputStopped else { return }
-            guard let current = try groupMailbox().message(message.id), current.acknowledgedAt == nil,
-                  current.attempts == message.attempts, current.lastResult == message.lastResult,
-                  activeGroupMailboxMessages.insert(message.id).inserted else { continue }
-            defer { activeGroupMailboxMessages.remove(message.id) }
-            if current.urgentPermission { try? await interruptForUrgentPermission(current, observed: observed) }
+            guard activeGroupMailboxMessages.insert(selected.id).inserted else { continue }
+            defer { activeGroupMailboxMessages.remove(selected.id) }
+            if selected.urgentPermission { try? await interruptForUrgentPermission(selected, observed: observed) }
             let receiptDue = Date().addingTimeInterval(groupMailboxReceiptGrace)
-            try groupMailbox().noteAttempt(message.id, result: "direct_attempting", retryAt: receiptDue, increment: true)
+            guard let message = try box.claimDelivery(selected, retryAt: receiptDue) else { continue }
             do {
                 try await sendGroupMailboxNotice(message, observed: observed)
                 try groupMailbox().noteAttempt(message.id, result: "direct_submitted", retryAt: receiptDue)
@@ -6734,8 +6730,30 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let priority = try Self.mailboxPriority(object)
             let category = (object["category"] as? String).flatMap(SessionGroupMessage.Category.init(rawValue:))
             guard category != nil || object["category"] == nil else { throw RemoteHTTPError(400, "category는 message 또는 permissionRequest로 지정해주세요.") }
+            if try GroupWaitRequest.flag(object, "deliveryOrder") {
+                guard direction == "inbox", object["afterSequence"] == nil, object["messageID"] == nil,
+                      priority == nil, category == nil, try !GroupWaitRequest.flag(object, "unansweredOnly"),
+                      try !GroupWaitRequest.flag(object, "includeAcknowledged") else {
+                    throw RemoteHTTPError(400, "전달 대기열은 수신함에서 limit와 offset으로 조회해주세요.")
+                }
+                let offset = try integer("offset", fallback: 0)
+                let rows = try groupMailbox().deliveryQueue(group: groupID, recipient: mailbox.id, limit: limit + 1, offset: offset)
+                let page = rows.prefix(limit).enumerated().map { index, item -> JSONObject in
+                    var value = item.json
+                    value["deliveryPosition"] = offset + Int64(index) + 1
+                    if item.lastResult == "not_started" {
+                        value["nextAttemptAt"] = ISO8601DateFormatter().string(from: item.nextAttemptAt)
+                    }
+                    return value
+                }
+                return ["groupID": groupID.uuidString, "memberID": mailbox.id.uuidString, "messages": page,
+                        "direction": direction, "deliveryOrder": true, "hasMore": rows.count > limit,
+                        "nextOffset": rows.count > limit ? offset + Int64(limit) as Any : NSNull()]
+            }
+            guard object["offset"] == nil else { throw RemoteHTTPError(400, "offset은 deliveryOrder=true에 사용하세요.") }
             if let id = try GroupWaitRequest.uuid(object, "messageID") {
                 guard let message = try groupMailbox().message(id), message.groupID == groupID,
+                      (direction == "outbox" || !message.inboxDeleted),
                       (direction == "outbox" ? message.senderID : message.recipientID) == mailbox.id,
                       priority == nil || priority == message.priority, category == nil || category == message.category else { throw RemoteHTTPError(404, "지정한 수신함·발신함에 해당 메시지가 없습니다.") }
                 return ["memberID": mailbox.id.uuidString, "messages": [message.json], "hasMore": false, "direction": direction, "groupID": groupID.uuidString]
@@ -6919,6 +6937,40 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let item = try groupMailbox().setPriority(priority, id: id, group: groupID, recipient: leader.id)
             scheduleGroupMailboxDelivery()
             return item.json
+        case "manage_group_inbox":
+            guard let gid = try GroupWaitRequest.uuid(object, "groupID"), let member = try GroupWaitRequest.uuid(object, "memberID"),
+                  let raw = object["action"] as? String,
+                  let action = SessionGroupMailbox.InboxAction(rawValue: raw) else {
+                throw RemoteHTTPError(400, "groupID, memberID, messageID와 action을 지정해주세요.")
+            }
+            let (group, leader) = try await groupMailboxCaller(object, groupID: gid, verified: true)
+            guard group.members.contains(where: { $0.id == member }), group.canManage(leader.id, member: member) else {
+                throw RemoteHTTPError(403, "담당 그룹장만 구성원의 수신함을 관리할 수 있습니다.")
+            }
+            let before = try GroupWaitRequest.uuid(object, "beforeMessageID")
+            guard action == .move || before == nil, (action == .edit ? object["text"] is String : object["text"] == nil) else {
+                throw RemoteHTTPError(400, "edit에는 text를, move에는 선택적으로 beforeMessageID를 지정해주세요.")
+            }
+            let revision = object["expectedRevision"] as? NSNumber
+            if object["expectedRevision"] != nil {
+                guard let revision, CFGetTypeID(revision) != CFBooleanGetTypeID(), revision.intValue >= 0,
+                      revision.doubleValue == Double(revision.intValue) else { throw RemoteHTTPError(400, "expectedRevision은 음수가 아닌 정수여야 합니다.") }
+            }
+            let ids: [UUID]
+            if let id = try GroupWaitRequest.uuid(object, "messageID"), object["messageIDs"] == nil {
+                ids = [id]
+            } else {
+                guard object["messageID"] == nil, action == .cancel || action == .delete, revision == nil else {
+                    throw RemoteHTTPError(400, "단일 messageID 또는 일괄 취소·삭제할 messageIDs를 지정해주세요.")
+                }
+                ids = try Self.queueMessageIDs(object, key: "messageIDs")
+            }
+            guard activeGroupMailboxMessages.isDisjoint(with: ids) else { throw RemoteHTTPError(409, "이 메시지의 전달이 진행 중입니다.") }
+            let items = try groupMailbox().manageInbox(group: gid, recipient: member, leader: leader.id, ids: ids, action: action,
+                                                  text: object["text"] as? String, before: before, expectedRevision: revision?.intValue)
+            scheduleGroupMailboxDelivery()
+            if object["messageID"] != nil, let item = items.first { return item.json }
+            return ["action": action.rawValue, "memberID": member.uuidString, "messageIDs": ids.map(\.uuidString), "count": ids.count]
         case "cancel_group_messages":
             guard let group = try GroupWaitRequest.uuid(object, "groupID"), let member = try GroupWaitRequest.uuid(object, "memberID") else {
                 throw RemoteHTTPError(400, "그룹과 수신자 ID를 지정해주세요.")
@@ -8058,7 +8110,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         restoreNotificationReceipts(&session)
         if let saved = store.value("systemSafety:\(session.id)"),
-           let state = try? JSONDecoder().decode(SystemSafetyState.self, from: Data(saved.utf8)) {
+           let state = try? JSONDecoder().decode(SystemSafetyState.self, from: Data(saved.utf8)), state.notice.risk.blocksAutomatically {
             systemSafetyStates[session.id] = state; session.systemSafety = state.notice
         }
     }
@@ -9820,8 +9872,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         var response: JSONObject = [:]
         if let risk {
-            // Legacy hook decisions use the same safe denial as the durable bridge.
-            // Denying a tool with a reason leaves Claude free to choose an alternative.
+            if !risk.blocksAutomatically {
+                session.systemSafety = nil
+                session.setPhase(.approval, detail: risk.detail)
+                session.pendingSummary = summary; session.pendingInTerminal = true
+                sessions[key] = session
+                publish()
+                return event == "PreToolUse" ? risk.manualHookResponse : [:]
+            }
             let toolID = payload["tool_use_id"] as? String ?? requestID
             session.systemSafety = SystemSafetyNotice(id: "hook:" + providerID + ":" + toolID, risk: risk, request: summary)
             session.setPhase(.approval, detail: risk.detail); session.pendingSummary = summary; session.pendingInTerminal = true
@@ -9994,7 +10052,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     /// Every other request returns at once, so Claude's own terminal dialog and choices appear.
     private func holdsClaudeHook(_ request: ClaudeHookRequest, questionEditing: Bool) -> Bool {
         guard effectiveAutomatic(request.sessionID), !snapshot.paused else { return false }
-        if request.safetyResponse != nil { return true }
+        if let risk = request.systemCommandRisk { return risk.blocksAutomatically }
         return request.response != nil && !questionEditing
     }
 
@@ -10084,7 +10142,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if saved == nil {
             if let logicalID = request.logicalID, let previous = try store.claudeHook(logicalID: logicalID), previous.expiresAt > now {
                 // PreToolUse -> PermissionRequest is the same tool call, not another approval.
-                if previous.audit?.outcome.hasPrefix("시스템 변경 거절") == true,
+                if request.systemCommandRisk?.blocksAutomatically == true, previous.audit?.outcome.hasPrefix("시스템 변경 거절") == true,
                    let message = previous.audit?.answer, let event = payload["hook_event_name"] as? String {
                     let response = SystemCommandRisk.denial(event: event, message: message)
                     receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
@@ -10221,6 +10279,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
         if automatically, snapshot.paused || !effectiveAutomatic(sessionID) { return }
         let risk = pending.request.systemCommandRisk ?? SystemCommandRisk.detect(tool: pending.request.tool,
             input: pending.request.payload["tool_input"] as? JSONObject ?? [:], summary: pending.request.summary, cwd: sessions[sessionID]?.cwd ?? "")
+        if let risk, !risk.blocksAutomatically {
+            let response = pending.request.payload["hook_event_name"] as? String == "PreToolUse" ? risk.manualHookResponse : [:]
+            var receipt = pending.receipt
+            receipt.response = String(decoding: try JSONSerialization.data(withJSONObject: response), as: UTF8.self)
+            try saveClaudeReceipt(receipt)
+            liveClaudeHooks[requestID]?.receipt = receipt
+            publish()
+            return
+        }
         let response = risk?.denial(event: pending.request.payload["hook_event_name"] as? String ?? "PermissionRequest") ?? defaultResponse
         if enableAutomatic, risk == nil { try setAutomatic(sessionID, enabled: true) }
         var receipt = pending.receipt
@@ -10826,7 +10893,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         activityTrackers.removeValue(forKey: sessionID)
         let risk = Self.screenApprovalRisk(prompt,agent:session.agent,cwd:session.cwd)
         sessions[sessionID]?.systemCommandRisk = risk
-        if let risk { observeSystemSafety(sessionID, risk: risk, prompt: prompt, generation: generation, at: now) }
+        if let risk, risk.blocksAutomatically { observeSystemSafety(sessionID, risk: risk, prompt: prompt, generation: generation, at: now) }
         if let existing = screens[sessionID], existing.isCurrent, existing.generation == generation, existing.prompt.identity == prompt.identity {
             screens[sessionID]?.raw = raw; screens[sessionID]?.prompt = prompt
             if let risk { screens[sessionID]?.scheduledID = nil; sessions[sessionID]?.pendingInTerminal = true; sessions[sessionID]?.activityDetail = risk.detail }
@@ -10939,8 +11006,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
         modelRetentionTasks[id] = ModelRetentionTask(token: token, questionID: choice.id, generation: generation, revision: revision, task: task)
     }
 
-    // MARK: System changes: refuse the mutation, continue in the same conversation
-
     private func saveSystemSafety(_ id: String, _ state: SystemSafetyState) throws {
         try store.set("systemSafety:" + id, String(decoding: try JSONEncoder().encode(state), as: UTF8.self))
         systemSafetyStates[id] = state; sessions[id]?.systemSafety = state.notice
@@ -10948,7 +11013,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
 
     private func observeSystemSafety(_ id: String, risk: SystemCommandRisk, prompt: ApprovalPrompt, generation: String, at now: Date) {
         if systemSafetyStates[id] == nil, let saved = store.value("systemSafety:" + id),
-           let state = try? JSONDecoder().decode(SystemSafetyState.self, from: Data(saved.utf8)) {
+           let state = try? JSONDecoder().decode(SystemSafetyState.self, from: Data(saved.utf8)), state.notice.risk.blocksAutomatically {
             systemSafetyStates[id] = state; sessions[id]?.systemSafety = state.notice
         }
         let previous = systemSafetyStates[id]
@@ -11078,7 +11143,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 case .detected,
                      .unavailable where state.cancelledAt == nil:
                     guard let prompt = PromptDetector.detect(raw, agent: original.agent), prompt.requestIdentity == state.promptIdentity,
-                          SystemCommandRisk.detect(prompt.summary, cwd: original.cwd) != nil else {
+                          Self.screenApprovalRisk(prompt, agent: original.agent, cwd: original.cwd)?.blocksAutomatically == true else {
                         try update(.uncertain, "원본 요청이 바뀌어 입력하지 않았습니다. 현재 대화에서 안전하게 진행해주세요."); return
                     }
                     try update(.cancelling, "이 시스템 변경 요청을 거절하고 있습니다…")
@@ -15070,8 +15135,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         agent == .codex && prompt.summary.filter{!$0.isWhitespace}.hasPrefix("Wouldyouliketomakethefollowingedits?")
     }
     private static func screenApprovalRisk(_ prompt:ApprovalPrompt,agent:AgentKind,cwd:String)->SystemCommandRisk? {
-        let operation=isCodexFileEdit(prompt,agent:agent) ? "write_text ":""
-        return SystemCommandRisk.detect(operation+prompt.summary,cwd:cwd)
+        if isCodexFileEdit(prompt, agent: agent) {
+            if FileDeletionCommand.deletesInPatch(prompt.dialog) ||
+                prompt.dialog.range(of: #"(?im)^\s*(?:description:\s*(?:delete|remove)\s+(?:a\s+|the\s+)?(?:file|director)|(?:deleted|delete file:)\s+\S)"#, options: .regularExpression) != nil {
+                return FileDeletionCommand.risk
+            }
+            return SystemCommandRisk.detect("write_text " + prompt.summary, cwd: cwd)
+        }
+        return SystemCommandRisk.detect(prompt.summary, cwd: cwd)
     }
     private func scheduleScreenApproval(_ id: String) {
         guard !hasOSPermissionWait(id) else {return}

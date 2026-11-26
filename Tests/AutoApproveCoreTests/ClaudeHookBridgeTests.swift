@@ -96,12 +96,12 @@ extension ApprovalTests {
         riskyConfirmation["hook_event_name"] = "PermissionRequest"
         riskyConfirmation["tool_input"] = ["questions": [["question": "sudo id 명령을 실행할까요?", "options": [["label": "Yes"], ["label": "No"]]]]]
         let riskyOutput = bridgeAnswer(try engine.handleClaudeHook(riskyConfirmation, at: now))?["hookSpecificOutput"] as? JSONObject
-        try expectEqual((riskyOutput?["decision"] as? JSONObject)?["behavior"] as? String, "deny", "A risky yes/no request still receives safe redirection")
+        try expectNil(riskyOutput, "A privileged question is left to its original approval prompt")
         var operation = hookPayload(now)
         operation["hook_event_name"] = "PermissionRequest"; operation["tool_name"] = "Bash"
         operation["tool_input"] = ["command": "cp fixture ~/Library/LaunchAgents/com.fixture.plist"]
         let output = bridgeAnswer(try engine.handleClaudeHook(operation, at: now))?["hookSpecificOutput"] as? JSONObject
-        try expectEqual((output?["decision"] as? JSONObject)?["behavior"] as? String, "deny", "Actual system changes still receive safe redirection")
+        try expectNil(output, "A system change stays in the original approval prompt")
     }
 
     func testClaudeAppApprovalThenThirtySequentialQuestions() throws {
@@ -297,9 +297,9 @@ extension ApprovalTests {
         request["tool_input"] = ["command": "python3 tools/install_fixture.py --install"]
         let response = bridgeAnswer(try engine.handleClaudeHook(request, at: now))
         let output = response?["hookSpecificOutput"] as? JSONObject
-        try expectEqual(output?["permissionDecision"] as? String, "deny",
+        try expectEqual(output?["permissionDecision"] as? String, "ask",
                         "A missing payload cwd must use the current session directory for installer inspection")
-        try expectEqual(engine.snapshot.events.first?.outcome, "시스템 변경 거절 · 안전한 대안 안내")
+        try expect(engine.snapshot.events.allSatisfy { !$0.outcome.hasPrefix("시스템 변경 거절") })
     }
 
     func testClaudeHookPauseManualAndConcurrentIsolation() throws {

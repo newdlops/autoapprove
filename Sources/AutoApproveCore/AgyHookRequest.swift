@@ -41,8 +41,9 @@ public struct AgyHookRequest: Decodable {
     public let terminationReason: String?
 
     package func permission(automatic: Bool, cwd: String?) -> JSONObject {
-        if let command = toolCall?.commandLine, let risk = SystemCommandRisk.detect(command) {
-            return ["decision": "deny", "reason": risk.detail]
+        if let call = toolCall, let risk = SystemCommandRisk.detect(tool: call.name,
+            input: call.commandLine.map { ["command": $0] } ?? [:], cwd: cwd ?? "") {
+            return ["decision": risk.blocksAutomatically ? "deny" : "ask", "reason": risk.detail]
         }
         guard hookEventName == .preToolUse, automatic, let toolCall else { return ["decision": "ask"] }
         if toolCall.name == "run_command", toolCall.commandLine == "/bin/pwd" { return ["decision": "auto_approve"] }

@@ -1838,3 +1838,114 @@ extension ApprovalTests {
         }
     }
 }
+
+extension ApprovalTests {
+    @MainActor func testLeaderUnblocksMemberInbox() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let records = ProcessDiscovery.parse("""
+        101801 1 fixture801 101801 101801 Wed Oct 28 12:00:00 2026 /fixture/claude
+        101802 1 fixture802 101802 101802 Wed Oct 28 12:00:00 2026 /fixture/claude
+        101803 1 fixture803 101803 101803 Wed Oct 28 12:00:00 2026 /fixture/claude
+        """)
+        let sessions = records.map { AgentSession(id: $0.key, agent: .claude, pid: $0.pid, started: $0.started,
+                                                 tty: "/dev/" + $0.tty, cwd: "/fixture", terminal: .iterm) }
+        let threads = Dictionary(uniqueKeysWithValues: records.map { ($0.pid, UUID().uuidString) })
+        let terminal = GroupLineTerminal()
+        terminal.needsEnter = false
+        let registry: @Sendable ([ProcessRecord]) -> [ClaudeSessionRegistration] = { rows in
+            rows.map { .init(processID: $0.key, kind: "interactive", sessionID: threads[$0.pid], status: terminal.status($0.pid)) }
+        }
+        let screen = "answer\n──────────────────────────\n❯ \n──────────────────────────\n? for shortcuts"
+        var adapter = ScreenHostAdapter(screens: { targets in TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: screen) }) },
+            approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { _,_,_,_ in .missingTarget })
+        adapter.typeLine = { target, text in terminal.type(target, text, pid: target.sourcePID ?? 0) }
+        let engine = try ApprovalEngine(paths: .init(directory: directory), claudeRegistryReader: registry, processReader: { records },
+                                        screenAdapters: [.iterm: adapter], isolateByDefault: true)
+        defer { engine.stop() }
+        engine.groupMailboxPollInterval = 60
+        engine.updateDiscovery(sessions, records: records)
+        await engine.connectScreenHost(.iterm)
+        let live = try await engine.sessionGroupSessions()
+        let members = try sessions.map { session in try unwrapGroup(live.first { $0.id == session.id }).member }
+        let group = SessionGroup(name: "queue", members: members, leaderMemberID: members[0].id)
+        try SessionGroupStore(directory: directory).save([group])
+        let box = try SessionGroupMailbox(directory: directory)
+        let recipient = members[2].id
+        terminal.setStatus(records[2].pid, "busy")
+        func call(_ tool: String, _ args: JSONObject, caller: Int = 0) async throws -> JSONObject {
+            let base: JSONObject = ["owner": UUID().uuidString, "tool": tool, "sessionID": sessions[caller].id, "groupID": group.id.uuidString]
+            return try await engine.mcpAction(base.merging(args) { _, value in value })
+        }
+        func manage(_ action: String, _ id: UUID, _ extra: JSONObject = [:], caller: Int = 0) async throws -> JSONObject {
+            let args: JSONObject = ["action": action, "memberID": recipient.uuidString, "messageID": id.uuidString]
+            return try await call("manage_group_inbox", args.merging(extra) { _, value in value }, caller: caller)
+        }
+        func rejected(_ status: Int, _ op: () async throws -> JSONObject) async throws {
+            do { _ = try await op(); throw AppError.message("Unexpected inbox access") }
+            catch let error as RemoteHTTPError { try expectEqual(error.status, status) }
+        }
+        func enqueue(_ body: String) throws -> UUID {
+            try box.enqueue(groupID: group.id, senderID: members[1].id, recipientID: recipient, kind: .message, text: body).id
+        }
+        let first = try enqueue("blocked first"), obsolete = try enqueue("obsolete"), important = try enqueue("old content")
+        let archived = try enqueue("archive me")
+        try box.acknowledge([archived], groupID: group.id, recipientID: recipient)
+        try box.recordSubmission(first, conversation: members[2].conversationID, prompt: "preflight")
+        try box.noteAttempt(first, result: "not_started", error: "recipient busy", retryAt: Date().addingTimeInterval(300))
+        let inbox: JSONObject = ["mailboxMemberID": recipient.uuidString, "deliveryOrder": true, "limit": 1]
+        let initial = try await call("get_group_messages", inbox)
+        let head = try unwrapGroup((initial["messages"] as? [JSONObject])?.first)
+        try expectEqual(head["messageID"] as? String, first.uuidString)
+        try expectEqual(head["lastError"] as? String, "recipient busy")
+        try expectNotNil(head["nextAttemptAt"])
+        try expectEqual(initial["nextOffset"] as? Int64, 1)
+        let second = try await call("get_group_messages", inbox.merging(["offset": 1]) { _, value in value })
+        try expectEqual((second["messages"] as? [JSONObject])?.first?["messageID"] as? String, obsolete.uuidString)
+        try await rejected(403) { try await manage("delete", important, caller: 1) }
+        try await rejected(403) { try await manage("delete", important, ["groupID": UUID().uuidString]) }
+        try await rejected(404) { try await manage("delete", important, ["memberID": members[1].id.uuidString]) }
+        try await rejected(400) { try await manage("edit", important, ["text": "/quit"]) }
+        let edited = try await manage("edit", important, ["text": "deliver this first", "expectedRevision": 0])
+        try expectEqual(edited["editedByMemberID"] as? String, members[0].id.uuidString)
+        try expectEqual(edited["senderMemberID"] as? String, members[1].id.uuidString)
+        try await rejected(409) { try await manage("edit", important, ["text": "stale", "expectedRevision": 0]) }
+        let replay = try box.enqueue(id: important, groupID: group.id, senderID: members[1].id, recipientID: recipient,
+                                     kind: .message, text: "old content")
+        try expectEqual(replay.text, "deliver this first")
+        try await rejected(409) { try await manage("move", important, ["beforeMessageID": archived.uuidString]) }
+        _ = try await manage("move", important, ["beforeMessageID": first.uuidString])
+        try expectEqual(try SessionGroupMailbox(directory: directory).heads().first?.id, important)
+        let chronological = try box.list(groupID: group.id, memberID: recipient)
+        try expectEqual(chronological.map(\.id), [first, obsolete, important])
+        let bulk: JSONObject = ["action": "cancel", "memberID": recipient.uuidString]
+        try await rejected(409) {
+            try await call("manage_group_inbox", bulk.merging(["messageIDs": [obsolete.uuidString, archived.uuidString]]) { _, value in value })
+        }
+        try expectNil(try box.message(obsolete)?.lastResult)
+        let obsolete2 = try enqueue("obsolete too")
+        let cancelled = try await call("manage_group_inbox", bulk.merging(["messageIDs": [obsolete.uuidString, obsolete2.uuidString]]) { _, value in value })
+        try expectEqual(cancelled["count"] as? Int, 2)
+        try expectEqual(try box.message(obsolete)?.json["state"] as? String, "cancelled")
+        _ = try await manage("delete", archived)
+        _ = try await manage("delete", archived)
+        try box.acknowledge([archived], groupID: group.id, recipientID: recipient)
+        let lookup: JSONObject = ["messageID": archived.uuidString, "includeAcknowledged": true]
+        try await rejected(404) { try await call("get_group_messages", lookup, caller: 2) }
+        try expect(!((try box.list(groupID: group.id, memberID: recipient, includeAcknowledged: true)).contains { $0.id == archived }))
+        let outbox = try await call("get_group_messages", lookup.merging(["direction": "outbox"]) { _, value in value }, caller: 1)
+        try expectEqual((outbox["messages"] as? [JSONObject])?.first?["inboxDeleted"] as? Bool, true)
+        try expect(try await waitForGroup(5) { (try? box.message(important)?.lastResult) == "not_started" })
+        try expect(terminal.typed.isEmpty)
+        terminal.setStatus(records[2].pid, "idle")
+        _ = try await manage("retry", important)
+        try expect(try await waitForGroup(8) { (try? box.message(important)?.lastResult) == "direct_submitted" })
+        try expectEqual(terminal.typed.count, 1)
+        try expect(terminal.typed[0].contains("[그룹장 편집]") && terminal.typed[0].contains("deliver this first"))
+        try await rejected(409) { try await manage("edit", important, ["text": "too late"]) }
+        try await rejected(409) { try await manage("retry", important) }
+        _ = try await manage("delete", first)
+        try expectEqual(try box.heads().count, 0)
+        try expectEqual(try box.pendingCount, 1)
+    }
+}

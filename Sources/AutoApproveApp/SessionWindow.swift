@@ -870,7 +870,7 @@ private struct SessionDetail: View {
                             Text(notice.message).font(.callout).fixedSize(horizontal: false, vertical: true)
                             if source.id != session.id { Text("백그라운드 실행 · \(source.tty)").font(.caption).foregroundStyle(.secondary) }
                             if notice.phase == .detected && (!session.automatic || paused) {
-                                Text(paused ? "전체 일시정지 중입니다. 자동 안내는 재개한 뒤 진행합니다." : "자동 승인을 켜면 시스템 변경을 거절하고 안전한 대안을 안내합니다.")
+                                Text(paused ? "전체 일시정지 중입니다. 자동 안내는 재개한 뒤 진행합니다." : "자동 승인을 켜면 이 요청을 거절하고 원본을 보존하는 방법을 안내합니다.")
                                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                             }
                             DisclosureGroup("요청과 안전한 대안") {
@@ -1057,7 +1057,7 @@ private struct ClaudeApprovalControls: View {
         } else {
             Button(approval.buttonTitle) { perform { try approve(false) } }
                 .buttonStyle(.borderedProminent)
-                .help(approval.systemCommandRisk != nil ? "시스템 변경을 거절하고 같은 대화에서 안전한 방법으로 계속합니다." : "이번 요청의 응답: \(approval.answer). 항상 허용 규칙은 추가하지 않습니다.")
+                .help(approval.systemCommandRisk != nil ? "이 요청을 거절하고 같은 대화에 원본을 보존하는 방법을 안내합니다." : "이번 요청의 응답: \(approval.answer). 항상 허용 규칙은 추가하지 않습니다.")
             if approval.systemCommandRisk == nil && !automatic && !paused {
                 Button("허용하고 자동 승인 켜기") { perform { try approve(true) } }
                     .help("현재 요청에 응답하고 이 메인 세션과 연결된 백그라운드의 자동 승인을 켭니다.")

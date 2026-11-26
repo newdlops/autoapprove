@@ -11,7 +11,7 @@ private let safetyRecords = ProcessDiscovery.parse("""
 """)
 private let safetyCodex = safetyRecords.first { $0.pid == 41 }!
 private let safetyClaude = safetyRecords.first { $0.pid == 51 }!
-private func safetyPrompt(_ command: String = "cp artifacts/report.plist ~/Library/LaunchAgents/com.fixture.hourly.plist") -> String {
+private func safetyPrompt(_ command: String = "rm fixture-report.txt") -> String {
     "Would you like to run the following command?\n\nReason: fixture command review\n\n$ " + command + "\n\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n\nPress enter to confirm or esc to cancel"
 }
 private func safetyReady(_ agent: AgentKind = .codex, body: String = "") -> String {
@@ -65,7 +65,7 @@ private final class SafetyProbe: @unchecked Sendable {
     session.channel = .itermScreen; engine.updateDiscovery([session], records: probe.processes())
     return engine
 }
-private func safetyHook(_ date: Date, event: String = "PermissionRequest", command: String = "launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.fixture.plist") -> JSONObject {
+private func safetyHook(_ date: Date, event: String = "PermissionRequest", command: String = "rm fixture-report.txt") -> JSONObject {
     ["autoapproveProtocol": 1, "requestID": UUID().uuidString, "autoapproveExpiresAt": date.addingTimeInterval(600).timeIntervalSince1970,
      "hook_event_name": event, "session_id": "fixture-claude", "agentPID": NSNumber(value: safetyClaude.pid), "agentStarted": safetyClaude.started,
      "cwd": "/fixture", "tty": "/dev/ttys981", "tool_name": "Bash", "tool_use_id": UUID().uuidString, "tool_input": ["command": command]]
@@ -168,7 +168,7 @@ extension ApprovalTests {
     }
 
     func testSystemSafetyComposerOwnershipAndSubmission() throws {
-        let risk = SystemCommandRisk.detect("launchctl bootstrap gui/501 fixture")!, text = risk.guidance
+        let risk = SystemCommandRisk.detect("rm fixture-file")!, text = risk.guidance
         for agent in [AgentKind.codex, .claude] {
             let before = safetyReady(agent), composer = SystemSafetyComposer.capture(before, agent: agent, text: text)!
             let draft = safetyReady(agent, body: text)
@@ -208,7 +208,7 @@ extension ApprovalTests {
             let next = ((try engine.handleClaudeHook(permission, at: now))["autoapproveBridge"] as! JSONObject)["response"] as! JSONObject
             try expectEqual(((next["hookSpecificOutput"] as! JSONObject)["decision"] as! JSONObject)["behavior"] as? String, "deny")
         }
-        try expect(engine.snapshot.events.allSatisfy { $0.outcome.hasPrefix("시스템 변경 거절") && $0.answer?.contains("우회는 하지") == true })
+        try expect(engine.snapshot.events.allSatisfy { $0.outcome.hasPrefix("시스템 변경 거절") && $0.answer?.contains("기존 파일") == true })
         engine.stop()
     }
 
@@ -307,13 +307,51 @@ extension ApprovalTests {
         defer { try? FileManager.default.removeItem(at: paths.directory) }
         let engine = try safetyHookEngine(paths, probe: SafetyProbe()), now = Date(); defer { engine.stop() }
         try engine.setAutomatic(safetyClaude.key, enabled: true)
-        let first = safetyHook(now), second = safetyHook(now, command: "sudo pmset -a sleep 0")
+        let first = safetyHook(now), second = safetyHook(now, command: "unlink second-fixture")
         _ = try engine.handleClaudeHook(first, at: now); _ = try engine.handleClaudeHook(second, at: now)
-        try expectEqual(engine.snapshot.sessions.first { $0.id == safetyClaude.key }?.systemSafety?.risk.kind, .privileged)
+        try expectEqual(engine.snapshot.sessions.first { $0.id == safetyClaude.key }?.systemSafety?.risk.kind, .fileDeletion)
         try engine.acknowledgeClaudeHook(first, at: now)
         try expectEqual(engine.snapshot.sessions.first { $0.id == safetyClaude.key }?.systemSafety?.phase, .submitting, "An old acknowledgement cannot confirm a newer safety instruction")
         try engine.acknowledgeClaudeHook(second, at: now)
         try expectEqual(engine.snapshot.sessions.first { $0.id == safetyClaude.key }?.systemSafety?.phase, .guided)
         try expectEqual(engine.snapshot.events.filter { $0.outcome == "시스템 변경 거절 · 안전한 대안 안내 전달 확인" }.count, 2)
+    }
+}
+
+extension ApprovalTests {
+    @MainActor func testFileDeletionAndOriginalReview() async throws {
+        for command in ["rm file", "/bin/rm -rf 'old directory'", "cd project && rm old", "sudo -u worker rm old",
+                        "git -C project rm old", "find . -name '*.old' -delete", "find . -name old -exec rm {} \\;",
+                        "sh -c 'unlink old'", "python3 -c 'import os; os.remove(path)'", "git clean -fd"] {
+            try expectEqual(SystemCommandRisk.detect(command)?.kind, .fileDeletion, command)
+        }
+        for command in ["echo 'rm old'", "ls old", "git rm --cached file", "git clean -nfd", "chmod +x build.sh"] {
+            try expectNil(SystemCommandRisk.detect(command), command)
+        }
+        try expectNil(SystemCommandRisk.detect(tool: "Bash", input: ["command": "git status"], summary: "security authorizationdb and rm old"))
+        try expectNil(SystemCommandRisk.detect(tool: "Edit", input: ["file_path": "/fixture/file", "new_string": "rm old"]))
+        try expectEqual(SystemCommandRisk.detect(tool: "mcp__local__exec_command", input: ["cmd":"unlink old"])?.kind, .fileDeletion)
+        try expectNil(SystemCommandRisk.detect(tool: "manage_group_inbox", input: ["action":"delete","messageID":"fixture"]))
+        try expectNil(SystemCommandRisk.detect(tool: "mcp__mailbox__delete", input: ["messageID": "fixture"]))
+        try expectNil(SystemCommandRisk.detect(tool: "send_group_message", input: ["text": "fixture"], summary: "rm old"))
+        try expectEqual(SystemCommandRisk.detect(tool: "Delete", input: ["file_path": "/fixture/old"])?.kind, .fileDeletion)
+        try expectEqual(SystemCommandRisk.detect(tool: "apply_patch", input: ["patch": "*** Begin Patch\n*** Delete File: old\n*** End Patch"])?.kind, .fileDeletion)
+        try expectEqual(SystemCommandRisk.detect(tool: "mcp__filesystem__delete_file", input: ["path": "/fixture/file"])?.kind, .fileDeletion)
+        let paths = AppPaths(directory: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        defer { try? FileManager.default.removeItem(at: paths.directory) }
+        let engine = try safetyHookEngine(paths, probe: SafetyProbe())
+        defer { engine.stop() }
+        try engine.setAutomatic(safetyClaude.key, enabled: true)
+        for command in ["chmod 777 /etc/fixture", "defaults write local.fixture setting 1", "sudo id"] {
+            let now = Date()
+            for event in ["PreToolUse", "PermissionRequest"] {
+                let reply = try engine.handleClaudeHook(safetyHook(now, event: event, command: command), at: now)
+                let response = (reply["autoapproveBridge"] as? JSONObject)?["response"] as? JSONObject
+                try expectNotNil(response)
+                if event == "PreToolUse" {
+                    try expectEqual((response?["hookSpecificOutput"] as? JSONObject)?["permissionDecision"] as? String, "ask")
+                } else { try expectEqual(response?.isEmpty, true) }
+            }
+        }
     }
 }

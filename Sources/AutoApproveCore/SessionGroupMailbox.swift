@@ -25,6 +25,10 @@ public struct SessionGroupMessage: Equatable {
     public var lastResult: String?
     public var lastError: String?
     public var sourceKey: String?
+    var originalText: String?
+    var editedBy: UUID?
+    var inboxDeleted = false
+    var inboxRevision = 0
     var containsOriginalReport = false
 
     var urgentPermission: Bool { category == .permissionRequest && priority == .urgent && kind == .choiceQuestion }
@@ -59,7 +63,7 @@ public struct SessionGroupMessage: Equatable {
         }
         let label = category == .permissionRequest ? (priority == .urgent ? "[긴급 권한 요청] " : "[일반 권한 요청] ")
             : priority == .urgent ? "[긴급 메시지] " : ""
-        let heading = Self.promptPrefix + id.uuidString + "] " + label
+        let heading = Self.promptPrefix + id.uuidString + "] " + label + (editedBy == nil ? "" : "[그룹장 편집] ")
         let context: String
         if kind == .notice {
             context = heading + "AutoApprove 알림 · notice · groupID " + groupID.uuidString +
@@ -132,11 +136,14 @@ public struct SessionGroupMessage: Equatable {
                 "notificationAttempts": attempts, "lastNotificationResult": lastResult as Any? ?? NSNull(),
                 "lastError": lastError as Any? ?? NSNull()]
         if lastResult == "superseded", acknowledgedAt == nil { value["state"] = "superseded" }
-        if lastResult == "superseded", lastError == "cancelledBySender" { value["state"] = "cancelled" }
+        if lastResult == "superseded", ["cancelledBySender", "cancelledByLeader"].contains(lastError) { value["state"] = "cancelled" }
         if lastResult == "superseded", let reason = lastError, reason.hasPrefix("supersededBy=") {
             value["supersededBy"] = String(reason.dropFirst("supersededBy=".count))
         }
         if lastResult == "answered" { value["state"] = "answered" }
+        if kind == .message || inboxRevision > 0 { value["inboxRevision"] = inboxRevision }
+        if let editedBy { value["editedByMemberID"] = editedBy.uuidString }
+        if inboxDeleted { value["inboxDeleted"] = true }
         if isExpired { value["state"] = "expired" }
         if let key = sourceKey, key.hasPrefix("answer:") { value["inReplyTo"] = String(key.dropFirst(7)) }
         if kind == .question { value["replyWith"] = ["inReplyTo": id.uuidString] }
@@ -163,7 +170,7 @@ public struct SessionGroupConversationPage: Equatable {
 public final class SessionGroupMailbox {
     private var db: OpaquePointer?
     private let maximumPending: Int
-    private let columns = "sequence,id,group_id,sender_id,recipient_id,kind,body,created,acknowledged,attempts,next_attempt,last_result,last_error,source_key,EXISTS(SELECT 1 FROM group_original_reports o WHERE o.message_id=messages.id),requested_priority,priority_override,category"
+    private let columns = "sequence,id,group_id,sender_id,recipient_id,kind,body,created,acknowledged,attempts,next_attempt,last_result,last_error,source_key,EXISTS(SELECT 1 FROM group_original_reports o WHERE o.message_id=messages.id),requested_priority,priority_override,category,original_body,edited_by,inbox_deleted,inbox_revision"
 
     public init(directory: URL, maximumPending: Int = 1000) throws {
         self.maximumPending = maximumPending
@@ -198,6 +205,18 @@ public final class SessionGroupMailbox {
                         ALTER TABLE messages ADD COLUMN category TEXT NOT NULL DEFAULT 'message';
                         UPDATE messages SET category='permissionRequest',requested_priority='urgent'
                         WHERE kind='choiceQuestion' AND source_key LIKE 'question:%' AND body LIKE '[AutoApprove 그룹 승인 요청 %';
+                        """)
+                }
+            }
+            if try scalar("SELECT count(*) FROM pragma_table_info('messages') WHERE name='inbox_revision'") == 0 {
+                try transaction {
+                    guard try scalar("SELECT count(*) FROM pragma_table_info('messages') WHERE name='inbox_revision'") == 0 else { return }
+                    try execute("""
+                        ALTER TABLE messages ADD COLUMN inbox_revision INTEGER NOT NULL DEFAULT 0;
+                        ALTER TABLE messages ADD COLUMN original_body TEXT;
+                        ALTER TABLE messages ADD COLUMN edited_by TEXT;
+                        ALTER TABLE messages ADD COLUMN inbox_deleted INTEGER NOT NULL DEFAULT 0;
+                        ALTER TABLE messages ADD COLUMN delivery_order INTEGER;
                         """)
                 }
             }
@@ -324,8 +343,9 @@ public final class SessionGroupMailbox {
         guard sqlite3_step(s) == SQLITE_ROW else { throw AppError.message("그룹 수신함 상태를 읽지 못했습니다.") }
         return Int(sqlite3_column_int64(s, 0))
     }
-    private func rows(_ suffix: String, _ values: [String] = []) throws -> [SessionGroupMessage] {
-        let s = try statement("SELECT " + columns + " FROM messages " + suffix, values); defer { sqlite3_finalize(s) }
+    private func rows(_ suffix: String, _ values: [String] = [], alias: Bool = false) throws -> [SessionGroupMessage] {
+        let projection = alias ? columns.replacingOccurrences(of: "messages.id", with: "m.id") : columns
+        let s = try statement("SELECT " + projection + (alias ? " FROM messages m " : " FROM messages ") + suffix, values); defer { sqlite3_finalize(s) }
         func text(_ index: Int32) -> String? { sqlite3_column_text(s, index).map { String(cString: $0) } }
         var result: [SessionGroupMessage] = []
         while true {
@@ -341,7 +361,9 @@ public final class SessionGroupMailbox {
                 kind: kind, text: body, createdAt: Date(timeIntervalSince1970: sqlite3_column_double(s, 7)),
                 acknowledgedAt: sqlite3_column_type(s, 8) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(s, 8)),
                 attempts: Int(sqlite3_column_int64(s, 9)), nextAttemptAt: Date(timeIntervalSince1970: sqlite3_column_double(s, 10)),
-                lastResult: text(11), lastError: text(12), sourceKey: text(13), containsOriginalReport: sqlite3_column_int(s, 14) != 0))
+                lastResult: text(11), lastError: text(12), sourceKey: text(13), originalText: text(18),
+                editedBy: text(19).flatMap(UUID.init(uuidString:)), inboxDeleted: sqlite3_column_int(s, 20) != 0,
+                inboxRevision: Int(sqlite3_column_int64(s, 21)), containsOriginalReport: sqlite3_column_int(s, 14) != 0))
         }
     }
     func transaction<T>(_ body: () throws -> T) throws -> T {
@@ -557,10 +579,10 @@ public final class SessionGroupMailbox {
         }
         if let id, let previous = try message(id) {
             guard previous.groupID == groupID, previous.senderID == senderID, previous.recipientID == recipientID,
-                  previous.kind == kind, previous.text == text, previous.sourceKey == sourceKey, previous.requestedPriority == priority, previous.category == category else { throw RemoteHTTPError(409, "같은 messageID의 내용이나 대상이 다릅니다. 새 메시지에만 새 ID를 사용하세요.") }
+                  previous.kind == kind, (previous.originalText ?? previous.text) == text, previous.sourceKey == sourceKey, previous.requestedPriority == priority, previous.category == category else { throw RemoteHTTPError(409, "같은 messageID의 내용이나 대상이 다릅니다. 새 메시지에만 새 ID를 사용하세요.") }
             return previous
         }
-        if id == nil, sourceKey == nil, let previous = try rows("WHERE group_id=? AND sender_id=? AND recipient_id=? AND kind=? AND body=? AND requested_priority=? AND category=? AND source_key IS NULL AND \(Self.pendingFilter) ORDER BY sequence LIMIT 1",
+        if id == nil, sourceKey == nil, let previous = try rows("WHERE group_id=? AND sender_id=? AND recipient_id=? AND kind=? AND COALESCE(original_body,body)=? AND requested_priority=? AND category=? AND source_key IS NULL AND \(Self.pendingFilter) ORDER BY sequence LIMIT 1",
             [groupID.uuidString, senderID.uuidString, recipientID.uuidString, kind.rawValue, text, priority.rawValue, category.rawValue]).first { return previous }
         guard try kind == .waitNotice || kind == .notice || pendingCount < maximumPending else { throw RemoteHTTPError(409, "미확인 그룹 메시지가 너무 많아 새 메시지를 접수하지 않았습니다. 기존 메시지를 수신 확인한 뒤 다시 보내세요.") }
         let key = id ?? UUID()
@@ -688,7 +710,7 @@ public final class SessionGroupMailbox {
                      after: Int64 = 0, limit: Int = 50, priority: SessionGroupMessage.Priority? = nil,
                      category: SessionGroupMessage.Category? = nil) throws -> [SessionGroupMessage] {
         try rows("WHERE group_id=? AND " + (outbox ? "sender_id" : "recipient_id") + "=? AND sequence>?" +
-                 (includeAcknowledged ? "" : " AND " + Self.pendingFilter) +
+                 (outbox ? "" : " AND inbox_deleted=0") + (includeAcknowledged ? "" : " AND " + Self.pendingFilter) +
                  (priority == nil ? "" : " AND COALESCE(priority_override,requested_priority)=?") +
                  (category == nil ? "" : " AND category=?") + " ORDER BY sequence LIMIT ?",
                  [groupID.uuidString, memberID.uuidString, String(after)] + [priority?.rawValue, category?.rawValue].compactMap { $0 } + [String(max(1, min(limit, 101)))])
@@ -749,7 +771,8 @@ public final class SessionGroupMailbox {
         ) ELSE 1 END
         """
 
-    private static let notificationOrder = "CASE WHEN m.category='permissionRequest' AND COALESCE(m.priority_override,m.requested_priority)='urgent' THEN -4 WHEN m.source_key LIKE 'userButton:rename:%' THEN -3 WHEN m.source_key LIKE 'userButton:questionPriority:%' THEN -2 WHEN (m.kind='notice' AND m.body LIKE '[AutoApprove 닉네임 요청]%') THEN -1 WHEN COALESCE(m.priority_override,m.requested_priority)='urgent' THEN 0 WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 1 ELSE 2 END,CASE WHEN m.source_key LIKE 'userButton:rename:%' THEN -m.sequence ELSE m.sequence END"
+    private static let notificationTier = "CASE WHEN m.category='permissionRequest' AND COALESCE(m.priority_override,m.requested_priority)='urgent' THEN -4 WHEN m.source_key LIKE 'userButton:rename:%' THEN -3 WHEN m.source_key LIKE 'userButton:questionPriority:%' THEN -2 WHEN (m.kind='notice' AND m.body LIKE '[AutoApprove 닉네임 요청]%') THEN -1 WHEN COALESCE(m.priority_override,m.requested_priority)='urgent' THEN 0 WHEN m.source_key LIKE 'decision:%' OR m.kind='waitNotice' THEN 1 ELSE 2 END"
+    private static let notificationOrder = notificationTier + ",CASE WHEN m.source_key LIKE 'userButton:rename:%' THEN -m.sequence ELSE COALESCE(m.delivery_order,m.sequence) END,m.sequence"
 
     public struct InboxOperation: Equatable, Sendable {
         public let unacknowledgedCount: Int
@@ -1061,9 +1084,161 @@ public final class SessionGroupMailbox {
                 guard let message = try message(id), message.groupID == groupID, message.recipientID == recipientID else {
                     throw RemoteHTTPError(403, "자기 수신함의 메시지만 수신 확인할 수 있습니다.")
                 }
+                guard message.acknowledgedAt != nil || (!message.inboxDeleted && message.lastError != "cancelledByLeader") else {
+                    throw RemoteHTTPError(409, "그룹장이 취소하거나 삭제한 메시지입니다.")
+                }
                 guard !message.isExpired else { throw RemoteHTTPError(409, "만료된 메시지는 수신 확인할 수 없습니다.") }
             }
             for id in ids { try update("UPDATE messages SET acknowledged=? WHERE id=? AND acknowledged IS NULL", [String(date.timeIntervalSince1970), id.uuidString]) }
+        }
+    }
+}
+
+extension SessionGroupMailbox {
+    private static let recipientQueue = "m.group_id=? AND m.recipient_id=? AND " + notificationFilter
+
+    func deliveryQueue(group: UUID, recipient: UUID, limit: Int, offset: Int64 = 0) throws -> [SessionGroupMessage] {
+        try rows("WHERE " + Self.recipientQueue + " ORDER BY " + Self.notificationOrder + " LIMIT ? OFFSET ?",
+                 [group.uuidString, recipient.uuidString, String(limit), String(offset)], alias: true)
+    }
+
+    package func claimDelivery(_ selected: SessionGroupMessage, retryAt: Date) throws -> SessionGroupMessage? {
+        try transaction {
+            guard let current = try deliveryQueue(group: selected.groupID, recipient: selected.recipientID, limit: 1).first,
+                  current.id == selected.id, current.attempts == selected.attempts,
+                  current.lastResult == selected.lastResult, current.nextAttemptAt == selected.nextAttemptAt else { return nil }
+            try noteAttempt(current.id, result: "direct_attempting", retryAt: retryAt, increment: true)
+            return current
+        }
+    }
+
+    package enum InboxAction: String { case edit, cancel, delete, move, retry }
+
+    package func manageInbox(group: UUID, recipient: UUID, leader: UUID, ids: [UUID], action: InboxAction,
+                     text: String?, before: UUID?, expectedRevision: Int?) throws -> [SessionGroupMessage] {
+        try transaction {
+            let previousHead = try deliveryQueue(group: group, recipient: recipient, limit: 1).first?.id
+            let changed = try ids.map { id in
+                try changeMessage(group: group, recipient: recipient, leader: leader, id: id,
+                                  action: action, text: text, before: before, expectedRevision: expectedRevision)
+            }
+            let includesHead = previousHead.map(ids.contains) == true
+            let retryHead = includesHead && (action == .edit || action == .retry)
+            if includesHead || action == .move {
+                try update("""
+                    UPDATE messages SET next_attempt=0 WHERE last_result='not_started' AND next_attempt>0
+                    AND (id<>? OR ?='1') AND id=(
+                        SELECT m.id FROM messages m WHERE \(Self.recipientQueue) ORDER BY \(Self.notificationOrder) LIMIT 1
+                    )
+                    """, [previousHead?.uuidString ?? "", retryHead ? "1" : "0", group.uuidString, recipient.uuidString])
+            }
+            return changed
+        }
+    }
+
+    private func changeMessage(group: UUID, recipient: UUID, leader: UUID, id: UUID, action: InboxAction,
+                               text: String?, before: UUID?, expectedRevision: Int?) throws -> SessionGroupMessage {
+        guard let item = try message(id), item.groupID == group, item.recipientID == recipient else {
+            throw RemoteHTTPError(404, "지정한 구성원의 수신함에서 메시지를 찾지 못했습니다.")
+        }
+        let ordinary = item.kind == .message && item.category == .message &&
+            (item.sourceKey == nil || item.sourceKey?.hasPrefix("replacement:") == true)
+        guard ordinary || action == .move || action == .retry else {
+            throw RemoteHTTPError(409, "일반 메시지만 관리할 수 있습니다. 질문·권한 요청·작업 보고는 해당 처리 도구를 사용하세요.")
+        }
+        if item.inboxDeleted {
+            guard action == .delete else { throw RemoteHTTPError(404, "수신함에서 삭제된 메시지입니다.") }
+            return item
+        }
+        if action == .cancel, item.lastError == "cancelledByLeader" { return item }
+        guard expectedRevision == nil || item.inboxRevision == expectedRevision else {
+            throw RemoteHTTPError(409, "메시지가 변경됐습니다. 수신함에서 최신 inboxRevision을 확인해주세요.")
+        }
+        if item.lastResult == "not_started", item.attempts == 0, item.acknowledgedAt == nil {
+            try update("""
+                DELETE FROM group_submissions WHERE message_id=?1
+                AND NOT EXISTS(SELECT 1 FROM group_submit_enters WHERE message_id=?1)
+                AND NOT EXISTS(SELECT 1 FROM group_manual_enters WHERE message_id=?1)
+                AND NOT EXISTS(SELECT 1 FROM group_observed_turns WHERE message_id=?1)
+                AND NOT EXISTS(SELECT 1 FROM group_prompt_receipts WHERE message_id=?1)
+                """, [id.uuidString])
+        }
+        let finished = item.acknowledgedAt != nil || ["superseded", "expired"].contains(item.lastResult)
+        if action != .delete || !finished {
+            guard !finished, [nil, "not_started", "sender_absent"].contains(item.lastResult),
+                  try submittedAt(id) == nil else {
+                throw RemoteHTTPError(409, "전달 중이거나 이미 처리한 메시지입니다. 수신 확인 후 수신함에서 삭제할 수 있습니다.")
+            }
+        }
+        let key = id.uuidString
+        switch action {
+        case .edit:
+            let body = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !body.isEmpty, body.count <= SessionGroupOrchestration.maximumTaskLength, !body.contains("\0"),
+                  SessionGroupOrchestration.commandPrefix(SessionGroupOrchestration.oneLine(body)) == nil else {
+                throw RemoteHTTPError(400, "일반 메시지의 길이와 명령 접두사를 확인해주세요.")
+            }
+            if body == item.text { return item }
+            try update("UPDATE messages SET original_body=COALESCE(original_body,body),body=?,edited_by=?,inbox_revision=inbox_revision+1 WHERE id=?",
+                       [body, leader.uuidString, key])
+        case .cancel:
+            try update("UPDATE messages SET last_result='superseded',last_error='cancelledByLeader',inbox_revision=inbox_revision+1 WHERE id=?", [key])
+        case .delete:
+            if !finished {
+                try update("UPDATE messages SET last_result='superseded',last_error='cancelledByLeader' WHERE id=?", [key])
+            }
+            try update("UPDATE messages SET inbox_deleted=1,inbox_revision=inbox_revision+1 WHERE id=?", [key])
+        case .move:
+            try moveQueued(item, before: before)
+        case .retry:
+            guard item.lastResult == "not_started",
+                  try deliveryQueue(group: group, recipient: recipient, limit: 1).first?.id == id else {
+                throw RemoteHTTPError(409, "전달 시작 전에 보류된 대기열의 첫 메시지만 즉시 재시도할 수 있습니다.")
+            }
+        }
+        guard let saved = try message(id) else { throw RemoteHTTPError(404, "메시지를 찾지 못했습니다.") }
+        return saved
+    }
+
+    private func moveQueued(_ item: SessionGroupMessage, before anchor: UUID?) throws {
+        if let anchor {
+            guard let target = try message(anchor), target.groupID == item.groupID, target.recipientID == item.recipientID else {
+                throw RemoteHTTPError(409, "같은 수신함에서 전달을 기다리는 메시지를 기준으로 지정해주세요.")
+            }
+            if target.priority != item.priority {
+                guard item.kind == .message, target.kind == .message, item.category == .message, target.category == .message else {
+                    throw RemoteHTTPError(409, "질문·보고·시스템 알림은 같은 우선순위 안에서 이동해주세요.")
+                }
+                try update("UPDATE messages SET priority_override=?,inbox_revision=inbox_revision+1 WHERE id=?", [target.priority.rawValue, item.id.uuidString])
+            }
+        }
+        let q = try statement("""
+            SELECT m.id,COALESCE(m.delivery_order,m.sequence) FROM messages m WHERE \(Self.recipientQueue)
+            AND (\(Self.notificationTier))=(SELECT \(Self.notificationTier) FROM messages m WHERE m.id=?)
+            ORDER BY \(Self.notificationOrder)
+            """, [item.groupID.uuidString, item.recipientID.uuidString, item.id.uuidString])
+        defer { sqlite3_finalize(q) }
+        var ids: [String] = [], slots: [Int64] = []
+        while true {
+            let status = sqlite3_step(q)
+            if status == SQLITE_DONE { break }
+            guard status == SQLITE_ROW else { throw AppError.message("수신함 전달 순서를 읽지 못했습니다.") }
+            ids.append(String(cString: sqlite3_column_text(q, 0)))
+            slots.append(sqlite3_column_int64(q, 1))
+        }
+        let key = item.id.uuidString
+        guard ids.contains(key), anchor.map({ ids.contains($0.uuidString) }) ?? true else {
+            throw RemoteHTTPError(409, "위치가 바뀌었습니다. 현재 전달 대기열을 다시 조회해주세요.")
+        }
+        guard item.sourceKey?.hasPrefix("userButton:rename:") != true else {
+            throw RemoteHTTPError(409, "닉네임 요청은 최신 요청을 우선합니다.")
+        }
+        if anchor == item.id { return }
+        var newOrder = ids.filter { $0 != key }
+        let index = anchor.flatMap { newOrder.firstIndex(of: $0.uuidString) } ?? newOrder.endIndex
+        newOrder.insert(key, at: index)
+        for i in ids.indices where ids[i] != newOrder[i] {
+            try update("UPDATE messages SET delivery_order=?,inbox_revision=inbox_revision+1 WHERE id=?", [String(slots[i]), newOrder[i]])
         }
     }
 }

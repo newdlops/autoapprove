@@ -63,6 +63,7 @@ struct CodexServerApproval {
               let bytes = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return nil }
         let turn = p["turnId"] as? String ?? "", item = p["itemId"] as? String ?? ""
         let text: String
+        let risk: SystemCommandRisk?
         switch method {
         case "item/commandExecution/requestApproval":
             guard !turn.isEmpty, !item.isEmpty,
@@ -71,6 +72,7 @@ struct CodexServerApproval {
                   let commandCWD = p["cwd"] as? String, commandCWD.hasPrefix("/"),
                   p["availableDecisions"] == nil || p["availableDecisions"] is NSNull ||
                     (p["availableDecisions"] as? [Any])?.contains(where: { $0 as? String == "accept" }) == true else { return nil }
+            risk = SystemCommandRisk.detect(command, cwd: commandCWD)
             text = command + "\n" + String(decoding: (try? JSONSerialization.data(withJSONObject: p, options: [.sortedKeys])) ?? Data(), as: UTF8.self)
         case "item/fileChange/requestApproval":
             guard !turn.isEmpty, !item.isEmpty, p["grantRoot"] == nil || p["grantRoot"] is NSNull,
@@ -79,6 +81,13 @@ struct CodexServerApproval {
                   let changes = fileItem["changes"] as? [JSONObject], !changes.isEmpty,
                   changes.allSatisfy({ ($0["path"] as? String)?.hasPrefix("/") == true }),
                   let data = try? JSONSerialization.data(withJSONObject: fileItem, options: [.sortedKeys]) else { return nil }
+            let deleted = changes.contains { change in
+                (change["kind"] as? String ?? (change["kind"] as? JSONObject)?["type"] as? String) == "delete"
+            }
+            risk = deleted ? FileDeletionCommand.risk : changes.compactMap { change -> SystemCommandRisk? in
+                guard let path = change["path"] as? String else { return nil }
+                return SystemCommandRisk.detect(tool: "Edit", input: ["file_path": path], cwd: cwd)
+            }.first
             text = String(decoding: data, as: UTF8.self)
         case "mcpServer/elicitation/request":
             // Computer Use permission is an empty form with an explicit Allow
@@ -93,9 +102,10 @@ struct CodexServerApproval {
                   let message = p["message"] as? String,
                   message.range(of: #"^Allow [^\r\n]+\?$"#, options: .regularExpression) != nil else { return nil }
             text = server + "\n" + message
+            risk = SystemCommandRisk.detect(text, cwd: cwd)
         default: return nil
         }
-        let risk = SystemCommandRisk.detect(text, cwd: p["cwd"] as? String ?? cwd)
+        if let risk, !risk.blocksAutomatically { return nil }
         var denial = "decline"
         if risk != nil, let decisions = p["availableDecisions"] as? [Any], !decisions.contains(where: { $0 as? String == denial }) {
             guard decisions.contains(where: { $0 as? String == "cancel" }) else { return nil }

@@ -85,7 +85,7 @@ struct ClaudeHookRequest {
     let questions: [WebQuestionField]?
     var systemCommandRisk: SystemCommandRisk?
     var safetyResponse: JSONObject? {
-        guard let risk = systemCommandRisk, let event = payload["hook_event_name"] as? String,
+        guard let risk = systemCommandRisk, risk.blocksAutomatically, let event = payload["hook_event_name"] as? String,
               ["PreToolUse", "PermissionRequest"].contains(event) else { return nil }
         return risk.denial(event: event)
     }

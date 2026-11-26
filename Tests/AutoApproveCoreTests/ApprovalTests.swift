@@ -488,7 +488,7 @@ func expect(_ value: Bool, _ message: String = "Expected true", file: StaticStri
 }
 func expectFalse(_ value: Bool, _ message: String = "Expected false") throws { try expect(!value, message) }
 func expectEqual<T: Equatable>(_ lhs: T, _ rhs: T, _ message: String = "Values differ") throws { try expect(lhs == rhs, "\(message): \(lhs) != \(rhs)") }
-func expectNil<T>(_ value: T?) throws { try expect(value == nil, "Expected nil") }
+func expectNil<T>(_ value: T?, _ message: String = "Expected nil") throws { try expect(value == nil, message) }
 func expectNotNil<T>(_ value: T?, _ message: String = "Expected a value") throws { try expect(value != nil, message) }
 func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
     do { _ = try operation() } catch { return }
@@ -553,6 +553,9 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: a stalled message notifies its sender once",tests.testStalledGroupMessageNotifiesItsSenderOnce),
             ("Session groups: messages for a removed member are kept and reported",tests.testMessagesForRemovedMemberAreKeptAndReported),
             ("Session groups: Claude original reply without MCP",tests.testGroupClaudeReplyWithoutMCP),
+            ("File protection: delete requests and original permission review",tests.testFileDeletionAndOriginalReview),
+            ("Session groups: inbox migration and concurrent delivery claims",tests.testInboxMigrationAndConcurrentClaims),
+            ("Session groups: leader unblocks a member inbox in delivery order",tests.testLeaderUnblocksMemberInbox),
             ("Session groups: summary mailbox pages and receipts",tests.testSummaryMailboxPagesAndReceipts),
             ("Session groups: completion reports require recipient ACK",tests.testGroupReportRequiresRecipientAcknowledgement),
             ("Session groups: corrupt mailbox never accepts or deletes messages",tests.testGroupMailboxRefusesCorruptStorage),

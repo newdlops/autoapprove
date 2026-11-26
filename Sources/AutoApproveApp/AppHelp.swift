@@ -8,7 +8,7 @@ enum AppHelp {
     static let search = "프로젝트 이름·전체 경로, 표시 이름·메모·원래 터미널 제목, Git 브랜치·커밋, Claude Code·Codex, TTY 또는 PID로 실행 중인 세션을 찾습니다."
     static let tty = "터미널 탭의 식별자입니다. 같은 프로젝트를 여러 창에서 실행할 때 구분할 수 있습니다."
     static let pid = "실행 중인 Claude Code·Codex 프로세스의 번호입니다."
-    static let automaticDescription = "일반 권한 요청과 예·아니오 확인에는 이번 요청만 허용합니다. 지원 확인 질문에는 0.5초 후 응답합니다. 시스템 자동 실행 등록·보안 설정 변경·관리자 실행은 승인 대신 거절하고, 같은 대화에 안전한 대안으로 계속하라는 지시를 전달합니다. Mac과 웹에 경고와 전달 상태를 표시합니다. 오류 재시도는 원본 세션에서 이어갑니다."
+    static let automaticDescription = "일반 권한 요청과 예·아니오 확인에는 이번 요청만 허용합니다. 지원 확인 질문에는 0.5초 후 응답합니다. 파일·폴더 삭제 요청을 감지하면 거절하고 같은 대화에 원본을 보존하는 방법을 안내합니다. 보안·접근 권한, 시스템 설정, 관리자 권한 요청은 원래 승인창에서 직접 결정할 수 있습니다. 오류 재시도는 원본 세션에서 이어갑니다."
     static let sendingAnswer = "답변을 보내고 있습니다. 중복 전송을 막기 위해 완료될 때까지 기다려주세요."
     static let quit = "AutoApprove와 자동 승인을 종료합니다. Claude Code·Codex 터미널은 계속 실행됩니다."
 

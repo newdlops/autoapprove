@@ -111,7 +111,7 @@ extension ApprovalTests {
         try expectEqual((initialize?["result"] as? JSONObject)?["protocolVersion"] as? String, "2025-11-25")
         let list = AutoApproveMCPServer.response(["jsonrpc": "2.0", "id": "list", "method": "tools/list"]) { _, _ in [:] }
         let tools=(list?["result"] as? JSONObject)?["tools"] as? [JSONObject] ?? []
-        try expectEqual(Set(tools.compactMap{$0["name"] as? String}),Set(["ask_user","get_user_answers","get_session_groups","get_group_topology","set_group_relationship","get_group_status","assign_group_task","assign_group_tasks","list_group_background_jobs","stop_group_background_job","watch_group_events","explain_group_delivery","get_group_member_goal","manage_group_member_goal","manage_group_task","retry_group_submission","replace_group_task","clear_group_composer","interrupt_group_task","set_group_message_priority","cancel_group_messages","answer_group_question","reconnect_group_member","send_group_message","ask_group_question","reply_group_question","get_group_messages","get_group_member_terminal","ack_group_messages","clear_session_group","clear_group_member","set_group_member_title","set_group_member_tab_color","get_group_clear_status","wait_group_dependencies","update_group_wait","complete_group_task","get_diagnostics","list_screens","start_screen_share","stop_screen_share",
+        try expectEqual(Set(tools.compactMap{$0["name"] as? String}),Set(["ask_user","get_user_answers","get_session_groups","get_group_topology","set_group_relationship","get_group_status","assign_group_task","assign_group_tasks","list_group_background_jobs","stop_group_background_job","watch_group_events","explain_group_delivery","get_group_member_goal","manage_group_member_goal","manage_group_task","retry_group_submission","replace_group_task","clear_group_composer","interrupt_group_task","set_group_message_priority","manage_group_inbox","cancel_group_messages","answer_group_question","reconnect_group_member","send_group_message","ask_group_question","reply_group_question","get_group_messages","get_group_member_terminal","ack_group_messages","clear_session_group","clear_group_member","set_group_member_title","set_group_member_tab_color","get_group_clear_status","wait_group_dependencies","update_group_wait","complete_group_task","get_diagnostics","list_screens","start_screen_share","stop_screen_share",
             "desktop_list_apps","desktop_open_app","desktop_snapshot","desktop_screenshot","desktop_press","desktop_set_value","desktop_type","desktop_key"]))
         for name in ["get_group_topology","desktop_list_apps","desktop_snapshot","desktop_screenshot"] {
             try expectEqual((tools.first(where:{$0["name"] as? String==name})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,true)
@@ -120,7 +120,7 @@ extension ApprovalTests {
             try expectEqual((tools.first(where:{$0["name"] as? String==name})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,false)
         }
         try expectEqual((tools.first(where:{$0["name"] as? String=="get_session_groups"})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,true)
-        for name in ["set_group_relationship","get_group_status","assign_group_task","assign_group_tasks","stop_group_background_job","manage_group_member_goal","manage_group_task","retry_group_submission","replace_group_task","clear_group_composer","interrupt_group_task","set_group_message_priority","cancel_group_messages","answer_group_question","reconnect_group_member","send_group_message","ask_group_question","reply_group_question","ack_group_messages"] {
+        for name in ["set_group_relationship","get_group_status","assign_group_task","assign_group_tasks","stop_group_background_job","manage_group_member_goal","manage_group_task","retry_group_submission","replace_group_task","clear_group_composer","interrupt_group_task","set_group_message_priority","manage_group_inbox","cancel_group_messages","answer_group_question","reconnect_group_member","send_group_message","ask_group_question","reply_group_question","ack_group_messages"] {
             try expectEqual((tools.first(where:{$0["name"] as? String==name})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,false)
         }
         try expectEqual((tools.first(where:{$0["name"] as? String=="get_diagnostics"})?["annotations"] as? JSONObject)?["readOnlyHint"] as? Bool,true)
@@ -130,7 +130,7 @@ extension ApprovalTests {
         let clearMember = tools.first(where:{$0["name"] as? String=="clear_group_member"})!
         try expectEqual((clearMember["annotations"] as? JSONObject)?["destructiveHint"] as? Bool,true)
         try expectEqual((clearMember["inputSchema"] as? JSONObject)?["required"] as? [String],["groupID","memberID","requestID"])
-        for (profile, count) in [(MCPToolProfile.orchestrator, 38), (.worker, 20), (.desktop, 9)] {
+        for (profile, count) in [(MCPToolProfile.orchestrator, 39), (.worker, 20), (.desktop, 9)] {
             let list = AutoApproveMCPServer.response(["jsonrpc": "2.0", "id": 1, "method": "tools/list"], profile: profile) { _, _ in [:] }
             let visible = (list?["result"] as? JSONObject)?["tools"] as? [JSONObject] ?? []
             let names = Set(visible.compactMap { $0["name"] as? String })

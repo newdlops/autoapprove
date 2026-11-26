@@ -1352,11 +1352,11 @@ function renderMachines() {
   if(removedFocus && document.activeElement===document.body)$('list-cleanup').querySelector('summary').focus({preventScroll:true});
 }
 function systemSafetyTitle(risk) {
-  return {persistence:'시스템 자동 실행 변경',security:'보안·접근 권한 변경',settings:'시스템 설정·파일 변경',privileged:'관리자 권한 실행'}[risk?.kind] || '시스템 변경';
+  return {fileDeletion:'파일 삭제',persistence:'시스템 자동 실행 변경',security:'보안·접근 권한 변경',settings:'시스템 설정·파일 변경',privileged:'관리자 권한 실행'}[risk?.kind] || '시스템 변경';
 }
 function systemSafetyStatus(source, node) {
   const notice = source.systemSafety;
-  if (notice.phase === 'detected') return node.state?.snapshot.paused ? '전체 일시정지 중 · 시스템 변경을 자동 승인하지 않습니다.' : !source.automatic ? '자동 승인 꺼짐 · 켜면 시스템 변경을 거절하고 안전한 대안을 안내합니다.' : notice.message;
+  if (notice.phase === 'detected') return node.state?.snapshot.paused ? '전체 일시정지 중 · 원래 터미널에서 확인하세요.' : !source.automatic ? '자동 승인 꺼짐 · 켜면 이 요청을 거절하고 대안을 안내합니다.' : notice.message;
   return notice.message;
 }
 function renderSystemSafety() {
@@ -1404,7 +1404,7 @@ function renderSessionSafety() {
     article.dataset.warningKey = warningKey(selectedItem,source,'safety');
     text(article.querySelector('.safety-status'),systemSafetyStatus(source,node));
     text(article.querySelector('.safety-request'),notice.request);
-    text(article.querySelector('.safety-alternative'),'이미 실행 중인 프로그램의 타이머나 프로젝트 내부 작업으로 계속합니다. 시스템 자동 실행 등록·관리자 권한 상승·보안 설정 변경이나 우회는 하지 않습니다.');
+    text(article.querySelector('.safety-alternative'),notice.risk?.kind === 'fileDeletion' ? '기존 파일을 보존하고 새 경로나 새 파일로 작업을 계속합니다.' : '원래 터미널에서 사용자의 결정을 기다립니다.');
   }
 }
 function interruptionStatus(session) {

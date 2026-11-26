@@ -52,7 +52,19 @@ import Foundation
         let observations = await readOnly.value
         precondition(observations == 1)
         let safety: JSONObject = ["id": "protected", "method": "item/commandExecution/requestApproval", "params": ["threadId": child, "turnId": "turn", "itemId": "command", "cwd": "/fixture", "command": "sudo launchctl bootstrap system /Library/LaunchDaemons/fixture.plist", "availableDecisions": ["accept", "cancel"]]]
-        precondition(CodexServerApproval.parse(safety, threads: [child: rows[1]])?.result["decision"] as? String == "cancel")
+        precondition(CodexServerApproval.parse(safety, threads: [child: rows[1]]) == nil)
+        var removal = safety, params = safety["params"] as! JSONObject
+        params["command"] = "rm fixture.txt"
+        removal["params"] = params
+        precondition(CodexServerApproval.parse(removal, threads: [child: rows[1]])?.result["decision"] as? String == "cancel")
+        let fileRequest: JSONObject = ["id": "patch", "method": "item/fileChange/requestApproval",
+            "params": ["threadId": child, "turnId": "turn", "itemId": "patch"]]
+        for (kind, expected) in [("delete", "decline"), ("update", "accept")] {
+            let fileItem: JSONObject = ["id": "patch", "type": "fileChange", "status": "inProgress",
+                "changes": [["path": "/fixture/file.txt", "kind": ["type": kind]]]]
+            let parsed = CodexServerApproval.parse(fileRequest, threads: [child: rows[1]], fileItem: fileItem)
+            precondition(parsed?.result["decision"] as? String == expected)
+        }
         for key in ["subAgent", "subagent"] {
             let row: JSONObject = ["parentThreadId": root, "source": [key: ["thread_spawn": ["parent_thread_id": root, "agent_path": "/root/worker"]]]]
             precondition(CodexSubagentApprovals.taskPath(row) == "/root/worker")
@@ -133,7 +145,7 @@ import Foundation
             try await Task.sleep(for: .milliseconds(100))
         }
         precondition(engine.snapshot.events.contains(where: { $0.outcome == "서버 승인 확인" }))
-        try await Task.sleep(for: .seconds(4)) // The same replay must not be sent twice.
+        try await Task.sleep(for: .seconds(4))
         let attempts = engine.snapshot.events.filter { $0.outcome == "서버 승인 응답 시도 · 결과 미확인" }.count
         precondition(attempts == 2)
         if uncertain { precondition(engine.snapshot.events.contains { $0.outcome == "서버 응답 결과 미확인 · 중복 전송하지 않음" }) }

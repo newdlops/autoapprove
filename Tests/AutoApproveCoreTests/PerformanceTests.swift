@@ -237,7 +237,7 @@ extension ApprovalTests {
             try expectEqual(result[sessions[0].id]?.pendingSummary, "Would you like to run the following command?\n$ pwd")
             try expectEqual(result[sessions[1].id]?.phase, .approval)
             try expectNotNil(result[sessions[1].id]?.systemCommandRisk)
-            try expectNotNil(result[sessions[1].id]?.systemSafety, "A system mutation remains excluded from ordinary approvals")
+            try expectNil(result[sessions[1].id]?.systemSafety, "A system mutation waits for the terminal without cancelling the request")
             for index in [2, 3] {
                 try expectEqual(result[sessions[index].id]?.phase, .input)
                 try expect(result[sessions[index].id]?.pendingSummary?.contains("Which synthetic test?") == true)

@@ -1,26 +1,30 @@
 import Foundation
 
-/// A local approval guard, not a claim to understand arbitrary executable code.
 public struct SystemCommandRisk: Codable, Equatable, Sendable {
-    public enum Kind: String, Codable, Sendable { case persistence, security, settings, privileged }
+    public enum Kind: String, Codable, Sendable { case persistence, security, settings, privileged, fileDeletion }
     public var kind: Kind
     public var evidence: String
     public var title: String {
         switch kind {
+        case .fileDeletion: return "파일 삭제"
         case .persistence: return "시스템 자동 실행 변경"
         case .security: return "보안·접근 권한 변경"
         case .settings: return "시스템 설정·파일 변경"
         case .privileged: return "관리자 권한 실행"
         }
     }
-    public var detail: String { title + " 요청을 감지했습니다. 이 변경을 승인하는 대신 같은 대화에 안전한 대안을 안내합니다." }
-    public var alternative: String {
-        "이미 실행 중인 프로그램의 타이머나 프로젝트 안에서 명시적으로 실행하는 작업으로 목적을 달성합니다. 시스템 자동 실행 등록과 보안 설정 변경은 하지 않습니다."
+    var blocksAutomatically: Bool { kind == .fileDeletion }
+    public var detail: String {
+        blocksAutomatically ? "파일 삭제 요청을 감지했습니다. 기존 파일을 보존하는 방법으로 계속합니다."
+            : title + " 요청입니다. 원래 터미널에서 승인 여부를 결정해주세요."
     }
-    /// A denial explains how to continue; it never asks the agent to bypass an OS,
-    /// endpoint-security, sandbox or corporate-network restriction.
+    public var alternative: String { guidance }
     public var guidance: String {
-        "이 시스템 변경은 실행하지 마세요. 원래 목표는 멈추지 말고 안전한 방법으로 계속 진행하세요. LaunchAgent·LaunchDaemon·cron 등 자동 실행 등록, 시스템 경로 수정, 관리자 권한 상승, 보안 도구·권한·VPN 정책 변경이나 우회는 하지 마세요. 예약·반복 작업은 이미 실행 중인 프로그램의 타이머 또는 프로젝트 내부에서 명시적으로 실행하는 작업으로 구현하고, 별도 상주 서비스는 만들지 마세요. 안전하게 가능한 작업부터 계속하고 제한과 대안을 보고하세요."
+        blocksAutomatically ? "기존 파일과 디렉터리를 보존하세요. 새 경로나 새 파일을 사용해 가능한 작업을 계속 진행하세요."
+            : "원래 터미널에서 사용자의 결정을 기다리세요."
+    }
+    var manualHookResponse: JSONObject {
+        ["hookSpecificOutput": ["hookEventName": "PreToolUse", "permissionDecision": "ask", "permissionDecisionReason": detail]]
     }
     public func denial(event: String) -> JSONObject {
         Self.denial(event: event, message: title + " 요청을 AutoApprove가 거절했습니다. " + guidance)
@@ -49,6 +53,7 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         guard riskCandidates.contains(candidate) != false,
               matches(candidate, riskCandidatePattern) else { return nil }
         let command = commandText(text)
+        if FileDeletionCommand.deletesInPatch(command) || FileDeletionCommand.removesFile(command) { return FileDeletionCommand.risk }
         // Only complete, simple read-only commands get this exception. Compound
         // shell input still goes through all mutation checks.
         if isReadOnly(command) { return nil }
@@ -78,7 +83,7 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         if (computedHome || targetsStartup()), (matches(text, writePattern) || matches(compact(), #"--install|--register|write_bytes|write_text|writeFile|copyFile|등록|설치|생성|수정|삭제"#)) {
             return Self(kind: .persistence, evidence: "자동 실행 항목 또는 관리자 입력 서비스 경로 변경")
         }
-        if matches(text, #"(?i)\b(?:spctl|csrutil|tccutil)\s+(?:(?:authenticated-root)\s+)?(?:--master-disable|--global-disable|disable|reset)\b|\b(?:security|dscl)\s+(?:add-|delete-|authorizationdb|create|passwd)|\bchmod\s+(?:-\S+\s+)*(?:777|666)\b|with\s+administrator\s+privileges"#) {
+        if matches(command, #"(?i)\b(?:spctl|csrutil|tccutil)\s+(?:(?:authenticated-root)\s+)?(?:--master-disable|--global-disable|disable|reset)\b|\b(?:security|dscl)\s+(?:add-|delete-|authorizationdb|create|passwd)|\bchmod\s+(?:-\S+\s+)*(?:777|666)\b|with\s+administrator\s+privileges"#) {
             return Self(kind: .security, evidence: "보안 제어·계정·접근 권한 또는 관리자 승인 변경")
         }
         if matches(command, #"(?i)(?:^|[\s;&|])(?:/usr/bin/|/bin/)?sudo\b"#) {
@@ -114,10 +119,16 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         // operation to deny or replace automatically. Actual tool permissions
         // and yes/no requests still pass through the system-change guard.
         if tool == "AskUserQuestion", AutomaticQuestionDecision.detect(input) == nil { return nil }
-        if let command = input["command"] as? String {
-            if isReadOnly(command) { return nil }
-            return detect(command + (summary.isEmpty ? "" : "\n" + summary), cwd: cwd)
+        let name = tool.lowercased().components(separatedBy: "__").last ?? tool.lowercased()
+        let deletesPath = name == "delete" && (input["file_path"] is String || input["path"] is String)
+        if deletesPath || ["deletefile", "delete_file", "remove_file", "delete_directory", "remove_directory", "trash_file"].contains(name) {
+            return FileDeletionCommand.risk
         }
+        if name == "apply_patch", let patch = (input["patch"] ?? input["input"] ?? input["patchText"]) as? String,
+           FileDeletionCommand.deletesInPatch(patch) { return FileDeletionCommand.risk }
+        if let command = input["command"] as? String { return detect(command, cwd: cwd) }
+        if ["exec_command", "run_command", "shell"].contains(name),
+           let command = (input["cmd"] ?? input["CommandLine"]) as? String { return detect(command, cwd: cwd) }
         // File-edit hooks name the destination. Source code containing a system
         // path is not itself a write to that system path.
         if ["Write", "Edit", "MultiEdit"].contains(tool), let path = input["file_path"] as? String ?? input["path"] as? String {
@@ -126,7 +137,8 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         let encoded = (try? JSONSerialization.data(withJSONObject: input, options: [.withoutEscapingSlashes]))
             .map { String(decoding: $0, as: UTF8.self) } ?? ""
         let operation = ["Write", "Edit", "MultiEdit"].contains(tool) ? "write_text " : ""
-        return detect(operation + encoded + "\n" + summary, cwd: cwd)
+        let risk = detect(operation + encoded + "\n" + summary, cwd: cwd)
+        return risk?.kind == .fileDeletion && tool != "AskUserQuestion" ? nil : risk
     }
 
     /// ASCII's six whitespace characters avoid a Unicode property lookup.
@@ -198,7 +210,7 @@ public struct SystemCommandRisk: Codable, Equatable, Sendable {
         "privilegedhelpertools", "cron", "systemd", "autostart", "spctl", "csrutil", "tccutil", "security", "dscl",
         "chmod", "sudo", "defaults", "pmset", "networksetup", "systemsetup", "administratorprivileges",
         "etc/", "system/", "library/preferences/", "library/security/", "--install", "--register", "install_"
-    ]
+    ] + FileDeletionCommand.candidates
     private static let riskCandidatePattern = "(?i)(?:" + riskCandidateWords.map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|") + ")"
     private static let riskCandidates = RiskCandidateMatcher(words: riskCandidateWords)
     private static let compiledPatterns: [String: NSRegularExpression] = {

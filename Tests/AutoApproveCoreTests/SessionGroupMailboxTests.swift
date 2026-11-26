@@ -431,3 +431,51 @@ extension ApprovalTests {
         try expect(rejected); try expectEqual(try Data(contentsOf: path), original)
     }
 }
+
+extension ApprovalTests {
+    func testInboxMigrationAndConcurrentClaims() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let group = UUID(), sender = UUID(), recipient = UUID(), leader = UUID(), old = UUID()
+        var legacy: OpaquePointer?
+        try expectEqual(sqlite3_open(directory.appendingPathComponent("group-messages.sqlite").path, &legacy), SQLITE_OK)
+        let sql = """
+            CREATE TABLE messages(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,group_id TEXT NOT NULL,
+                sender_id TEXT NOT NULL,recipient_id TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,created REAL NOT NULL,
+                acknowledged REAL,attempts INTEGER NOT NULL DEFAULT 0,next_attempt REAL NOT NULL DEFAULT 0,last_result TEXT,
+                last_error TEXT,source_key TEXT UNIQUE,requested_priority TEXT NOT NULL DEFAULT 'normal',priority_override TEXT,
+                category TEXT NOT NULL DEFAULT 'message');
+            INSERT INTO messages(id,group_id,sender_id,recipient_id,kind,body,created)
+                VALUES('\(old)','\(group)','\(sender)','\(recipient)','message','existing',123);
+            """
+        let status = sqlite3_exec(legacy, sql, nil, nil, nil)
+        sqlite3_close(legacy)
+        try expectEqual(status, SQLITE_OK)
+        let worker = try SessionGroupMailbox(directory: directory)
+        let writer = try SessionGroupMailbox(directory: directory)
+        let first = try worker.heads()[0]
+        try expectEqual(first.id, old)
+        let next = try writer.enqueue(groupID: group, senderID: sender, recipientID: recipient, kind: .message, text: "next")
+        let urgent = try writer.enqueue(groupID: group, senderID: sender, recipientID: recipient, kind: .message, text: "urgent", priority: .urgent)
+        func change(_ id: UUID, _ action: SessionGroupMailbox.InboxAction, before: UUID? = nil, text: String? = nil) throws {
+            _ = try writer.manageInbox(group: group, recipient: recipient, leader: leader, ids: [id], action: action, text: text, before: before, expectedRevision: nil)
+        }
+        try change(old, .move, before: urgent.id)
+        try expectEqual(try worker.heads().first?.id, old)
+        try expectEqual(try worker.message(old)?.priority, .urgent)
+        try change(old, .move)
+        try expectEqual(try worker.heads().first?.id, urgent.id)
+        try expectNil(try worker.claimDelivery(first, retryAt: .distantFuture))
+        try change(urgent.id, .cancel)
+        try change(old, .edit, text: "updated")
+        let claimed = try worker.claimDelivery(first, retryAt: .distantFuture)
+        try expectEqual(claimed?.text, "updated")
+        try expectEqual(claimed?.sequence, first.sequence)
+        try expectNil(try writer.claimDelivery(first, retryAt: .distantFuture))
+        try expectThrows(try change(old, .delete))
+        try change(next.id, .delete)
+        try expectNil(try worker.claimDelivery(next, retryAt: .distantFuture))
+        try expectEqual(try worker.list(groupID: group, memberID: recipient, includeAcknowledged: true).map(\.id), [old, urgent.id])
+    }
+}
