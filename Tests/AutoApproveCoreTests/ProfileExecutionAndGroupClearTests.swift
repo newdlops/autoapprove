@@ -300,6 +300,12 @@ extension ApprovalTests {
             try expectEqual(fixture.counts(), [0,0,0], "Drafts and unfinished members also hold the caller until last")
             _ = try await call("clear_session_group")
             do { _ = try await call("clear_session_group", requestID: UUID().uuidString); throw AppError.message("Overlapping reset accepted") } catch is RemoteHTTPError { }
+            let memberAlias = UUID().uuidString
+            let memberReceipt = try await clearFixtureAction(engine, ["owner": UUID().uuidString, "tool": "clear_group_member",
+                "groupID": group.id.uuidString, "requestID": memberAlias, "sessionID": sessions[0].id, "memberID": members[1].id.uuidString])
+            try expectEqual(memberReceipt["activeRequestID"] as? String, request)
+            try expectEqual(memberReceipt["total"] as? Int, 1)
+            try expectEqual(try await call("get_group_clear_status", requestID: memberAlias)["memberID"] as? String, members[1].id.uuidString)
             var changed = group; changed.leaderMemberID = members[1].id; try store.save([changed])
             for _ in 0..<30 {
                 if try await call("get_group_clear_status")["done"] as? Bool == true { break }
@@ -398,6 +404,7 @@ extension ApprovalTests {
             do { _ = try await call(member: ordered[1].id.uuidString, caller: 1); throw AppError.message("Member reset without leader authority") } catch let error as RemoteHTTPError { try expectEqual(error.status, 403) }
             do { _ = try await call(member: ordered[1].id.uuidString, caller: 2); throw AppError.message("Outside caller reset a member") } catch let error as RemoteHTTPError { try expectEqual(error.status, 403) }
             fixture.draft(1, enabled: true)
+            fixture.draft(0, enabled: true)
             let receipt = try await call(member: ordered[1].id.uuidString)
             try expectEqual(receipt["accepted"] as? Bool, true); try expectEqual(receipt["total"] as? Int, 1)
             try expectEqual(receipt["scope"] as? String, "member"); try expectEqual(receipt["memberID"] as? String, ordered[1].id.uuidString)
@@ -405,6 +412,13 @@ extension ApprovalTests {
             do { _ = try await call(member: ordered[0].id.uuidString); throw AppError.message("Reused request changed its target") } catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
             do { _ = try await call("clear_session_group"); throw AppError.message("Member request became whole-group reset") } catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
             do { _ = try await call("clear_session_group", requestID: UUID().uuidString); throw AppError.message("Overlapping whole-group reset accepted") } catch let error as RemoteHTTPError { try expectEqual(error.status, 409) }
+            let alias = UUID().uuidString, selfRequest = UUID().uuidString
+            let joined = try await call(member: ordered[1].id.uuidString, requestID: alias)
+            try expectEqual(joined["activeRequestID"] as? String, request)
+            try expectEqual(joined["requestID"] as? String, alias)
+            let independent = try await call(member: ordered[0].id.uuidString, requestID: selfRequest)
+            try expectEqual(independent["accepted"] as? Bool, true)
+            try expectEqual(independent["requestID"] as? String, selfRequest)
             fixture.draft(1, enabled: false)
             var result: JSONObject = [:]
             for _ in 0..<120 {
@@ -413,6 +427,10 @@ extension ApprovalTests {
                 try await Task.sleep(for: .milliseconds(100))
             }
             try expectEqual(result["status"] as? String, "completed", String(describing: result))
+            let aliasStatus = try await call("get_group_clear_status", requestID: alias)
+            try expectEqual(aliasStatus["status"] as? String, "completed")
+            let retry = try await call(member: ordered[1].id.uuidString, requestID: alias)
+            try expectEqual(retry["activeRequestID"] as? String, request)
             _ = try await call(member: ordered[1].id.uuidString)
             try expectEqual(fixture.counts(), [0,1,0], "Only the selected Codex/Claude receives /clear, even after a lost reply")
             try expectEqual(fixture.id(0), originalLeaderID); try expectEqual(fixture.id(2), originalOutsideID)
@@ -426,10 +444,8 @@ extension ApprovalTests {
             legacy.removeValue(forKey: "selectedMemberID")
             let decoded = try JSONDecoder().decode(SessionGroupClearOperation.self, from: JSONSerialization.data(withJSONObject: legacy))
             try expectNil(decoded.selectedMemberID); try expectEqual(decoded.json["scope"] as? String, "group")
-            // Selecting the caller does not wait on other members' drafts.
             fixture.draft(1, enabled: true)
-            let selfRequest = UUID().uuidString
-            _ = try await call(member: ordered[0].id.uuidString, requestID: selfRequest)
+            fixture.draft(0, enabled: false)
             for _ in 0..<120 {
                 result = try await call("get_group_clear_status", requestID: selfRequest)
                 if result["done"] as? Bool == true { break }
@@ -437,6 +453,7 @@ extension ApprovalTests {
             }
             try expectEqual(result["status"] as? String, "completed", String(describing: result))
             try expectEqual(fixture.counts(), [1,1,0])
+            try expectEqual(fixture.queries(), 0, "Process-verified identities need no status input during clear")
         }
     }
 

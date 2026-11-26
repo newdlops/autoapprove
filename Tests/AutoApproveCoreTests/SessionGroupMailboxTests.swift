@@ -7,6 +7,47 @@ import AutoApproveCore
 import CSQLite
 
 extension ApprovalTests {
+    @MainActor func testClearGraphMessageQueues() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let box = try SessionGroupMailbox(directory: directory)
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [] })
+        defer { engine.stop() }
+        let root = SessionGroup(name: "Cluster"), other = SessionGroup(name: "Other")
+        let child = try SessionGroup(name: "Child").linkingGroupParent(root.id, connected: true)
+        try SessionGroupStore(directory: directory).save([root, child, other])
+        let sender = UUID(), receiver = UUID()
+        func send(_ group: UUID, _ kind: SessionGroupMessage.Kind, _ body: String) throws -> SessionGroupMessage {
+            try box.enqueue(groupID: group, senderID: sender, recipientID: receiver, kind: kind, text: body)
+        }
+        let history = try send(root.id, .message, "read")
+        try box.acknowledge([history.id], groupID: root.id, recipientID: receiver)
+        let flight = try send(root.id, .message, "pending")
+        let question = try send(child.id, .question, "open question")
+        try box.acknowledge([question.id], groupID: child.id, recipientID: receiver)
+        let untouched = try send(other.id, .message, "other")
+        let claimed = try box.claimDelivery(flight, retryAt: Date())
+        try expectEqual(claimed?.id, flight.id)
+        try box.recordSubmission(flight.id, conversation: "original", prompt: "pending")
+        let result = try await engine.clearSessionGroupMessages(groupID: root.id)
+        try expect(result.contains("메시지 2개"))
+        let reopened = try SessionGroupMailbox(directory: directory)
+        try expectEqual(try reopened.pendingCount, 1)
+        try expectEqual(try reopened.heads().map(\.id), [untouched.id])
+        try expectEqual(try reopened.message(flight.id)?.text, "")
+        try expectEqual(try reopened.conversations(groupID: child.id).conversations.count, 0)
+        try expectEqual(try reopened.list(groupID: root.id, memberID: receiver, includeAcknowledged: true).map(\.id), [history.id])
+        try expectEqual(try reopened.list(groupID: root.id, memberID: sender, outbox: true, includeAcknowledged: true).map(\.id), [history.id])
+        try reopened.noteAttempt(flight.id, result: "not_started", retryAt: Date())
+        try reopened.recordSubmission(flight.id, conversation: "original", prompt: "pending")
+        try expectEqual(try reopened.message(flight.id)?.lastResult, "superseded")
+        try expectNil(try reopened.claimDelivery(flight, retryAt: Date()))
+        try expectThrows(try engine.queueSessionGroupReply(groupID: child.id, questionID: question.id, text: "late"))
+        try expect((try await engine.clearSessionGroupMessages(groupID: root.id)).contains("메시지 0개"))
+        _ = try send(root.id, .message, "new")
+        try expectEqual(try reopened.pendingCount, 2)
+    }
+
     @MainActor func testUnconfirmedGroupMessagesExpireWithoutRemovingHistory() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

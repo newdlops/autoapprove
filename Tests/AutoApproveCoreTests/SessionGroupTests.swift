@@ -1106,6 +1106,22 @@ extension ApprovalTests {
         try expectEqual(ActivityDetector.detect("❯ draft\n1 shell still running",agent:.claude).phase,.input)
         try expectEqual(ActivityDetector.detect("Esc to interrupt\n❯ \n1 shell still running",agent:.claude).phase,.working)
 
+        writer.show(empty, on: worker.session.tty)
+        let clearTask = try unwrapGroup(try await assign("큐 비우기 중단 확인")["taskID"] as? String)
+        let busy = "Compiling packages…\n❯ \nEsc to interrupt"
+        writer.show(busy, on: worker.session.tty)
+        writer.show(busy, on: sessions[2].tty)
+        engine.receiveScreen(sessionID: sessions[2].id, raw: busy, generation: "clear-unassigned")
+        try expectEqual(engine.snapshot.sessions.first(where: { $0.id == sessions[2].id })?.phase, .working)
+        let beforeClear = writer.writes.count
+        let clearedQueue = try await engine.clearSessionGroupMessages(groupID: group.id)
+        try expect(clearedQueue.contains("작업 2개 중단 요청"), clearedQueue)
+        try expectEqual(writer.writes.count, beforeClear + 2)
+        try expectEqual(writer.writes.last, "\u{1b}")
+        try expectEqual(try engine.sessionGroupAssignments().first(where: { $0.id.uuidString == clearTask })?.status, .superseded)
+        writer.show(empty, on: worker.session.tty)
+        writer.show(empty, on: sessions[2].tty)
+
         try engine.setPaused(true); defer { try? engine.setPaused(false) }
         let paused = try await assign("일시정지 중 작업")
         try expectEqual(paused["automaticApproval"] as? String, "paused", "The global pause stays the user's decision")

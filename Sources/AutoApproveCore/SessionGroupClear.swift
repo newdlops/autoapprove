@@ -12,6 +12,7 @@ public struct SessionGroupClearTarget: Codable, Equatable, Sendable {
     public var beforeID: String
     public var savedID: String
     public var afterID: String?
+    var processVerifiedBefore: Bool?
     public var verifiedAt: Date?
     public var phase: String = "waiting"
     public var detail: String?
@@ -35,8 +36,8 @@ public struct SessionGroupClearOperation: Codable, Equatable, Sendable, Identifi
     public var id: UUID
     public var groupID: UUID
     public var callerMemberID: UUID
-    /// nil includes the whole group; older saved operations also decode as whole-group requests.
     public var selectedMemberID: UUID?
+    var memberRequests: [UUID: UUID]?
     public var createdAt: Date
     public var targets: [SessionGroupClearTarget]
     public var done: Bool { targets.allSatisfy(\.terminal) }
@@ -44,6 +45,19 @@ public struct SessionGroupClearOperation: Codable, Equatable, Sendable, Identifi
         self.id = id; self.groupID = groupID; self.callerMemberID = callerMemberID; createdAt = Date(); self.targets = targets
         self.selectedMemberID = selectedMemberID
     }
+    func includes(request: UUID) -> Bool { id == request || memberRequests?[request] != nil }
+
+    func receipt(for request: UUID) -> JSONObject {
+        guard let member = memberRequests?[request] else { return json }
+        var view = self
+        view.id = request
+        view.selectedMemberID = member
+        view.targets = targets.filter { $0.memberID == member }
+        var result = view.json
+        result["activeRequestID"] = id.uuidString
+        return result
+    }
+
     public var json: JSONObject {
         ["requestID": id.uuidString, "groupID": groupID.uuidString, "done": done,
          "scope": selectedMemberID == nil ? "group" : "member", "memberID": selectedMemberID?.uuidString as Any? ?? NSNull(),

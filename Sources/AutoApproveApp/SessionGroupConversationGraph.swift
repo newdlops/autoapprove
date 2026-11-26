@@ -20,6 +20,8 @@ import AutoApproveCore
     @State private var prioritizing: Set<UUID> = []
     @State private var deliveryFeedback: String?
     @State private var alert: GraphAlert?
+    @State private var confirmClearMessages = false
+    @State private var clearingMessages = false
     @State private var requestingNicknames = false
     @State private var nicknameNote: String?
     private let initialScope: SessionGroupGraph.Scope
@@ -64,7 +66,7 @@ import AutoApproveCore
                     Button("닫기", systemImage: "xmark") { self.deliveryFeedback = nil }
                         .labelStyle(.iconOnly)
                         .buttonStyle(.borderless)
-                        .help("질문 전달 결과 표시를 닫습니다.")
+                        .help("결과 표시를 닫습니다.")
                 }
                 .font(.caption).foregroundStyle(.secondary)
                 .padding(.horizontal, 16).padding(.vertical, 8)
@@ -72,7 +74,11 @@ import AutoApproveCore
             }
             if let content {
                 if content.group.members.isEmpty {
-                    ContentUnavailableView("구성원이 없습니다", systemImage: "person.2")
+                    ContentUnavailableView {
+                        Label("구성원이 없습니다", systemImage: "person.2")
+                    } actions: {
+                        clearMessagesButton
+                    }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     HStack(spacing: 0) {
@@ -136,6 +142,12 @@ import AutoApproveCore
                 defer { model.reload() }
                 _ = try engine.queueSessionGroupReply(groupID: groupID, questionID: question.id, text: text)
             }
+        }
+        .confirmationDialog("모든 메시지를 비울까요?", isPresented: $confirmClearMessages, titleVisibility: .visible) {
+            Button("모든 메시지 비우기", role: .destructive) { clearMessages() }
+            Button("취소", role: .cancel) {}
+        } message: {
+            Text("‘\(content?.group.name ?? "선택한 그룹")’ 및 하위 그룹의 대기 메시지를 삭제하고 실행 중인 그룹 작업에 중단을 요청합니다.")
         }
         .confirmationDialog("원래 수신 노드에 질문 전달", isPresented: Binding(
             get: { deliveryTarget != nil }, set: { if !$0 { deliveryTarget = nil } }
@@ -267,6 +279,27 @@ import AutoApproveCore
         }
     }
 
+    private var clearMessagesButton: some View {
+        Button(clearingMessages ? "비우는 중…" : "모든 메시지 비우기", role: .destructive) {
+            confirmClearMessages = true
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .disabled(clearingMessages || requestingNicknames)
+    }
+
+    private func clearMessages() {
+        guard !clearingMessages else { return }
+        clearingMessages = true
+        nicknameNote = nil
+        Task {
+            defer { clearingMessages = false; model.reload() }
+            do {
+                deliveryFeedback = try await engine.clearSessionGroupMessages(groupID: groupID)
+            } catch { alert = GraphAlert(title: "메시지 큐를 비우지 못했습니다", message: error.localizedDescription) }
+        }
+    }
+
     private func requestNicknames(_ members: [UUID]?) {
         guard !requestingNicknames else { return }
         requestingNicknames = true
@@ -310,12 +343,15 @@ import AutoApproveCore
                 .padding(.horizontal, 16).padding(.top, 12)
             if !content.nodes.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Button("전체 다시 정하기") { requestNicknames(nil) }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .disabled(requestingNicknames)
-                        .help(requestingNicknames ? "요청을 저장하고 있습니다."
-                              : "구성원 \(content.nodes.count)명 각각의 큐에 자기 이름과 역할을 정하는 요청을 맨 앞에 등록합니다.")
+                    HStack(spacing: 6) {
+                        Button("전체 다시 정하기") { requestNicknames(nil) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(requestingNicknames || clearingMessages)
+                            .help(requestingNicknames ? "요청을 저장하고 있습니다."
+                                  : "구성원 \(content.nodes.count)명 각각의 큐에 자기 이름과 역할을 정하는 요청을 맨 앞에 등록합니다.")
+                        clearMessagesButton
+                    }
                     nicknameNoteView()
                 }
                 .padding(.horizontal, 16)

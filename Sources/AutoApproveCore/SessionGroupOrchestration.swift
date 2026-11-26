@@ -167,6 +167,12 @@ public struct SessionGroupOrchestration: Codable, Equatable {
         }
     }
 
+    mutating func retireAssignments(_ ids: Set<UUID>) {
+        for index in assignments.indices where ids.contains(assignments[index].id) && [.working, .completed].contains(assignments[index].status) {
+            assignments[index].status = .superseded
+        }
+    }
+
     mutating func retireSubgroup(_ id: UUID) {
         queue?.removeAll { $0.assignment.groupID == id }
         for index in assignments.indices where assignments[index].groupID == id && [.working, .completed].contains(assignments[index].status) {

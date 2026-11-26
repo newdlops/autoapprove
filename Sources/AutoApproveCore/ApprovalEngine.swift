@@ -282,6 +282,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var groupWaitTimer: Task<Void, Never>?
     private let groupMailboxSignal = RemoteTerminalChangeSignal()
     private var groupMailboxIdleSessions: Set<String> = []
+    private var clearingMessageGroups = Set<UUID>()
+    private var messageClearRevisions: [UUID: UUID] = [:]
     private var groupMailboxTask: Task<Void, Never>?
     private var activeGroupMailboxMessages: Set<UUID> = []
     private var claudeGroupPrompts: [String: (prompt: String, turn: String)] = [:]
@@ -3555,6 +3557,103 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return value
     }
 
+    public func clearSessionGroupMessages(groupID: UUID) async throws -> String {
+        let groups = try SessionGroupStore(directory: paths.directory).load()
+        guard groups.contains(where: { $0.id == groupID }) else { throw AppError.message("그룹을 찾지 못했습니다.") }
+        let scope = SessionGroup.downstream(of: groupID, in: groups)
+        guard clearingMessageGroups.isDisjoint(with: scope) else { throw AppError.message("이 그룹의 메시지 큐를 비우고 있습니다.") }
+        clearingMessageGroups.formUnion(scope)
+        defer { clearingMessageGroups.subtract(scope) }
+        let box = try groupMailbox()
+        let original = try groupOrchestration()
+        let queued = (original.queue ?? []).filter { scope.contains($0.assignment.groupID) }
+        let working = original.assignments.filter { scope.contains($0.groupID) && $0.status == .working && $0.isDelivered }
+        let assignedSessions = Set(working.map(\.workerSessionID))
+        let extra = Set(groups.filter { scope.contains($0.id) }.flatMap(\.members).compactMap(\.runtimeID)).filter {
+            !assignedSessions.contains($0) && sessions[$0]?.phase == .working
+        }
+        for id in scope { messageClearRevisions[id] = UUID() }
+        let count = try box.clearMessageQueues(groups: scope)
+        var state = original
+        state.queue?.removeAll { scope.contains($0.assignment.groupID) }
+        state.retireAssignments(Set(original.assignments.filter {
+            scope.contains($0.groupID) && ($0.status == .completed || $0.status == .working && !$0.isDelivered)
+        }.map(\.id)))
+        if state != original { try saveGroupOrchestration(state) }
+        refreshGroupWaits()
+        groupMailboxSignal.notify()
+        publish()
+        var requested = 0
+        var unresolved: [String] = []
+        for item in working {
+            guard let group = groups.first(where: { $0.id == item.groupID }),
+                  let member = group.members.first(where: { $0.id == item.workerMemberID }) else {
+                unresolved.append(item.shortID)
+                continue
+            }
+            do {
+                let input: JSONObject = ["groupID": group.id.uuidString, "memberID": member.id.uuidString,
+                                         "taskID": item.id.uuidString, "tool": "interrupt_group_task"]
+                let result = try await interruptGroupTask(input, localGroup: group)
+                guard result["escapeSent"] as? Bool == true || result["alreadyRequested"] as? Bool == true ||
+                        ["stopping", "stopped", "workerStopRequested"].contains(result["stage"] as? String ?? "") else {
+                    throw AppError.message("작업의 중단을 확인해주세요.")
+                }
+                var latest = try groupOrchestration()
+                latest.retireAssignments([item.id])
+                try saveGroupOrchestration(latest)
+                requested += 1
+            } catch { unresolved.append(member.nickname ?? member.title) }
+        }
+        if !extra.isEmpty {
+            let observed = (try? await readSessionGroupSessions(selectedIDs: extra, reconcile: false, useStatusCache: false)) ?? []
+            var checked = Set<String>()
+            for group in groups where scope.contains(group.id) {
+                for member in group.members {
+                    guard let runtime = member.runtimeID, extra.contains(runtime), !checked.contains(runtime) else { continue }
+                    guard let live = SessionGroupMatching.match(member, in: observed), live.id == runtime,
+                          live.conversationID.flatMap(UUID.init(uuidString:)) == UUID(uuidString: member.conversationID) else { continue }
+                    checked.insert(runtime)
+                    do { if try await interruptActiveGroupConversation(member, group: group, live: live) { requested += 1 } }
+                    catch { unresolved.append(member.nickname ?? member.title) }
+                }
+            }
+            unresolved += extra.subtracting(checked).sorted().map { sessions[$0]?.displayedTerminalTitle ?? $0 }
+        }
+        var detail = "메시지 \(count)개 삭제 · 예약 작업 \(queued.count)개 취소 · 작업 \(requested)개 중단 요청"
+        if !unresolved.isEmpty { detail += " · 중단 확인 필요 \(unresolved.count)개 (\(unresolved.joined(separator: ", ")))" }
+        return detail
+    }
+
+    private func interruptActiveGroupConversation(_ member: SessionGroupMember, group: SessionGroup,
+                                                 live: SessionGroupLiveSession) async throws -> Bool {
+        let session = live.session
+        guard let expected = UUID(uuidString: member.conversationID), live.conversationID.flatMap(UUID.init(uuidString:)) == expected,
+              groupWorkerActions.insert(live.id).inserted else { throw GroupJobProvider.stale() }
+        defer { groupWorkerActions.remove(live.id) }
+        func validate() throws {
+            guard clearingMessageGroups.contains(group.id), !snapshot.paused, !remoteInputStopped, !groupClearActive(group.id),
+                  let current = sessions[live.id], current.phase != .ended, current.tty == session.tty,
+                  current.started == session.started, !current.pendingInTerminal, !sendingMessages.contains(live.id),
+                  let saved = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == group.id }),
+                  group.sameMembership(as: saved), saved.members.contains(member) else { throw GroupJobProvider.stale() }
+        }
+        try validate()
+        let frame = try await remoteTerminal(sessionID: live.id, realtime: true, textOnly: true)
+        guard frame.outputReason == nil, frame.inputReason == nil,
+              !RemoteMessageReadiness.hasMenu(frame.screen, agent: session.agent) else { throw GroupJobProvider.stale() }
+        let phase = ActivityDetector.detect(frame.screen, agent: session.agent).phase
+        if phase == .idle && (ActivityDetector.backgroundCount(frame.screen, agent: session.agent) ?? 0) == 0 { return false }
+        guard phase == .working, !(await nativeUserInputHasPriority(live.id, backgroundOnly: true)),
+              let confirmed = try await readSessionGroupSessions(runtimeID: live.id, reconcile: false, useStatusCache: false).first,
+              confirmed.conversationID.flatMap(UUID.init(uuidString:)) == expected, confirmed.providerHome == live.providerHome,
+              SessionGroupMatching.match(member, in: [confirmed])?.id == live.id else { throw GroupJobProvider.stale() }
+        var input: JSONObject = ["sessionID": live.id, "revision": frame.revision, "kind": "escape"]
+        if usesOrcaSnapshot(session), let stream = frame.streamID { input["relay"] = true; input["streamID"] = stream }
+        _ = try await remoteInput(input, automaticAuthorization: { try validate() }, authorizationSource: "그룹 메시지 비우기", backgroundOnly: true)
+        return true
+    }
+
     @discardableResult
     public func requestSessionGroupNicknames(groupID: UUID, memberIDs: [UUID]?, byUser: Bool = false) throws -> Int {
         guard let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }) else { return 0 }
@@ -3771,7 +3870,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return priority
     }
 
+    private func validateMessageQueue(_ group: UUID, revision: UUID?) throws {
+        guard !clearingMessageGroups.contains(group), messageClearRevisions[group] == revision else {
+            throw RemoteHTTPError(409, "메시지 큐가 비워졌습니다.", diagnostics: ["delivery": "not_started"])
+        }
+    }
+
     private func enqueueGroupMessage(_ object: JSONObject, groupID: UUID, memberID: UUID, text: String, kind: SessionGroupMessage.Kind) async throws -> JSONObject {
+        let revision = messageClearRevisions[groupID]
         let priority = try Self.mailboxPriority(object) ?? .normal
         let includeReceiptText = try object["includeReceiptText"] == nil || GroupWaitRequest.flag(object, "includeReceiptText")
         let line = SessionGroupOrchestration.oneLine(text)
@@ -3790,6 +3896,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
               let recipient = group.members.first(where: { $0.id == memberID }), recipient.id != sender.id else {
             throw RemoteHTTPError(403, "확인된 현재 세션에서 같은 그룹의 다른 구성원에게만 보낼 수 있습니다.")
         }
+        try validateMessageQueue(groupID, revision: revision)
         let box = try groupMailbox()
         let blocking = try GroupWaitRequest.flag(object, "blocksProgress")
         let reply = try GroupWaitRequest.uuid(object, "inReplyTo")
@@ -3847,7 +3954,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (group, member)
     }
 
-    private func groupEvidenceTarget(_ object: JSONObject, groupID: UUID, memberID: UUID, workerControl: Bool = false) async throws -> (SessionGroup, SessionGroupMember, SessionGroupLiveSession?) {
+    private func groupEvidenceTarget(_ object: JSONObject, groupID: UUID, memberID: UUID, workerControl: Bool = false, localGroup: SessionGroup? = nil) async throws -> (SessionGroup, SessionGroupMember, SessionGroupLiveSession?) {
+        if let localGroup {
+            guard clearingMessageGroups.contains(groupID), localGroup.id == groupID,
+                  let group = try SessionGroupStore(directory: paths.directory).load().first(where: { $0.id == groupID }),
+                  group.sameMembership(as: localGroup), let member = group.members.first(where: { $0.id == memberID }) else { throw GroupJobProvider.stale() }
+            let observed = try await readSessionGroupSessions(runtimeID: member.runtimeID, reconcile: false)
+            return (group, member, SessionGroupMatching.match(member, in: observed))
+        }
         let observed = try await readSessionGroupSessions(reconcile: false)
         let (caller, attribution) = try await sessionGroupCaller(object, observed: observed)
         guard attribution != "provided_conversation_id",
@@ -3966,13 +4080,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
 
-    private func groupBackgroundAction(_ object: JSONObject, stop: Bool, authorizeStop: (@MainActor () throws -> Void)? = nil) async throws -> JSONObject {
+    private func groupBackgroundAction(_ object: JSONObject, stop: Bool, localGroup: SessionGroup? = nil, authorizeStop: (@MainActor () throws -> Void)? = nil) async throws -> JSONObject {
         guard let gid = try GroupWaitRequest.uuid(object,"groupID") else { throw RemoteHTTPError(400,"그룹 ID가 필요합니다.") }
         let selected = try GroupWaitRequest.uuid(object,"memberID")
         let id = object["jobID"] as? String
         guard object["jobID"] == nil || (id?.count == 64 && id?.allSatisfy(\.isHexDigit) == true),
               (!stop && id == nil) || selected != nil && id != nil else { throw RemoteHTTPError(400,"개별 작업에는 구성원 ID와 조회한 작업 ID가 필요합니다.") }
         func leader() async throws -> SessionGroup {
+            if let localGroup, let selected {
+                return try await groupEvidenceTarget(object, groupID: gid, memberID: selected, localGroup: localGroup).0
+            }
             let (group,caller) = try await groupMailboxCaller(object,groupID:gid,verified:true)
             guard group.isLeader(caller.id), !stop || selected.map({ group.canManage(caller.id, member: $0) }) == true else { throw RemoteHTTPError(403,"관리 권한이 있는 구성원의 백그라운드 작업을 지정해주세요.") }
             return group
@@ -3996,7 +4113,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     guard let conversation = live.conversationID,
                           var job = try groupMailbox().backgroundJobs(group:gid,member:member.id,session:live.id,conversation:conversation,id:id).first,
                           job.server == jobSnapshots[jobKey(gid,member.id,live)]?.server,
-                          let (_,_,confirmed) = try? await groupEvidenceTarget(object,groupID:gid,memberID:member.id),
+                          let (_,_,confirmed) = try? await groupEvidenceTarget(object,groupID:gid,memberID:member.id,localGroup:localGroup),
                           confirmed?.id == live.id, confirmed?.conversationID == live.conversationID else { throw GroupJobProvider.stale() }
                     let provider = jobProvider(live)
                     if stop {
@@ -4013,7 +4130,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             accepted = try await Task.detached {
                                 try await provider.stop(live,reserved) { @MainActor in
                                 let authorized = try await leader()
-                                let (_,_,endpoint) = try await self.groupEvidenceTarget(object,groupID:gid,memberID:member.id)
+                                let (_,_,endpoint) = try await self.groupEvidenceTarget(object,groupID:gid,memberID:member.id,localGroup:localGroup)
                                 let fresh = try await self.readSessionGroupSessions(runtimeID:live.id,reconcile:false,useStatusCache:false).first
                                 guard fresh?.conversationID?.lowercased() == reserved.conversation, fresh?.providerHome == live.providerHome,
                                       !self.snapshot.paused, !self.remoteInputStopped, !self.groupClearActive(gid), endpoint?.id == live.id,
@@ -4673,10 +4790,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return ["stage":Self.groupComposerIdle(after, agent: agent) ? "cleared" : "unconfirmed"]
     }
 
-    private func interruptGroupTask(_ object: JSONObject) async throws -> JSONObject {
+    private func interruptGroupTask(_ object: JSONObject, localGroup: SessionGroup? = nil) async throws -> JSONObject {
         guard let group = try GroupWaitRequest.uuid(object, "groupID"), let member = try GroupWaitRequest.uuid(object, "memberID"),
               let taskID = try GroupWaitRequest.uuid(object, "taskID") else { throw RemoteHTTPError(400, "그룹·구성원·현재 작업 ID를 지정해주세요.") }
-        let (saved, target, endpoint) = try await groupEvidenceTarget(object, groupID: group, memberID: member, workerControl: true)
+        let (saved, target, endpoint) = try await groupEvidenceTarget(object, groupID: group, memberID: member, workerControl: true, localGroup: localGroup)
         guard let endpoint, let session = sessions[endpoint.id],
               groupWorkerActions.insert(endpoint.id).inserted else { throw RemoteHTTPError(409, "작업자 연결 또는 진행 중인 요청을 확인해주세요.") }
         defer { groupWorkerActions.remove(endpoint.id) }
@@ -4713,7 +4830,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         guard !sendingMessages.contains(endpoint.id), !(await nativeUserInputHasPriority(endpoint.id, backgroundOnly: true)) else {
             throw RemoteHTTPError(409, "원래 터미널에서 입력이 진행 중입니다.")
         }
-        let (_, _, confirmed) = try await groupEvidenceTarget(object, groupID: group, memberID: member, workerControl: true)
+        let (_, _, confirmed) = try await groupEvidenceTarget(object, groupID: group, memberID: member, workerControl: true, localGroup: localGroup)
         try validate()
         let agyWorking = session.agent == .agy && sessions[session.id]?.phase == .working &&
             ActivityDetector.nonemptyTail(frame.screen).suffix(6).joined(separator: " ").range(of: #"(?i)esc(?:ape)? to (?:cancel|interrupt|stop)"#, options: .regularExpression) != nil
@@ -4748,14 +4865,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if let selected {
                     var params = object
                     params["jobID"] = selected.id
-                    let result = try await groupBackgroundAction(params,stop:true) { try reserve(selected.id) }
+                    let result = try await groupBackgroundAction(params,stop:true,localGroup:localGroup) { try reserve(selected.id) }
                     guard let status = result["status"] as? String, status != "running" else {
                         throw RemoteHTTPError(409,"셸 종료 요청이 접수되지 않았습니다.",diagnostics:["delivery":"not_started"])
                     }
                     return ["taskID":taskID.uuidString,"jobID":selected.id,"stage":status,"escapeSent":false,"checkpoint":checkpoint]
                 }
                 if let fetch {
-                    let (_,_,bound) = try await groupEvidenceTarget(object,groupID:group,memberID:member,workerControl:true)
+                    let (_,_,bound) = try await groupEvidenceTarget(object,groupID:group,memberID:member,workerControl:true,localGroup:localGroup)
                     let liveFrame = try await remoteTerminal(sessionID:endpoint.id,realtime:true,textOnly:true)
                     guard bound?.id == endpoint.id, bound?.conversationID == endpoint.conversationID,
                           liveFrame.screen == frame.screen, Self.groupComposerIdle(liveFrame,agent:.claude),
@@ -4765,7 +4882,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     return ["taskID":taskID.uuidString,"stage":ClaudeFetchInterrupt.status(fetch.token),"escapeSent":false,"checkpoint":checkpoint]
                 }
                 try await sendGroupLine(session,text:stopPrompt,groupTarget:endpoint) {
-                    let (_,_,latest) = try await self.groupEvidenceTarget(object,groupID:group,memberID:member,workerControl:true)
+                    let (_,_,latest) = try await self.groupEvidenceTarget(object,groupID:group,memberID:member,workerControl:true,localGroup:localGroup)
                     let fresh = try await self.remoteTerminal(sessionID:endpoint.id,realtime:true,textOnly:true)
                     guard latest?.id == endpoint.id, latest?.conversationID == endpoint.conversationID,
                           Self.groupComposerIdle(fresh,agent:.claude), ActivityDetector.backgroundCount(fresh.screen,agent:.claude) == 1,
@@ -6492,16 +6609,27 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard clearFrameReady(frame.screen, agent: current.agent) else {
                 target.detail = "작업·작성 중인 입력·질문이 끝나고 빈 입력창이 될 때까지 기다립니다."; try saveGroupClearTarget(job.id, target); return
             }
+            func codexProcessID() async throws -> String? {
+                guard current.agent == .codex,
+                      let live = try await readSessionGroupSessions(runtimeID: current.id, reconcile: false, useStatusCache: false).first,
+                      live.session.started == target.started, live.session.tty == target.tty, live.session.cwd == target.cwd,
+                      live.providerHome == target.providerHome, !live.providerIdentityAmbiguous, live.codexIdentityFromMCP != true,
+                      let id = live.conversationID, let uuid = UUID(uuidString: id),
+                      groupStatusIdentities[current.id]?.contradictedRollout != uuid else { return nil }
+                return id
+            }
             if target.phase == "waiting" {
                 if target.verifiedAt.map({ Date().timeIntervalSince($0) > 10 }) ?? true {
                     let id: String
-                    if current.agent == .claude || current.agent == .agy, let live = try await sessionGroupSessions().first(where: { $0.id == current.id }), let fresh = live.conversationID { id = fresh }
+                    target.processVerifiedBefore = nil
+                    if let fresh = try await codexProcessID(), UUID(uuidString: fresh) == UUID(uuidString: target.savedID) {
+                        id = fresh
+                        target.processVerifiedBefore = true
+                    } else if current.agent == .claude || current.agent == .agy, let live = try await sessionGroupSessions().first(where: { $0.id == current.id }), let fresh = live.conversationID { id = fresh }
                     else { id = try await statusConversationID(current,backgroundOnly:true) }
                     target.beforeID = id; target.verifiedAt = Date(); target.identityAttempts = 0; try saveGroupClearTarget(job.id, target)
                     if current.agent == .codex { try await waitForGroupStatusInput(current,backgroundOnly:true) }
                 }
-                // Commit before the write. Recovery only queries identity;
-                // uncertain writes can never cause an automatic second /clear.
                 target.phase = "issued"; target.detail = "초기화 전달 후 새 세션 ID를 확인합니다."; try saveGroupClearTarget(job.id, target)
                 do {
                     _ = try await sendOriginalTerminalMessage(current, object: ["text": current.agent == .agy ? "/new" : "/clear", "revision": frame.revision], textOnly: true, backgroundOnly: true, preflight: { _ in
@@ -6535,6 +6663,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard !Task.isCancelled, !remoteInputStopped else { return }
             let newID: String?
             if current.agent == .claude || current.agent == .agy { newID = try await sessionGroupSessions().first(where: { $0.id == current.id })?.conversationID }
+            else if target.processVerifiedBefore == true, let fresh = try await codexProcessID(),
+                    UUID(uuidString: fresh) != UUID(uuidString: target.beforeID) { newID = fresh }
             else { newID = try await statusConversationID(current,backgroundOnly:true) }
             guard let newID, UUID(uuidString: newID) != nil, UUID(uuidString: newID) != UUID(uuidString: target.beforeID) else {
                 target.identityAttempts += 1
@@ -6823,26 +6953,42 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   let callerMember = group.members.first(where: { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }) else { throw RemoteHTTPError(403, "현재 세션이 속한 그룹만 조회하거나 초기화할 수 있습니다.") }
             var jobs = try loadGroupClears()
             if tool == "get_group_clear_status" {
-                guard let previous = jobs.last(where: { $0.groupID == groupID && (suppliedRequest == nil || suppliedRequest == $0.id) }) else { throw RemoteHTTPError(404, "초기화 요청을 찾지 못했습니다.") }
-                return previous.json
+                let scoped = jobs.filter { $0.groupID == groupID }
+                let found = suppliedRequest.flatMap { request in scoped.first { $0.includes(request: request) } }
+                guard let previous = found ?? (suppliedRequest == nil ? scoped.last(where: { !$0.done }) ?? scoped.last : nil) else { throw RemoteHTTPError(404, "초기화 요청을 찾지 못했습니다.") }
+                return previous.receipt(for: suppliedRequest ?? previous.id)
             }
             let request = suppliedRequest!
-            if let previous = jobs.first(where: { $0.id == request }) {
+            if let previous = jobs.first(where: { $0.includes(request: request) }) {
                 guard previous.groupID == groupID else { throw RemoteHTTPError(409, "다른 그룹에서 사용한 requestID입니다.") }
-                guard previous.selectedMemberID == selectedMemberID else { throw RemoteHTTPError(409, "다른 초기화 대상에 사용한 requestID입니다. 대상이 다른 새 요청에는 새 requestID를 사용해주세요.") }
-                return previous.json
+                guard (previous.memberRequests?[request] ?? previous.selectedMemberID) == selectedMemberID else { throw RemoteHTTPError(409, "다른 초기화 대상에 사용한 requestID입니다. 대상이 다른 새 요청에는 새 requestID를 사용해주세요.") }
+                return previous.receipt(for: request)
             }
             guard group.leaderMemberID == nil || group.isLeader(callerMember.id) else { throw RemoteHTTPError(403, "그룹 초기화는 그룹장만 요청할 수 있습니다.") }
-            guard !groupClearActive(groupID) else { throw RemoteHTTPError(409, "이 그룹의 초기화가 진행 중입니다. 기존 requestID로 상태를 확인해주세요.") }
-            jobs.removeAll { $0.done && Date().timeIntervalSince($0.createdAt) > 604800 }
-            if jobs.count >= 40 { jobs.removeAll { $0.done } }
-            guard jobs.count < 40 else { throw RemoteHTTPError(409, "진행 중인 그룹 초기화 요청이 너무 많습니다.") }
             let members: [SessionGroupMember]
             if let selectedMemberID {
                 guard let member = group.members.first(where: { $0.id == selectedMemberID }) else { throw RemoteHTTPError(404, "이 그룹에서 지정한 구성원을 찾지 못했습니다.") }
                 members = [member]
             } else { members = group.members.filter { $0.id != callerMember.id } + [callerMember] }
             guard group.leaderMemberID == nil || members.allSatisfy({ group.canManage(callerMember.id, member: $0.id) }) else { throw RemoteHTTPError(403, "현재 그룹장이 초기화할 수 있는 구성원을 선택해주세요.") }
+            if let selectedMemberID, let index = jobs.firstIndex(where: {
+                $0.groupID == groupID && !$0.done && $0.targets.contains(where: { $0.memberID == selectedMemberID })
+            }) {
+                jobs[index].memberRequests = jobs[index].memberRequests ?? [:]
+                jobs[index].memberRequests?[request] = selectedMemberID
+                try saveGroupClears(jobs)
+                var result = jobs[index].receipt(for: request)
+                result["accepted"] = true
+                result["message"] = "같은 구성원의 기존 초기화에 연결했습니다. 이번 requestID로 get_group_clear_status를 조회할 수 있습니다."
+                return result
+            }
+            if selectedMemberID == nil, let active = jobs.first(where: { $0.groupID == groupID && !$0.done }) {
+                throw RemoteHTTPError(409, "기존 초기화가 끝나면 그룹 전체를 초기화할 수 있습니다. 진행 중인 요청: " + active.id.uuidString,
+                                      diagnostics: ["requestID": active.id.uuidString, "nextTool": "get_group_clear_status"])
+            }
+            jobs.removeAll { $0.done && Date().timeIntervalSince($0.createdAt) > 604800 }
+            if jobs.count >= 40 { jobs.removeAll { $0.done } }
+            guard jobs.count < 40 else { throw RemoteHTTPError(409, "진행 중인 그룹 초기화 요청이 너무 많습니다.") }
             let job = SessionGroupClearOperation(id: request, groupID: groupID, callerMemberID: callerMember.id,
                 targets: members.map { SessionGroupClearTarget(member: $0, live: SessionGroupMatching.connection($0, in: observed)) }, selectedMemberID: selectedMemberID)
             jobs.append(job); try saveGroupClears(jobs); scheduleGroupClears()
@@ -7202,6 +7348,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)),
                   let raw = object["task"] as? String else { throw RemoteHTTPError(400, "그룹 ID, 구성원 ID와 작업 내용을 지정해주세요.") }
+            let queueRevision = messageClearRevisions[groupID]
+            try validateMessageQueue(groupID, revision: queueRevision)
             guard !groupClearActive(groupID) else { throw RemoteHTTPError(409, "그룹 초기화가 끝난 뒤 새 작업을 지시해주세요.") }
             let permissionPriority = try Self.mailboxPriority(object, key: "permissionPriority") ?? .urgent
             let task = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -7234,6 +7382,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
                 _ = try await groupMailboxCaller(object,groupID:groupID,verified:true)
                 var state = try groupOrchestration()
+                try validateMessageQueue(groupID, revision: queueRevision)
                 var queue = state.queue ?? []
                 if let prior = queue.first(where:{ $0.assignment.id == requestID }) {
                     guard prior.after == after, prior.assignment.task == task, (prior.assignment.permissionPriority ?? .urgent) == permissionPriority, prior.assignment.parentMemberID == callerMember.id,
@@ -7339,6 +7488,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                       reserved.assignment.parentMemberID == callerMember.id, reserved.parentConversation == caller.conversationID,
                       reserved.assignment.workerConversationID == worker.conversationID, state.ready(reserved) else { throw RemoteHTTPError(409,"예약한 작업의 순서·대화·선행 조건을 확인해주세요.") }
             }
+            try validateMessageQueue(groupID, revision: queueRevision)
             state.begin(assignment); try saveGroupOrchestration(state)
             let approval = enableGroupWorkerApproval(worker.id)
             do {
@@ -7360,6 +7510,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         }
                         expected = frame.screen
                     }
+                    try self.validateMessageQueue(groupID, revision: queueRevision)
                     try self.verifyGroupDirection(groupID, caller: callerMember, target: target)
                     if let conversation = assignment.workerConversationID {
                         try self.groupMailbox().recordSubmission(assignment.id, conversation: conversation, prompt: prompt)
@@ -7383,7 +7534,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         latest.recordUncertainAssignment(assignment.id)
                     } else {
                         latest.cancel(assignment.id)
-                        if let original { latest.restoreAfterFailedReplacement(original) }
+                        if let original, messageClearRevisions[groupID] == queueRevision { latest.restoreAfterFailedReplacement(original) }
                     }
                     try? saveGroupOrchestration(latest)
                 }
@@ -10228,7 +10379,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private func groupDelegationContext(sessionID: String, prompt: String?, at now: Date = Date()) -> String? {
         guard let prompt, let id = SessionGroupMessage.terminalMessageID(prompt),
               let receipt = groupMailboxDelegations[id], receipt.sessionID == sessionID,
-              now.timeIntervalSince(receipt.at) < 600, prompt == receipt.prompt else { return nil }
+              now.timeIntervalSince(receipt.at) < 600, prompt == receipt.prompt,
+              let message = try? groupMailbox().message(id), message.lastError != "queueCleared" else { return nil }
         return receipt.context
     }
 

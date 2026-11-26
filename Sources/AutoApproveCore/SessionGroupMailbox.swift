@@ -512,10 +512,32 @@ public final class SessionGroupMailbox {
             """).filter { members[$0.groupID]?.contains($0.recipientID) != true }
     }
 
-    /// Takes a message out of the delivery queue and keeps it in the mailbox, readable as before.
     func park(_ id: UUID, reason: String) throws {
-        try update("UPDATE messages SET last_result='undelivered',last_error=? WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'expired'",
+        try update("UPDATE messages SET last_result='undelivered',last_error=? WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'expired' AND last_result IS NOT 'superseded'",
                    [String(reason.prefix(500)), id.uuidString])
+    }
+
+    func clearMessageQueues(groups: Set<UUID>) throws -> Int {
+        guard !groups.isEmpty else { return 0 }
+        let ids = String(decoding: try JSONEncoder().encode(groups), as: UTF8.self)
+        let scope = "group_id IN (SELECT value FROM json_each(?))"
+        return try transaction {
+            try update("""
+                UPDATE group_waits SET state='cancelled',detail='그룹 메시지 큐를 비웠습니다.'
+                WHERE \(scope) AND state IN ('waiting','ready','expired')
+                """, [ids])
+            try update("""
+                UPDATE messages SET last_result='superseded',last_error='queueCleared',inbox_deleted=1,
+                    body='',original_body=NULL,inbox_revision=inbox_revision+1
+                WHERE \(scope) AND (\(Self.pendingFilter) OR (\(Self.outstandingQuestionFilter)))
+                """, [ids])
+            let count = Int(sqlite3_changes(db))
+            try update("""
+                DELETE FROM group_submissions WHERE message_id IN
+                    (SELECT id FROM messages WHERE \(scope) AND last_error='queueCleared')
+                """, [ids])
+            return count
+        }
     }
 
     func retireSubgroup(_ id: UUID) throws {
@@ -586,6 +608,7 @@ public final class SessionGroupMailbox {
             throw RemoteHTTPError(400, "그룹 메시지 내용과 대상을 확인해주세요.")
         }
         if let sourceKey, let previous = try message(sourceKey: sourceKey) {
+            guard previous.lastError != "queueCleared" else { throw RemoteHTTPError(409, "비운 메시지입니다.") }
             guard previous.groupID == groupID, previous.senderID == senderID, previous.recipientID == recipientID, previous.kind == kind, previous.requestedPriority == priority, previous.category == category else { throw RemoteHTTPError(409, "그룹 보고의 원래 대상을 확인해주세요.") }
             return previous
         }
@@ -722,7 +745,7 @@ public final class SessionGroupMailbox {
                      after: Int64 = 0, limit: Int = 50, priority: SessionGroupMessage.Priority? = nil,
                      category: SessionGroupMessage.Category? = nil) throws -> [SessionGroupMessage] {
         try rows("WHERE group_id=? AND " + (outbox ? "sender_id" : "recipient_id") + "=? AND sequence>?" +
-                 (outbox ? "" : " AND inbox_deleted=0") + (includeAcknowledged ? "" : " AND " + Self.pendingFilter) +
+                 (outbox ? " AND last_error IS NOT 'queueCleared'" : " AND inbox_deleted=0") + (includeAcknowledged ? "" : " AND " + Self.pendingFilter) +
                  (priority == nil ? "" : " AND COALESCE(priority_override,requested_priority)=?") +
                  (category == nil ? "" : " AND category=?") + " ORDER BY sequence LIMIT ?",
                  [groupID.uuidString, memberID.uuidString, String(after)] + [priority?.rawValue, category?.rawValue].compactMap { $0 } + [String(max(1, min(limit, 101)))])
@@ -860,7 +883,8 @@ public final class SessionGroupMailbox {
     package func recordSubmission(_ id: UUID, conversation: String, prompt: String, at date: Date = Date()) throws {
         try update("""
             INSERT INTO group_submissions(message_id,conversation,prompt,submitted)
-            VALUES(?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET
+            SELECT ?1,?2,?3,?4 WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id=?1 AND last_error='queueCleared')
+            ON CONFLICT(message_id) DO UPDATE SET
             conversation=excluded.conversation,prompt=excluded.prompt,submitted=excluded.submitted
             """, [id.uuidString, conversation.lowercased(), prompt, String(date.timeIntervalSince1970)])
     }
@@ -1061,7 +1085,7 @@ public final class SessionGroupMailbox {
     }
 
     func confirmDelivery(_ message: SessionGroupMessage, at date: Date = Date()) throws {
-        try update("UPDATE messages SET acknowledged=?,last_result='observed',last_error=NULL WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'expired'",
+        try update("UPDATE messages SET acknowledged=?,last_result='observed',last_error=NULL WHERE id=? AND acknowledged IS NULL AND last_result IS NOT 'expired' AND last_result IS NOT 'superseded'",
                    [String(date.timeIntervalSince1970), message.id.uuidString])
     }
 

@@ -529,6 +529,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session groups: model settings match the exact conversation and refresh",tests.testGroupModelSettingsUseExactConversationAndFreshMetadata),
             ("Session groups: Claude metadata and final turns stay conversation-bound",tests.testClaudeGroupMetadataAndCompletionStayConversationBound),
             ("Session groups: metadata parent directs Claude and recovers a missing Stop report",tests.testCrossAgentMetadataParentAndMissingClaudeStopRecovery),
+            ("Session groups: clear graph message queues across scoped groups",tests.testClearGraphMessageQueues),
             ("Session groups: mailbox persistence, deduplication and atomic receipts",tests.testGroupMailboxDurabilityReceiptsAndOrdering),
             ("Session groups: unconfirmed messages expire without removing history",tests.testUnconfirmedGroupMessagesExpireWithoutRemovingHistory),
             ("Session groups: dependency cycles, alternatives, callbacks and durable deadlines",tests.testGroupDependencyWaits),

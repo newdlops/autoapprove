@@ -201,11 +201,11 @@ extension SessionGroupMailbox {
             }
         }
         if let decision = request.decision {
-            guard let q = try message(decision), q.kind == .question, q.groupID == request.group, q.recipientID == request.member,
+            guard let q = try message(decision), q.kind == .question, q.lastError != "queueCleared", q.groupID == request.group, q.recipientID == request.member,
                   try message(sourceKey: "answer:" + decision.uuidString) == nil else { throw RemoteHTTPError(403, "자신이 답해야 하는 미해결 질문을 지정해주세요.") }
         }
         for q in request.questions {
-            guard let m = try message(q), m.groupID == request.group, m.kind == .question, m.senderID == request.member else {
+            guard let m = try message(q), m.groupID == request.group, m.kind == .question, m.lastError != "queueCleared", m.senderID == request.member else {
                 throw RemoteHTTPError(403, "이 그룹에서 자신이 보낸 질문 ID를 지정해주세요.")
             }
         }
@@ -262,6 +262,7 @@ extension SessionGroupMailbox {
         guard let q = try message(question), q.kind == .question, q.groupID == group, q.senderID == recipient, q.recipientID == sender else {
             throw RemoteHTTPError(403, "원래 질문의 지정 수신자만 같은 그룹에서 답할 수 있습니다.")
         }
+        guard q.lastError != "queueCleared" else { throw RemoteHTTPError(409, "비운 질문입니다.") }
         let key = "answer:" + question.uuidString
         if q.isExpired, try message(sourceKey: key) == nil {
             throw RemoteHTTPError(409, "수신 기한이 지난 질문입니다. 필요한 내용은 새 메시지로 보내주세요.")
