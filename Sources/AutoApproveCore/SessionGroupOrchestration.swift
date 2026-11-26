@@ -36,6 +36,7 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
     public var pendingDelivery: Bool?
     public var workScope: String?
     var closedWithoutReport: Bool?
+    var codexQueueReceipt: String?
     public var replacesTaskID: UUID?
     public var interruptCheckpoint: String?
     var backgroundInterrupt: String?
@@ -50,7 +51,7 @@ public struct SessionGroupAssignment: Codable, Equatable, Identifiable {
     }
     public var isDelivered: Bool { pendingDelivery != true }
     var canReplace: Bool {
-        status == .working || (interruptCheckpoint != nil && (status == .completed || status == .reported))
+        status == .working || (isDelivered && (status == .completed || status == .reported))
     }
 
     public var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
@@ -195,8 +196,13 @@ public struct SessionGroupOrchestration: Codable, Equatable {
         if let index = assignments.firstIndex(where: { $0.id == id }) { assignments[index].interruptCheckpoint = text }
     }
 
-    public mutating func markDelivered(_ id: UUID) {
-        for index in assignments.indices where assignments[index].id == id { assignments[index].pendingDelivery = nil }
+    public mutating func markDelivered(_ id: UUID, codexQueueReceipt: String? = nil) {
+        guard let index = assignments.firstIndex(where: { $0.id == id }) else { return }
+        assignments[index].pendingDelivery = nil
+        if let codexQueueReceipt {
+            assignments[index].codexQueueReceipt = codexQueueReceipt
+            assignments[index].deliveryError = nil
+        }
     }
 
     /// Drops tasks that were recorded but never typed, for example when the app stopped in between.

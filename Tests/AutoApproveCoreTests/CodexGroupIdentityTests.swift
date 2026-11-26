@@ -1,5 +1,6 @@
 import Foundation
 import CSQLite
+import JavaScriptCore
 #if DEBUG
 @testable import AutoApproveCore
 #else
@@ -916,7 +917,11 @@ extension ApprovalTests {
     }
 
     @MainActor func testCodexMetadataParentCanDirectConfirmedWorker() async throws {
-        for (useTerminal, textUnavailable, backgroundAvailable) in [(false, false, true), (false, true, true), (true, false, true), (true, false, false)] {
+        enum Route { case direct, queue, wrongHome, unknown }
+        let cases: [(Bool, Bool, Bool, Route)] = [(false,false,true,.direct), (false,true,true,.direct),
+            (true,false,true,.direct), (true,false,false,.direct), (true,false,true,.queue),
+            (true,false,true,.wrongHome), (true,false,true,.unknown)]
+        for (useTerminal, textUnavailable, backgroundAvailable, route) in cases {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-group-parent-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let parentID = UUID().uuidString, workerID = UUID().uuidString, home = "/fixture/home"
@@ -945,14 +950,47 @@ extension ApprovalTests {
                     captureIdentity: { _ in identity }, run: { script in
                         try expect(!script.contains("activate") && !script.contains("selectedTab=") && !script.contains("selectedTab =") && !script.contains("System Events"), "Group delivery must not select or focus any window")
                         try expect(script.contains("app.doScript(target.text, {in: tab})"))
+                        if route != .direct {
+                            let context = JSContext()!
+                            context.setObject(target.tty, forKeyedSubscript: "tty" as NSString)
+                            context.setObject(raw, forKeyedSubscript: "raw" as NSString)
+                            context.evaluateScript("""
+                            const tab={tty:()=>tty,contents:()=>raw,processes:()=>['codex']};
+                            const front={exists:()=>true,miniaturized:()=>false,tabs:()=>[],selectedTab:()=>({tty:()=>'/dev/another'})};
+                            function Application(){const windows=()=>[front,{tabs:()=>[tab]}];windows[0]=front;
+                              return {running:()=>true,frontmost:()=>true,windows,doScript:()=>{throw Error('focus stolen')}};}
+                            """)
+                            let result = context.evaluateScript(script)?.toString()
+                            try expectNil(context.exception)
+                            return result ?? ""
+                        }
                         _ = screen.send(input)
                         return "sent"
                     })
             }
         }
-        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), processReader: { [record] }, screenAdapters: [host: adapter],
+        let queued = CodexGroupScreen(), receiptID = UUID().uuidString
+        let transport = CodexReplyTransport(prepare: { _,_ in throw CancellationError() }, send: { target, text in
+            try expectEqual(target.threadID, workerID)
+            _ = queued.send(.init(kind: .message, text: text))
+            if route == .unknown { throw AppError.message("Receipt lost after sending") }
+            return receiptID
+        }, prepareQueue: { source, thread in
+            try expectEqual(source.id, session.id); try expectEqual(thread, workerID)
+            return .init(executable: "", home: route == .wrongHome ? "/other/home" : home, threadID: thread)
+        })
+        let deleted = CodexGroupScreen()
+        let queue = CodexQueueTransport(list: { _ in [.init(id:receiptID,text:"Inspect the fixture"), .init(id:"unrelated",text:"Other input")] },
+            delete: { _, ids in
+                try expectEqual(ids, [receiptID])
+                _ = deleted.send(.init(kind:.message,text:receiptID))
+                return .init(removed:ids)
+            }, validate: { target, cwd in
+            try expectEqual(target.threadID, workerID); try expectEqual(cwd, session.cwd)
+        })
+        let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport, processReader: { [record] }, screenAdapters: [host: adapter],
             terminalInputAvailable: { true }, terminalInputIdentity: { _ in identity },
-            codexGroupReader: { _ in .init(threadID: workerID, database: home + "/thread_history_1.sqlite") })
+            codexQueue: queue, codexGroupReader: { _ in .init(threadID: workerID, database: home + "/thread_history_1.sqlite") })
         defer { engine.stop() }
         engine.updateDiscovery([session], records: [record]); await engine.connectScreenHost(host)
         let worker = SessionGroupLiveSession(session: session, conversationID: workerID, providerHome: home).member
@@ -960,8 +998,32 @@ extension ApprovalTests {
         let group = SessionGroup(name: "fixture", members: [peer, parent, worker], leaderMemberID: peer.id).addingLeader(parent.id)
         try SessionGroupStore(directory: directory).save([group])
         let params: JSONObject = ["owner": UUID().uuidString, "tool": "assign_group_task", "agentKind": "codex",
-            "sessionID": "shared-daemon", "conversationID": parentID, "codexCallerConversationID": parentID, "codexCallerHome": home,
+            "requestID": UUID().uuidString, "sessionID": "shared-daemon", "conversationID": parentID, "codexCallerConversationID": parentID, "codexCallerHome": home,
             "groupID": group.id.uuidString, "memberID": worker.id.uuidString, "task": "Inspect the fixture"]
+        if route != .direct {
+            if route == .queue {
+                let receipt = try await engine.mcpAction(params)
+                try expectEqual(receipt["delivery"] as? String, "queued")
+            } else {
+                do { _ = try await engine.mcpAction(params); throw AppError.message("Expected queue refusal") }
+                catch let error as RemoteHTTPError {
+                    try expectEqual(error.diagnostics?["delivery"], route == .unknown ? "unknown" : "not_started")
+                }
+            }
+            if route != .wrongHome {
+                let repeatResult = try await engine.mcpAction(params)
+                try expectEqual(repeatResult["alreadyRecorded"] as? Bool, true)
+                try expectEqual(repeatResult["delivery"] as? String, route == .unknown ? "unknown" : "queued")
+            }
+            if route == .queue {
+                let result = try await engine.clearSessionGroupMessages(groupID: group.id)
+                try expectEqual(deleted.inputs.count, 1, result)
+                try expectEqual(try engine.sessionGroupAssignments().first?.status, .superseded)
+            }
+            try expectEqual(queued.inputs.count, route == .wrongHome ? 0 : 1)
+            try expectEqual(screen.inputs.count, 0)
+            continue
+        }
         if textUnavailable || !backgroundAvailable {
             do { _ = try await engine.mcpAction(params); throw AppError.message("Unreadable text accepted a task") }
             catch let error as RemoteHTTPError {

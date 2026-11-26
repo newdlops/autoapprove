@@ -962,6 +962,11 @@ extension ApprovalTests {
         try expect((result["message"] as? String)?.contains("자동 승인을 켰습니다") == true)
         try expectEqual(writer.writes.count, 1)
         try expect(writer.writes[0].contains("빌드를 확인하세요"))
+        writer.reject(10)
+        do { _ = try await assign("실패해도 기존 배정을 유지하세요"); throw AppError.message("Rejected assignment succeeded") }
+        catch let error as RemoteHTTPError { try expectEqual(error.diagnostics?["delivery"], "not_started") }
+        try expectEqual(try engine.sessionGroupAssignments().first?.status, .working)
+        writer.reject(0)
         let again = try await assign("다시 확인하세요")
         try expectEqual(again["automaticApproval"] as? String, "already")
         engine.refreshSessionGroupBadges()
@@ -1072,6 +1077,16 @@ extension ApprovalTests {
         try expect(try await waitForGroup(20) { (try? engine.sessionGroupAssignments().contains { $0.id.uuidString == next && $0.isDelivered }) == true })
         try expectEqual(try engine.sessionGroupAssignments().first { $0.id.uuidString == waitingID }?.status,.reported)
         try expectEqual(writer.writes.filter { $0.contains("후속 검증") }.count,1)
+        _ = try await action("manage_group_task", ["taskID":next, "action":"closeWithoutReport"])
+        let finishedReplacement = UUID().uuidString
+        let afterCompletion: JSONObject = ["taskID": next, "requestID": finishedReplacement, "task":"완료 후 후속 작업"]
+        writer.show(empty, on: worker.session.tty)
+        let beforeFollowup = writer.writes.count
+        let followup = try await action("replace_group_task", afterCompletion)
+        try expectEqual(followup["taskID"] as? String, finishedReplacement)
+        try expectEqual(try await action("replace_group_task", afterCompletion)["alreadyRecorded"] as? Bool, true)
+        try expectEqual(writer.writes.count, beforeFollowup + 1, "Closed work receives one follow-up and no interrupt")
+        try expectEqual(try engine.sessionGroupAssignments().first { $0.id.uuidString == next }?.status, .reported)
         let command = try await action("send_group_message",["text":"다음 검증","asTask":true,"messageID":UUID().uuidString])
         try expectNotNil(command["taskID"])
         let currentID = try unwrapGroup(command["taskID"] as? String)

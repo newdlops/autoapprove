@@ -62,12 +62,16 @@ public enum TerminalDeviceInput {
           const tab = matches[0];
           if (normalize(tab.contents()) !== normalize(target.screen)) return 'screenChanged';
           if (!tab.processes().some(name => String(name).toLowerCase().includes(target.agent))) return 'agentMissing';
-          if (!preservesSelection(target.tty)) return 'screenChanged';
+          if (!preservesSelection(target.tty)) return 'focusHeld';
           app.doScript(target.text, {in: tab});
           return 'sent';
         })();
         """
         let result = try run?(script) ?? AutomationScript.run(script, app: "Terminal", denied: .permissionDenied, timeout: 25)
+        if result == "focusHeld" {
+            throw RemoteHTTPError(409, "다른 Terminal 창이나 탭의 포커스를 유지하기 위해 입력을 보류했습니다.",
+                diagnostics: ["delivery":"not_started", "reason":"terminal_focus"])
+        }
         guard let delivered = TerminalDelivery(rawValue: result) else {
             throw RemoteHTTPError(409, "백그라운드 전달 결과를 확인하지 못했습니다. 중복 전송하지 말고 대상 입력을 확인해주세요.", diagnostics: ["delivery": "unknown"])
         }

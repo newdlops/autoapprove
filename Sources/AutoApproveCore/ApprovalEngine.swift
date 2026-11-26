@@ -277,6 +277,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
     }
     private var groupWorkerActions = Set<String>()
+    private var submittingGroupQueue: [UUID: UUID] = [:]
     private var groupDeliveryTask: Task<Void, Never>?
     private var groupMailboxStore: SessionGroupMailbox?
     private var groupWaitTimer: Task<Void, Never>?
@@ -2505,6 +2506,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
             event.outcome = sent ? "웹 입력 전달" : "웹 입력 미전달 · 화면 변경"; _ = log(event)
             guard sent else { throw RemoteHTTPError(409, "현재 화면이나 CLI가 바뀌어 입력하지 않았습니다. 최신 화면을 확인해주세요.", diagnostics: ["delivery": "not_started", "retryable": "true"]) }
             return ["sent": true, "message": "터미널에 입력을 전달했습니다. 화면에서 반영 결과를 확인하세요."]
+        } catch let error as RemoteHTTPError where error.diagnostics?["delivery"] == "not_started" {
+            deliveryStarted = false
+            if event.outcome == "웹 입력 전달 확인 중" {
+                event.outcome = "웹 입력 미전달 · " + error.message
+                _ = log(event)
+            }
+            throw error
         } catch let deferred as AutomationIPC.InputNotStarted {
             deliveryStarted = false
             event.outcome = "웹 입력 미전달 · 터미널 연결 대기"
@@ -3565,6 +3573,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         clearingMessageGroups.formUnion(scope)
         defer { clearingMessageGroups.subtract(scope) }
         let box = try groupMailbox()
+        // New submissions are excluded by clearingMessageGroups. Let an admitted send persist its receipt first.
+        let deadline = Date().addingTimeInterval(10)
+        while submittingGroupQueue.values.contains(where: scope.contains) {
+            guard Date() < deadline else { throw AppError.message("Codex 대기열 접수 결과를 기다리고 있습니다. 큐 비우기를 다시 요청해주세요.") }
+            try await Task.sleep(for: .milliseconds(100))
+        }
         let original = try groupOrchestration()
         let queued = (original.queue ?? []).filter { scope.contains($0.assignment.groupID) }
         let working = original.assignments.filter { scope.contains($0.groupID) && $0.status == .working && $0.isDelivered }
@@ -4818,6 +4832,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         try validate()
         guard let assignment = try groupOrchestration().current(groupID:group,workerMemberID:member) else { throw GroupJobProvider.stale() }
+        if let receipt = assignment.codexQueueReceipt, let thread = assignment.workerConversationID {
+            let destination = try await questionTransport.prepareQueue(session, thread)
+            guard destination.queueAvailable, destination.threadID == thread, destination.home == endpoint.providerHome else { throw GroupJobProvider.stale() }
+            try await codexQueue.validate(destination, session.cwd)
+            let pending = try await codexQueue.list(destination)
+            try validate()
+            try validateCodexQueueSession(session, threadID: thread)
+            if pending.contains(where: { $0.id == receipt }) {
+                let deleted = try await codexQueue.delete(destination, [receipt])
+                guard deleted.removed == [receipt] else { throw RemoteHTTPError(409, "대기 작업이 실행 중인지 다시 확인해주세요.") }
+                var latest = try groupOrchestration()
+                latest.checkpointInterrupt(taskID, text: "실행 전 Codex 대기열에서 취소했습니다.")
+                try saveGroupOrchestration(latest)
+                return ["taskID":taskID.uuidString, "stage":"stopped", "escapeSent":false]
+            }
+        }
         let stopPrompt = "배정 " + taskID.uuidString + "에서 시작해 대기 중인 백그라운드 Bash 셸을 확인하세요. 이 대화의 해당 배정에 속한 셸 하나가 확인될 때만 그 작업 ID로 TaskStop을 호출하고 결과를 알려주세요. 대상이 불분명하면 중단하지 말고 이유를 알려주세요."
         if let prior = assignment.backgroundInterrupt, object["tool"] as? String == "interrupt_group_task" {
             var reply: JSONObject = ["taskID":taskID.uuidString,"alreadyRequested":true,"escapeSent":false,"checkpoint":assignment.backgroundCheckpoint ?? ""]
@@ -4845,6 +4875,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
             ActivityDetector.nonemptyTail(frame.screen).suffix(6).joined(separator: " ").range(of: #"(?i)esc(?:ape)? to (?:cancel|interrupt|stop)"#, options: .regularExpression) != nil
         guard confirmed?.id == endpoint.id, confirmed?.conversationID == endpoint.conversationID, frame.outputReason == nil,
               frame.inputReason == nil, !RemoteMessageReadiness.hasMenu(frame.screen, agent: session.agent) else { throw GroupJobProvider.stale() }
+        if assignment.codexQueueReceipt != nil, Self.groupComposerIdle(frame, agent: .codex) {
+            return ["taskID":taskID.uuidString, "stage":"stopped", "escapeSent":false]
+        }
         if object["tool"] as? String == "interrupt_group_task", session.agent == .claude, Self.groupComposerIdle(frame,agent:.claude),
            let count = ActivityDetector.backgroundCount(frame.screen,agent:.claude), count > 0 {
             let jobs = try? await refreshBackgroundJobs(endpoint,group:saved,member:target)
@@ -7382,7 +7415,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     throw RemoteHTTPError(409, "같은 requestID의 배정 내용이 다릅니다.")
                 }
                 return ["taskID": requestID.uuidString, "workerMemberID": memberID.uuidString, "alreadyRecorded": true,
-                        "delivery": prior.deliveryError ?? (prior.isDelivered ? "sent" : "pending")]
+                        "delivery": prior.deliveryError ?? (prior.codexQueueReceipt != nil ? "queued" : prior.isDelivered ? "sent" : "pending")]
             }
             if let after = try GroupWaitRequest.uuid(object,"afterTaskID") {
                 guard !replacing, let requestID, let parentConversation = caller.conversationID, let workerConversation = worker.conversationID,
@@ -7413,10 +7446,19 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if let busy = try groupOrchestration().current(groupID:groupID, workerMemberID:memberID), busy.status == .working, busy.parentMemberID != callerMember.id {
                 throw Self.taskOwnershipConflict(busy)
             }
+            if !replacing, let prior = try groupOrchestration().current(groupID: groupID, workerMemberID: memberID),
+               prior.status == .working, prior.codexQueueReceipt != nil {
+                throw RemoteHTTPError(409, "기존 Codex 배정을 교체하려면 replace_group_task와 원래 taskID를 사용해주세요.",
+                    diagnostics: ["delivery":"not_started", "taskID":prior.id.uuidString])
+            }
             var original: SessionGroupAssignment?
             if replacing {
-                guard let old = try groupOrchestration().current(groupID: groupID, workerMemberID: memberID),
-                      old.id == (try GroupWaitRequest.uuid(object, "taskID")), old.parentMemberID == callerMember.id,
+                let expectedID = try GroupWaitRequest.uuid(object, "taskID")
+                guard let old = try groupOrchestration().current(groupID: groupID, workerMemberID: memberID), old.id == expectedID else {
+                    throw RemoteHTTPError(409, "교체할 작업이 현재 배정과 다릅니다. get_group_status에서 최신 taskID를 확인해주세요.",
+                        diagnostics: ["delivery":"not_started"])
+                }
+                guard old.parentMemberID == callerMember.id,
                       old.workerSessionID == worker.id, old.workerConversationID == worker.conversationID,
                       old.canReplace, old.deliveryError != "unknown", !snapshot.paused,
                       !groupWorkerActions.contains(worker.id) else { throw RemoteHTTPError(409, "원래 배정·대화 또는 진행 중인 전달을 확인해주세요.") }
@@ -7424,10 +7466,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     throw RemoteHTTPError(409, "이전 작업 전송이 시작됐지만 결과가 불명입니다. 먼저 구성원 터미널을 확인해주세요.")
                 }
                 original = old
-                if old.isDelivered {
+                if old.isDelivered && old.status == .working {
                     if old.interruptCheckpoint == nil {
                         let frame = try await remoteTerminal(sessionID: worker.id, realtime: true, textOnly: true)
-                        if !Self.groupComposerIdle(frame, agent: current.agent) { _ = try await interruptGroupTask(object) }
+                        if old.codexQueueReceipt != nil || !Self.groupComposerIdle(frame, agent: current.agent) {
+                            _ = try await interruptGroupTask(object)
+                        }
                     }
                     var idle = false
                     for attempt in 0..<5 {
@@ -7498,11 +7542,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                       reserved.assignment.workerConversationID == worker.conversationID, state.ready(reserved) else { throw RemoteHTTPError(409,"예약한 작업의 순서·대화·선행 조건을 확인해주세요.") }
             }
             try validateMessageQueue(groupID, revision: queueRevision)
+            let previous = state.current(groupID: groupID, workerMemberID: memberID)
             state.begin(assignment); try saveGroupOrchestration(state)
+            var deliveryAccepted = false
+            var queueSendStarted = false
+            var queueReceipt: String?
             let approval = enableGroupWorkerApproval(worker.id)
             do {
                 let prompt = SessionGroupOrchestration.taskMessage(assignment)
-                try await sendGroupLine(current, text: prompt, groupTarget: worker) {
+                func preflight() async throws -> String? {
                     var expected: String?
                     if original != nil {
                         let frame = try await self.remoteTerminal(sessionID: worker.id, realtime: true, textOnly: true)
@@ -7526,13 +7574,62 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     }
                     return expected
                 }
-                if var latest = try? groupOrchestration() { latest.markDelivered(assignment.id); try? saveGroupOrchestration(latest) }
+                do {
+                    try await sendGroupLine(current, text: prompt, groupTarget: worker, preflight: preflight)
+                } catch let error as RemoteHTTPError where current.agent == .codex && current.terminal == .terminal &&
+                    error.diagnostics?["delivery"] == "not_started" && error.diagnostics?["reason"] == "terminal_focus" {
+                    guard let thread = worker.conversationID, let home = worker.providerHome else { throw error }
+                    let destination: CodexReplyTarget
+                    do {
+                        destination = try await questionTransport.prepareQueue(current, thread)
+                        guard destination.queueAvailable, destination.threadID == thread, destination.home == home else { throw error }
+                        try await codexQueue.validate(destination, current.cwd)
+                        let (_, _, parent, member, live, _) = try await groupDirectWorker(object, groupID: groupID, memberID: memberID)
+                        guard parent.id == callerMember.id, member == target, live.id == worker.id,
+                              live.conversationID == thread, live.providerHome == home else { throw GroupJobProvider.stale() }
+                        let frame = try await remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
+                        guard Self.groupComposerIdle(frame, agent: .codex), !(await nativeUserInputHasPriority(current.id, backgroundOnly: true)) else {
+                            throw RemoteHTTPError(409, "대상 대화의 입력이 끝난 뒤 다시 배정해주세요.")
+                        }
+                        try validateCodexQueueSession(current, threadID: thread)
+                        try validateMessageQueue(groupID, revision: queueRevision)
+                        try verifyGroupDirection(groupID, caller: callerMember, target: target)
+                        guard !snapshot.paused, sessions[current.id]?.pendingInTerminal == false, !automaticInputBusy(current.id),
+                              !remoteInputSessions.contains(current.id), !sendingMessages.contains(current.id),
+                              !changingGoals.contains(current.id), !codexAccountInputHeld(current.id),
+                              try groupOrchestration().current(groupID: groupID, workerMemberID: memberID)?.id == assignment.id else {
+                            throw RemoteHTTPError(409, "대상 대화나 현재 배정이 바뀌어 작업을 보내지 않았습니다.")
+                        }
+                    } catch { throw Self.beforeTerminalWrite(error) }
+                    try Task.checkCancellation()
+                    // Persist the reservation before IPC: a lost receipt or restart must not replay this write.
+                    var reserved = try groupOrchestration()
+                    reserved.recordUncertainAssignment(assignment.id)
+                    try saveGroupOrchestration(reserved)
+                    queueSendStarted = true
+                    submittingGroupQueue[assignment.id] = groupID
+                    sendingMessages.insert(current.id)
+                    defer {
+                        submittingGroupQueue.removeValue(forKey: assignment.id)
+                        sendingMessages.remove(current.id)
+                    }
+                    do { queueReceipt = try await questionTransport.send(destination, prompt) }
+                    catch {
+                        if (error as? RemoteHTTPError)?.diagnostics?["delivery"] == "not_started" { throw error }
+                        throw RemoteHTTPError(409, "Codex 대기열의 접수 결과를 확인하지 못했습니다. 같은 작업을 다시 보내기 전에 상태를 확인해주세요.",
+                            diagnostics: ["delivery":"unknown"])
+                    }
+                }
+                deliveryAccepted = true
+                var latest = try groupOrchestration()
+                latest.markDelivered(assignment.id, codexQueueReceipt: queueReceipt)
+                try saveGroupOrchestration(latest)
             } catch {
                 log(AuditEvent(sessionID: worker.id, summary: "세션 그룹 작업 \(assignment.shortID)",
                                outcome: "그룹 작업 전달 실패: " + error.localizedDescription,
                                source: "세션 그룹", tool: "assign_group_task"))
                 let failure = error as? RemoteHTTPError
-                var retain = requestID != nil && failure?.diagnostics?["delivery"] != "not_started"
+                var retain = (requestID != nil || queueSendStarted || deliveryAccepted) && failure?.diagnostics?["delivery"] != "not_started"
                 if !retain, failure?.diagnostics?["delivery"] == "unknown",
                    (try? groupMailbox().submittedAt(assignment.id)) != nil,
                    let frame = try? await remoteTerminal(sessionID:worker.id,realtime:true,textOnly:true), frame.outputReason == nil {
@@ -7543,7 +7640,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         latest.recordUncertainAssignment(assignment.id)
                     } else {
                         latest.cancel(assignment.id)
-                        if let original, messageClearRevisions[groupID] == queueRevision { latest.restoreAfterFailedReplacement(original) }
+                        if let previous, messageClearRevisions[groupID] == queueRevision { latest.restoreAfterFailedReplacement(previous) }
                     }
                     try? saveGroupOrchestration(latest)
                 }
@@ -7561,11 +7658,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 log(AuditEvent(sessionID: worker.id, summary: "세션 그룹 작업 \(assignment.shortID)", outcome: "그룹 작업 자동 승인 켬",
                                source: "세션 그룹", tool: "assign_group_task", request: task))
             }
-            log(AuditEvent(sessionID: worker.id, summary: "세션 그룹 작업 \(assignment.shortID)", outcome: "그룹 작업 전달",
+            log(AuditEvent(sessionID: worker.id, summary: "세션 그룹 작업 \(assignment.shortID)", outcome: queueReceipt != nil ? "Codex 대기열 접수" : "그룹 작업 전달",
                            source: "세션 그룹", tool: "assign_group_task", request: task))
             scheduleGroupDelivery()
             return ["scopeConflicts": conflicts, "taskID": assignment.id.uuidString, "workerMemberID": target.id.uuidString, "automaticApproval": approval.rawValue,
-                    "message": ("작업을 전달했습니다. " + approval.message).trimmingCharacters(in: .whitespaces)]
+                    "delivery": queueReceipt != nil ? "queued" : "sent",
+                    "message": ((queueReceipt != nil ? "작업을 원래 Codex 대기열에 접수했습니다. " : "작업을 전달했습니다. ") + approval.message).trimmingCharacters(in: .whitespaces)]
         case "answer_group_question":
             guard let groupID = (object["groupID"] as? String).flatMap(UUID.init(uuidString:)),
                   let memberID = (object["memberID"] as? String).flatMap(UUID.init(uuidString:)),
