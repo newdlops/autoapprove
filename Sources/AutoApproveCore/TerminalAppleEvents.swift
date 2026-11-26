@@ -196,6 +196,38 @@ public struct TerminalAppleEventReader {
         }
     }
 
+    private func allWindows() throws -> NSAppleEventDescriptor {
+        guard let all = NSAppleEventDescriptor(descriptorType: aeCode("abso"), data: NSAppleEventDescriptor(enumCode: aeCode("all ")).data) else {
+            throw TerminalReadEventError.incompatible
+        }
+        return try object("cwin", form: "indx", selector: all)
+    }
+
+    private func readTitles(_ ttys: [String], in windows: NSAppleEventDescriptor,
+                            get: (NSAppleEventDescriptor, RemoteTerminalPerformance.NativeQuery) throws -> NSAppleEventDescriptor) throws -> [String: String] {
+        let tabs = try matching("ttab", property: ["ttty"], ttys: ttys, container: windows)
+        return try RemoteTerminalPerformance.shared.measure(.terminalMetadata) {
+            let before = try get(property("ttty", of: tabs), .bulkBefore)
+            let names = try strings(get(property("titl", of: tabs), .bulkTitle))
+            let after = try get(property("ttty", of: tabs), .bulkAfter)
+            let keys = try strings(before)
+            guard before.descriptorType == after.descriptorType, before.data == after.data,
+                  keys.count == names.count, Set(keys).count == keys.count, Set(keys).isSubset(of: Set(ttys)) else { return [:] }
+            return Dictionary(uniqueKeysWithValues: zip(keys, names))
+        }
+    }
+
+    func profileTitles(_ ttys: [String]) throws -> [String: String] {
+        guard !ttys.isEmpty else { return [:] }
+        let deadline = clock() + timeout
+        return try readTitles(ttys, in: allWindows()) { subject, _ in
+            try Task.checkCancellation()
+            let remaining = deadline - clock()
+            guard remaining > 0 else { throw TerminalReadEventError.timedOut }
+            return try send(subject, remaining)
+        }
+    }
+
     public func history(tty:String) throws -> String {
         try autoreleasepool {
             let all=NSAppleEventDescriptor(descriptorType:aeCode("abso"),data:NSAppleEventDescriptor(enumCode:aeCode("all ")).data)!
@@ -252,11 +284,7 @@ public struct TerminalAppleEventReader {
             func get(_ subject: NSAppleEventDescriptor, _ query: RemoteTerminalPerformance.NativeQuery) throws -> [String] {
                 try strings(getValue(subject,query))
             }
-            // An absolute ordinal has type 'abso', not a generic enumeration.
-            guard let all = NSAppleEventDescriptor(descriptorType: aeCode("abso"), data: NSAppleEventDescriptor(enumCode: aeCode("all ")).data) else {
-                throw TerminalReadEventError.incompatible
-            }
-            let windows = try object("cwin", form: "indx", selector: all)
+            let windows = try allWindows()
             var result = TerminalSnapshot()
             var titlesByTTY: [String: String] = [:]
             var contentsByTTY: [String: String]?
@@ -300,19 +328,7 @@ public struct TerminalAppleEventReader {
             // stable three-event identity check.
             if includeTitles, batchTitles, titleTargets.count >= 4, titleTargets.count <= 256 {
                 do {
-                    // Read only requested tabs' presentation metadata. Contents
-                    // and input binding still use their own exact-TTY predicate.
-                    let tabs = try matching("ttab", property: ["ttty"], ttys: titleTargets, container: windows)
-                    let values = try RemoteTerminalPerformance.shared.measure(.terminalMetadata) { () -> [String: String] in
-                        let before = try getValue(property("ttty", of: tabs),.bulkBefore)
-                        let names = try get(property("titl", of: tabs),.bulkTitle)
-                        let after = try getValue(property("ttty", of: tabs),.bulkAfter)
-                        let selected = try strings(before)
-                        guard before.descriptorType == after.descriptorType, before.data == after.data,
-                              selected.count == names.count, Set(selected).count == selected.count,
-                              selected.allSatisfy({ titleTargets.contains($0) }) else { return [:] }
-                        return Dictionary(uniqueKeysWithValues: zip(selected, names))
-                    }
+                    let values = try readTitles(titleTargets, in: windows, get: getValue)
                     if values.count == titleTargets.count && Set(values.keys) == Set(titleTargets) {
                         titlesByTTY = values
                     } else {
@@ -450,6 +466,11 @@ enum TerminalAppleEvents {
         let reader=TerminalAppleEventReader(timeout:3) {try inputEvent(owner:owner,subject:$0,timeout:$1)}
         guard let windowID=try reader.selectedWindow(tty:tty) else {return nil}
         return try inputMetadata(tty:tty,windowID:windowID,owner:owner)
+    }
+
+    static func profileTitles(_ ttys: [String]) throws -> [String: String] {
+        let owner = try TerminalProcessLookup.running()
+        return try TerminalAppleEventReader(timeout: 2) { try inputEvent(owner: owner, subject: $0, timeout: $1) }.profileTitles(ttys)
     }
 
     static func keyboardTargetTTY() throws -> String? {

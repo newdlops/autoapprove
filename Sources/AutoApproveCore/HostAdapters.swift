@@ -40,21 +40,20 @@ public enum ITermAdapter {
       return (rows > 0 ? lines.slice(-rows) : lines).map(line => line.replace(/ +$/, '')).join('\\n');
     }
     """
-    public static func screens(ttys: [String]) throws -> TerminalSnapshot {
+    public static func screens(ttys: [String], titlesOnly: Bool = false) throws -> TerminalSnapshot {
         if let app = NSRunningApplication.runningApplications(withBundleIdentifier:ScreenHost.iterm.bundleID).first {
             guard let status = try HostAutomationPermission.status(.iterm,application:app,eventClass:typeWildCard,eventID:typeWildCard,cacheOnly:false) else { throw AutomationIPC.Failure.busy }
             guard status == 0 else { throw TerminalAdapterError.automationDenied("iTerm2") }
         } else { throw AppError.message("iTerm2 앱을 먼저 실행해주세요.") }
-        let output = try AutomationScript.run(screenScript(ttys:ttys),app:"iTerm2",denied:.automationDenied("iTerm2"),timeout:5,readOnly:true)
+        let output = try AutomationScript.run(screenScript(ttys:ttys, titlesOnly:titlesOnly),app:"iTerm2",denied:.automationDenied("iTerm2"),timeout:5,readOnly:true)
         return try JSONDecoder().decode(TerminalSnapshot.self, from: Data(output.utf8))
     }
-    /// Exposed for contract tests against iTerm2's scripting dictionary, without sending Apple events.
-    public static func screenScript(ttys: [String]) throws -> String {
+    public static func screenScript(ttys: [String], titlesOnly: Bool = false) throws -> String {
         let allowed = try AutomationScript.literal(ttys)
         return """
         const app = \(app);
         const allowed = \(allowed); const screens = []; const failures = [];
-        \(visibleFunction)
+        \(titlesOnly ? "" : visibleFunction)
         function recordFailure(tty, error) {
           if (Number(error.errorNumber || error.number) === -1743 || String(error).includes('-1743')) throw error;
           failures.push({tty:tty, message:String(error)});
@@ -73,7 +72,8 @@ public enum ITermAdapter {
                 if (!allowed.includes(tty)) continue;
                 let title = null;
                 try { title = String(session.name() || '').trim() || null; } catch (_) {}
-                screens.push({tty:tty, contents:visible(session), title:title});
+                \(titlesOnly ? "if (session.tty() !== tty) continue;" : "")
+                screens.push({tty:tty, contents:\(titlesOnly ? "''" : "visible(session)"), title:title});
               } catch (error) { recordFailure(tty, error); }
             }
           }

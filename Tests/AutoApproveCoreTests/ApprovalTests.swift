@@ -739,6 +739,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Automation IPC: permission coalescing, cancellation and global limit",tests.testPermissionAndCancelledFlights),
             ("Automation IPC: expired keyboard sample retains user priority",tests.testStaleKeyboardSampleRetainsPriority),
             ("Automation IPC: blocked target isolation and late replies",tests.testBlockedAutomationIsolation),
+            ("Session profiles: save and revalidate original named tabs without window layout",tests.testProfileSaveResolvesOriginalTabsWithoutWindowLayout),
             ("Session profiles: save completes during an occupied Terminal transaction",tests.testProfileSaveCompletesWhileTerminalIsOccupied),
             ("Goal resume: revalidate the owned draft after status footer changes", tests.testBlockedGoalScriptsVerifyTheLifecycleFooter),
             ("Mailbox priority: urgent permission routing and durable interrupt reservations", tests.testMailboxPriorityRoutingAndInterruptReservation),

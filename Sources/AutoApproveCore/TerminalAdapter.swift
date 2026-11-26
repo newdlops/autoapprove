@@ -80,6 +80,7 @@ public struct ScreenHostAdapter: Sendable {
     public var screens: @Sendable ([ScreenTarget]) throws -> TerminalSnapshot
     /// Explicit identity reads require a current title even when the monitor has cached one.
     var identityScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
+    public var profileTitles: (@Sendable ([String]) throws -> [String: String])?
     public var presentationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var initialScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
     public var validationScreens: (@Sendable ([ScreenTarget]) throws -> TerminalSnapshot)?
@@ -154,6 +155,7 @@ public struct ScreenHostAdapter: Sendable {
             adapter.checkedTypeLine = { try TerminalAdapter.typeLine(target: $0, text: $1, expected: $2) }
             adapter.typeLine = { try TerminalAdapter.typeLine(target: $0, text: $1) }
             adapter.backgroundInput = { try TerminalDeviceInput.deliverBackground(target: $0, screen: $1, agent: $2, input: $3) }
+            if terminalReader == nil { adapter.profileTitles = { try TerminalAppleEvents.profileTitles($0) } }
             adapter.usesHostIPC = terminalReader == nil
             if let terminalReader {
                 adapter.screens = { try terminalReader($0.map(\.tty)) }
@@ -171,6 +173,15 @@ public struct ScreenHostAdapter: Sendable {
                 restart: { try ITermAdapter.restart(target:$0,expected:$1,command:$2) },
                 input: { try RemoteTerminalAdapter.input(host: .iterm, target: $0, expected: $1, agent: $2, input: $3) },
                 setTabLabel:{try TerminalTabLabelAdapter.apply(host:.iterm,target:$0,label:$1)})
+            adapter.profileTitles = { ttys in
+                let snapshot = try ITermAdapter.screens(ttys: ttys, titlesOnly: true)
+                let failed = Set(snapshot.failures.compactMap(\.tty))
+                guard !snapshot.failures.contains(where: { $0.tty == nil }) else { return [:] }
+                return Dictionary(grouping: snapshot.screens, by: \.tty).compactMapValues { rows in
+                    guard rows.count == 1, !failed.contains(rows[0].tty) else { return nil }
+                    return rows[0].title
+                }
+            }
             adapter.usesHostIPC = true
             return adapter
         case .orca:

@@ -1333,6 +1333,18 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return result
     }
 
+    private func profileTabTitles(_ targets: [AgentSession]) async -> [String: String] {
+        var result: [String: String] = [:]
+        for host in [ScreenHost.terminal, .iterm] {
+            let rows = targets.filter { $0.terminal == host.kind && remoteCanRead($0) }
+            guard !rows.isEmpty, let adapter = screenAdapters[host], let read = adapter.profileTitles else { continue }
+            let ttys = Array(Set(rows.map(\.tty))).sorted()
+            guard let titles = try? await adapter.isolatedRead(host, { try read(ttys) }) else { continue }
+            for row in rows { result[row.id] = titles[row.tty] }
+        }
+        return result
+    }
+
     private func terminalProfileCandidates(_ mode:ProfileObservation, sessionIDs:Set<String>?) async throws -> [TerminalProfileCandidate] {
         let collectChoices = mode == .captureSessions || mode == .captureLayout
         let allowScreenIdentity = mode == .captureLayout || mode == .validateWithScreen
@@ -1348,6 +1360,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let pids = Set(targets.map(\.pid))
         let observed=try await readSessionGroupSessions(selectedIDs: Set(targetsByID.keys), reconcile:false, priority:.userInitiated)
         let identities=Dictionary(uniqueKeysWithValues:observed.map {($0.id,$0)})
+        let needsTitle = targets.filter { session in
+            guard !allowObservedTitle, session.agent == .codex,
+                  let row = identities[session.id] else { return false }
+            return row.conversationID == nil && !row.providerIdentityAmbiguous
+        }
+        let tabTitles = await profileTabTitles(needsTitle)
         var result:[TerminalProfileCandidate]=[]
         var conversationLists:[String:[String:[CodexQueueConversation]]]=[:]
         var namedCodexBindings:[String:String]=[:]
@@ -1381,7 +1399,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                 explicitCodexBindings[session.id]=thread
                             } catch {detail="현재 대화를 확인하지 못했습니다: "+error.localizedDescription}
                         }
-                        if collectChoices || (entry.conversationID.isEmpty && allowObservedTitle) {
+                        let title = allowObservedTitle ? session.terminalTitle : tabTitles[session.id]
+                        if collectChoices || (entry.conversationID.isEmpty && (allowObservedTitle || title != nil)) {
                             let conversations:[CodexQueueConversation]
                             if let cached=conversationLists[target.home]?[session.cwd] {conversations=cached}
                             else {
@@ -1389,7 +1408,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
                                 conversationLists[target.home,default:[:]][session.cwd]=conversations
                             }
                             if collectChoices {choices=conversations.map {CodexProfileConversation(id:$0.id,title:$0.title)}}
-                            if allowObservedTitle,entry.conversationID.isEmpty,let bound=CodexProfileConversationBinding.match(title:session.terminalTitle,cwd:session.cwd,conversations:conversations),let name=bound.name {
+                            let approvalThread = session.codexApprovalBinding?.threadID.lowercased()
+                            let listedApproval = approvalThread.flatMap { id in conversations.first { $0.id.lowercased() == id } }
+                            if entry.conversationID.isEmpty,
+                               let bound = CodexProfileConversationBinding.match(title: title, cwd: session.cwd, conversations: conversations),
+                               let name = bound.name,
+                               listedApproval == nil || listedApproval?.id == bound.id {
                                 entry.conversationID=bound.id
                                 namedCodexBindings[session.id]=name.precomposedStringWithCanonicalMapping
                             }
@@ -1466,6 +1490,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
         }
+        let namedTabs = needsTitle.filter { namedCodexBindings[$0.id] != nil }
+        let confirmedTitles = await profileTabTitles(namedTabs)
         let fresh=try await Task.detached(priority:.userInitiated) {ProcessDiscovery.index(try reader(pids))}.value
         try Task.checkCancellation()
         guard observationEpoch == epoch, !remoteInputStopped,result.allSatisfy({candidate in
@@ -1479,7 +1505,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if let thread=explicitCodexBindings[candidate.id],current.codexApprovalBinding?.threadID != thread {return false}
             if let name=namedCodexBindings[candidate.id] {
                 let matches=CodexProfileConversationBinding.terminalName(current.terminalTitle,cwd:current.cwd)==name
-                guard matches || (layoutNamedBindings.contains(candidate.id) && current.terminalTitle==original.terminalTitle) else {return false}
+                let usedTabTitle = tabTitles[candidate.id] != nil
+                if usedTabTitle {
+                    guard remoteCanRead(current), current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
+                          CodexProfileConversationBinding.terminalName(confirmedTitles[candidate.id], cwd: current.cwd) == name else { return false }
+                    if let bound = groupMCPIdentity(for: current, home: candidate.entry.providerHome)?.conversationID,
+                       bound != UUID(uuidString: candidate.entry.conversationID) { return false }
+                }
+                guard matches || ((usedTabTitle || layoutNamedBindings.contains(candidate.id)) && current.terminalTitle==original.terminalTitle) else {return false}
                 if let title=candidate.entry.terminalTab?.customTitle,!title.isEmpty,
                    CodexProfileConversationBinding.terminalName(title,cwd:current.cwd) != name {return false}
             }

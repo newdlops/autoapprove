@@ -536,6 +536,68 @@ extension ApprovalTests {
         try expect(skipped.allSatisfy {$0.phase == .alreadyOpen})
     }
 
+    func testProfileSaveResolvesOriginalTabsWithoutWindowLayout() async throws {
+        final class Titles: @unchecked Sendable {
+            let lock = NSLock()
+            var reads: [[String]] = []
+            var changeOnConfirmation = false
+            func read(_ ttys: [String]) -> [String: String] {
+                lock.withLock {
+                    reads.append(ttys)
+                    return Dictionary(uniqueKeysWithValues: ttys.map { tty in
+                        let first = tty == "/dev/named1" && !(changeOnConfirmation && reads.count.isMultiple(of: 2))
+                        return (tty, (first ? "First" : ["/dev/named2", "/dev/named4"].contains(tty) ? "Second" : "Duplicate") + " | project")
+                    })
+                }
+            }
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let paths = AppPaths(directory: directory)
+        try paths.prepare()
+        try AuditStore(path: paths.database).set("terminalEnabled", "true")
+        let names = ["First", "Second", "Duplicate", "Duplicate"]
+        let choices = names.map { CodexQueueConversation(id: UUID().uuidString.lowercased(), title: $0, name: $0) }
+        let expiredThread = UUID().uuidString.lowercased()
+        let records = ProcessDiscovery.parse((1...4).map { "98770\($0) 1 named\($0) 1 1 Wed Oct 28 12:00:00 2026 /fixture/codex" }.joined(separator: "\n"))
+        let sessions = records.map { record in
+            var s = AgentSession(id: record.key, agent: .codex, pid: record.pid, started: record.started, tty: "/dev/" + record.tty, cwd: "/tmp/project", terminal: .terminal)
+            s.terminalTitle = "Old | project"
+            if record.tty == "named2" { s.codexApprovalBinding = .init(threadID: expiredThread, title: "Ended") }
+            if record.tty == "named4" { s.codexApprovalBinding = .init(threadID: choices[0].id, title: "First") }
+            return s
+        }
+        let titles = Titles()
+        var adapter = ScreenHostAdapter(screens: { _ in throw AppError.message("Unexpected screen read") }, approve: { _,_,_ in .missingTarget }, reveal: { _ in nil })
+        adapter.profileTitles = { titles.read($0) }
+        let reply = CodexReplyTransport(prepare: { _,_ in throw AppError.message("Unexpected input") }, send: { _,_ in throw AppError.message("Unexpected input") },
+            queueHome: { _ in .init(executable: "", home: directory.path, threadID: "") })
+        let queue = CodexQueueTransport(list: { _ in [] }, delete: { _,_ in .init(removed: []) }, conversations: { _,_ in choices },
+            validate: { _,_ in throw AppError.message("Earlier approval binding could not be validated") })
+        let engine = try ApprovalEngine(paths: paths, questionTransport: reply, processReader: { records }, screenAdapters: [.terminal: adapter], codexQueue: queue,
+            codexGroupReader: { _ in nil }, codexGroupEnvironment: { _ in ["CODEX_HOME":directory.path] },
+            terminalProfileLayoutReader: { _ in throw AppError.message("Unexpected window layout") })
+        defer { engine.stop() }
+        engine.updateDiscovery(sessions, records: records)
+        let draft = try await engine.terminalProfileSaveCandidates(readWindowLayout: false)
+        try expectEqual(draft.first { $0.tty == "/dev/named1" }?.entry.conversationID, choices[0].id)
+        try expectEqual(draft.first { $0.tty == "/dev/named2" }?.entry.conversationID, choices[1].id)
+        try expectEqual(draft.first { $0.tty == "/dev/named3" }?.entry.conversationID, "")
+        try expectEqual(draft.first { $0.tty == "/dev/named4" }?.entry.conversationID, "")
+        let selected: Set<String> = [records[0].key]
+        let fresh = try await engine.terminalProfileSaveCandidates(readWindowLayout: false, sessionIDs: selected)
+        let profile = try TerminalSessionProfile(name: "Saved", entries: fresh.map(\.entry)).validatedForSaving(newCLIIDs: [])
+        let store = TerminalProfileStore(directory: directory.appendingPathComponent("profiles"))
+        let saved = try store.save(profile)
+        try expectEqual(try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(saved.id))).entries.first?.conversationID, choices[0].id)
+        try expectEqual(titles.lock.withLock { titles.reads }, [["/dev/named1","/dev/named2","/dev/named3","/dev/named4"],["/dev/named1","/dev/named2"],["/dev/named1"],["/dev/named1"]])
+        titles.lock.withLock { titles.changeOnConfirmation = true }
+        do {
+            _ = try await engine.terminalProfileSaveCandidates(readWindowLayout: false, sessionIDs: selected)
+            throw AppError.message("Changed conversation was accepted")
+        } catch { try expect(error.localizedDescription.contains("바뀌었습니다")) }
+    }
+
     func testTerminalProfileSavingRequiresExplicitNewCLISelection() throws {
         var missing=profileEntry();missing.conversationID=""
         let known=profileEntry(),profile=TerminalSessionProfile(name:"업무",entries:[known,missing])
