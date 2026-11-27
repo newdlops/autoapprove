@@ -195,7 +195,7 @@ public enum TerminalProfileTopology {
             let verified=Dictionary(uniqueKeysWithValues:final.map { ($0.tty,$0) })
             guard rows.allSatisfy({ row in
                 guard let current=verified[row.tty] else {return false}
-                return current.windowID==row.windowID && current.tabOrder==row.tabOrder && current.selectedTTY==row.selectedTTY &&
+                return current.windowID==row.windowID && current.windowOrder==row.windowOrder && current.tabOrder==row.tabOrder && current.selectedTTY==row.selectedTTY &&
                     current.windowTitle==row.windowTitle && current.tabLabel==row.tabLabel
             }) else {throw AppError.message("읽는 동안 Terminal 창·탭 배치가 바뀌었습니다. 배치를 다시 읽어주세요.")}
             return captured
@@ -211,14 +211,13 @@ public enum TerminalProfileTopology {
         let wanted=Set(terminal.compactMap(\.tty)),rows=snapshots.filter {wanted.contains($0.tty)}
         guard terminal.count==wanted.count,rows.count==wanted.count,Set(rows.map(\.tty))==wanted,Set(rows.map(\.tty)).count==rows.count,
               rows.allSatisfy({$0.windowID>0 && (0..<512).contains($0.windowOrder)}) else {throw AppError.message("Terminal 창·탭 구성을 확인하지 못했습니다. 창을 다시 불러와주세요.")}
-        let nativeGroups=Dictionary(grouping:rows,by:\.windowID)
+        let nativeGroups=Dictionary(grouping:snapshots,by:\.windowID)
         guard Set(nativeGroups.values.compactMap {$0.first?.windowOrder}).count==nativeGroups.count,
               nativeGroups.values.allSatisfy({group in Set(group.map(\.windowOrder)).count==1 && Set(group.map(\.tabOrder)).count==group.count && group.filter(\.selected).count<=1}) else {
             throw AppError.message("Terminal 창·탭 구성이 바뀌었습니다. 현재 창을 다시 불러와주세요.")
         }
-        let windowIDs=Array(Set(rows.map(\.windowID))).sorted {left,right in
-            (rows.first {$0.windowID==left}!.windowOrder,left)<(rows.first {$0.windowID==right}!.windowOrder,right)
-        }
+        // Saved window numbers refer to the full inventory even when only one row is being saved.
+        let windowIDs=nativeGroups.keys.sorted { nativeGroups[$0]![0].windowOrder < nativeGroups[$1]![0].windowOrder }
         let groups=Dictionary(uniqueKeysWithValues:windowIDs.enumerated().map {($0.element,(UUID(),$0.offset))})
         var result=candidates
         for index in result.indices {

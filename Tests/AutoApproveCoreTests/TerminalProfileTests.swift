@@ -536,6 +536,68 @@ extension ApprovalTests {
         try expect(skipped.allSatisfy {$0.phase == .alreadyOpen})
     }
 
+    func testSavedProfileSlotUsesCurrentConversationAndSettings() async throws {
+        final class Inventory: @unchecked Sendable {
+            let lock = NSLock()
+            var reads = 0
+            let moves: Bool
+            init(moves: Bool) { self.moves = moves }
+            func read(_ ttys: [String]) -> [TerminalProfileTabSnapshot] {
+                lock.withLock {
+                    reads += 1
+                    return ttys.sorted().enumerated().map { index, tty in
+                        .init(tty: tty, windowID: UInt32(70 + index), windowOrder: index,
+                              tabOrder: moves && reads > 1 ? 1 : 0, customTitle: "현재 작업 | project")
+                    }
+                }
+            }
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:directory) }
+        let records = ProcessDiscovery.parse("""
+        100541 1 slot1 100541 100541 Wed Oct 28 12:00:00 2026 /fixture/codex
+        100542 1 slot2 100542 100542 Wed Oct 28 12:00:00 2026 /fixture/codex
+        """)
+        let home = "/fixture/profile-home", thread = UUID().uuidString.lowercased()
+        let sessions = records.map { AgentSession(id:$0.key,agent:.codex,pid:$0.pid,started:$0.started,
+            tty:"/dev/"+$0.tty,cwd:"/tmp/project",terminal:.terminal) }
+        let saved = TerminalProfileEntry(title:"이전 작업",agent:"codex",cwd:"/tmp/project",conversationID:UUID().uuidString,
+            providerHome:home,host:.terminal,terminalTab:.init(window:UUID(),windowOrder:1,tabOrder:0,customTitle:"이전 작업 | project"))
+        for scenario in ["stable","moved","ambiguous","wrongSlot"] {
+            let inventory = Inventory(moves:scenario == "moved")
+            let reply = CodexReplyTransport(prepare:{_,_ in throw CancellationError()},send:{_,_ in throw CancellationError()},
+                queueHome:{_ in .init(executable:"",home:home,threadID:"")})
+            let queue = CodexQueueTransport(list:{_ in []},delete:{_,_ in .init(removed:[])},conversations:{_,_ in
+                var items = [CodexQueueConversation(id:thread,title:"현재 작업",name:"현재 작업")]
+                if scenario == "ambiguous" { items.append(.init(id:UUID().uuidString,title:"현재 작업",name:"현재 작업")) }
+                return items
+            })
+            let engine = try ApprovalEngine(paths:.init(directory:directory.appendingPathComponent(scenario)),questionTransport:reply,
+                processReader:{records},codexQueue:queue,codexGroupReader:{_ in nil},codexGroupEnvironment:{_ in ["CODEX_HOME":home]},
+                profileExecutionSettingsReader:{row in row.conversationID == thread ? .init(model:"fixture",reasoningEffort:"high") : nil},
+                terminalProfileLayoutReader:{inventory.read($0)})
+            defer { engine.stop() }
+            engine.updateDiscovery(sessions,records:records)
+            let selected = scenario == "wrongSlot" ? records[0].key : records[1].key
+            do {
+                let rows = try await engine.terminalProfileSaveCandidates(readWindowLayout:false,sessionIDs:[selected],savedEntries:[saved])
+                try expect(scenario != "moved","Moving a tab during capture must invalidate the saved-slot proof")
+                let candidate = try unwrap(rows.first)
+                if scenario == "stable" {
+                    try expectEqual(candidate.entry.conversationID,thread)
+                    try expectEqual(candidate.entry.executionSettings?.reasoningEffort,"high")
+                    try expectEqual(candidate.entry.terminalTab?.window,saved.terminalTab?.window)
+                    try expectEqual(candidate.entry.terminalTab?.customTitle,"현재 작업 | project")
+                } else {
+                    try expectEqual(candidate.entry.conversationID,"")
+                    try expectNil(candidate.entry.executionSettings)
+                }
+            } catch {
+                guard scenario == "moved", error.localizedDescription.contains("바뀌었습니다") else { throw error }
+            }
+        }
+    }
+
     func testProfileSaveResolvesOriginalTabsWithoutWindowLayout() async throws {
         final class Titles: @unchecked Sendable {
             let lock = NSLock()

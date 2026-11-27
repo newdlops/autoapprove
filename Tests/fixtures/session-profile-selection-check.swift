@@ -164,7 +164,8 @@ private actor LaunchLog {
         liveEntry.terminalTab=nil
         var requests:[(Bool, Set<String>?)]=[]
         let captures=SessionProfilesController(store:store,capture:{throw AppError.message("Unexpected restoration")},
-            captureForSaving:{layout,selected in
+            captureForSaving:{layout,selected,savedEntries in
+                if !layout {try check(savedEntries.first?.terminalTab == pinned.terminalTab,"Saved slot reaches capture and commit")}
                 requests.append((layout,selected))
                 if layout {throw AppError.message("Layout unavailable")}
                 return [.init(id:"live",entry:liveEntry)]
@@ -187,7 +188,7 @@ private actor LaunchLog {
         try check(requests.last?.0==true && captures.error=="Layout unavailable" && captures.draft==nil,"Exact layout errors stay visible")
         try check(try TerminalProfileStore.read(store.file(changed.id))==bytes,"Failed exact capture leaves the existing profile intact")
         var queries = [String]()
-        let lookup = SessionProfilesController(store:store,capture:{[]},captureForSaving:{_,_ in
+        let lookup = SessionProfilesController(store:store,capture:{[]},captureForSaving:{_,_,_ in
             [.init(id:"selected",entry:liveEntry,canQueryConversation:true), .init(id:"other",entry:pinned)]
         },queryConversation:{candidate in
             queries.append(candidate.id)

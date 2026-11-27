@@ -114,7 +114,7 @@ struct SessionProfileEntryFilter:Equatable {
     @Published var error:String?
     @Published private(set) var message:String?
     @Published private(set) var results:[UUID:TerminalProfileRestoreResult]=[:]
-    private let captureForSaving:@MainActor (Bool, Set<String>?) async throws -> [TerminalProfileCandidate]
+    private let captureForSaving:@MainActor (Bool, Set<String>?, [TerminalProfileEntry]) async throws -> [TerminalProfileCandidate]
     private let queryConversation: (@MainActor (TerminalProfileCandidate) async throws -> TerminalProfileCandidate)?
     private let activeSessions:@MainActor () async throws -> [TerminalProfileCandidate]
     private let captureGroups:@MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup]
@@ -126,14 +126,14 @@ struct SessionProfileEntryFilter:Equatable {
     private var repositoryGeneration=UUID()
     init(store:TerminalProfileStore,capture:@escaping @MainActor () async throws -> [TerminalProfileCandidate],
          activeSessions:(@MainActor () async throws -> [TerminalProfileCandidate])? = nil,
-         captureForSaving:(@MainActor (Bool, Set<String>?) async throws -> [TerminalProfileCandidate])? = nil,
+         captureForSaving:(@MainActor (Bool, Set<String>?, [TerminalProfileEntry]) async throws -> [TerminalProfileCandidate])? = nil,
          queryConversation:(@MainActor (TerminalProfileCandidate) async throws -> TerminalProfileCandidate)? = nil,
          captureGroups:@escaping @MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup] = {_ in []},
          restoreGroups:@escaping @MainActor (TerminalSessionProfile,[TerminalProfileRestoreResult],[TerminalProfileCandidate]) async throws -> Void = {_,_,_ in},
          launch:(@Sendable (TerminalProfileEntry,String?) async throws -> String)? = nil,
          selectTab:(@Sendable (String,String) async throws -> Void)? = nil) {
         self.store=store;self.activeSessions=activeSessions ?? capture
-        self.captureForSaving=captureForSaving ?? { _,_ in try await capture() }
+        self.captureForSaving=captureForSaving ?? { _,_,_ in try await capture() }
         self.queryConversation=queryConversation
         self.captureGroups=captureGroups;self.restoreGroups=restoreGroups
         self.launch=launch ?? {try await TerminalProfileLauncher.launch($0,anchorTTY:$1)}
@@ -144,7 +144,7 @@ struct SessionProfileEntryFilter:Equatable {
     convenience init(engine:ApprovalEngine) {
         self.init(store:TerminalProfileStore(directory:engine.paths.directory.appendingPathComponent("session-profiles",isDirectory:true)),
                   capture:{try await engine.terminalProfileCandidates(includeLayout:false)},
-                  captureForSaving:{try await engine.terminalProfileSaveCandidates(readWindowLayout:$0,sessionIDs:$1)},
+                  captureForSaving:{try await engine.terminalProfileSaveCandidates(readWindowLayout:$0,sessionIDs:$1, savedEntries:$2)},
                   queryConversation:engine.resolveProfileConversation,
                   captureGroups:{try engine.terminalProfileGroups(candidates:$0)},
                   restoreGroups:{try await engine.restoreTerminalProfileGroups($0,results:$1,previous:$2)})
@@ -201,15 +201,15 @@ struct SessionProfileEntryFilter:Equatable {
     func captureCurrent(replacing:TerminalSessionProfile? = nil, readWindowLayout:Bool = false) async {
         guard !busy else {return};busy=true;error=nil;message=nil;defer {busy=false}
         do {
-            let candidates=try await captureForSaving(readWindowLayout,nil)
+            let candidates=try await captureForSaving(readWindowLayout,nil,replacing?.entries ?? [])
             guard !candidates.isEmpty else {throw AppError.message("실행 중인 에이전트 세션이 없습니다. 터미널에서 CLI를 연 뒤 다시 저장해주세요.")}
             var snapshot=SessionProfileDraft(profileID:replacing?.id ?? UUID(),name:replacing?.name ?? "",candidates:candidates,
                 groups:try captureGroups(candidates),capturesLiveSessions:true,readsWindowLayout:readWindowLayout,
-                previousEntries:readWindowLayout ? [] : replacing?.entries ?? [])
-            if !snapshot.previousEntries.isEmpty {
+                previousEntries:replacing?.entries ?? [])
+            if !readWindowLayout && !snapshot.previousEntries.isEmpty {
                 for index in snapshot.candidates.indices {
                     let layout=snapshot.previousLayout(for:snapshot.candidates[index].entry)
-                    snapshot.candidates[index].entry.terminalTab=layout
+                    if snapshot.candidates[index].entry.terminalTab == nil { snapshot.candidates[index].entry.terminalTab=layout }
                 }
             }
             draft=snapshot
@@ -249,7 +249,7 @@ struct SessionProfileEntryFilter:Equatable {
             if draft.capturesLiveSessions {
                 let chosenIDs = Set(value.entries.map(\.id))
                 let runtimes = Set(draft.candidates.filter { chosenIDs.contains($0.entry.id) }.map(\.id))
-                let fresh=try await captureForSaving(draft.readsWindowLayout,runtimes)
+                let fresh=try await captureForSaving(draft.readsWindowLayout,runtimes,draft.previousEntries)
                 var selected:[TerminalProfileCandidate]=[]
                 for index in value.entries.indices {
                     let chosen=value.entries[index]
@@ -270,8 +270,10 @@ struct SessionProfileEntryFilter:Equatable {
                         value.entries[index].executionSettings = settings.isEmpty ? nil : settings
                     }
                     value.entries[index].providerHome=current.entry.providerHome
-                    if !draft.readsWindowLayout {
-                        value.entries[index].terminalTab=draft.previousLayout(for:value.entries[index])
+                    if draft.readsWindowLayout {
+                        value.entries[index].terminalTab=current.entry.terminalTab
+                    } else {
+                        value.entries[index].terminalTab=(followsCurrent ? current.entry.terminalTab : nil) ?? draft.previousLayout(for:value.entries[index])
                     }
                     selected.append(current)
                 }
