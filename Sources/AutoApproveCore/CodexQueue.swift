@@ -6,6 +6,8 @@ public struct CodexQueuedInput: Codable, Equatable, Sendable {
     public var id: String
     public var text: String
     public var attachments: Int
+    package var clientMessageID: UUID? = nil
+    private enum CodingKeys: String, CodingKey { case id, text, attachments }
     public init(id: String, text: String, attachments: Int = 0) {
         self.id = id; self.text = text; self.attachments = attachments
     }
@@ -43,14 +45,14 @@ public struct CodexQueueTransport: Sendable {
     public static let unavailableMessage = "실행 중인 Codex의 로컬 서버를 찾지 못했습니다. Mac에서 Codex 연결을 확인해주세요."
     public static let unavailableReason = "이 Codex 실행 방식에서는 대기 입력 목록·삭제를 지원하지 않습니다. 질문 답변과 새 메시지는 같은 원본 터미널로 전달할 수 있습니다."
     public static func isAvailable(home: String) -> Bool { CodexQueueConnection.socketPath(home: home) != nil }
-    public static func enqueue(_ target: CodexReplyTarget, message: String) async throws -> String {
+    public static func enqueue(_ target: CodexReplyTarget, message: String, clientMessageID: UUID = UUID()) async throws -> String {
         try await Task.detached(priority: .utility) {
             guard UUID(uuidString: target.threadID) != nil, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   message.utf8.count <= 65_536, !message.contains("\0") else {
                 throw AppError.message("Codex 대화와 메시지를 다시 확인해주세요.")
             }
             let connection = try CodexQueueConnection(home: target.home)
-            let clientID = UUID().uuidString
+            let clientID = clientMessageID.uuidString
             let result = try connection.request("thread/queue/add", ["threadId": target.threadID,
                 "clientUserMessageId": clientID, "input": [["type": "text", "text": message]]])
             guard let submission = result["queuedSubmission"] as? JSONObject,
@@ -62,6 +64,9 @@ public struct CodexQueueTransport: Sendable {
             }
             return id
         }.value
+    }
+    package var enqueueMailbox: @Sendable (CodexReplyTarget, String, UUID) async throws -> String = { target, text, id in
+        try await CodexQueueTransport.enqueue(target, message: text, clientMessageID: id)
     }
     public var list: @Sendable (CodexReplyTarget) async throws -> [CodexQueuedInput]
     public var delete: @Sendable (CodexReplyTarget, [String]) async throws -> CodexQueueDeletion
@@ -93,7 +98,9 @@ public struct CodexQueueTransport: Sendable {
                     let texts = input.filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }
                     let full = texts.joined(separator: "\n"), preview = String(full.prefix(min(4000,textBudget)))
                     textBudget -= preview.count
-                    result.append(CodexQueuedInput(id: id, text: preview + (preview.count < full.count ? "…" : ""), attachments: input.count - texts.count))
+                    var item = CodexQueuedInput(id: id, text: preview + (preview.count < full.count ? "…" : ""), attachments: input.count - texts.count)
+                    item.clientMessageID = (row["clientUserMessageId"] as? String).flatMap(UUID.init(uuidString:))
+                    result.append(item)
                 }
                 cursor = page["nextCursor"] as? String
                 guard result.count <= 1000, cursor == nil || cursors.insert(cursor!).inserted else {

@@ -917,10 +917,11 @@ extension ApprovalTests {
     }
 
     @MainActor func testCodexMetadataParentCanDirectConfirmedWorker() async throws {
-        enum Route { case direct, queue, wrongHome, unknown }
+        enum Route { case direct, queue, wrongHome, unknown, mailbox, mailboxUnknown, mailboxWrongHome, mailboxMCP }
         let cases: [(Bool, Bool, Bool, Route)] = [(false,false,true,.direct), (false,true,true,.direct),
             (true,false,true,.direct), (true,false,false,.direct), (true,false,true,.queue),
-            (true,false,true,.wrongHome), (true,false,true,.unknown)]
+            (true,false,true,.wrongHome), (true,false,true,.unknown), (true,false,true,.mailbox),
+            (true,false,true,.mailboxUnknown), (true,false,true,.mailboxWrongHome), (true,false,true,.mailboxMCP)]
         for (useTerminal, textUnavailable, backgroundAvailable, route) in cases {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-group-parent-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -977,10 +978,15 @@ extension ApprovalTests {
             return receiptID
         }, prepareQueue: { source, thread in
             try expectEqual(source.id, session.id); try expectEqual(thread, workerID)
-            return .init(executable: "", home: route == .wrongHome ? "/other/home" : home, threadID: thread)
+            return .init(executable: "", home: [.wrongHome,.mailboxWrongHome].contains(route) ? "/other/home" : home, threadID: thread)
         })
         let deleted = CodexGroupScreen()
-        let queue = CodexQueueTransport(list: { _ in [.init(id:receiptID,text:"Inspect the fixture"), .init(id:"unrelated",text:"Other input")] },
+        let mailboxID = UUID()
+        var queue = CodexQueueTransport(list: { _ in
+            var item = CodexQueuedInput(id: receiptID, text: "Queued input")
+            item.clientMessageID = mailboxID
+            return [item, .init(id:"unrelated",text:"Other input")]
+        },
             delete: { _, ids in
                 try expectEqual(ids, [receiptID])
                 _ = deleted.send(.init(kind:.message,text:receiptID))
@@ -988,6 +994,15 @@ extension ApprovalTests {
             }, validate: { target, cwd in
             try expectEqual(target.threadID, workerID); try expectEqual(cwd, session.cwd)
         })
+        queue.enqueueMailbox = { target, text, id in
+            try expectEqual(target.threadID, workerID)
+            try expectEqual(target.home, home)
+            try expectEqual(id, mailboxID)
+            try expect(text.contains("Background question") && text.contains(id.uuidString))
+            _ = queued.send(.init(kind: .message, text: text))
+            if route == .mailboxUnknown { throw AppError.message("Receipt lost after sending") }
+            return receiptID
+        }
         let engine = try ApprovalEngine(paths: AppPaths(directory: directory), questionTransport: transport, processReader: { [record] }, screenAdapters: [host: adapter],
             terminalInputAvailable: { true }, terminalInputIdentity: { _ in identity },
             codexQueue: queue, codexGroupReader: { _ in .init(threadID: workerID, database: home + "/thread_history_1.sqlite") })
@@ -1000,6 +1015,43 @@ extension ApprovalTests {
         let params: JSONObject = ["owner": UUID().uuidString, "tool": "assign_group_task", "agentKind": "codex",
             "requestID": UUID().uuidString, "sessionID": "shared-daemon", "conversationID": parentID, "codexCallerConversationID": parentID, "codexCallerHome": home,
             "groupID": group.id.uuidString, "memberID": worker.id.uuidString, "task": "Inspect the fixture"]
+        if route == .mailboxMCP {
+            var message = params
+            message["tool"] = "send_group_message"
+            message["messageID"] = mailboxID.uuidString
+            message["text"] = "Background question from MCP"
+            let result = try await engine.mcpAction(message)
+            try expectEqual(result["messageID"] as? String, mailboxID.uuidString)
+            let box = try SessionGroupMailbox(directory: directory)
+            let deadline = Date().addingTimeInterval(6)
+            while try box.message(mailboxID)?.lastResult != "direct_submitted", Date() < deadline {
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            try expectEqual(try box.message(mailboxID)?.lastResult, "direct_submitted")
+            try expectEqual(queued.inputs.count, 1)
+            try expectEqual(screen.inputs.count, 0)
+            continue
+        }
+        if [.mailbox, .mailboxUnknown, .mailboxWrongHome].contains(route) {
+            let box = try SessionGroupMailbox(directory: directory)
+            _ = try box.enqueue(id: mailboxID, groupID: group.id, senderID: parent.id, recipientID: worker.id,
+                                kind: .question, text: "Background question")
+            var deliveryError: Error?
+            do { try await engine.deliverSessionGroupQuestion(groupID: group.id, questionID: mailboxID) }
+            catch { deliveryError = error }
+            try expect((deliveryError == nil) == (route == .mailbox), "Unexpected mailbox outcome: " + (deliveryError?.localizedDescription ?? "submitted"))
+            if route != .mailboxWrongHome {
+                var rejectedReplay = false
+                do { try await engine.deliverSessionGroupQuestion(groupID: group.id, questionID: mailboxID) }
+                catch { rejectedReplay = true }
+                try expect(rejectedReplay)
+            }
+            try expectEqual(queued.inputs.count, route == .mailboxWrongHome ? 0 : 1)
+            try expectEqual(screen.inputs.count, 0)
+            _ = try await engine.clearSessionGroupMessages(groupID: group.id)
+            try expectEqual(deleted.inputs.count, route == .mailboxWrongHome ? 0 : 1)
+            continue
+        }
         if route != .direct {
             if route == .queue {
                 let receipt = try await engine.mcpAction(params)

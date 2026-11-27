@@ -243,6 +243,10 @@ public final class SessionGroupMailbox {
                 CREATE TABLE IF NOT EXISTS group_submissions (
                     message_id TEXT PRIMARY KEY, conversation TEXT NOT NULL, prompt TEXT NOT NULL, submitted REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS group_codex_queue (
+                    message_id TEXT PRIMARY KEY, runtime TEXT NOT NULL, home TEXT NOT NULL,
+                    conversation TEXT NOT NULL, receipt TEXT
+                );
                 CREATE TABLE IF NOT EXISTS group_submit_enters (message_id TEXT PRIMARY KEY, submitted REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS group_permission_interrupts (message_id TEXT PRIMARY KEY, at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS group_manual_enters (message_id TEXT PRIMARY KEY, submitted REAL NOT NULL);
@@ -545,6 +549,49 @@ public final class SessionGroupMailbox {
         try transaction {
             try update("UPDATE group_waits SET state='cancelled',detail=? WHERE group_id=? AND state IN ('waiting','expired')", [reason, id.uuidString])
             try update("UPDATE messages SET last_result='superseded',last_error=? WHERE group_id=? AND (" + Self.pendingFilter + " OR (" + Self.outstandingQuestionFilter + "))", [reason, id.uuidString])
+        }
+    }
+
+    struct CodexQueueEntry {
+        let messageID: UUID
+        let runtime: String
+        let home: String
+        let conversation: String
+        let receipt: String?
+    }
+
+    func reserveCodexQueue(_ id: UUID, runtime: String, destination: CodexReplyTarget) throws {
+        try update("INSERT INTO group_codex_queue(message_id,runtime,home,conversation) VALUES(?,?,?,?)",
+                   [id.uuidString, runtime, destination.home, destination.threadID])
+    }
+
+    func confirmCodexQueue(_ id: UUID, receipt: String) throws {
+        try update("UPDATE group_codex_queue SET receipt=? WHERE message_id=?", [receipt, id.uuidString])
+    }
+
+    func forgetCodexQueue(_ id: UUID) throws {
+        try update("DELETE FROM group_codex_queue WHERE message_id=?", [id.uuidString])
+    }
+
+    func hasCodexQueueReservation(_ id: UUID) throws -> Bool {
+        try scalar("SELECT EXISTS(SELECT 1 FROM group_codex_queue WHERE message_id=?)", [id.uuidString]) != 0
+    }
+
+    func codexQueueEntries(groups: Set<UUID>) throws -> [CodexQueueEntry] {
+        let scope = String(decoding: try JSONEncoder().encode(groups), as: UTF8.self)
+        let q = try statement("""
+            SELECT q.message_id,q.runtime,q.home,q.conversation,q.receipt FROM group_codex_queue q
+            JOIN messages m ON m.id=q.message_id WHERE m.group_id IN (SELECT value FROM json_each(?))
+            """, [scope])
+        defer { sqlite3_finalize(q) }
+        var result: [CodexQueueEntry] = []
+        while true {
+            let step = sqlite3_step(q)
+            if step == SQLITE_DONE { return result }
+            func text(_ i: Int32) -> String? { sqlite3_column_text(q,i).map { String(cString:$0) } }
+            guard step == SQLITE_ROW, let id = text(0).flatMap(UUID.init(uuidString:)), let runtime = text(1),
+                  let home = text(2), let thread = text(3) else { throw AppError.message("Codex 메시지 접수 기록을 읽지 못했습니다.") }
+            result.append(.init(messageID:id, runtime:runtime, home:home, conversation:thread, receipt:text(4)))
         }
     }
 

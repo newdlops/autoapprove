@@ -2392,7 +2392,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
         remoteInputSessions.insert(id)
         remoteTerminalChanges[id]?.notify()
         defer {
-            remoteInputSessions.remove(id); remoteInputUntil[id] = Date().addingTimeInterval(0.8)
+            remoteInputSessions.remove(id)
+            // A background operation that never wrote must not block its focus-independent delivery.
+            if !backgroundOnly || deliveryStarted { remoteInputUntil[id] = Date().addingTimeInterval(0.8) }
             invalidateRemoteRead(id)
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 810_000_000)
@@ -3625,6 +3627,22 @@ private struct ScreenAnalysisStorageKey: Hashable {
         publish()
         var requested = 0
         var unresolved: [String] = []
+        for entry in try box.codexQueueEntries(groups: scope) {
+            do {
+                guard let session = sessions[entry.runtime], session.agent == .codex else { throw GroupJobProvider.stale() }
+                let target = try await questionTransport.prepareQueue(session, entry.conversation)
+                guard target.queueAvailable, target.home == entry.home, target.threadID == entry.conversation else { throw GroupJobProvider.stale() }
+                try await codexQueue.validate(target, session.cwd)
+                let items = try await codexQueue.list(target)
+                let matches = items.filter { item in entry.receipt.map { $0 == item.id } ?? (item.clientMessageID == entry.messageID) }
+                if !matches.isEmpty {
+                    let ids = matches.map(\.id)
+                    let deleted = try await codexQueue.delete(target, ids)
+                    guard deleted.error == nil, Set(deleted.removed) == Set(ids) else { throw GroupJobProvider.stale() }
+                }
+                try box.forgetCodexQueue(entry.messageID)
+            } catch { unresolved.append(String(entry.messageID.uuidString.prefix(8))) }
+        }
         for item in working {
             guard let group = groups.first(where: { $0.id == item.groupID }),
                   let member = group.members.first(where: { $0.id == item.workerMemberID }) else {
@@ -5463,6 +5481,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func groupReceiptEvidence(_ messageID: UUID, live: SessionGroupLiveSession, session: AgentSession) async -> GroupReceiptEvidence {
+        // A later, unrelated turn cannot prove that a server-queued input was lost.
+        if session.agent == .codex, (try? groupMailbox().hasCodexQueueReservation(messageID)) != false { return .unknown }
         if session.agent == .agy {
             guard let conversation = live.conversationID,
                   let turn = await Task.detached(priority: .utility, operation: {
@@ -5587,7 +5607,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         try await ready()
         let prompt = message.terminalPrompt(senderTitle: group.members.first { $0.id == message.senderID }?.title ?? "", recipientAgent: current.agent)
-        try await sendGroupLine(current, text: prompt, groupTarget: live, manualQuestion: manualQuestion, preflight: {
+        let box = try groupMailbox()
+        guard try !box.hasCodexQueueReservation(message.id) else {
+            throw RemoteHTTPError(409, "원래 Codex 대화의 접수 결과를 기다리고 있습니다.", diagnostics: ["delivery":"unknown"])
+        }
+        let clearRevision = messageClearRevisions[group.id]
+        func preflight() async throws -> String? {
             let frame = try await self.remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
             var empty = current.agent == .codex ? CodexStatusIdentity.canQuery(frame.screen)
                 : current.agent == .agy ? AgyComposerReadiness.isEmpty(frame.screen) : ClaudeComposerReadiness.isEmpty(frame.screen)
@@ -5630,8 +5655,47 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     self.groupMailboxDelegations[message.id] = (current.id, prompt, Date(), context)
                 }
             }
+            try self.validateMessageQueue(group.id, revision: clearRevision)
             return frame.screen
-        })
+        }
+        do {
+            try await sendGroupLine(current, text: prompt, groupTarget: live, manualQuestion: manualQuestion, preflight: preflight)
+        } catch let error as RemoteHTTPError where current.agent == .codex && current.terminal == .terminal &&
+                error.diagnostics?["delivery"] == "not_started" && error.diagnostics?["reason"] == "terminal_focus" {
+            let destination: CodexReplyTarget
+            do {
+                guard let thread = live.conversationID, let home = live.providerHome else { throw GroupJobProvider.stale() }
+                destination = try await questionTransport.prepareQueue(current, thread)
+                guard destination.queueAvailable, destination.threadID == thread, destination.home == home else {
+                    throw AppError.message("원래 대화의 Codex 대기열 연결을 확인해주세요.")
+                }
+                try await codexQueue.validate(destination, current.cwd)
+                let refreshed = try await readSessionGroupSessions(reconcile: false)
+                guard let endpoint = SessionGroupMatching.match(recipient, in: refreshed),
+                      endpoint.id == live.id, endpoint.conversationID == thread, endpoint.providerHome == home else { throw GroupJobProvider.stale() }
+                _ = try await preflight()
+                try validateCodexQueueSession(current, threadID: thread)
+                try Task.checkCancellation()
+                guard !sendingMessages.contains(current.id), !remoteInputSessions.contains(current.id),
+                      !changingGoals.contains(current.id), !codexAccountInputHeld(current.id) else { throw GroupJobProvider.stale() }
+                try box.reserveCodexQueue(message.id, runtime: current.id, destination: destination)
+            } catch { throw Self.beforeTerminalWrite(error) }
+            submittingGroupQueue[message.id] = group.id
+            sendingMessages.insert(current.id)
+            defer {
+                submittingGroupQueue.removeValue(forKey: message.id)
+                sendingMessages.remove(current.id)
+            }
+            let receipt: String
+            do { receipt = try await codexQueue.enqueueMailbox(destination, prompt, message.id) }
+            catch let failure as RemoteHTTPError where failure.diagnostics?["delivery"] == "not_started" {
+                try box.forgetCodexQueue(message.id)
+                throw failure
+            } catch {
+                throw RemoteHTTPError(409, "원래 Codex 대화의 접수 결과를 기다리고 있습니다.", diagnostics: ["delivery":"unknown"])
+            }
+            try box.confirmCodexQueue(message.id, receipt: receipt)
+        }
     }
 
     private func groupOrchestration() throws -> SessionGroupOrchestration {
@@ -6194,6 +6258,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             try box.transaction {
                 guard try box.claimTurn(id, turn: turn) else { return }
                 try box.confirmDelivery(request)
+                try box.forgetCodexQueue(id)
                 // An observed report or choice question counts as received, exactly like an ACK.
                 if [.report, .choiceQuestion].contains(request.kind) { receipts.append(id) }
                 let isReference = request.isReferencePrompt(prompt)
