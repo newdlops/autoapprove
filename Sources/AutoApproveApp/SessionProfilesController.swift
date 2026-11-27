@@ -14,15 +14,6 @@ struct SessionProfileDraft: Identifiable {
     var candidates: [TerminalProfileCandidate]
     var groups:[TerminalProfileGroup]=[]
     var capturesLiveSessions=false
-    var readsWindowLayout=false
-    var previousEntries:[TerminalProfileEntry]=[]
-
-    func previousLayout(for entry:TerminalProfileEntry) -> TerminalProfileTabLayout? {
-        guard entry.host == .terminal, entry.resumesConversation else { return nil }
-        return previousEntries.first {
-            $0.host == .terminal && $0.cwd == entry.cwd && $0.key == entry.key
-        }?.terminalTab
-    }
 }
 
 struct SessionProfileEntryFilter:Equatable {
@@ -114,7 +105,7 @@ struct SessionProfileEntryFilter:Equatable {
     @Published var error:String?
     @Published private(set) var message:String?
     @Published private(set) var results:[UUID:TerminalProfileRestoreResult]=[:]
-    private let captureForSaving:@MainActor (Bool, Set<String>?, [TerminalProfileEntry]) async throws -> [TerminalProfileCandidate]
+    private let captureForSaving:@MainActor (Bool, [TerminalProfileEntry]) async throws -> [TerminalProfileCandidate]
     private let queryConversation: (@MainActor (TerminalProfileCandidate) async throws -> TerminalProfileCandidate)?
     private let activeSessions:@MainActor () async throws -> [TerminalProfileCandidate]
     private let captureGroups:@MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup]
@@ -122,18 +113,19 @@ struct SessionProfileEntryFilter:Equatable {
     private let launch:@Sendable (TerminalProfileEntry,String?) async throws -> String
     private let selectTab:@Sendable (String,String) async throws -> Void
     private let restorer=TerminalProfileRestorer()
+    private var savingProfileID: UUID?
     private var repositoryTask:Task<Void,Never>?
     private var repositoryGeneration=UUID()
     init(store:TerminalProfileStore,capture:@escaping @MainActor () async throws -> [TerminalProfileCandidate],
          activeSessions:(@MainActor () async throws -> [TerminalProfileCandidate])? = nil,
-         captureForSaving:(@MainActor (Bool, Set<String>?, [TerminalProfileEntry]) async throws -> [TerminalProfileCandidate])? = nil,
+         captureForSaving:(@MainActor (Bool, [TerminalProfileEntry]) async throws -> [TerminalProfileCandidate])? = nil,
          queryConversation:(@MainActor (TerminalProfileCandidate) async throws -> TerminalProfileCandidate)? = nil,
          captureGroups:@escaping @MainActor ([TerminalProfileCandidate]) throws -> [TerminalProfileGroup] = {_ in []},
          restoreGroups:@escaping @MainActor (TerminalSessionProfile,[TerminalProfileRestoreResult],[TerminalProfileCandidate]) async throws -> Void = {_,_,_ in},
          launch:(@Sendable (TerminalProfileEntry,String?) async throws -> String)? = nil,
          selectTab:(@Sendable (String,String) async throws -> Void)? = nil) {
         self.store=store;self.activeSessions=activeSessions ?? capture
-        self.captureForSaving=captureForSaving ?? { _,_,_ in try await capture() }
+        self.captureForSaving=captureForSaving ?? { _,_ in try await capture() }
         self.queryConversation=queryConversation
         self.captureGroups=captureGroups;self.restoreGroups=restoreGroups
         self.launch=launch ?? {try await TerminalProfileLauncher.launch($0,anchorTTY:$1)}
@@ -144,7 +136,7 @@ struct SessionProfileEntryFilter:Equatable {
     convenience init(engine:ApprovalEngine) {
         self.init(store:TerminalProfileStore(directory:engine.paths.directory.appendingPathComponent("session-profiles",isDirectory:true)),
                   capture:{try await engine.terminalProfileCandidates(includeLayout:false)},
-                  captureForSaving:{try await engine.terminalProfileSaveCandidates(readWindowLayout:$0,sessionIDs:$1, savedEntries:$2)},
+                  captureForSaving:{try await engine.terminalProfileSaveCandidates(readWindowLayout:$0,savedEntries:$1)},
                   queryConversation:engine.resolveProfileConversation,
                   captureGroups:{try engine.terminalProfileGroups(candidates:$0)},
                   restoreGroups:{try await engine.restoreTerminalProfileGroups($0,results:$1,previous:$2)})
@@ -174,9 +166,10 @@ struct SessionProfileEntryFilter:Equatable {
         else {selectedEntries.formIntersection(profile.entries.map(\.id))}
         resolvingRepositories=true
         let entries = profile.entries
+        let refreshSettings = profile.id != savingProfileID
         repositoryTask=Task { [weak self] in
             let (value, refreshed) = await Task.detached(priority:.utility) {
-                (SessionProfileEntryFilter.repositories(for:entries.map(\.cwd)), TerminalProfileExecutionSettingsReader.refreshed(entries))
+                (SessionProfileEntryFilter.repositories(for:entries.map(\.cwd)), refreshSettings ? TerminalProfileExecutionSettingsReader.refreshed(entries) : entries)
             }.value
             guard let self,self.repositoryGeneration==generation,self.selectedID==profile.id else {return}
             if let index = self.profiles.firstIndex(where: { $0.id == profile.id }), self.profiles[index].entries == entries, refreshed != entries {
@@ -201,15 +194,18 @@ struct SessionProfileEntryFilter:Equatable {
     func captureCurrent(replacing:TerminalSessionProfile? = nil, readWindowLayout:Bool = false) async {
         guard !busy else {return};busy=true;error=nil;message=nil;defer {busy=false}
         do {
-            let candidates=try await captureForSaving(readWindowLayout,nil,replacing?.entries ?? [])
+            let previousEntries = replacing?.entries ?? []
+            let candidates=try await captureForSaving(readWindowLayout,previousEntries)
             guard !candidates.isEmpty else {throw AppError.message("실행 중인 에이전트 세션이 없습니다. 터미널에서 CLI를 연 뒤 다시 저장해주세요.")}
             var snapshot=SessionProfileDraft(profileID:replacing?.id ?? UUID(),name:replacing?.name ?? "",candidates:candidates,
-                groups:try captureGroups(candidates),capturesLiveSessions:true,readsWindowLayout:readWindowLayout,
-                previousEntries:replacing?.entries ?? [])
-            if !readWindowLayout && !snapshot.previousEntries.isEmpty {
+                groups:try captureGroups(candidates),capturesLiveSessions:true)
+            if !readWindowLayout && !previousEntries.isEmpty {
                 for index in snapshot.candidates.indices {
-                    let layout=snapshot.previousLayout(for:snapshot.candidates[index].entry)
-                    if snapshot.candidates[index].entry.terminalTab == nil { snapshot.candidates[index].entry.terminalTab=layout }
+                    let entry = snapshot.candidates[index].entry
+                    guard entry.host == .terminal, entry.resumesConversation, entry.terminalTab == nil else { continue }
+                    snapshot.candidates[index].entry.terminalTab = previousEntries.first {
+                        $0.host == .terminal && $0.cwd == entry.cwd && $0.key == entry.key
+                    }?.terminalTab
                 }
             }
             draft=snapshot
@@ -235,7 +231,9 @@ struct SessionProfileEntryFilter:Equatable {
     }
     func save(_ profile:TerminalSessionProfile) async throws {
         guard !busy else {throw AppError.message("다른 프로필 작업을 마친 뒤 저장해주세요.")}
-        busy=true;defer {busy=false};let store=store
+        busy=true;savingProfileID=profile.id
+        defer {busy=false;savingProfileID=nil}
+        let store=store
         var value=profile
         if let draft,draft.profileID==profile.id {
             for index in value.entries.indices {
@@ -245,41 +243,7 @@ struct SessionProfileEntryFilter:Equatable {
                     value.entries[index].usesProfileReasoningEffort = true
                 }
             }
-            var groups=draft.groups
-            if draft.capturesLiveSessions {
-                let chosenIDs = Set(value.entries.map(\.id))
-                let runtimes = Set(draft.candidates.filter { chosenIDs.contains($0.entry.id) }.map(\.id))
-                let fresh=try await captureForSaving(draft.readsWindowLayout,runtimes,draft.previousEntries)
-                var selected:[TerminalProfileCandidate]=[]
-                for index in value.entries.indices {
-                    let chosen=value.entries[index]
-                    guard let original=draft.candidates.first(where:{$0.entry.id==chosen.id}),
-                          var current=fresh.first(where:{$0.id==original.id}),
-                          current.entry.agent==original.entry.agent,current.entry.cwd==original.entry.cwd else {
-                        throw AppError.message("선택한 터미널이 종료되거나 변경되었습니다. 현재 창을 다시 불러와주세요.")
-                    }
-                    current.entry.id=chosen.id
-                    let followsCurrent=chosen.resumesConversation && chosen.conversationID.caseInsensitiveCompare(original.entry.conversationID) == .orderedSame
-                    if followsCurrent {
-                        guard current.entry.resumesConversation else {throw AppError.message("현재 대화 ID를 확인할 수 없습니다. 현재 창을 다시 불러와주세요.")}
-                        value.entries[index].conversationID=current.entry.conversationID
-                        var settings = chosen.executionSettings ?? .init()
-                        if chosen.executionSettings?.model == original.entry.executionSettings?.model { settings.model = current.entry.executionSettings?.model }
-                        if chosen.usesProfileReasoningEffort != true { settings.reasoningEffort = current.entry.executionSettings?.reasoningEffort }
-                        if chosen.executionSettings?.serviceTier == original.entry.executionSettings?.serviceTier { settings.serviceTier = current.entry.executionSettings?.serviceTier }
-                        value.entries[index].executionSettings = settings.isEmpty ? nil : settings
-                    }
-                    value.entries[index].providerHome=current.entry.providerHome
-                    if draft.readsWindowLayout {
-                        value.entries[index].terminalTab=current.entry.terminalTab
-                    } else {
-                        value.entries[index].terminalTab=(followsCurrent ? current.entry.terminalTab : nil) ?? draft.previousLayout(for:value.entries[index])
-                    }
-                    selected.append(current)
-                }
-                groups=try captureGroups(selected)
-            }
-            value.groups=TerminalProfileGroup.selecting(groups,entries:value.entries)
+            value.groups=TerminalProfileGroup.selecting(draft.groups,entries:value.entries)
         }
         value.schema=4
         let saved=value

@@ -176,8 +176,7 @@ public struct TerminalProfileStore: Sendable {
     }
     public func list() throws -> TerminalProfileListing {
         try prepare()
-        let files=try FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil)
-            .filter {$0.lastPathComponent.hasSuffix(".autoapprove-profile.json")}
+        let files=try profileFiles()
         guard files.count <= 200 else {throw AppError.message("프로필은 최대 200개까지 관리합니다. 파일을 정리해주세요.")}
         var profiles:[TerminalSessionProfile]=[],warnings:[String]=[]
         for url in files {
@@ -189,6 +188,10 @@ public struct TerminalProfileStore: Sendable {
         }
         return TerminalProfileListing(profiles:profiles.sorted {$0.savedAt == $1.savedAt ? $0.name < $1.name : $0.savedAt > $1.savedAt},warnings:warnings)
     }
+    private func profileFiles() throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil)
+            .filter {$0.lastPathComponent.hasSuffix(".autoapprove-profile.json")}
+    }
     @discardableResult public func save(_ profile: TerminalSessionProfile) throws -> TerminalSessionProfile {
         try prepare(); let value=try profile.validated(),target=file(value.id)
         var info=stat()
@@ -196,17 +199,19 @@ public struct TerminalProfileStore: Sendable {
             guard info.st_mode&S_IFMT == S_IFREG,info.st_uid == getuid() else {throw AppError.message("이 프로필 파일에 저장할 수 없습니다.")}
         } else {
             guard errno == ENOENT else {throw POSIXError(.EACCES)}
-            let listing=try list()
-            guard listing.profiles.count+listing.warnings.count < 200 else {throw AppError.message("프로필은 최대 200개까지 저장합니다.")}
+            guard try profileFiles().count < 200 else {throw AppError.message("프로필은 최대 200개까지 저장합니다.")}
         }
-        try Self.write(try Self.encode(value),to:target);return value
+        try Self.write(try Self.encodeValidated(value),to:target);return value
     }
     @discardableResult public func importFile(_ source: URL) throws -> TerminalSessionProfile {
         var value=try Self.decode(Self.read(source));value.id=UUID();value.savedAt=Date();return try save(value)
     }
     public static func encode(_ value: TerminalSessionProfile) throws -> Data {
+        try encodeValidated(value.validated())
+    }
+    private static func encodeValidated(_ value: TerminalSessionProfile) throws -> Data {
         let encoder=JSONEncoder();encoder.dateEncodingStrategy = .iso8601;encoder.outputFormatting=[.prettyPrinted,.sortedKeys]
-        let data=try encoder.encode(value.validated());guard data.count <= maximumBytes else {throw AppError.message("프로필 파일이 너무 큽니다.")};return data
+        let data=try encoder.encode(value);guard data.count <= maximumBytes else {throw AppError.message("프로필 파일이 너무 큽니다.")};return data
     }
     public static func decode(_ data: Data) throws -> TerminalSessionProfile {
         guard data.count <= maximumBytes else {throw AppError.message("프로필 파일은 512KB 이하여야 합니다.")}

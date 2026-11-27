@@ -124,22 +124,34 @@ private actor LaunchLog {
         await controller.waitForRepositories(); await controller.restoreSelection()
         try check(await log.opened.contains { $0.id == configured.entries[0].id && $0.executionSettings == configured.entries[0].executionSettings },"Controller restore forwards model, reasoning and speed to the launcher")
         var current=entry(20,"agy",plain,"Antigravity")
+        current.executionSettings = .init(model:"original",reasoningEffort:"high")
+        current.terminalTab = .init(window:UUID(),windowOrder:0,tabOrder:1)
         let original=current
         var member=SessionGroupMember(agent:.agy,title:"그룹장",cwd:plain,conversationID:current.conversationID)
         member.runtimeID="runtime"
         let group=SessionGroup(name:"Current",members:[member],leaderMemberID:member.id)
-        let live=SessionProfilesController(store:store,capture:{[.init(id:"runtime",entry:current)]},
-            captureGroups:{TerminalProfileGroup.capture([group],candidates:$0)})
+        var terminalAvailable=true, groupReads=0
+        let live=SessionProfilesController(store:store,capture:{
+            guard terminalAvailable else { throw AppError.message("Terminal closed") }
+            return [.init(id:"runtime",entry:current)]
+        },captureGroups:{ candidates in
+            groupReads += 1
+            return TerminalProfileGroup.capture([group],candidates:candidates)
+        })
         await live.captureCurrent()
         let capture=live.draft!
         let chosen=TerminalSessionProfile(id:capture.profileID,name:"Current",entries:[original])
         current.conversationID=UUID().uuidString.lowercased()
+        current.executionSettings=nil
+        terminalAvailable=false
         try await live.save(chosen)
         let persisted=try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(chosen.id)))
-        try check(persisted.entries[0].conversationID==current.conversationID,"Save follows a conversation changed after capture")
-        try check(persisted.groups?.first?.group.members.first?.agent == .agy,"Antigravity group role survives selection")
+        try check(persisted.entries==[original] && groupReads==1,"Save preserves the displayed conversation, settings and position after Terminal closes")
+        try check(live.selected?.entries == persisted.entries,"Reloading the just-saved selection keeps the displayed reasoning setting offline")
+        try check(persisted.groups?.first?.group.members.first?.conversationID == original.conversationID,"Antigravity group role survives selection")
         let command=try persisted.entries[0].resumeCommand()
-        try check(command.contains("'agy' '--conversation' '"+current.conversationID+"'") && !command.contains("CLAUDE_CONFIG_DIR"),"Antigravity resume uses its CLI grammar")
+        try check(command.contains("'agy' '--conversation' '"+original.conversationID+"'") && !command.contains("CLAUDE_CONFIG_DIR"),"Antigravity resume uses its CLI grammar")
+        terminalAvailable=true
         await live.captureCurrent()
         let manual=live.draft!
         var selected=manual.candidates[0].entry
@@ -162,11 +174,11 @@ private actor LaunchLog {
         var liveEntry=pinned
         liveEntry.id=UUID()
         liveEntry.terminalTab=nil
-        var requests:[(Bool, Set<String>?)]=[]
+        var requests:[Bool]=[]
         let captures=SessionProfilesController(store:store,capture:{throw AppError.message("Unexpected restoration")},
-            captureForSaving:{layout,selected,savedEntries in
-                if !layout {try check(savedEntries.first?.terminalTab == pinned.terminalTab,"Saved slot reaches capture and commit")}
-                requests.append((layout,selected))
+            captureForSaving:{layout,savedEntries in
+                if !layout {try check(savedEntries.first?.terminalTab == pinned.terminalTab,"Saved slot reaches capture")}
+                requests.append(layout)
                 if layout {throw AppError.message("Layout unavailable")}
                 return [.init(id:"live",entry:liveEntry)]
             })
@@ -176,19 +188,19 @@ private actor LaunchLog {
         try await captures.save(.init(id:quick.profileID,name:quick.name,entries:quick.candidates.map(\.entry)))
         let retained=try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(quick.profileID)))
         try check(retained.entries[0].terminalTab==pinned.terminalTab,"Quick save retains only a matching arrangement")
-        try check(requests.count==2 && !requests[0].0 && requests[0].1==nil && !requests[1].0 && requests[1].1==["live"],"Draft and selected commit both skip terminal automation")
+        try check(requests == [false],"Save uses the captured rows without another read")
         await captures.captureCurrent(replacing:retained)
         let changing=captures.draft!
         liveEntry.conversationID=UUID().uuidString.lowercased()
         try await captures.save(.init(id:changing.profileID,name:changing.name,entries:changing.candidates.map(\.entry)))
         let changed=try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(changing.profileID)))
-        try check(changed.entries[0].terminalTab==nil && changed.entries[0].conversationID==liveEntry.conversationID,"A switched conversation cannot inherit the previous layout")
+        try check(changed.entries == changing.candidates.map(\.entry) && requests == [false,false],"Changing the live conversation leaves the saved snapshot intact")
         let bytes=try TerminalProfileStore.read(store.file(changed.id))
         await captures.captureCurrent(replacing:changed,readWindowLayout:true)
-        try check(requests.last?.0==true && captures.error=="Layout unavailable" && captures.draft==nil,"Exact layout errors stay visible")
+        try check(requests.last==true && captures.error=="Layout unavailable" && captures.draft==nil,"Exact layout errors stay visible")
         try check(try TerminalProfileStore.read(store.file(changed.id))==bytes,"Failed exact capture leaves the existing profile intact")
         var queries = [String]()
-        let lookup = SessionProfilesController(store:store,capture:{[]},captureForSaving:{_,_,_ in
+        let lookup = SessionProfilesController(store:store,capture:{[]},captureForSaving:{_,_ in
             [.init(id:"selected",entry:liveEntry,canQueryConversation:true), .init(id:"other",entry:pinned)]
         },queryConversation:{candidate in
             queries.append(candidate.id)

@@ -572,6 +572,9 @@ extension ApprovalTests {
             engine.updateDiscovery([session],records:[record])
             do {
                 let captured = try await engine.terminalProfileSaveCandidates(readWindowLayout:true)
+                try expectEqual(tab.lock.withLock { tab.reads },1)
+                try expectEqual(captured.first?.entry.conversationID,current)
+                if scenario == "renamed" { continue }
                 let fresh = try await engine.terminalProfileSaveCandidates(readWindowLayout:true,sessionIDs:[session.id],savedEntries:captured.map(\.entry))
                 try expect(["live","approvalOnly"].contains(scenario),"A conflicting live identity or a renamed tab was accepted")
                 try expectEqual(captured.first?.entry.conversationID,current)
@@ -579,7 +582,6 @@ extension ApprovalTests {
                 try expectEqual(fresh.first?.entry.executionSettings?.reasoningEffort,"high")
                 try expectEqual(engine.snapshot.sessions.first?.codexApprovalBinding?.threadID,previous)
             } catch {
-                if scenario == "renamed", error.localizedDescription.contains("바뀌었습니다") { continue }
                 if scenario == "conflict", error.localizedDescription.contains("다릅니다") { continue }
                 throw error
             }
@@ -629,21 +631,17 @@ extension ApprovalTests {
             defer { engine.stop() }
             engine.updateDiscovery(sessions,records:records)
             let selected = scenario == "wrongSlot" ? records[0].key : records[1].key
-            do {
-                let rows = try await engine.terminalProfileSaveCandidates(readWindowLayout:false,sessionIDs:[selected],savedEntries:[saved])
-                try expect(scenario != "moved","Moving a tab during capture must invalidate the saved-slot proof")
-                let candidate = try unwrap(rows.first)
-                if scenario == "stable" {
-                    try expectEqual(candidate.entry.conversationID,thread)
-                    try expectEqual(candidate.entry.executionSettings?.reasoningEffort,"high")
-                    try expectEqual(candidate.entry.terminalTab?.window,saved.terminalTab?.window)
-                    try expectEqual(candidate.entry.terminalTab?.customTitle,"현재 작업 | project")
-                } else {
-                    try expectEqual(candidate.entry.conversationID,"")
-                    try expectNil(candidate.entry.executionSettings)
-                }
-            } catch {
-                guard scenario == "moved", error.localizedDescription.contains("바뀌었습니다") else { throw error }
+            let rows = try await engine.terminalProfileSaveCandidates(readWindowLayout:false,sessionIDs:[selected],savedEntries:[saved])
+            try expectEqual(inventory.lock.withLock { inventory.reads },1)
+            let candidate = try unwrap(rows.first)
+            if scenario == "stable" || scenario == "moved" {
+                try expectEqual(candidate.entry.conversationID,thread)
+                try expectEqual(candidate.entry.executionSettings?.reasoningEffort,"high")
+                try expectEqual(candidate.entry.terminalTab?.window,saved.terminalTab?.window)
+                try expectEqual(candidate.entry.terminalTab?.customTitle,"현재 작업 | project")
+            } else {
+                try expectEqual(candidate.entry.conversationID,"")
+                try expectNil(candidate.entry.executionSettings)
             }
         }
     }
@@ -652,13 +650,13 @@ extension ApprovalTests {
         final class Titles: @unchecked Sendable {
             let lock = NSLock()
             var reads: [[String]] = []
-            var changeOnConfirmation = false
+            var switchTitle = false
             func read(_ ttys: [String]) -> [String: String] {
                 lock.withLock {
                     reads.append(ttys)
                     return Dictionary(uniqueKeysWithValues: ttys.map { tty in
-                        let first = tty == "/dev/named1" && !(changeOnConfirmation && reads.count.isMultiple(of: 2))
-                        return (tty, (first ? "First" : ["/dev/named2", "/dev/named4"].contains(tty) ? "Second" : "Duplicate") + " | project")
+                        let first = tty == "/dev/named1" && !switchTitle
+                        return (tty, (first ? "First" : ["/dev/named1", "/dev/named2", "/dev/named4"].contains(tty) ? "Second" : "Duplicate") + " | project")
                     })
                 }
             }
@@ -702,12 +700,11 @@ extension ApprovalTests {
         let store = TerminalProfileStore(directory: directory.appendingPathComponent("profiles"))
         let saved = try store.save(profile)
         try expectEqual(try TerminalProfileStore.decode(TerminalProfileStore.read(store.file(saved.id))).entries.first?.conversationID, choices[0].id)
-        try expectEqual(titles.lock.withLock { titles.reads }, [["/dev/named1","/dev/named2","/dev/named3","/dev/named4"],["/dev/named1","/dev/named2"],["/dev/named1"],["/dev/named1"]])
-        titles.lock.withLock { titles.changeOnConfirmation = true }
-        do {
-            _ = try await engine.terminalProfileSaveCandidates(readWindowLayout: false, sessionIDs: selected)
-            throw AppError.message("Changed conversation was accepted")
-        } catch { try expect(error.localizedDescription.contains("바뀌었습니다")) }
+        try expectEqual(titles.lock.withLock { titles.reads }, [["/dev/named1","/dev/named2","/dev/named3","/dev/named4"],["/dev/named1"]])
+        titles.lock.withLock { titles.switchTitle = true }
+        let switched = try await engine.terminalProfileSaveCandidates(readWindowLayout: false, sessionIDs: selected)
+        try expectEqual(switched.first?.entry.conversationID, choices[1].id)
+        try expectEqual(saved.entries.first?.conversationID, choices[0].id)
     }
 
     func testTerminalProfileSavingRequiresExplicitNewCLISelection() throws {

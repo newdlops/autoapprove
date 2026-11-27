@@ -1469,7 +1469,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             result.append(.init(id:session.id,entry:entry,conversations:choices,detail:detail,tty:session.terminal == .terminal ? session.tty:nil, canQueryConversation: session.agent == .codex && [.terminal,.iterm].contains(session.terminal)))
         }
         let terminalTTYs=result.filter {$0.entry.host == .terminal}.compactMap(\.tty)
-        var slotEvidence: [String:TerminalProfileTabSnapshot] = [:]
+        var locatedTTYs = Set<String>()
         // Native macOS tab groups can span multiple Apple Event windows. Include siblings
         // even when saving one selected row so the window and tab ordinals keep their meaning.
         let inventoryTTYs = Array(Set(snapshot.sessions.filter {
@@ -1488,8 +1488,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 let positions = Dictionary(uniqueKeysWithValues: positioned.map { ($0.id,$0.entry) })
                 for index in result.indices {
                     let candidate = result[index]
-                    guard let tty = candidate.tty, let position = positions[candidate.id]?.terminalTab,
-                          let row = layout.first(where: { $0.tty == tty }) else { continue }
+                    guard let tty = candidate.tty, let position = positions[candidate.id]?.terminalTab else { continue }
                     let entry = candidate.entry
                     let title = position.customTitle
                     if entry.agent == "codex", (exactLayout || !savedSlots.isEmpty), let home = entry.providerHome, conversationLists[home]?[entry.cwd] == nil,
@@ -1514,7 +1513,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     guard exactLayout || prior != nil else { continue }
                     if identities[candidate.id]?.providerIdentityAmbiguous == false, let bound, let name = bound.name {
                         // Approval routing can still point to an earlier conversation on this same TTY.
-                        // A unique live tab name is re-read below. Keep independent process/turn evidence authoritative.
+                        // Keep independent process/turn evidence authoritative.
                         let approvalOnly = explicitCodexBindings.removeValue(forKey:candidate.id) != nil
                         if !approvalOnly, !entry.conversationID.isEmpty, UUID(uuidString:entry.conversationID) != UUID(uuidString:bound.id) {
                             throw AppError.message("\(tty)의 현재 대화 ID와 탭 제목이 가리키는 대화가 다릅니다. 해당 탭의 대화를 다시 확인해주세요.")
@@ -1538,7 +1537,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                         }
                     }
                     if result[index].entry.resumesConversation && (prior != nil || layoutNamedBindings.contains(candidate.id) || entry.conversationID.isEmpty) {
-                        slotEvidence[tty] = row
+                        locatedTTYs.insert(tty)
                         if !exactLayout, var retained = prior?.terminalTab {
                             retained.customTitle = position.customTitle
                             result[index].entry.terminalTab = retained
@@ -1564,17 +1563,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 }
             }
         }
-        let namedTabs = needsTitle.filter { namedCodexBindings[$0.id] != nil && !layoutNamedBindings.contains($0.id) }
-        let confirmedTitles = await profileTabTitles(namedTabs)
-        if !slotEvidence.isEmpty {
-            let confirmed = try await terminalProfileLayoutReader(inventoryTTYs)
-            guard slotEvidence.allSatisfy({ tty, before in
-                let rows = confirmed.filter { $0.tty == tty }
-                guard rows.count == 1, let after = rows.first else { return false }
-                return before.windowID == after.windowID && before.windowOrder == after.windowOrder && before.tabOrder == after.tabOrder &&
-                    before.customTitle.map(TerminalProfileTabTitles.stable) == after.customTitle.map(TerminalProfileTabTitles.stable)
-            }) else { throw AppError.message("저장하는 동안 Terminal 창·탭 위치나 제목이 바뀌었습니다. 현재 창을 다시 불러와주세요.") }
-        }
         let fresh=try await Task.detached(priority:.userInitiated) {ProcessDiscovery.index(try reader(pids))}.value
         try Task.checkCancellation()
         guard observationEpoch == epoch, !remoteInputStopped else { throw CancellationError() }
@@ -1589,7 +1577,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   "/dev/"+process.tty == original.tty else { throw changed("실행 세션") }
             let thread = UUID(uuidString:candidate.entry.conversationID)
             let usedTabTitle = tabTitles[candidate.id] != nil && namedCodexBindings[candidate.id] != nil && !layoutNamedBindings.contains(candidate.id)
-            if current.agent == .codex, slotEvidence[current.tty] != nil || usedTabTitle || profileRevisions[candidate.id] != nil,
+            if current.agent == .codex, locatedTTYs.contains(current.tty) || usedTabTitle || profileRevisions[candidate.id] != nil,
                let active = groupMCPIdentity(for:current,home:candidate.entry.providerHome)?.conversationID, active != thread {
                 throw AppError.message("\(current.tty)의 MCP 대화 ID와 프로필에서 확인한 대화 ID가 다릅니다. 해당 탭의 대화를 다시 조회해주세요.")
             }
@@ -1601,15 +1589,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                current.codexApprovalBinding.flatMap({ UUID(uuidString:$0.threadID) }) != UUID(uuidString:expected) {
                 throw changed("대화 조회에 사용한 승인 연결")
             }
-            if let name = namedCodexBindings[candidate.id] {
-                // Polling titles and native tab titles update independently. Check the source that identified this row.
-                if usedTabTitle {
-                    guard remoteCanRead(current), CodexProfileConversationBinding.terminalName(confirmedTitles[candidate.id],cwd:current.cwd) == name
-                    else { throw changed("탭 제목") }
-                } else if !layoutNamedBindings.contains(candidate.id) {
-                    guard CodexProfileConversationBinding.terminalName(current.terminalTitle,cwd:current.cwd) == name
-                    else { throw changed("대화 제목") }
-                }
+            if let name = namedCodexBindings[candidate.id], !usedTabTitle, !layoutNamedBindings.contains(candidate.id),
+               CodexProfileConversationBinding.terminalName(current.terminalTitle,cwd:current.cwd) != name {
+                throw changed("대화 제목")
             }
         }
         return result
