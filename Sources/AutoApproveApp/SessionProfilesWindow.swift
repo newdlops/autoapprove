@@ -214,6 +214,15 @@ private struct ProfileDraftRow:Identifiable {
     var startsNewCLI=false
 }
 
+private extension CodexProfileConversation {
+    var pickerLabel: String {
+        let name = title.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        guard !name.isEmpty, name.caseInsensitiveCompare(id) != .orderedSame else { return id }
+        let preview = name.count > 24 ? String(name.prefix(24)) + "…" : name
+        return id + "  ·  " + preview
+    }
+}
+
 struct SessionProfileEditor:View {
     let draft:SessionProfileDraft
     let resolve: ((String) async throws -> TerminalProfileCandidate)?
@@ -333,7 +342,12 @@ struct SessionProfileEditor:View {
                                 if !row.choices.isEmpty {
                                     Picker("복원할 대화",selection:$row.entry.conversationID) {
                                         Text("이어갈 대화 선택").tag("")
-                                        ForEach(row.choices) {choice in Text(choice.title).tag(choice.id)}
+                                        ForEach(row.choices) { choice in
+                                            Text(verbatim: choice.pickerLabel)
+                                                .accessibilityLabel(Text(verbatim: choice.id + " " + choice.title))
+                                                .help(Text(verbatim: choice.title))
+                                                .tag(choice.id)
+                                        }
                                     }.frame(maxWidth:.infinity,alignment:.leading)
                                 }
                                 TextField("대화 ID",text:$row.entry.conversationID).textFieldStyle(.roundedBorder)
