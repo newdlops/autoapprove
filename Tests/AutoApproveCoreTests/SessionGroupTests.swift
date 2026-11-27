@@ -772,10 +772,12 @@ extension ApprovalTests {
         final class Fixture: @unchecked Sendable {
             let lock = NSLock()
             var stopped = Set<String>()
+            var inventoryReads = 0
             var calls: [String] = []
             var failed = false
             func list(_ key:String) -> [String] {
                 lock.lock(); defer { lock.unlock() }
+                inventoryReads += 1
                 return (stopped.contains(key) ? [] : ["server"]) + (failed ? [] : ["tests"])
             }
             func stop(_ key:String) {
@@ -811,6 +813,8 @@ extension ApprovalTests {
         func call(_ tool:String,_ fields:JSONObject = [:]) async throws -> JSONObject {
             try await e.mcpAction(["tool":tool,"owner":UUID().uuidString,"sessionID":sessions[0].id,"groupID":group.id.uuidString].merging(fields) { _,new in new })
         }
+        _ = try await call("get_group_status", ["view": "overview"])
+        try expectEqual(fixture.inventoryReads, 0, "Quick status must not wait for a cold provider inventory")
         let all = try unwrapGroup(try await call("list_group_background_jobs")["members"] as? [JSONObject])
         try expectEqual(all.count,3)
         let worker = try unwrapGroup(all.first { $0["memberID"] as? String == members[1].id.uuidString })

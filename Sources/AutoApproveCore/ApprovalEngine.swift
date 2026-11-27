@@ -3198,6 +3198,12 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return updated
     }
 
+    /// Visible graphs share validated observations with group tools and with one another.
+    public func refreshGroupConnectionObservation() async throws {
+        if let cached = groupConnectionObservation, Date().timeIntervalSince(cached.at) < 10 { return }
+        _ = try await sessionGroupSessions()
+    }
+
     public func sessionGroupSessions() async throws -> [SessionGroupLiveSession] {
         if let pending = groupIdentityObservationTask { return try await pending.value }
         let epoch = observationEpoch
@@ -3300,14 +3306,17 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             result.tabShell = SessionGroupTabShell.observe(current, process: process, records: byPID, environment: environment)
             let mcp = current.agent == .codex ? groupMCPIdentity(for: current, home: result.providerHome) : nil
-            if let mcp, let id = mcp.conversationID {
+            let status = groupStatusIdentities[current.id]
+            // A helper confirming the new ID must not revive the rollout explicitly superseded by /clear.
+            let confirmsReceipt = status?.contradictedRollout != nil && mcp?.conversationID == status.flatMap { UUID(uuidString: $0.conversationID) }
+            if let mcp, let id = mcp.conversationID, !confirmsReceipt {
                 groupStatusIdentities.removeValue(forKey: current.id)
                 if result.conversationID == nil {
                     result.conversationID = id.uuidString.lowercased()
                     result.providerHome = mcp.home
                     result.codexIdentityFromMCP = true
                 }
-            } else if useStatusCache, let status = groupStatusIdentities[current.id] {
+            } else if useStatusCache, let status {
                 let compatible = status.session.started == current.started && status.session.tty == current.tty &&
                     status.session.cwd == current.cwd && status.session.agent == current.agent &&
                     (result.providerHome == nil || status.home == nil || result.providerHome == status.home)
@@ -4240,12 +4249,55 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (count,jobs,waiting)
     }
 
+    private func refreshGroupStatusScreens(_ visibleGroups: [SessionGroup], observed: [SessionGroupLiveSession]) async {
+        let ids = Set(visibleGroups.flatMap(\.members).compactMap { SessionGroupMatching.match($0, in: observed)?.id })
+        let missing = ids.filter { id in
+            guard let current = sessions[id], remoteCanRead(current) else { return false }
+            let last = max(remoteObservedScreens[id]?.observedAt ?? .distantPast, remoteFrames[id]?.frame.observedAt ?? .distantPast)
+            return Date().timeIntervalSince(last) >= 10
+        }
+        var iterator = missing.makeIterator()
+        await withTaskGroup(of: Void.self) { reads in
+            for _ in 0..<min(missing.count, 3) {
+                if let id = iterator.next() { reads.addTask { _ = try? await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true) } }
+            }
+            while await reads.next() != nil {
+                if let id = iterator.next() { reads.addTask { _ = try? await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true) } }
+            }
+        }
+    }
+
+    private func refreshGroupStatusJobs(_ visibleGroups: [SessionGroup], observed: [SessionGroupLiveSession]) async {
+        let native = visibleGroups.flatMap { group in
+            group.members.compactMap { member -> (SessionGroup,SessionGroupMember,SessionGroupLiveSession)? in
+                guard [.codex,.claude].contains(member.agent), let live = SessionGroupMatching.match(member,in:observed),
+                      Date().timeIntervalSince(jobSnapshots[jobKey(group.id,member.id,live)]?.at ?? .distantPast) > 20 else { return nil }
+                return (group,member,live)
+            }
+        }
+        var jobs = native.makeIterator()
+        await withTaskGroup(of:Void.self) { reads in
+            func schedule() {
+                guard let (group,member,live) = jobs.next() else { return }
+                reads.addTask { _ = try? await self.refreshBackgroundJobs(live,group:group,member:member) }
+            }
+            for _ in 0..<min(native.count,4) { schedule() }
+            while await reads.next() != nil { schedule() }
+        }
+    }
+
     private func groupOverview(_ group: SessionGroup, observed: [SessionGroupLiveSession], models: [String: SessionGroupModelSettings], state: SessionGroupOrchestration) throws -> JSONObject {
         let inbox = try groupMailbox().inboxOperations(groupID: group.id)
         let formatter = ISO8601DateFormatter()
         let rows: [JSONObject] = try group.treeOrder.map { entry in
             let member = entry.member
-            let live = SessionGroupMatching.match(member, in: observed)
+            let live = SessionGroupMatching.match(member, in: observed).flatMap { observed -> SessionGroupLiveSession? in
+                guard let current = sessions[observed.id], current.phase != .ended,
+                      current.codexApprovalBinding?.threadID == observed.session.codexApprovalBinding?.threadID else { return nil }
+                var row = observed
+                row.session = current
+                return row
+            }
             let task = state.current(groupID: group.id, workerMemberID: member.id)
             let frame = live.flatMap { row -> (raw: String, observedAt: Date)? in
                 let polled = remoteObservedScreens[row.id]
@@ -6645,11 +6697,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
                   member.runtimeID == nil || member.runtimeID == current.id, member.providerHome == nil || target.providerHome == nil || member.providerHome == target.providerHome else {
                 target.phase = "failed"; target.detail = "그룹 소속이나 원래 연결이 바뀌었습니다."; try saveGroupClearTarget(job.id, target); return
             }
-            guard !(await userInputHasPriority(current.id,backgroundOnly:true)), !snapshot.paused, !automaticInputBusy(current.id), !current.pendingInTerminal,
-                  ![.approval, .ended].contains(current.phase), !sendingMessages.contains(current.id), !groupStatusQueries.contains(current.id) else { return }
-            let frame = try await remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
-            guard clearFrameReady(frame.screen, agent: current.agent) else {
-                target.detail = "작업·작성 중인 입력·질문이 끝나고 빈 입력창이 될 때까지 기다립니다."; try saveGroupClearTarget(job.id, target); return
+            func readyFrame() async throws -> RemoteTerminalFrame? {
+                guard !(await userInputHasPriority(current.id,backgroundOnly:true)), !snapshot.paused, !automaticInputBusy(current.id),
+                      sessions[current.id]?.pendingInTerminal == false, sessions[current.id]?.phase != .approval,
+                      !sendingMessages.contains(current.id), !groupStatusQueries.contains(current.id) else { return nil }
+                let frame = try await remoteTerminal(sessionID: current.id, realtime: true, textOnly: true)
+                guard clearFrameReady(frame.screen, agent: current.agent) else { return nil }
+                return frame
             }
             func codexProcessID() async throws -> String? {
                 guard current.agent == .codex,
@@ -6661,13 +6715,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return id
             }
             if target.phase == "waiting" {
+                guard let frame = try await readyFrame() else { return }
                 if target.verifiedAt.map({ Date().timeIntervalSince($0) > 10 }) ?? true {
                     let id: String
                     target.processVerifiedBefore = nil
                     if let fresh = try await codexProcessID(), UUID(uuidString: fresh) == UUID(uuidString: target.savedID) {
                         id = fresh
                         target.processVerifiedBefore = true
-                    } else if current.agent == .claude || current.agent == .agy, let live = try await sessionGroupSessions().first(where: { $0.id == current.id }), let fresh = live.conversationID { id = fresh }
+                    } else if current.agent == .claude || current.agent == .agy, let live = try await readSessionGroupSessions(runtimeID: current.id, reconcile: false, useStatusCache: false).first, !live.providerIdentityAmbiguous, let fresh = live.conversationID { id = fresh }
                     else { id = try await statusConversationID(current,backgroundOnly:true) }
                     target.beforeID = id; target.verifiedAt = Date(); target.identityAttempts = 0; try saveGroupClearTarget(job.id, target)
                     if current.agent == .codex { try await waitForGroupStatusInput(current,backgroundOnly:true) }
@@ -6704,10 +6759,16 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             guard !Task.isCancelled, !remoteInputStopped else { return }
             let newID: String?
-            if current.agent == .claude || current.agent == .agy { newID = try await sessionGroupSessions().first(where: { $0.id == current.id })?.conversationID }
+            if current.agent == .claude || current.agent == .agy {
+                let row = try await readSessionGroupSessions(runtimeID: current.id, reconcile: false, useStatusCache: false).first
+                newID = row?.providerIdentityAmbiguous == false && row?.providerHome == target.providerHome ? row?.conversationID : nil
+            }
             else if target.processVerifiedBefore == true, let fresh = try await codexProcessID(),
                     UUID(uuidString: fresh) != UUID(uuidString: target.beforeID) { newID = fresh }
-            else { newID = try await statusConversationID(current,backgroundOnly:true) }
+            else {
+                guard try await readyFrame() != nil else { return }
+                newID = try await statusConversationID(current,backgroundOnly:true)
+            }
             guard let newID, UUID(uuidString: newID) != nil, UUID(uuidString: newID) != UUID(uuidString: target.beforeID) else {
                 target.identityAttempts += 1
                 if target.identityAttempts >= 3 { target.phase = "needs_review"; target.detail = "새 ID를 확인하지 못했습니다. /clear는 다시 보내지 않습니다. 원래 터미널에서 세션 ID를 갱신해주세요." }
@@ -6733,6 +6794,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             groupStatusIdentities[current.id] = GroupStatusIdentity(session: current, conversationID: newID, home: target.providerHome,
                                                                    contradictedRollout: UUID(uuidString: target.beforeID))
             var state = try groupOrchestration(); state.supersede(groupID: job.groupID, workerMemberID: target.memberID); try saveGroupOrchestration(state)
+            groupConnectionObservation = nil
             target.afterID = newID; target.phase = "completed"; target.detail = "초기화와 새 세션 ID 갱신을 확인했습니다."
             try saveGroupClearTarget(job.id, target); refreshSessionGroupBadges(); scheduleGroupMailboxDelivery()
         } catch {
@@ -7195,41 +7257,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let observed = try await sessionGroupSessions()
             let (caller, attribution) = try await sessionGroupCaller(object, observed: observed)
             let groups = try SessionGroupStore(directory: paths.directory).load()
-            let state = try groupOrchestration()
             let visibleGroups = groups.filter { group in group.members.contains { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) } }
-            let modelSettings = await groupModelSettings(visibleGroups, observed: observed)
             guard let mode = (object["view"] ?? "full") as? String, ["overview","full"].contains(mode) else { throw RemoteHTTPError(400,"view는 overview 또는 full이어야 합니다.") }
-            let ids = Set(visibleGroups.flatMap(\.members).compactMap { SessionGroupMatching.match($0, in: observed)?.id })
-            let missing = ids.filter { id in
-                guard let current = sessions[id], remoteCanRead(current) else { return false }
-                let last = max(remoteObservedScreens[id]?.observedAt ?? .distantPast, remoteFrames[id]?.frame.observedAt ?? .distantPast)
-                return Date().timeIntervalSince(last) >= 10
-            }
-            var iterator = missing.makeIterator()
-            await withTaskGroup(of: Void.self) { reads in
-                for _ in 0..<min(missing.count, 3) {
-                    if let id = iterator.next() { reads.addTask { _ = try? await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true) } }
-                }
-                while await reads.next() != nil {
-                    if let id = iterator.next() { reads.addTask { _ = try? await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true) } }
-                }
-            }
-            let native = visibleGroups.flatMap { group in
-                group.members.compactMap { member -> (SessionGroup,SessionGroupMember,SessionGroupLiveSession)? in
-                    guard [.codex,.claude].contains(member.agent), let live = SessionGroupMatching.match(member,in:observed),
-                          Date().timeIntervalSince(jobSnapshots[jobKey(group.id,member.id,live)]?.at ?? .distantPast) > 20 else { return nil }
-                    return (group,member,live)
-                }
-            }
-            var jobs = native.makeIterator()
-            await withTaskGroup(of:Void.self) { reads in
-                func schedule() {
-                    guard let (group,member,live) = jobs.next() else { return }
-                    reads.addTask { _ = try? await self.refreshBackgroundJobs(live,group:group,member:member) }
-                }
-                for _ in 0..<min(native.count,4) { schedule() }
-                while await reads.next() != nil { schedule() }
-            }
+            async let screens: Void = refreshGroupStatusScreens(visibleGroups, observed: observed)
+            // Overview already has terminal counts and the monitor's conversation-scoped inventory.
+            // A cold or unavailable provider must not hold up a quick status check.
+            async let inventory: Void = mode == "full" ? refreshGroupStatusJobs(visibleGroups, observed: observed) : ()
+            let modelSettings = await groupModelSettings(visibleGroups, observed: observed)
+            _ = await (screens, inventory)
+            let state = try groupOrchestration()
             let latestGroups = try SessionGroupStore(directory: paths.directory).load()
             guard visibleGroups.allSatisfy({ old in latestGroups.contains(where: { $0.id == old.id && $0.sameMembership(as: old) }) }) else {
                 throw RemoteHTTPError(409, "조회 중 그룹 연결이 바뀌었습니다. 다시 확인해주세요.")
@@ -7243,7 +7279,6 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     if let mid = (row["id"] as? String).flatMap(UUID.init(uuidString:)) { waitingByGroup[gid,default:[:]][mid] = row }
                 }
             }
-            let memberStatuses = await claudeStatuses(observed.map(\.session))
             let includeGraph = try GroupWaitRequest.flag(object, "includeWaitGraph")
             let output: [JSONObject] = try groups.compactMap { group in
                 guard let callerMember = group.members.first(where: { groupMemberIsCaller($0, in: group, caller: caller, observed: observed) }) else { return nil }
@@ -7253,7 +7288,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let phase = live.flatMap { row in sessions[row.id].map { groupDisplayPhase($0, observation: row) } }
                     var result: JSONObject = ["id": member.id.uuidString, "agent": member.agent.rawValue, "title": member.nickname ?? member.title, "role": member.role as Any? ?? NSNull(), "cwd": member.cwd,
                             "identityWarning": warnings[member.id] as Any? ?? NSNull(), "tty": live?.session.tty as Any? ?? NSNull(),
-                            "claudeStatus": live.flatMap { memberStatuses[$0.id] } as Any? ?? NSNull(),
+                            "claudeStatus": live?.claudeRegisteredStatus as Any? ?? NSNull(),
                             "model": live.flatMap { modelSettings[$0.id]?.model } as Any? ?? NSNull(),
                             "reasoningEffort": live.flatMap { modelSettings[$0.id]?.reasoningEffort } as Any? ?? NSNull(),
                             "modelSettingsSource": live.flatMap { modelSettings[$0.id]?.source } as Any? ?? NSNull(),

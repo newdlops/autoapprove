@@ -544,7 +544,7 @@ extension ApprovalTests {
     }
 
     @MainActor func testGroupClearRecoveryQueriesIdentityWithoutReplayingClear() async throws {
-        for didClear in [true, false] {
+        for (didClear, userDraft) in [(true, true), (true, false), (false, false)] {
         let fixture = GroupClearFixture(leader: .claude)
         let directory = URL(fileURLWithPath: "/private/tmp/aa-group-clear-recover-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -553,9 +553,22 @@ extension ApprovalTests {
         let group = SessionGroup(name: "recovery", members: Array(members.prefix(2)), leaderMemberID: members[0].id)
         let paths = AppPaths(directory: directory); try paths.prepare(); try SessionGroupStore(directory: directory).save([group])
         var target = SessionGroupClearTarget(member: members[1], live: .init(session: sessions[1], conversationID: fixture.id(1), providerHome: "/fixture/home"))
-        target.phase = "issued"; if didClear { fixture.resetIdentity(1) }
+        target.phase = "issued"
+        if didClear {
+            fixture.resetIdentity(1)
+            fixture.draft(1, enabled: userDraft)
+        }
         let job = SessionGroupClearOperation(id: UUID(), groupID: group.id, callerMemberID: members[0].id, targets: [target], selectedMemberID: members[1].id)
-        try AuditStore(path: paths.database).set("sessionGroupClearOperations", String(decoding: JSONEncoder().encode([job]), as: UTF8.self))
+        var persisted = try JSONEncoder().encode([job])
+        if userDraft {
+            // Seed the pre-crash process receipt as it was stored by the clear worker.
+            var rows = try JSONSerialization.jsonObject(with: persisted) as! [JSONObject]
+            var targets = rows[0]["targets"] as! [JSONObject]
+            targets[0]["processVerifiedBefore"] = true
+            rows[0]["targets"] = targets
+            persisted = try JSONSerialization.data(withJSONObject: rows)
+        }
+        try AuditStore(path: paths.database).set("sessionGroupClearOperations", String(decoding: persisted, as: UTF8.self))
         let adapter = ScreenHostAdapter(screens: { targets in .init(screens: targets.map { .init(tty: $0.tty, contents: fixture.screen($0.tty)) }) }, approve: { _,_,_ in .missingTarget }, reveal: { _ in nil }, input: { try fixture.send($0, $3) })
         let engine = try ApprovalEngine(paths: paths, claudeRegistryReader: { records in records.filter { $0.agent == .claude }.map { .init(processID: $0.key, kind: "interactive", sessionID: fixture.id(0), status: "idle") } }, processReader: { fixture.records }, screenAdapters: [.iterm: adapter], codexGroupReader: { _ in .init(threadID: fixture.id(1), database: "/fixture/home/thread_history_1.sqlite") }, isolateByDefault: true, nativeKeyboardActivity: .inactive)
         defer { engine.stop() }; engine.groupClearInterval = 0.05
@@ -565,7 +578,7 @@ extension ApprovalTests {
         try await Task.sleep(for: .milliseconds(350))
         let stored = try AuditStore(path: paths.database).value("sessionGroupClearOperations")
         let undiscovered = try JSONDecoder().decode([SessionGroupClearOperation].self, from: Data((stored ?? "").utf8))
-        try expectEqual(undiscovered, [job], "No expiry or resend before the first successful inventory")
+        try expectEqual(undiscovered, try JSONDecoder().decode([SessionGroupClearOperation].self, from: persisted), "No expiry or resend before the first successful inventory")
         try expectEqual(fixture.counts(), [0,0,0])
         engine.updateDiscovery(sessions, records: fixture.records)
         var result: JSONObject = [:]
@@ -575,6 +588,11 @@ extension ApprovalTests {
         }
         try expectEqual(result["status"] as? String, didClear ? "completed" : "needs_review")
         try expectEqual(fixture.counts(), [0,0,0], "An uncertain pre-crash write must never be replayed")
+        if userDraft {
+            try expectEqual(fixture.queries(), 0, "A verified identity change must be recognized while the user is drafting")
+            let refreshed = try SessionGroupStore(directory: directory).load().first { $0.id == group.id }?.members.first { $0.id == members[1].id }?.conversationID
+            try expectEqual(refreshed, fixture.id(1))
+        }
         let queries = fixture.queries(); try await Task.sleep(for:.milliseconds(250))
         try expectEqual(fixture.queries(), queries, "A finished or uncertain reset must not accumulate status scripts")
         }

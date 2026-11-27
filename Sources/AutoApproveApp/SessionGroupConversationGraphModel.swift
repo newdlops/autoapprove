@@ -129,6 +129,8 @@ actor ConversationGraphReader {
         var liveNicknames: @MainActor ([SessionGroupMember]) -> [UUID: String]
         var sessions: AnyPublisher<[SessionKey], Never>
 
+        var refreshConnections: @MainActor () async throws -> Void = {}
+
         @MainActor static func live(_ engine: ApprovalEngine) -> Sources {
             Sources(
                 now: { Date() },
@@ -145,7 +147,8 @@ actor ConversationGraphReader {
                 },
                 sessions: engine.$snapshot.map { snapshot in
                     snapshot.sessions.map { SessionKey(id: $0.id, phase: $0.phase, title: $0.customization?.title ?? "") }
-                }.eraseToAnyPublisher())
+                }.eraseToAnyPublisher(),
+                refreshConnections: { try await engine.refreshGroupConnectionObservation() })
         }
     }
 
@@ -194,7 +197,15 @@ actor ConversationGraphReader {
             .removeDuplicates()
             .debounce(for: .seconds(0.3), scheduler: RunLoop.main)
             .sink { [weak self] _ in MainActor.assumeIsolated { self?.recombine() } }
-        defer { sessionWatch = nil }
+        let connectionWatch = Task {
+            while !Task.isCancelled {
+                try? await sources.refreshConnections()
+                guard !Task.isCancelled else { return }
+                recombine()
+                do { try await Task.sleep(for: .seconds(10)) } catch { return }
+            }
+        }
+        defer { connectionWatch.cancel(); sessionWatch = nil }
         while !Task.isCancelled {
             await check()
             do { try await Task.sleep(for: .seconds(1)) } catch { return }

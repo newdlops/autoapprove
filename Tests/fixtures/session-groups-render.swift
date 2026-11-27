@@ -784,6 +784,30 @@ final class GraphReadProbe: @unchecked Sendable {
                                  "viewKeptAfterStepChange": same(zoomed, viewAfterBurst)]
     let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
     try data.write(to: root.appendingPathComponent("refresh-verify.json"))
+    // No session publisher or mailbox write accompanies a new provider registration after /clear.
+    var sources = fixedSources(fixture)
+    let readOperations = sources.operations
+    let workerID = fixture.id["api"]!
+    var connectionReads = 0
+    sources.refreshConnections = { connectionReads += 1 }
+    sources.operations = { group, inboxes in
+        var result = readOperations(group, inboxes)
+        result[workerID]?.phase = connectionReads >= 2 ? .working : .idle
+        return result
+    }
+    let model = ConversationGraphModel(groupID: fixture.group.id, directory: fixture.directory, sources: sources)
+    let watch = Task { await model.observe() }
+    defer { watch.cancel() }
+    let deadline = Date().addingTimeInterval(15)
+    var sawIdle = false
+    while Date() < deadline {
+        let phase = model.content?.operations[workerID]?.phase
+        if phase == .idle { sawIdle = true }
+        if sawIdle && phase == .working { break }
+        try await Task.sleep(for: .milliseconds(100))
+    }
+    try require(sawIdle && model.content?.operations[workerID]?.phase == .working,
+                "An open graph must refresh member status without messages or session events")
     print("PASS graph refresh: new message in \(Int(latency * 1000)) ms, 0 root bodies while unchanged, reads off the main thread, no checks while hidden, nodes kept their positions, a user zoom survived a new message, a new member and a size step change, no overlaps after the step change, switching 최근 and 전체 kept every node in place, drags and scrolls on the zoom buttons left the graph alone\n" + String(decoding: data, as: UTF8.self))
 }
 
