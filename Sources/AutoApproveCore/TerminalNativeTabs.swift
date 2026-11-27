@@ -306,7 +306,13 @@ struct TerminalProfileTabTitles {
     private var tokens: [String: Set<Int>] = [:]
 
     static func stable(_ value: String) -> String {
-        value.replacingOccurrences(of: #"^[\u2800-\u28ff]+\s*"#, with: "", options: .regularExpression)
+        var title = value.replacingOccurrences(of: #"^[\u2800-\u28ff]+\s*"#, with: "", options: .regularExpression)
+        for prefix in ["[ . ] Action Required | ", "[ ! ] Action Required | "] where title.hasPrefix(prefix) {
+            let rest = String(title.dropFirst(prefix.count))
+            if rest.contains(" | ") { title = rest }
+            break
+        }
+        return title.precomposedStringWithCanonicalMapping
     }
 
     static func identity(_ title: String, window: Bool) -> String {

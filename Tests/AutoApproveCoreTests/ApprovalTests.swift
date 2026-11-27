@@ -632,6 +632,7 @@ func expectThrows<T>(_ operation: @autoclosure () throws -> T) throws {
             ("Session profiles: owned settings checkpoint without global guesses",tests.testProfileSettingsReadOwnedCheckpointWithoutGlobalGuessing),
             ("Session profiles: portable group hierarchy, selection and legacy files",tests.testTerminalProfileGroupsSavePortableHierarchyAndSelection),
             ("Session profiles: group receipts reconnect without claiming conversation identity",tests.testTerminalProfileGroupsReconnectReceiptsWithoutClaimingConversation),
+            ("Session profiles: stable layout survives stale approval routing and status titles",tests.testProfileLayoutIgnoresHistoricalApprovalRouteAndActivityDecoration),
             ("Session profiles: saved window and tab locate current conversation and settings",tests.testSavedProfileSlotUsesCurrentConversationAndSettings),
             ("Session profiles: fresh native titles repair startup capture and active duplicate detection",tests.testTerminalProfileFreshTabTitleRepairsStartupCaptureAndActiveDeduplication),
             ("Session profiles: unresolved conversations require an explicit new CLI choice",tests.testTerminalProfileSavingRequiresExplicitNewCLISelection),

@@ -1276,7 +1276,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         func matches(_ current: AgentSession, home: String?) -> Bool {
             guard self.home == home, session.pid == current.pid, session.started == current.started,
                   session.tty == current.tty, session.cwd == current.cwd, session.terminal == current.terminal else { return false }
-            return current.terminalTitle == session.terminalTitle ||
+            return current.terminalTitle.map(TerminalProfileTabTitles.stable) == session.terminalTitle.map(TerminalProfileTabTitles.stable) ||
                 (name != nil && name == CodexProfileConversationBinding.terminalName(current.terminalTitle, cwd: current.cwd))
         }
     }
@@ -1336,8 +1336,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let last = try await observe()
         guard last.providerHome == first.providerHome,
               last.conversationID.map({ UUID(uuidString: $0) == uuid }) ?? (first.conversationID == nil),
-              (last.session.codexApprovalBinding?.threadID).map({ UUID(uuidString: $0) == uuid }) ?? true,
-              last.session.terminalTitle == original.terminalTitle || (name != nil && CodexProfileConversationBinding.terminalName(last.session.terminalTitle, cwd: original.cwd) == name)
+              last.session.terminalTitle.map(TerminalProfileTabTitles.stable) == original.terminalTitle.map(TerminalProfileTabTitles.stable) || (name != nil && CodexProfileConversationBinding.terminalName(last.session.terminalTitle, cwd: original.cwd) == name)
         else { throw changed }
         if remember, last.conversationID == nil {
             profileConversations[runtime] = ProfileConversation(session: last.session, id: uuid, home: last.providerHome, name: name)
@@ -1493,7 +1492,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                           let row = layout.first(where: { $0.tty == tty }) else { continue }
                     let entry = candidate.entry
                     let title = position.customTitle
-                    if entry.agent == "codex", !savedSlots.isEmpty, let home = entry.providerHome, conversationLists[home]?[entry.cwd] == nil,
+                    if entry.agent == "codex", (exactLayout || !savedSlots.isEmpty), let home = entry.providerHome, conversationLists[home]?[entry.cwd] == nil,
                        CodexProfileConversationBinding.terminalName(title,cwd:entry.cwd) != nil,
                        let session = targetsByID[candidate.id], let target = try? await questionTransport.queueHome(session),
                        target.home == home {
@@ -1514,8 +1513,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     let prior = saved.count == 1 ? saved[0] : nil
                     guard exactLayout || prior != nil else { continue }
                     if identities[candidate.id]?.providerIdentityAmbiguous == false, let bound, let name = bound.name {
-                        if !entry.conversationID.isEmpty, UUID(uuidString:entry.conversationID) != UUID(uuidString:bound.id) {
-                            throw AppError.message("대화 연결과 현재 Terminal 탭이 다릅니다. 현재 대화를 다시 확인해주세요.")
+                        // Approval routing can still point to an earlier conversation on this same TTY.
+                        // A unique live tab name is re-read below. Keep independent process/turn evidence authoritative.
+                        let approvalOnly = explicitCodexBindings.removeValue(forKey:candidate.id) != nil
+                        if !approvalOnly, !entry.conversationID.isEmpty, UUID(uuidString:entry.conversationID) != UUID(uuidString:bound.id) {
+                            throw AppError.message("\(tty)의 현재 대화 ID와 탭 제목이 가리키는 대화가 다릅니다. 해당 탭의 대화를 다시 확인해주세요.")
                         }
                         result[index].entry.conversationID = bound.id
                         result[index].detail = nil
@@ -1575,36 +1577,41 @@ private struct ScreenAnalysisStorageKey: Hashable {
         }
         let fresh=try await Task.detached(priority:.userInitiated) {ProcessDiscovery.index(try reader(pids))}.value
         try Task.checkCancellation()
-        guard observationEpoch == epoch, !remoteInputStopped,result.allSatisfy({candidate in
-            guard let original=targetsByID[candidate.id],let current=sessions[candidate.id],current.phase != .ended, !isBackgroundGroupSession(current),
-                  current.tty == original.tty, current.terminal == original.terminal, let process=fresh[original.pid] else {return false}
-            if current.agent == .codex, slotEvidence[current.tty] != nil {
-                let thread = UUID(uuidString:candidate.entry.conversationID)
-                guard current.codexApprovalBinding.map({ UUID(uuidString:$0.threadID) == thread }) ?? true,
-                      groupMCPIdentity(for:current,home:candidate.entry.providerHome)?.conversationID.map({ $0 == thread }) ?? true else { return false }
+        guard observationEpoch == epoch, !remoteInputStopped else { throw CancellationError() }
+        for candidate in result {
+            func changed(_ evidence: String) -> AppError {
+                .message("\(candidate.tty ?? candidate.entry.title)에서 확인한 정보가 바뀌었습니다(\(evidence)). 현재 세션을 다시 불러와주세요.")
+            }
+            guard let original = targetsByID[candidate.id], let current = sessions[candidate.id], current.phase != .ended,
+                  !isBackgroundGroupSession(current), current.tty == original.tty, current.terminal == original.terminal,
+                  current.pid == original.pid, current.started == original.started, current.cwd == original.cwd,
+                  let process = fresh[original.pid], process.key == original.id, process.agent == original.agent,
+                  "/dev/"+process.tty == original.tty else { throw changed("실행 세션") }
+            let thread = UUID(uuidString:candidate.entry.conversationID)
+            let usedTabTitle = tabTitles[candidate.id] != nil && namedCodexBindings[candidate.id] != nil && !layoutNamedBindings.contains(candidate.id)
+            if current.agent == .codex, slotEvidence[current.tty] != nil || usedTabTitle || profileRevisions[candidate.id] != nil,
+               let active = groupMCPIdentity(for:current,home:candidate.entry.providerHome)?.conversationID, active != thread {
+                throw AppError.message("\(current.tty)의 MCP 대화 ID와 프로필에서 확인한 대화 ID가 다릅니다. 해당 탭의 대화를 다시 조회해주세요.")
             }
             if let revision = profileRevisions[candidate.id] {
                 guard let proof = profileConversations[candidate.id], proof.revision == revision,
-                      current.codexApprovalBinding == nil, proof.matches(current, home: candidate.entry.providerHome),
-                      groupMCPIdentity(for: current, home: candidate.entry.providerHome)?.conversationID.map({ $0 == proof.id }) ?? true else { return false }
+                      proof.matches(current, home:candidate.entry.providerHome) else { throw changed("조회한 대화") }
             }
-            if let thread=explicitCodexBindings[candidate.id],current.codexApprovalBinding?.threadID != thread {return false}
-            if let name=namedCodexBindings[candidate.id] {
-                let matches=CodexProfileConversationBinding.terminalName(current.terminalTitle,cwd:current.cwd)==name
-                let usedTabTitle = tabTitles[candidate.id] != nil && !layoutNamedBindings.contains(candidate.id)
+            if let expected = explicitCodexBindings[candidate.id],
+               current.codexApprovalBinding.flatMap({ UUID(uuidString:$0.threadID) }) != UUID(uuidString:expected) {
+                throw changed("대화 조회에 사용한 승인 연결")
+            }
+            if let name = namedCodexBindings[candidate.id] {
+                // Polling titles and native tab titles update independently. Check the source that identified this row.
                 if usedTabTitle {
-                    guard remoteCanRead(current), current.codexApprovalBinding?.threadID == original.codexApprovalBinding?.threadID,
-                          CodexProfileConversationBinding.terminalName(confirmedTitles[candidate.id], cwd: current.cwd) == name else { return false }
-                    if let bound = groupMCPIdentity(for: current, home: candidate.entry.providerHome)?.conversationID,
-                       bound != UUID(uuidString: candidate.entry.conversationID) { return false }
+                    guard remoteCanRead(current), CodexProfileConversationBinding.terminalName(confirmedTitles[candidate.id],cwd:current.cwd) == name
+                    else { throw changed("탭 제목") }
+                } else if !layoutNamedBindings.contains(candidate.id) {
+                    guard CodexProfileConversationBinding.terminalName(current.terminalTitle,cwd:current.cwd) == name
+                    else { throw changed("대화 제목") }
                 }
-                guard matches || ((usedTabTitle || layoutNamedBindings.contains(candidate.id)) && current.terminalTitle==original.terminalTitle) else {return false}
-                if let title=candidate.entry.terminalTab?.customTitle,!title.isEmpty,
-                   CodexProfileConversationBinding.terminalName(title,cwd:current.cwd) != name {return false}
             }
-            return current.pid == original.pid && current.started == original.started && current.cwd == original.cwd &&
-                process.key == original.id && process.agent == original.agent && "/dev/"+process.tty == original.tty
-        }) else {throw AppError.message("대화를 확인하는 동안 창이 바뀌었습니다. 현재 세션을 다시 불러와주세요.")}
+        }
         return result
     }
 

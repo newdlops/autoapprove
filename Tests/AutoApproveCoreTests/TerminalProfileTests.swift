@@ -536,6 +536,56 @@ extension ApprovalTests {
         try expect(skipped.allSatisfy {$0.phase == .alreadyOpen})
     }
 
+    func testProfileLayoutIgnoresHistoricalApprovalRouteAndActivityDecoration() async throws {
+        final class Tab: @unchecked Sendable {
+            let lock = NSLock()
+            var reads = 0
+            func layout(_ tty: String, renamed: Bool) -> [TerminalProfileTabSnapshot] {
+                lock.withLock {
+                    reads += 1
+                    let title = reads.isMultiple(of:2) ? (renamed ? "다른 작업 | project" : "[ ! ] Action Required | 진행 중 | project") : "⠋ 진행 중 | project"
+                    return [.init(tty:tty,windowID:77,windowOrder:0,tabOrder:0,customTitle:title)]
+                }
+            }
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at:root) }
+        let current = UUID().uuidString.lowercased(), previous = UUID().uuidString.lowercased(), home = "/fixture/home"
+        let record = ProcessDiscovery.parse("100851 1 profile1 100851 100851 Wed Oct 28 12:00:00 2026 /fixture/codex")[0]
+        var session = AgentSession(id:record.key,agent:.codex,pid:record.pid,started:record.started,tty:"/dev/profile1",cwd:"/tmp/project",terminal:.terminal)
+        session.codexApprovalBinding = .init(threadID:previous,title:"지난 승인 대화")
+        session.terminalTitle = "캐시된 제목"
+        let reply = CodexReplyTransport(prepare:{_,_ in throw CancellationError()},send:{_,_ in throw CancellationError()},
+                                       queueHome:{_ in .init(executable:"",home:home,threadID:"")})
+        let queue = CodexQueueTransport(list:{_ in []},delete:{_,_ in .init(removed:[])},conversations:{_,_ in
+            [.init(id:current,title:"진행 중",name:"진행 중"),.init(id:previous,title:"지난 승인 대화",name:"지난 승인 대화")]
+        })
+        for scenario in ["live","approvalOnly","renamed","conflict"] {
+            let tab = Tab()
+            let engine = try ApprovalEngine(paths:.init(directory:root.appendingPathComponent(scenario)),
+                questionTransport:reply,processReader:{[record]},codexQueue:queue,codexGroupReader:{_ in
+                    if scenario == "approvalOnly" { return nil }
+                    return .init(threadID:scenario == "conflict" ? previous : current,database:home+"/state_5.sqlite")
+                },profileExecutionSettingsReader:{row in row.conversationID == current ? .init(reasoningEffort:"high") : nil},
+                terminalProfileLayoutReader:{ttys in tab.layout(ttys[0],renamed:scenario == "renamed")})
+            defer { engine.stop() }
+            engine.updateDiscovery([session],records:[record])
+            do {
+                let captured = try await engine.terminalProfileSaveCandidates(readWindowLayout:true)
+                let fresh = try await engine.terminalProfileSaveCandidates(readWindowLayout:true,sessionIDs:[session.id],savedEntries:captured.map(\.entry))
+                try expect(["live","approvalOnly"].contains(scenario),"A conflicting live identity or a renamed tab was accepted")
+                try expectEqual(captured.first?.entry.conversationID,current)
+                try expectEqual(fresh.first?.entry.conversationID,current)
+                try expectEqual(fresh.first?.entry.executionSettings?.reasoningEffort,"high")
+                try expectEqual(engine.snapshot.sessions.first?.codexApprovalBinding?.threadID,previous)
+            } catch {
+                if scenario == "renamed", error.localizedDescription.contains("바뀌었습니다") { continue }
+                if scenario == "conflict", error.localizedDescription.contains("다릅니다") { continue }
+                throw error
+            }
+        }
+    }
+
     func testSavedProfileSlotUsesCurrentConversationAndSettings() async throws {
         final class Inventory: @unchecked Sendable {
             let lock = NSLock()
