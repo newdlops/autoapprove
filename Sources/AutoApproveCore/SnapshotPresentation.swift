@@ -49,23 +49,28 @@ extension Publisher where Output == EngineSnapshot, Failure == Never {
 }
 
 extension AgentSession {
-    package func projectedCodexActivity(now: Date = Date()) -> Self {
+    package func projectedCodexActivity(now: Date = Date(), conversationID: String? = nil,
+                                        terminal: ActivityObservation? = nil) -> Self {
+        guard agent == .codex, phase != .ended, codexApprovalBinding != nil || codexActivity != nil else { return self }
         var session = self
-        if session.agent == .codex, session.phase != .ended, session.codexApprovalBinding != nil || session.codexActivity != nil {
-            if let activity = session.codexActivity, (0..<12).contains(now.timeIntervalSince(activity.observedAt)),
-               session.codexApprovalBinding.map({ $0.threadID == activity.parent.id }) ?? true {
-                session.ownPhase = activity.parent.phase
-                session.phase = activity.phase
-                session.activityDetail = activity.summary
-                session.backgroundMonitoring = activity.children.contains { $0.phase == .working }
-                session.idleSince = nil
-            } else {
-                session.phase = .unknown
-                session.codexActivity = nil
-                session.activityDetail = "Codex의 실시간 상태를 확인하고 있습니다."
-                session.idleSince = nil
-            }
+        let activity = codexActivity
+        let sourceID = codexApprovalBinding?.threadID ?? activity?.parent.id
+        let sameConversation = conversationID.map { sourceID?.caseInsensitiveCompare($0) == .orderedSame } ?? true
+        if sameConversation, var current = activity, (0..<12).contains(now.timeIntervalSince(current.observedAt)),
+           sourceID?.caseInsensitiveCompare(current.parent.id) == .orderedSame {
+            if current.parent.phase == .unknown, let terminal { current.parent.phase = terminal.phase }
+            session.ownPhase = current.parent.phase
+            session.phase = current.phase
+            session.activityDetail = current.summary
+            session.backgroundMonitoring = current.children.contains { $0.phase == .working } || terminal?.monitoring == true
+        } else {
+            session.codexActivity = nil
+            session.ownPhase = terminal?.phase
+            session.phase = terminal?.phase ?? .unknown
+            session.backgroundMonitoring = terminal?.monitoring == true
+            session.activityDetail = terminal?.detail ?? "Codex의 실시간 상태를 확인하고 있습니다."
         }
+        session.idleSince = nil
         return session
     }
 

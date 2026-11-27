@@ -25,6 +25,19 @@ extension ApprovalTests {
         worker.codexActivity?.parent.phase = .working
         try expectEqual(worker.projectedCodexActivity(now: now).phase, .working)
         try expectEqual(worker.projectedCodexActivity(now: now.addingTimeInterval(12)).phase, .unknown)
+        let ready = ActivityDetector.detect("› \n ? for shortcuts", agent: .codex)
+        try expectEqual(ready.phase, .idle)
+        worker.codexApprovalBinding = .init(threadID: "thread", title: "old")
+        worker.codexActivity?.children = [try JSONDecoder().decode(CodexThreadActivity.self, from: Data(#"{"id":"child","title":"Child","phase":"approval"}"#.utf8))]
+        let afterClear = worker.projectedCodexActivity(now: now, conversationID: "new", terminal: ready)
+        try expectEqual(afterClear.phase, .idle, "An old parent and child cannot override the verified new terminal")
+        try expectNil(afterClear.codexActivity)
+        try expectEqual(worker.projectedCodexActivity(now: now, conversationID: "new").phase, .unknown)
+        worker.codexActivity?.parent.phase = .unknown
+        try expectEqual(worker.projectedCodexActivity(now: now, conversationID: "thread", terminal: ready).phase, .approval)
+        worker.codexActivity?.children = []
+        try expectEqual(worker.projectedCodexActivity(now: now, conversationID: "thread", terminal: ready).phase, .idle)
+
     }
 
     func testPresentationHeartbeatPreservesStateAndNotificationTransitions() throws {

@@ -875,15 +875,35 @@ extension ApprovalTests {
             state.begin(assignment); state.markDelivered(assignment.id)
         }
         try AuditStore(path: paths.database).set(SessionGroupOrchestration.storeKey, String(decoding: JSONEncoder().encode(state), as: UTF8.self))
+        final class BatchReads: @unchecked Sendable {
+            private let lock = NSLock()
+            private var sizes: [Int] = []
+            private var identities: [String: String] = [:]
+            func forget(_ runtime: String) { lock.lock(); defer { lock.unlock() }; identities[runtime] = "" }
+            func reset(_ runtime: String) { lock.lock(); defer { lock.unlock() }; identities[runtime] = UUID().uuidString }
+            func currentID(_ runtime: String) -> String? { lock.lock(); defer { lock.unlock() }; return identities[runtime] }
+            func record(_ targets: [ScreenTarget]) -> TerminalSnapshot {
+                lock.lock()
+                sizes.append(targets.count)
+                lock.unlock()
+                return TerminalSnapshot(screens: targets.map { TerminalScreen(tty: $0.tty, contents: "❯ \n ? for shortcuts") })
+            }
+            func counts() -> [Int] { lock.lock(); defer { lock.unlock() }; return sizes }
+        }
+        let reads = BatchReads()
+        let adapter = ScreenHostAdapter(screens: { _ in TerminalSnapshot() }, approve: { _,_,_ in .missingTarget },
+                                        reveal: { _ in nil }, validationScreens: { reads.record($0) })
         let engine = try ApprovalEngine(paths: paths, claudeRegistryReader: { rows in rows.map {
-            .init(processID: $0.key, kind: "interactive", sessionID: ids[$0.key], status: "idle")
-        } }, processReader: { records }, isolateByDefault: true)
+            .init(processID: $0.key, kind: "interactive", sessionID: reads.currentID($0.key) ?? ids[$0.key], status: "idle")
+        } }, processReader: { records }, screenAdapters: [.iterm: adapter], isolateByDefault: true)
         defer { engine.stop() }
+        await engine.connectScreenHost(.iterm)
         engine.updateDiscovery(sessions, records: records)
         let args: JSONObject = ["owner": UUID().uuidString, "sessionID": sessions[0].id, "tool": "get_group_status"]
         let full = try await engine.mcpAction(args)
         let overview = try await engine.mcpAction(args.merging(["view": "overview"]) { _, new in new })
         let rows = try unwrapGroup((overview["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject])
+        try expectEqual(reads.counts(), [11], "Full and quick status share one native read across eleven tabs")
         try expectEqual(rows.count, 11)
         let history = try unwrapGroup(rows.first { $0["id"] as? String == members[1].id.uuidString })
         try expectEqual(history["previousReport"] as? String,"리베이스 충돌로 멈춤")
@@ -893,6 +913,19 @@ extension ApprovalTests {
         let shortBytes = try JSONSerialization.data(withJSONObject: overview).count
         let fullBytes = try JSONSerialization.data(withJSONObject: full).count
         try expect(shortBytes * 5 < fullBytes)
+        reads.reset(sessions[1].id)
+        _ = try await engine.mcpAction(args.merging(["view": "overview"]) { _, new in new })
+        try expectEqual(reads.counts(), [11, 1], "Only the cleared member needs a fresh frame before the cache expires")
+        reads.forget(sessions[1].id)
+        for mode in ["overview", "full"] {
+            let output = try await engine.mcpAction(args.merging(["view": mode]) { _, new in new })
+            let roster = try unwrapGroup((output["groups"] as? [JSONObject])?.first?["members"] as? [JSONObject])
+            let row = try unwrapGroup(roster.first { $0["id"] as? String == members[1].id.uuidString })
+            try expectEqual(row["connectionState"] as? String, "identity_unverified")
+            try expectEqual(row["terminalPhase"] as? String, "idle")
+            try expectEqual(row["phase"] as? String, "idle")
+            if mode == "overview" { try expectEqual(row["canAcceptTask"] as? Bool, false) }
+        }
         print("11-member status fixture: overview=\(shortBytes) bytes, full=\(fullBytes) bytes")
     }
 

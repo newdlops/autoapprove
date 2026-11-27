@@ -336,6 +336,13 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var groupBadgeRefreshPending = false
     private var groupBadgeSessionIDs: Set<String> = []
     private var groupBadgeRefreshedAt = Date.distantPast
+    private var groupConversationStarts: [String: (id: String?, since: Date)] = [:]
+    private struct GroupStatusScreen {
+        var raw: String
+        var observedAt: Date
+        var activity: ActivityObservation?
+    }
+    private var groupReadScreens: [String: GroupStatusScreen] = [:]
     private var groupConnectionObservation: (at: Date, sessions: [SessionGroupLiveSession])?
     /// Sessions whose next choice input is a parent's delegated permission answer.
     private var delegatedPermissionInputs: Set<String> = []
@@ -414,6 +421,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     private var inboxes: [String: SessionInbox] = [:]
     private var noticeKeyCache: SessionNotice.KeyCache?
     private var records: [ProcessRecord] = []
+    private var foregroundCodexSessions = Set<String>()
     private var server: SocketServer?
     private var pollTask: Task<Void, Never>?
     private var historyPollTask: Task<Void, Never>?
@@ -1008,6 +1016,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         backgroundJobMonitor?.cancel(); backgroundJobMonitor = nil; jobSnapshots.removeAll(); jobExitObservers.removeAll()
         groupClearTask?.cancel(); groupClearTask = nil
         groupConnectionObservation = nil
+        groupConversationStarts.removeAll()
+        groupReadScreens.removeAll()
         groupMCPIdentities.removeAll()
         cohortExecutionTasks.values.forEach{$0.cancel()};cohortExecutionTasks.removeAll()
         goalRecoveryTask?.cancel();goalRecoveryTask=nil
@@ -3212,7 +3222,14 @@ private struct ScreenAnalysisStorageKey: Hashable {
             let observed = try await readSessionGroupSessions()
             try Task.checkCancellation()
             guard observationEpoch == epoch, !remoteInputStopped else { throw CancellationError() }
-            groupConnectionObservation = (.now, observed)
+            let now = Date()
+            groupConversationStarts = Dictionary(uniqueKeysWithValues: observed.map { row in
+                let id = row.conversationID?.lowercased()
+                let previous = groupConversationStarts[row.id]
+                return (row.id, (id, previous.map { $0.id == id ? $0.since : now } ?? .distantPast))
+            })
+            groupReadScreens = groupReadScreens.filter { groupConversationStarts[$0.key] != nil }
+            groupConnectionObservation = (now, observed)
             return observed
         }
         groupIdentityObservationTask = pending
@@ -4088,7 +4105,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 do { try await Task.sleep(for:.seconds(20)) } catch { return }
                 guard let self else { return }
                 guard let groups = try? SessionGroupStore(directory:self.paths.directory).load(), !groups.isEmpty,
-                      let observed = try? await self.readSessionGroupSessions(reconcile:false) else { continue }
+                      let observed = try? await self.sessionGroupSessions() else { continue }
                 for group in groups {
                     for member in group.members where [.codex,.claude].contains(member.agent) {
                         guard !Task.isCancelled else { return }
@@ -4249,13 +4266,71 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return (count,jobs,waiting)
     }
 
-    private func refreshGroupStatusScreens(_ visibleGroups: [SessionGroup], observed: [SessionGroupLiveSession]) async {
-        let ids = Set(visibleGroups.flatMap(\.members).compactMap { SessionGroupMatching.match($0, in: observed)?.id })
-        let missing = ids.filter { id in
-            guard let current = sessions[id], remoteCanRead(current) else { return false }
-            let last = max(remoteObservedScreens[id]?.observedAt ?? .distantPast, remoteFrames[id]?.frame.observedAt ?? .distantPast)
-            return Date().timeIntervalSince(last) >= 10
+    private func groupStatusScreen(_ session: AgentSession) -> GroupStatusScreen? {
+        guard remoteCanRead(session) else { return nil }
+        let since = max(Date().addingTimeInterval(-15), groupConversationStarts[session.id]?.since ?? .distantPast)
+        var best = groupReadScreens[session.id]
+        func consider(_ raw: String, _ at: Date) {
+            if at >= since && at > (best?.observedAt ?? .distantPast) {
+                best = GroupStatusScreen(raw: raw, observedAt: at)
+            }
         }
+        if let frame = remoteFrames[session.id]?.frame, frame.outputReason == nil { consider(frame.screen, frame.observedAt) }
+        if let polled = remoteObservedScreens[session.id] { consider(polled.raw, polled.observedAt) }
+        if let monitored = remoteMonitorFrames[session.id], let host = ScreenHost(kind: session.terminal),
+           monitored.generation == remoteGeneration(session, host: host) { consider(monitored.raw, monitored.observedAt) }
+        return best.flatMap { $0.observedAt >= since ? $0 : nil }
+    }
+
+    private func readGroupStatusBatch(_ targets: [AgentSession], host: ScreenHost) async {
+        guard !targets.isEmpty, let adapter = screenAdapters[host] else { return }
+        let started = Date(), epoch = observationEpoch
+        let requested = targets.map { ScreenTarget(tty: $0.tty, handle: $0.screenHandle) }
+        guard let snapshot = try? await adapter.readForValidation(requested, host: host),
+              !Task.isCancelled, observationEpoch == epoch, !remoteInputStopped else { return }
+        let rows = Dictionary(grouping: snapshot.screens, by: \.tty)
+        let owners = Dictionary(grouping: targets, by: \.tty)
+        for target in targets {
+            guard owners[target.tty]?.count == 1, let matches = rows[target.tty], matches.count == 1, let screen = matches.first,
+                  let current = sessions[target.id], remoteCanRead(current), current.terminal == host.kind,
+                  current.tty == target.tty, current.screenHandle == target.screenHandle,
+                  (groupConversationStarts[target.id]?.since ?? .distantPast) <= started,
+                  (groupReadScreens[target.id]?.observedAt ?? .distantPast) < started else { continue }
+            let raw = String(screen.contents.suffix(8192))
+            let activity = ActivityDetector.detect(raw, agent: current.agent)
+            groupReadScreens[target.id] = GroupStatusScreen(raw: raw, observedAt: started, activity: activity)
+        }
+    }
+
+    // A managed CLI may keep its rollout in the server process. While its new UUID is
+    // pending, report only the operating phase of the original foreground terminal.
+    private func groupStatusTerminal(_ member: SessionGroupMember, observed: [SessionGroupLiveSession]) -> SessionGroupLiveSession? {
+        guard let runtime = member.runtimeID, let row = SessionGroupMatching.currentTerminal(member, in: observed),
+              row.id == runtime, row.conversationID == nil, !row.providerIdentityAmbiguous,
+              SessionGroupMatching.permitsIdentityRefresh(member, candidate: row, conversation: nil, live: observed),
+              let process = records.first(where: { $0.pid == row.session.pid }), process.key == runtime,
+              process.isForeground else { return nil }
+        return row
+    }
+
+    private func unverifiedTerminalPhase(_ member: SessionGroupMember, observed: [SessionGroupLiveSession]) -> SessionPhase? {
+        guard let row = groupStatusTerminal(member, observed: observed), let session = sessions[row.id],
+              let frame = groupStatusScreen(session) else { return nil }
+        if let activity = frame.activity { return activity.phase }
+        if frame.observedAt == screenObservedAt[row.id] { return session.phase }
+        return ActivityDetector.detect(frame.raw, agent: member.agent).phase
+    }
+
+    private func refreshGroupStatusScreens(_ visibleGroups: [SessionGroup], observed: [SessionGroupLiveSession]) async {
+        let ids = Set(visibleGroups.flatMap(\.members).compactMap {
+            SessionGroupMatching.match($0, in: observed)?.id ?? groupStatusTerminal($0, observed: observed)?.id
+        })
+        let stale = ids.compactMap { sessions[$0] }.filter {
+            remoteCanRead($0) && Date().timeIntervalSince(groupStatusScreen($0)?.observedAt ?? .distantPast) >= 10
+        }
+        async let terminal: Void = readGroupStatusBatch(stale.filter { $0.terminal == .terminal }, host: .terminal)
+        async let iterm: Void = readGroupStatusBatch(stale.filter { $0.terminal == .iterm }, host: .iterm)
+        let missing = stale.filter { $0.terminal != .terminal && $0.terminal != .iterm }.map(\.id)
         var iterator = missing.makeIterator()
         await withTaskGroup(of: Void.self) { reads in
             for _ in 0..<min(missing.count, 3) {
@@ -4265,6 +4340,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 if let id = iterator.next() { reads.addTask { _ = try? await self.remoteTerminal(sessionID: id, realtime: true, textOnly: true) } }
             }
         }
+        _ = await (terminal, iterm)
     }
 
     private func refreshGroupStatusJobs(_ visibleGroups: [SessionGroup], observed: [SessionGroupLiveSession]) async {
@@ -4299,18 +4375,15 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return row
             }
             let task = state.current(groupID: group.id, workerMemberID: member.id)
-            let frame = live.flatMap { row -> (raw: String, observedAt: Date)? in
-                let polled = remoteObservedScreens[row.id]
-                let requested = remoteFrames[row.id]?.frame
-                if let requested, requested.outputReason == nil, Date().timeIntervalSince(requested.observedAt) < 15,
-                   requested.observedAt >= (polled?.observedAt ?? .distantPast) { return (requested.screen, requested.observedAt) }
-                guard let polled, Date().timeIntervalSince(polled.observedAt) < 15 else { return nil }
-                return (polled.raw, polled.observedAt)
-            }
+            let frame = live.flatMap { groupStatusScreen($0.session) }
             let connectionState = live != nil ? "verified" : SessionGroupMatching.connection(member, in: observed) != nil ? "identity_unverified" : "disconnected"
             var row: JSONObject = ["id": member.id.uuidString, "name": member.nickname ?? member.title, "composer": "unknown", "connectionState": connectionState,
                 "phase": live.map { groupDisplayPhase($0.session, observation: $0).rawValue } ?? connectionState,
                 "queued": inbox[member.id]?.queuedCount ?? 0, "unacknowledged": inbox[member.id]?.unacknowledgedCount ?? 0]
+            if live == nil, let phase = unverifiedTerminalPhase(member, observed: observed) {
+                row["phase"] = phase.rawValue
+                row["terminalPhase"] = phase.rawValue
+            }
             if let report = state.assignments.filter({ $0.groupID == group.id && $0.workerMemberID == member.id && $0.completedAt != nil && $0.summary != nil })
                 .max(by:{ $0.completedAt! < $1.completedAt! }), let summary = report.summary, let date = report.completedAt {
                 let text = String(SessionGroupOrchestration.oneLine(summary).prefix(180))
@@ -5607,7 +5680,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
                 return session
             }
             let observedTerminal = live?.session ?? terminal
-            let displayPhase = observedTerminal.map { groupDisplayPhase($0, observation: live) }
+            let displayPhase = live.map { groupDisplayPhase($0.session, observation: $0) }
+                ?? unverifiedTerminalPhase(member, observed: current)
+                ?? observedTerminal.map { groupDisplayPhase($0, observation: nil) }
             let inbox = inboxes[member.id]
             let input = groupOperationInput(live, stopped: stopped, clearing: clearing)
             let count = inbox?.unacknowledgedCount ?? 0
@@ -6794,6 +6869,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
             groupStatusIdentities[current.id] = GroupStatusIdentity(session: current, conversationID: newID, home: target.providerHome,
                                                                    contradictedRollout: UUID(uuidString: target.beforeID))
             var state = try groupOrchestration(); state.supersede(groupID: job.groupID, workerMemberID: target.memberID); try saveGroupOrchestration(state)
+            groupConversationStarts[current.id] = (newID.lowercased(), Date())
             groupConnectionObservation = nil
             target.afterID = newID; target.phase = "completed"; target.detail = "초기화와 새 세션 ID 갱신을 확인했습니다."
             try saveGroupClearTarget(job.id, target); refreshSessionGroupBadges(); scheduleGroupMailboxDelivery()
@@ -7272,11 +7348,11 @@ private struct ScreenAnalysisStorageKey: Hashable {
             }
             let summaries = try visibleGroups.map { try groupOverview($0,observed:observed,models:modelSettings,state:state) }
             if mode == "overview" { return ["groups":summaries] }
-            var waitingByGroup: [UUID:[UUID:JSONObject]] = [:]
+            var supplementalByGroup: [UUID:[UUID:JSONObject]] = [:]
             for summary in summaries {
                 guard let gid = (summary["id"] as? String).flatMap(UUID.init(uuidString:)), let rows = summary["members"] as? [JSONObject] else { continue }
-                for row in rows where row["phase"] as? String == "waitingOnBackground" {
-                    if let mid = (row["id"] as? String).flatMap(UUID.init(uuidString:)) { waitingByGroup[gid,default:[:]][mid] = row }
+                for row in rows where row["phase"] as? String == "waitingOnBackground" || row["terminalPhase"] != nil {
+                    if let mid = (row["id"] as? String).flatMap(UUID.init(uuidString:)) { supplementalByGroup[gid,default:[:]][mid] = row }
                 }
             }
             let includeGraph = try GroupWaitRequest.flag(object, "includeWaitGraph")
@@ -7302,8 +7378,10 @@ private struct ScreenAnalysisStorageKey: Hashable {
                             "canAskQuestion": member.id != callerMember.id && Self.canAddressGroupMember(member, live: live) && UUID(uuidString: callerMember.conversationID) != nil,
                             "canAssign": group.canDirect(callerMember.id, worker: member.id),
                             "task": groupTaskJSON(state.current(groupID: group.id, workerMemberID: member.id))]
-                    if let waiting = waitingByGroup[group.id]?[member.id] {
-                        for key in ["phase","taskStatus","assignmentStatus","backgroundRunning","backgroundJobs"] { result[key] = waiting[key] }
+                    if let summary = supplementalByGroup[group.id]?[member.id] {
+                        for key in ["phase","terminalPhase","taskStatus","assignmentStatus","backgroundRunning","backgroundJobs"] where summary[key] != nil {
+                            result[key] = summary[key]
+                        }
                     }
                     return result
                 }
@@ -8201,9 +8279,9 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func groupDisplayPhase(_ session: AgentSession, observation: SessionGroupLiveSession?) -> SessionPhase {
-        let projected = session.agent == .codex ? session.projectedCodexActivity() : projectClaudeActivity(session, observation: observation)
+        let projected = session.agent == .codex ? projectCodexActivity(session, conversationID: observation?.conversationID) : projectClaudeActivity(session, observation: observation)
         if [.idle, .unknown].contains(projected.phase),
-           projected.backgroundMonitoring == true || session.backgroundMonitoring == true || observation?.claudeRegisteredStatus == "shell" {
+           projected.backgroundMonitoring == true || observation?.claudeRegisteredStatus == "shell" {
             return .working
         }
         return projected.phase
@@ -8217,8 +8295,21 @@ private struct ScreenAnalysisStorageKey: Hashable {
         return session.projectedClaudeActivity(evidence, lastHook: claudeHookObservedAt[session.id])
     }
 
-    private func projectCodexActivity(_ value: AgentSession) -> AgentSession {
-        value.projectedCodexActivity()
+    private func projectCodexActivity(_ value: AgentSession, conversationID: String? = nil) -> AgentSession {
+        guard value.agent == .codex, value.phase != .ended,
+              value.codexActivity != nil || value.codexApprovalBinding != nil else { return value }
+        let identity = groupConversationStarts[value.id]
+        let since = max(Date().addingTimeInterval(-15), identity?.since ?? .distantPast)
+        var terminal: ActivityObservation?
+        if remoteCanRead(value), foregroundCodexSessions.contains(value.id) {
+            let monitored = screenObservedAt[value.id] ?? .distantPast
+            if let read = groupReadScreens[value.id], read.observedAt >= since, read.observedAt > monitored {
+                terminal = read.activity
+            } else if monitored >= since {
+                terminal = ActivityObservation(phase: value.phase, detail: value.activityDetail ?? value.phase.title, monitoring: value.backgroundMonitoring == true)
+            }
+        }
+        return value.projectedCodexActivity(conversationID: conversationID ?? identity?.id, terminal: terminal)
     }
 
     private func presentedSessions() -> [AgentSession] {
@@ -8454,7 +8545,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
         var ranks: [String: Int] = [:]
         ranks.reserveCapacity(sessionOrder.count)
         for (rank, id) in sessionOrder.enumerated() { ranks[id] = rank }
-        let rows = presentedSessions().map(projectCodexActivity).map(projectSessionGroup)
+        let rows = presentedSessions().map { projectCodexActivity($0) }.map(projectSessionGroup)
         var projects: [String: String] = [:]
         for row in rows where ranks[row.id] == nil { projects[row.id] = row.project }
         let precedes: (AgentSession, AgentSession) -> Bool = {
@@ -9497,6 +9588,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
         let previousPolling = pollingIdentities()
         let previousCodex = Set(sessions.values.lazy.filter { $0.agent == .codex && $0.phase != .ended }.map(\.id))
         self.records = records
+        let codexPIDs = Set(found.lazy.filter { $0.agent == .codex }.map(\.pid))
+        foregroundCodexSessions = Set(records.lazy.filter { codexPIDs.contains($0.pid) && $0.isForeground }.map(\.key))
         let managed = found.filter { value in
             guard value.agent != .shell else { return false }
             if let id = ptySessionBindings[value.id], let terminal = try? managedPTY.terminal(id), !terminal.isRunning { return false }
@@ -11180,6 +11273,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
     }
 
     private func clearScreen(_ id: String, keepRemote: Bool = false, preserveSummary:Bool = false) {
+        groupReadScreens.removeValue(forKey: id)
         cancelModelRetention(id)
         if sessions[id] == nil || sessions[id]?.phase == .ended {
             manuallyChangedModelQuestions.removeValue(forKey: id); retainedModelMenus.removeValue(forKey: id)
