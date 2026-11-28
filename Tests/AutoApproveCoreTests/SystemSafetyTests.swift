@@ -323,12 +323,17 @@ extension ApprovalTests {
         let cwd = "/Users/fixture/project"
         for command in ["rm /System/Library/fixture", "rm -rf /Volumes/TestDisk", "cd /etc && unlink fixture",
                         "find /Library -name '*.old' -delete", "git -C /System rm fixture", "rm /Volumes/External/System/fixture",
+                        "rm /dev/null > /dev/null", "rm harmless > /dev/null /System/fixture", "rm harmless 2>&1 /etc/fixture",
+                        "rm harmless &>/dev/null /System/fixture", "rm harmless '>' /dev/null", "rm harmless > '' /dev/null",
+                        "cd -- /etc && rm fixture",
                         "python3 -c 'import os; os.unlink(\"/etc/fixture\"); print(1)'",
                         "diskutil eraseVolume APFS Fixture /dev/disk999", "dd if=/dev/zero of=/dev/rdisk999"] {
             try expectEqual(SystemCommandRisk.detect(command, cwd: cwd)?.kind, .fileDeletion, command)
         }
         for command in ["rm file", "/bin/rm -rf 'old directory'", "cd project && rm old", "git -C project rm old",
                         "find . -name '*.old' -delete", "find . -name old -exec rm {} \\;", "sh -c 'unlink old'",
+                        "rm build/cache > /dev/null", "rm build/cache 2>/dev/null", "rm build/cache >>/dev/null 2>&1",
+                        "cd -- '/Users/fixture/Project One' && rm ./build/cache", "rm harmless &> /dev/null",
                         "rm build/*.log", "rm *.tmp", "git clean -fd", "echo 'rm old'", "ls old", "git rm --cached file",
                         "rm /tmp/old.txt", "rm /tmp/*.log", "rm /Volumes/TestDisk/project/old.txt", "git clean -nfd", "chmod +x build.sh"] {
             try expectNil(SystemCommandRisk.detect(command, cwd: cwd), command)

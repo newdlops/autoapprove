@@ -105,19 +105,41 @@ enum FileDeletionCommand {
 
     private static let commands = try! NSRegularExpression(pattern: #"(?i)\b(rm|rmdir|unlink|trash|shred|find|git|python\w*|node|ruby|perl|diskutil|newfs\w*|mkfs|dd|wipefs|blkdiscard|gpt)\b"#)
 
+    // Consume only complete, literal shell output redirects. Other targets stay visible
+    // to the classifier. Quoted or escaped operators never enter this path.
+    private static func afterOutputRedirect(operatorTail input: Substring) -> Substring? {
+        var rest = input
+        if rest.first == ">" { rest.removeFirst() }
+        if rest.first == "&" {
+            rest.removeFirst()
+            let descriptor = rest.prefix { $0.isASCII && $0.isNumber }
+            guard !descriptor.isEmpty else { return nil }
+            rest = rest.dropFirst(descriptor.count)
+        } else {
+            rest = rest.drop { $0 == " " || $0 == "\t" }
+            guard rest.hasPrefix("/dev/null") else { return nil }
+            rest = rest.dropFirst("/dev/null".count)
+        }
+        guard rest.first.map({ " \t\n;|&<>".contains($0) }) ?? true else { return nil }
+        return rest
+    }
+
     static func commandRisk(_ source: String, cwd: String, depth: Int = 0) -> SystemCommandRisk? {
         guard depth <= 5 else { return review }
         guard commands.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)) != nil else { return nil }
         var words: [String] = [], word = "", quote: Character?, escaped = false, comment = false
         var directory = cwd, result: SystemCommandRisk?
+        var plainWord = true
         func finishWord() {
             if !word.isEmpty { words.append(word); word = "" }
+            plainWord = true
         }
         func finishCommand(continuesOnSuccess: Bool = false) {
             finishWord()
             result = strongest(result, classify(words, cwd: directory, depth: depth))
             if let first = words.first, ["cd", "pushd", "popd"].contains(first) {
-                let path = words.count == 2 && first != "popd" ? words[1] : ""
+                let operands = words.dropFirst(words.dropFirst().first == "--" ? 2 : 1)
+                let path = operands.count == 1 && first != "popd" ? (operands.first ?? "") : ""
                 if !continuesOnSuccess || path.rangeOfCharacter(from: CharacterSet(charactersIn: "$*?[]{}`~")) != nil { directory = "" }
                 else if path.hasPrefix("/") { directory = path }
                 else if !path.isEmpty, directory.hasPrefix("/"), !path.hasPrefix("-"), !path.contains("$"), !path.contains("~") {
@@ -126,24 +148,28 @@ enum FileDeletionCommand {
             }
             words.removeAll(keepingCapacity: true)
         }
-        var characters = source.makeIterator()
-        var current = characters.next()
-        while let ch = current {
-            current = characters.next()
+        var remaining = source[...]
+        while let ch = remaining.popFirst() {
             if comment {
                 if ch != "\n" { continue }
                 comment = false
             }
             if escaped { if ch != "\n" { word.append(ch) }; escaped = false; continue }
-            if ch == "\\", quote != "'" { escaped = true; continue }
+            if ch == "\\", quote != "'" { plainWord = false; escaped = true; continue }
             if let open = quote {
                 if ch == open { quote = nil } else { word.append(ch) }
-            } else if ch == "'" || ch == "\"" { quote = ch }
+            } else if ch == "'" || ch == "\"" { plainWord = false; quote = ch }
+            else if (ch == ">" || (ch == "&" && remaining.first == ">")),
+                    let tail = afterOutputRedirect(operatorTail: ch == "&" ? remaining.dropFirst() : remaining) {
+                if ch == ">", plainWord, !word.isEmpty, word.allSatisfy({ $0.isASCII && $0.isNumber }) { word = "" }
+                finishWord()
+                remaining = tail
+            }
             else if ch == "#", word.isEmpty { comment = true }
             else if ";|&\n()`".contains(ch) {
-                let and = ch == "&" && current == "&"
+                let and = ch == "&" && remaining.first == "&"
                 finishCommand(continuesOnSuccess: and)
-                if and { current = characters.next() }
+                if and { remaining.removeFirst() }
                 else if directory != cwd { directory = "" }
             }
             else if ch.isWhitespace { finishWord() }
