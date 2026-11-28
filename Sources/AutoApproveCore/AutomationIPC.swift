@@ -82,7 +82,11 @@ package final class AutomationIPC: @unchecked Sendable {
     private let lock = NSLock()
     private var active: [String:Flight] = [:]
     private var waiters: [String:[UUID]] = [:]
-    private var reopen: [String:TimeInterval] = [:]
+    private struct Recovery {
+        let delay: TimeInterval
+        let retryAt: TimeInterval
+    }
+    private var reopen: [String:Recovery] = [:]
     private var metrics = Metrics()
     private var durations: [Double] = []
     private let cooldown: TimeInterval
@@ -90,16 +94,20 @@ package final class AutomationIPC: @unchecked Sendable {
     private var probes: [String:(key:String,flight:ResultFlight<OSStatus>)] = [:]
     package init(cooldown: TimeInterval = 15) { self.cooldown = cooldown }
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+    private func deferRecovery(_ host: String, readOnly: Bool) {
+        let delay = readOnly ? min(cooldown, reopen[host].map { $0.delay * 2 } ?? 1) : cooldown
+        reopen[host] = Recovery(delay: delay, retryAt: now + delay)
+    }
     private func expire(_ host:String, _ flight: Flight, _ reason: Failure) {
         guard active[host] === flight, flight.failed == nil else { return }
         flight.failed = reason
-        reopen[host] = now + cooldown
+        deferRecovery(host, readOnly: reason == .timeout && flight.readOnly)
         permissions.removeValue(forKey:host)
         if reason == .timeout { metrics.timeouts += 1 } else { metrics.cancelled += 1 }
     }
     private func reserve<T>(_ host:String, readOnly:Bool, budget:TimeInterval, ticket:UUID? = nil, body:@escaping () throws -> T) throws -> ResultFlight<T> {
         if let current = active[host], now >= current.deadline { expire(host,current,.timeout) }
-        if let time = reopen[host], !readOnly || now < time || active[host] != nil { metrics.rejected += 1; throw Failure.open }
+        if let time = reopen[host]?.retryAt, !readOnly || now < time || active[host] != nil { metrics.rejected += 1; throw Failure.open }
         guard active.count < 2, active[host] == nil,
               waiters[host]?.first == nil || waiters[host]?.first == ticket else { metrics.rejected += 1; throw Failure.busy }
         let flight = ResultFlight<T>(budget:budget)
@@ -131,7 +139,10 @@ package final class AutomationIPC: @unchecked Sendable {
                     switch result {
                     case .success: if probes[host]?.flight.id != flight.id { reopen.removeValue(forKey:host) }
                     case .failure(let error):
-                        if (error as NSError).code == -1712 || reopen[host] != nil { reopen[host] = now + cooldown }
+                        let timedOut = flight.readOnly ? TerminalAppleEvents.isTransientReadFailure(error) : (error as NSError).code == -1712
+                        if timedOut || reopen[host] != nil {
+                            deferRecovery(host, readOnly: flight.readOnly)
+                        }
                         permissions.removeValue(forKey:host)
                     }
                 }
@@ -269,7 +280,7 @@ package final class AutomationIPC: @unchecked Sendable {
     }
 
     func readRetryDelay(_ host: String) -> TimeInterval {
-        lock.withLock { max(0.25, (reopen[host] ?? 0) - now) }
+        lock.withLock { max(0.25, (reopen[host]?.retryAt ?? 0) - now) }
     }
 
     func blocksWrites(_ host:String) -> Bool {
@@ -281,7 +292,7 @@ package final class AutomationIPC: @unchecked Sendable {
     package func permission(host:String,key:String,cacheOnly:Bool,query:@escaping () -> OSStatus) throws -> OSStatus? {
         try Task.checkCancellation()
         lock.lock()
-        if let value = permissions[host], value.key == key, now < value.until, now >= (reopen[host] ?? 0) {
+        if let value = permissions[host], value.key == key, now < value.until, now >= (reopen[host]?.retryAt ?? 0) {
             metrics.permissionHits += 1; lock.unlock(); return value.status
         }
         if let parent = Thread.current.threadDictionary[threadKey] as? Flight, active[host] === parent {

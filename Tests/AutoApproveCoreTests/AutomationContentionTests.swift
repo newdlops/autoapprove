@@ -156,6 +156,30 @@ extension ApprovalTests {
     }
 
     func testBlockedAutomationIsolation() async throws {
+        let recovery = AutomationIPC()
+        let host = "Terminal"
+        func timeout() throws -> Int { throw NSError(domain:NSOSStatusErrorDomain,code:-1712) }
+        func expectReadBackoff() throws {
+            do {
+                _ = try recovery.run(host:host,readOnly:true,budget:2) { 0 }
+                throw AppError.message("Read started during recovery backoff")
+            } catch AutomationIPC.Failure.open {}
+        }
+        try expectThrows(try recovery.run(host:host,readOnly:true,budget:2) { throw AutomationIPC.Failure.timeout })
+        try expectReadBackoff()
+        try await Task.sleep(for:.milliseconds(1050))
+        do { _ = try recovery.run(host:host,readOnly:true,budget:2,body:timeout) }
+        catch let error as NSError { try expectEqual(error.code,-1712) }
+        try await Task.sleep(for:.milliseconds(1050))
+        try expectReadBackoff()
+        try await Task.sleep(for:.milliseconds(1050))
+        try expectThrows(try recovery.runInput(host:host,budget:2) { 0 })
+        try expectEqual(try await recovery.read(host:host) { 1 },1)
+        try expectEqual(try recovery.runInput(host:host,budget:2) { 1 },1)
+        try expectThrows(try recovery.runInput(host:host,budget:2,body:timeout))
+        try await Task.sleep(for:.milliseconds(1050))
+        try expectReadBackoff()
+
         let gate = AutomationIPC(cooldown:0.04)
         let release = DispatchSemaphore(value:0), entered = DispatchSemaphore(value:0)
         defer { release.signal() }

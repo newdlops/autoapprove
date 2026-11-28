@@ -10369,7 +10369,8 @@ private struct ScreenAnalysisStorageKey: Hashable {
             if TerminalAppleEvents.isTransientReadFailure(error) {
                 if hostTargets != nil, adapter.usesHostIPC { screenConnections[host]?.batchSize.timedOut(count: targets.count) }
                 let now = ProcessInfo.processInfo.systemUptime
-                screenConnections[host]?.retryAfter = Date().addingTimeInterval(1)
+                let retryDelay = adapter.usesHostIPC ? max(1, AutomationIPC.shared.readRetryDelay(host.title)) : 1
+                screenConnections[host]?.retryAfter = Date().addingTimeInterval(retryDelay)
                 func recentlyConfirmed(_ id: String) -> Bool {
                     screenReadSucceeded.contains(id) && lastConfirmedScreenRead[id].map { now - $0 < 20 } == true
                 }
@@ -10380,7 +10381,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     return true
                 }
                 let stillConnected = snapshot.health.screen(host).connected &&
-                    (hostTargets ?? targets).contains { recentlyConfirmed($0.id) }
+                    (hostTargets ?? pollingTargets(host)).contains { recentlyConfirmed($0.id) }
                 updateHealth(host) {
                     $0.connected = stillConnected
                     $0.status = stillConnected ? "화면 조회 지연 · 자동 재확인 중" : "화면 응답 대기 · 자동 재연결 중"
@@ -10395,6 +10396,7 @@ private struct ScreenAnalysisStorageKey: Hashable {
                     }
                     clearScreen(target.id, preserveSummary:true)
                 }
+                if !relevant.isEmpty { requestScreenRefresh(host, ids:Set(relevant.map(\.id))) }
                 publish()
                 return false
             }
